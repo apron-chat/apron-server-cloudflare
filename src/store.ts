@@ -14,6 +14,7 @@ import {
   MAX_EMOJI_BYTES,
   MAX_PUSH_CANDIDATES,
   MAX_PUSHES_PER_MESSAGE,
+  MAX_MEMBERSHIPS_PER_USER,
   MAX_PRIVATE_MEMBERSHIPS_PER_USER,
   MAX_PRIVATE_ROOM_LIMIT,
   MAX_THREAD_LIMIT,
@@ -117,41 +118,62 @@ const PRIVATE_ROOMS = privateRange("room_id");
 const PUBLIC_ROOMS = "(room_id < 'private_' OR room_id >= 'private`')";
 /**
  * Each room's kind, as an expression the rooms table is indexed by
- * (ROOM_KIND_INDEX): 0 a top-level public room (`general` included), 1 a
- * thread, 2 a private room. With the head, it orders the index so that each
- * kind's live rooms (head at or past the archive cutoff) are one range of
- * it, however many archived rooms the table holds: archived threads and
- * private rooms are kept for good (roomArchiveMs), so nothing that counts
- * or lists rooms may scan a whole range of the table's key. Queries must
- * spell the expression exactly so (roomKind) for SQLite's planner to use the
- * index; they name no INDEXED BY, so they still run where it is not yet made.
+ * (ROOM_INDEX_DDL): 0 a top-level public room (`general` included), 1 a
+ * thread, 2 a private room. Rooms are kept until their whole log has left
+ * every tier, which with a cold tier that keeps everything is never, so
+ * nothing that counts or lists rooms may scan a whole range of the table's
+ * key. With the creation log ID, the index makes each kind's rooms created
+ * within roomCreationWindowMs one range (recentRoomCount: what the caps
+ * count); with the head, each kind's most recently active rooms one range
+ * (listedRoomRows). Queries must spell the expression exactly so (roomKind)
+ * for SQLite's planner to use the indexes; they name no INDEXED BY, so they
+ * still run where these are not yet made.
  */
 const ROOM_KIND = "(CASE WHEN room_id >= 'private_' AND room_id < 'private`' THEN 2 WHEN parent_room_id IS NULL THEN 0 ELSE 1 END)";
 const roomKind = (kind: 0 | 1 | 2) => `${ROOM_KIND} = ${kind}`;
-/** The index of the rooms table by kind and head (ROOM_KIND): additive, made by SCHEMA_DDL in a new object and by the first cleanup of an older one (ensureRoomKindIndex). */
-const ROOM_KIND_INDEX = "rooms_kind_head_idx";
-const ROOM_KIND_INDEX_DDL = `CREATE INDEX IF NOT EXISTS ${ROOM_KIND_INDEX} ON rooms (${ROOM_KIND}, latest_log_id)`;
-/** Archived threads a listing names, the most recently active (listRooms): older ones are read by their room_id. */
-const LISTED_ARCHIVED_THREADS = MAX_THREAD_LIMIT;
-/** Archived private rooms a maintenance listing names, the most recently active. */
-const LISTED_ARCHIVED_PRIVATE = MAX_PRIVATE_ROOM_LIMIT;
+/**
+ * The rooms table's indexes by kind (ROOM_KIND): by head, for listings, and
+ * by creation, for the caps. Additive: made by SCHEMA_DDL in a new object
+ * and by the first cleanup of an older one (ensureRoomKindIndexes).
+ */
+const ROOM_HEAD_INDEX = "rooms_kind_head_idx";
+const ROOM_CREATED_INDEX = "rooms_kind_created_idx";
+const ROOM_INDEX_DDL = [
+  `CREATE INDEX IF NOT EXISTS ${ROOM_HEAD_INDEX} ON rooms (${ROOM_KIND}, latest_log_id)`,
+  `CREATE INDEX IF NOT EXISTS ${ROOM_CREATED_INDEX} ON rooms (${ROOM_KIND}, created_log_id)`,
+];
+/** Threads a listing names, the most recently active (listRooms): older ones are read by their room_id, and exported (allRooms). */
+const LISTED_THREADS = 2 * MAX_THREAD_LIMIT;
+/** Private rooms a maintenance listing names, the most recently active. */
+const LISTED_PRIVATE_ROOMS = 2 * MAX_PRIVATE_ROOM_LIMIT;
 /**
  * Most rooms one registered user's listing names as joined (userRooms), the
- * most recently active first: every live public room, as many archived
- * threads as a listing names, and their share of private ones.
+ * most recently active: the public rooms and threads a listing names, and
+ * their share of private ones.
  */
-const MAX_USER_ROOMS = 2 * MAX_THREAD_LIMIT + LISTED_ARCHIVED_THREADS + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
+const MAX_USER_ROOMS = 3 * MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
 /**
- * Most public rows a listing reads (listRooms): `general`, the top-level
- * rooms and live threads (each within the thread ceiling, which created
- * top-level rooms count against too), and the archived threads it names.
+ * A join past MAX_MEMBERSHIPS_PER_USER (budget.ts) is refused, so the reads
+ * of a user's own rooms (userRooms, their private rooms, a purge or rename
+ * of them) stay bounded and reserved for (MAX_MEMBERSHIP_ROWS).
  */
-const PUBLIC_ROOM_ROWS = 2 * MAX_THREAD_LIMIT + LISTED_ARCHIVED_THREADS + 1;
-/** Most private rows a maintenance listing reads: the live ones and the archived ones it names. */
-const PRIVATE_ROOM_ROWS = MAX_PRIVATE_ROOM_LIMIT + LISTED_ARCHIVED_PRIVATE;
-/** Reads for counting a kind's live rooms (activeRoomCount): its live range of ROOM_KIND_INDEX, both kinds' at most, and index pages. */
-const ROOM_REVIVE_READS = 2 * Math.max(PUBLIC_ROOM_ROWS, PRIVATE_ROOM_ROWS) + 16;
-const PRIVATE_ROOM_LIMIT_MESSAGE = "The demo holds as many private rooms as it can; one frees up when everyone has left it or it goes quiet long enough to be archived";
+const MEMBERSHIP_LIMIT_MESSAGE = `A user may be in at most ${MAX_MEMBERSHIPS_PER_USER} rooms; leave one to join another`;
+/**
+ * Most public rows a listing reads (listRooms): `general` and the top-level
+ * rooms (MAX_CREATED_ROOMS, well within one MAX_THREAD_LIMIT), and the
+ * LISTED_THREADS threads it names.
+ */
+const PUBLIC_ROOM_ROWS = MAX_THREAD_LIMIT + LISTED_THREADS + 1;
+/** Most private rows a maintenance listing reads: the ones it names. */
+const PRIVATE_ROOM_ROWS = LISTED_PRIVATE_ROOMS;
+/**
+ * Reads for counting a kind's rooms created within the window
+ * (recentRoomCount), or a user's among them: its range of
+ * ROOM_CREATED_INDEX, which the caps keep within the ceilings (a room is
+ * created, or restored inside the window, only while there is a slot), with
+ * room for a window lengthened since, and index pages.
+ */
+const ROOM_COUNT_READS = 2 * Math.max(PUBLIC_ROOM_ROWS, PRIVATE_ROOM_ROWS) + 16;
 /** The most members a private room may have for its members to see each other's read cursors (read receipts). */
 export const MAX_READ_RECEIPT_MEMBERS = 10;
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
@@ -233,11 +255,13 @@ export interface StoreConfig {
   /** Live thread rooms one registered user may have created (`creator_id`) at once. */
   maxThreadsPerUser: number;
   /**
-   * A thread or private room whose newest record (its head, a commit time)
-   * is older than this is archived: listed and readable, but no longer
-   * counted against the thread and private-room caps. 0 never archives.
+   * The thread and private-room caps (maxThreads, maxThreadsPerUser,
+   * maxPrivateRooms, maxPrivateRoomsPerUser) count the rooms created within
+   * this long (by their creation log ID, a commit time): they limit how many
+   * rooms are started, not how many exist, so posting in an older room never
+   * needs a slot. 0 counts every room that exists.
    */
-  roomArchiveMs: number;
+  roomCreationWindowMs: number;
   /** Serialized client fields of one room record. */
   roomMetadataLimit: number;
   /** Serialized client fields every room may hold whatever the total (roomMetadataMinLimit). */
@@ -561,7 +585,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxEmbeds: DEFAULT_LIMITS.maxEmbeds,
   maxThreads: DEFAULT_LIMITS.threadLimit,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
-  roomArchiveMs: DEFAULT_LIMITS.roomArchiveSeconds * 1000,
+  roomCreationWindowMs: DEFAULT_LIMITS.roomCreationWindowSeconds * 1000,
   roomMetadataLimit: DEFAULT_LIMITS.roomMetadataLimit,
   roomMetadataMinLimit: DEFAULT_LIMITS.roomMetadataMinLimit,
   roomMetadataTotalLimit: DEFAULT_LIMITS.roomMetadataTotalLimit,
@@ -619,9 +643,9 @@ const DEFAULT_CONFIG: StoreConfig = {
   mutationCost: { reads: 64, writes: 64, posts: 1 },
   historyCost: { reads: 64 },
   authCost: { reads: 24, writes: 8, frames: 1 },
-  // A batch also scans the public and private ranges for expired and
-  // excess archived rooms, twice, at up to two reads a row (its key's index
-  // entry and the row).
+  // A batch also scans the public and private ranges for rooms whose log has
+  // left every tier, at up to two reads a row (its key's index entry and the
+  // row).
   cleanupCost: { reads: 1024 + 4 * MAX_PRIVATE_ROOM_LIMIT, writes: 1024 },
 };
 
@@ -699,12 +723,6 @@ export interface RoomRecord {
   ext?: Record<string, unknown>;
   latest_log_id: string;
   history_log_id: string | null;
-  /**
-   * Present on an archived thread or private room only (roomArchiveMs): it
-   * has gone quiet and no longer counts against the room caps; a new post
-   * makes it active again. A delivery field, never logged.
-   */
-  archived?: true;
 }
 
 /** One logged reaction change (protocol §4.7). */
@@ -1078,8 +1096,23 @@ const MAX_RESTORED_AVATAR_BYTES = 2_048;
  * public and private, with slack for index pages.
  */
 const ROOM_FIELDS_TOTAL_READS = 16 + 2 * (PUBLIC_ROOM_ROWS + PRIVATE_ROOM_ROWS);
+/** A duration as a refusal names it: whole days (`30 days`), else hours. */
+function windowDays(ms: number): string {
+  const days = ms / 86_400_000;
+  if (Number.isInteger(days)) return days === 1 ? "1 day" : `${days} days`;
+  const hours = Math.max(1, Math.round(ms / 3_600_000));
+  return hours === 1 ? "1 hour" : `${hours} hours`;
+}
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
+/**
+ * Membership rows one user may hold: at most MAX_MEMBERSHIPS_PER_USER, and
+ * those of removed rooms awaiting purge. What a purge or rename of them
+ * moves, and the most a count of them reads (membershipCount).
+ */
+const MAX_MEMBERSHIP_ROWS = MAX_MEMBERSHIPS_PER_USER + MAX_PURGE_ROOMS;
+/** Reads for membershipCount(): its rows through the user index, and index pages. */
+const MEMBERSHIP_COUNT_READS = 8 + MAX_MEMBERSHIP_ROWS;
 /**
  * Reads for privateRoomCounts() and the private cap: the private range of
  * the rooms table, twice (the creator's live rooms, and the active ones),
@@ -1418,7 +1451,7 @@ const SEEN_COLUMN_PROBE = "SELECT seen_ms FROM identities LIMIT 0";
  * thread ceiling and `general`); rows of rooms removed since cleanup last
  * ran, at most the purge list, wait for it.
  */
-const MAX_PUSH_WAKES_PER_USER = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
+const MAX_PUSH_WAKES_PER_USER = MAX_MEMBERSHIP_ROWS;
 /**
  * Where a user's `unread` (protocol §4.9.3) is kept: the `uploads_day` of
  * their `push_recipient` counter, which every push claimed for them reads
@@ -1965,7 +1998,7 @@ const SCHEMA_DDL = `
     updated_ms INTEGER NOT NULL,
     member_count INTEGER NOT NULL DEFAULT 0
   ) WITHOUT ROWID;
-  ${ROOM_KIND_INDEX_DDL};
+  ${ROOM_INDEX_DDL.join(";\n  ")};
   CREATE TABLE IF NOT EXISTS records (
     room_id TEXT NOT NULL,
     log_id INTEGER NOT NULL,
@@ -2150,7 +2183,7 @@ export class Store {
   /** What the last room_set's total check saw, until taken (takeRoomNotesCheck). */
   private roomNotesCheck?: RoomNotesCheck;
   private inTransaction = false;
-  /** Whether this wake's first cleanup made sure of ROOM_KIND_INDEX (ensureRoomKindIndex). */
+  /** Whether this wake's first cleanup made sure of the rooms' kind indexes (ensureRoomKindIndexes). */
   private roomKindIndexReady = false;
   private observed = {
     reads: 0,
@@ -2364,16 +2397,16 @@ export class Store {
 
   /** True when the object holds data from another schema version that is not upgraded in place. */
   /**
-   * Adds ROOM_KIND_INDEX to an object made before it: once a wake, by the
-   * first cleanup (maintenance), never by a wake itself, which writes
-   * nothing. The schema version stays, since the index is additive (an older
-   * build ignores it and SQLite keeps it as rooms change). Until it exists the
-   * queries that would use it scan the table's key instead: the same rows,
-   * only read the slow way.
+   * Adds the rooms' kind indexes (ROOM_INDEX_DDL) to an object made before
+   * them: once a wake, by the first cleanup (maintenance), never by a wake
+   * itself, which writes nothing. The schema version stays, since the
+   * indexes are additive (an older build ignores them and SQLite keeps them
+   * as rooms change). Until they exist the queries that would use them scan
+   * the table's key instead: the same rows, only read the slow way.
    */
-  private ensureRoomKindIndex(): void {
+  private ensureRoomKindIndexes(): void {
     if (this.roomKindIndexReady) return;
-    this.rawExec(ROOM_KIND_INDEX_DDL);
+    for (const ddl of ROOM_INDEX_DDL) this.rawExec(ddl);
     this.roomKindIndexReady = true;
   }
 
@@ -3598,7 +3631,6 @@ export class Store {
     if (isPlainObject(fields.ext)) record.ext = fields.ext;
     record.latest_log_id = idString(row.latest_log_id);
     record.history_log_id = roomHistoryLogId(row, floor);
-    if (this.isArchived(row, this.clock.now())) record.archived = true;
     return record as unknown as RoomRecord;
   }
 
@@ -3622,7 +3654,7 @@ export class Store {
     const withPrivate = options.withPrivate === true;
     return this.reserved({ reads: this.roomListingReads() + (withPrivate ? 4 * PRIVATE_ROOM_ROWS : 0) }, options.maintenance === true, now, () => {
       const floor = this.publishedFloor();
-      const rows = this.listedRoomRows(now, withPrivate);
+      const rows = this.listedRoomRows(withPrivate);
       const since = options.changedSinceFloor;
       return rows
         .filter((row) => since === undefined || roomHistoryLogId(row, since) !== roomHistoryLogId(row, floor))
@@ -3632,31 +3664,25 @@ export class Store {
 
   /**
    * The rooms a listing names, oldest first: every top-level public room
-   * (`general` and those created, within the thread ceiling), every live
-   * thread, and the LISTED_ARCHIVED_THREADS archived threads most recently
-   * active; `withPrivate`, the live private rooms and LISTED_ARCHIVED_PRIVATE
-   * archived ones the same way. Archived rooms are kept for good, so each
-   * part is a bounded range of ROOM_KIND_INDEX, however many the table holds;
-   * an older archived room is read by its room_id (getRoom), and exported
-   * (allRooms).
+   * (`general` and those created, at most MAX_CREATED_ROOMS), and the
+   * LISTED_THREADS threads most recently active; `withPrivate`, the
+   * LISTED_PRIVATE_ROOMS private rooms most recently active. Rooms are kept
+   * until their log has left every tier, so the threads and private rooms
+   * are each a bounded range of ROOM_HEAD_INDEX, newest head first, however
+   * many the table holds; an older one is read by its room_id (getRoom), and
+   * exported (allRooms).
    */
-  private listedRoomRows(now: number, withPrivate: boolean): RawRoomRow[] {
-    const cutoff = this.archiveCutoff(now);
-    const live = (kind: 0 | 1 | 2) => this.rawRows<RawRoomRow>(
-      `SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${roomKind(kind)} AND latest_log_id >= ? LIMIT ?`,
-      kind === 0 ? 0 : cutoff, kind === 2 ? MAX_PRIVATE_ROOM_LIMIT + 1 : 2 * MAX_THREAD_LIMIT + 1,
+  private listedRoomRows(withPrivate: boolean): RawRoomRow[] {
+    const newest = (kind: 0 | 1 | 2, limit: number) => this.rawRows<RawRoomRow>(
+      `SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${roomKind(kind)} ORDER BY latest_log_id DESC LIMIT ?`, limit,
     );
-    const archived = (kind: 1 | 2, limit: number) => cutoff > 0 ? this.rawRows<RawRoomRow>(
-      `SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${roomKind(kind)} AND latest_log_id < ? ORDER BY latest_log_id DESC LIMIT ?`,
-      cutoff, limit,
-    ) : [];
-    const rows = [...live(0), ...live(1), ...archived(1, LISTED_ARCHIVED_THREADS)];
-    if (withPrivate) rows.push(...live(2), ...archived(2, LISTED_ARCHIVED_PRIVATE));
+    const rows = [...newest(0, MAX_CREATED_ROOMS + 1), ...newest(1, LISTED_THREADS)];
+    if (withPrivate) rows.push(...newest(2, LISTED_PRIVATE_ROOMS));
     return rows.sort((a, b) => integerColumn(a.created_log_id) - integerColumn(b.created_log_id) || (a.room_id < b.room_id ? -1 : 1));
   }
 
   /**
-   * Every room, archived ones included, oldest first, for an export (a
+   * Every room, those no listing names included, oldest first, for an export (a
    * history job, charged to maintenance): the one listing that names every
    * room, read in pages of the key, as many rows as the table holds.
    */
@@ -4257,7 +4283,7 @@ export class Store {
     // its state row read and written (a member's identity too, and for a
     // private room their private rooms); and the log head.
     const cost = {
-      reads: 128 + EMPTY_ROOM_SCAN + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + ROOM_REVIVE_READS + 4 * fresh.length + 8 * keys + 4 * named.size +
+      reads: 128 + EMPTY_ROOM_SCAN + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + ROOM_COUNT_READS + 4 * fresh.length + 8 * keys + 4 * named.size +
         (isPrivate ? memberships.size * this.userRoomsReads() : 0),
       writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
     };
@@ -4273,15 +4299,14 @@ export class Store {
         const createdLogId = Math.min(...known);
         const recordLogId = Math.max(createdLogId, listingLog ?? 0, latestRoom?.log_id ?? 0);
         const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? roomClientFields(latestRoom.fields) : roomClientFields(listing);
-        // A thread or private room whose newest record is already old comes in
-        // archived: it takes no slot (roomSlotFree, roomArchiveMs), and is kept for good.
-        const restoredHead = Math.max(recordLogId, parseLogId(listing.latest_log_id) ?? 0, ...batch.map((record) => record.log_id));
-        const archived = (isPrivate || parentRoomId !== null) && restoredHead < this.archiveCutoff(effective);
-        const slot = (kind: "public" | "private"): boolean => archived || this.roomSlotFree(kind, effective);
+        // A room created before roomCreationWindowMs takes no slot: the caps
+        // count the rooms started within it (roomSlotFree).
+        const old = createdLogId < this.creationCutoff(effective);
+        const slot = (kind: "public" | "private"): boolean => old || this.roomSlotFree(kind, effective);
         if (isPrivate) {
           if (parentRoomId !== null) throw new StoreError("invalid_params", "A private room cannot be a thread on this server");
           if (this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
-          if (!slot("private")) throw new StoreError("denied", "This server holds as many private rooms as it can");
+          if (!slot("private")) throw new StoreError("denied", this.privateRoomLimitMessage());
         } else {
           if (parentRoomId !== null) {
             const parent = this.roomRow(parentRoomId);
@@ -4549,25 +4574,32 @@ export class Store {
 
   /**
    * A registered user's joined rooms, oldest room first: the MAX_USER_ROOMS
-   * most recently active, archived threads are kept for good, so a user who
-   * joined many over the years is listed in the live ones and the newest
-   * archived; an older one is still theirs, read by its room_id. The join
-   * with `rooms` hides memberships of removed rooms awaiting purge.
+   * newest by room_id, read in the user index's own order, so however many
+   * rooms the user is in (rooms are kept for good) the read stops there.
+   * Room IDs order the private rooms (a user is in at most
+   * maxPrivateMembershipsPerUser) and `general` before the others, which are
+   * log IDs: the newest rooms by creation. An older one is still theirs,
+   * read by its room_id. The join with `rooms` hides memberships of removed
+   * rooms awaiting purge.
    */
   private userRooms(userId: string): string[] {
     return this.rawRows<{ room_id: string }>(
       `SELECT room_id FROM (
          SELECT m.room_id AS room_id, r.created_log_id AS created_log_id FROM memberships m INDEXED BY memberships_user_idx
          JOIN rooms r ON r.room_id = m.room_id
-         WHERE m.user_id = ? ORDER BY r.latest_log_id DESC LIMIT ?
+         WHERE m.user_id = ? ORDER BY m.room_id DESC LIMIT ?
        ) ORDER BY created_log_id`,
       userId, MAX_USER_ROOMS,
     ).map((row) => row.room_id);
   }
 
-  /** Reads for userRooms(): the user's membership rows, live and awaiting purge, and a room lookup each. */
+  /**
+   * Reads for userRooms(): at most MAX_USER_ROOMS of the user's membership
+   * rows, and those awaiting purge it passes on the way, each an index entry
+   * and a room lookup (measured: three reads a row).
+   */
   private userRoomsReads(): number {
-    return 8 + 2 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS);
+    return 8 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS);
   }
 
   /** Whether an identity has this `user_id` now, one indexed read. */
@@ -4639,7 +4671,7 @@ export class Store {
         requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
       };
     });
-    const membershipRows = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
+    const membershipRows = MAX_MEMBERSHIP_ROWS;
     // Moving a row keyed or indexed by the user_id reads its index entry and
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
@@ -4769,7 +4801,7 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 8 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
+    const perUser = 64 + 8 * MAX_MEMBERSHIP_ROWS + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
     const roomRows = this.roomRowCount() + MAX_PURGE_ROOMS;
@@ -5267,24 +5299,24 @@ export class Store {
    */
   restoreRoomCapacity(listings: readonly RoomListing[], now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 24 + MAX_CREATED_ROOMS + listings.length + 2 * ROOM_REVIVE_READS }, true, now, () => {
+    return this.reserved({ reads: 24 + MAX_CREATED_ROOMS + listings.length + 2 * ROOM_COUNT_READS }, true, now, () => {
       const privates = listings.filter((listing) => isPrivateRoomId(listing.room_id));
       const publics = listings.filter((listing) => !isPrivateRoomId(listing.room_id));
       const topLevel = publics.filter((listing) => typeof listing.parent_room_id !== "string");
-      // A thread or private room whose newest record is already old comes in
-      // archived (roomArchiveMs): it takes no slot.
-      const cutoff = this.archiveCutoff(now);
-      const active = (listing: RoomListing): boolean => {
-        if (!isPrivateRoomId(listing.room_id) && typeof listing.parent_room_id !== "string") return true;
-        // Without the listing's head, counted as active: the import never finds a cap mid-write.
-        const head = parseLogId(listing.latest_log_id) ?? Number.MAX_SAFE_INTEGER;
-        return head >= cutoff;
+      // A room created before roomCreationWindowMs takes no slot (restoreRoom):
+      // its creation is the lowest of its listing's log_id and history_log_id,
+      // and of its records, which planning has not read, so without the
+      // listing's it counts: the import never finds a cap mid-write.
+      const cutoff = this.creationCutoff(now);
+      const recent = (listing: RoomListing): boolean => {
+        const known = [parseLogId(listing.log_id), parseLogId(listing.history_log_id)].filter((logId): logId is number => logId !== undefined);
+        return !known.length || Math.min(...known) >= cutoff;
       };
       if (privates.length) {
         if (this.config.maxPrivateRooms === 0) return "this archive has private rooms, and private rooms are not supported on this server";
-        const used = this.activeRoomCount("private", now);
-        const adding = privates.filter(active).length;
-        if (used + adding > this.config.maxPrivateRooms) return `this archive would add ${adding} active private rooms, but there is room for ${Math.max(0, this.config.maxPrivateRooms - used)} more (${used} of ${this.config.maxPrivateRooms})`;
+        const used = this.recentRoomCount("private", now);
+        const adding = privates.filter(recent).length;
+        if (used + adding > this.config.maxPrivateRooms) return `this archive would add ${adding} recently created private rooms, but there is room for ${Math.max(0, this.config.maxPrivateRooms - used)} more (${used} of ${this.config.maxPrivateRooms})`;
       }
       if (topLevel.length) {
         const used = this.rawRows(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_CREATED_ROOMS + 2).length;
@@ -5292,9 +5324,9 @@ export class Store {
         if (used + topLevel.length - 1 > MAX_CREATED_ROOMS) return `this archive would add ${topLevel.length} top-level rooms, but there is room for ${Math.max(0, MAX_CREATED_ROOMS + 1 - used)} more (room_limit)`;
       }
       if (publics.length) {
-        const used = this.activeRoomCount("public", now);
-        const adding = publics.filter(active).length;
-        if (used + adding > this.config.maxThreads) return `this archive would add ${adding} active public rooms and threads, but there is room for ${Math.max(0, this.config.maxThreads - used)} more (thread_limit, ${used} of ${this.config.maxThreads})`;
+        const used = this.recentRoomCount("public", now);
+        const adding = publics.filter(recent).length;
+        if (used + adding > this.config.maxThreads) return `this archive would add ${adding} recently created public rooms and threads, but there is room for ${Math.max(0, this.config.maxThreads - used)} more (thread_limit, ${used} of ${this.config.maxThreads})`;
       }
       const newTop = new Set(topLevel.map((listing) => listing.room_id));
       for (const listing of publics) {
@@ -6261,9 +6293,8 @@ export class Store {
     // room record, and the user's rooms; a join of a private room also counts
     // the private rooms the user is in, through the same membership rows.
     const privateJoin = input.join && isPrivateRoomId(input.roomId);
-    // A join of an archived room makes it active again (reviveArchivedRooms); a leave never does.
-    const reviving = input.join && this.touchesArchivedRoom("room_set", { room_id: input.roomId }, operationNow);
-    const reserved = this.reserveCost({ reads: 64 + (privateJoin ? 2 : 1) * this.userRoomsReads() + (reviving ? ROOM_REVIVE_READS : 0), writes: 64, posts: 1 }, false, operationNow);
+    // A join also counts the user's memberships against MAX_MEMBERSHIPS_PER_USER.
+    const reserved = this.reserveCost({ reads: 64 + (privateJoin ? 2 : 1) * this.userRoomsReads() + (input.join ? MEMBERSHIP_COUNT_READS : 0), writes: 64, posts: 1 }, false, operationNow);
     try {
       const effective = this.effectiveNow(operationNow);
       if (input.join) this.ensureGrowthCapacity(1024);
@@ -6279,6 +6310,7 @@ export class Store {
         if (privateJoin && this.privateMembershipCount(input.userId) >= this.config.maxPrivateMembershipsPerUser) {
           throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
         }
+        if (input.join && this.membershipCount(input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
         this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else {
@@ -6289,8 +6321,6 @@ export class Store {
         const startLogId = state.last_log_id;
         const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
         const membership = this.logMembership(context, input.roomId, recordedUser(input.userId, identity.name), input.join);
-        // Leaving an archived room is never refused, though it makes the room active again.
-        if (input.join) this.reviveArchivedRooms(context, effective);
         this.finishCommit(context, startLogId);
         const updated = { ...room, latest_log_id: Math.max(room.latest_log_id, context.state.last_log_id) };
         const record = this.roomRecord(updated, this.publishedFloor());
@@ -8387,16 +8417,20 @@ export class Store {
     if (roomIdParam === undefined) {
       const parentId = params.parent_room_id;
       let parentRoomId: string | null = null;
+      // Creating a room joins its registered creator.
+      if (registered && this.membershipCount(input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
       if (makePrivate) {
-        const counts = this.privateRoomCounts(input.userId, Math.max(floor, this.archiveCutoff(context.commitMs)));
+        const counts = this.privateRoomCounts(input.userId, this.creationCutoff(context.commitMs));
         if (counts.memberships >= this.config.maxPrivateMembershipsPerUser) {
           throw new StoreError("denied", `You are in ${counts.memberships} private rooms, the most at once; leave one to start another`);
         }
         // So one account cannot take every slot by starting rooms and leaving them to others.
         if (counts.created >= this.config.maxPrivateRoomsPerUser) {
-          throw new StoreError("denied", `You can have started at most ${this.config.maxPrivateRoomsPerUser} private rooms at once; one stops counting when everyone has left it or its history expires`);
+          throw new StoreError("denied", this.config.roomCreationWindowMs > 0
+            ? `You can start at most ${this.config.maxPrivateRoomsPerUser} private rooms in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
+            : `You can have started at most ${this.config.maxPrivateRoomsPerUser} private rooms at once; one stops counting when everyone has left it`);
         }
-        if (!this.roomSlotFree("private", context.commitMs)) throw new StoreError("denied", PRIVATE_ROOM_LIMIT_MESSAGE);
+        if (!this.roomSlotFree("private", context.commitMs)) throw new StoreError("denied", this.privateRoomLimitMessage());
       } else if (parentId === undefined) {
         if (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES)) throw new StoreError("denied", "Only an admin or mod may create a room; others may create threads");
         const rooms = this.rawRows(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_CREATED_ROOMS + 1).length;
@@ -8409,11 +8443,11 @@ export class Store {
         if (isPrivateRoomId(parentId)) throw new StoreError("denied", "A private room has no threads on this demo");
         parentRoomId = parentId;
         // So one account cannot take every slot: the threads a registered user
-        // created that are still live, read from the capped rooms table. A
-        // thread removed when emptied, or whose log expired (still a row until
-        // cleanup), no longer counts.
-        if (registered && this.liveThreadsCreatedBy(input.userId, Math.max(floor, this.archiveCutoff(context.commitMs))) >= this.config.maxThreadsPerUser) {
-          throw new StoreError("denied", `You can have at most ${this.config.maxThreadsPerUser} threads at once; one stops counting when everyone has left it or its history expires`);
+        // started within roomCreationWindowMs.
+        if (registered && this.recentThreadsCreatedBy(input.userId, this.creationCutoff(context.commitMs)) >= this.config.maxThreadsPerUser) {
+          throw new StoreError("denied", this.config.roomCreationWindowMs > 0
+            ? `You can start at most ${this.config.maxThreadsPerUser} threads in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
+            : `You can have at most ${this.config.maxThreadsPerUser} threads at once; one stops counting when everyone has left it`);
         }
       }
       const counter = makePrivate ? "private_count" : "thread_count";
@@ -8442,8 +8476,6 @@ export class Store {
       } else if (existing.parent_room_id === null && !isPrivate && (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES))) {
         throw new StoreError("denied", "Only an admin or mod may edit a room; anyone may edit a thread");
       }
-      // A save makes an archived room active again, taking a slot; before the row's head moves below.
-      this.reviveArchivedRoom(existing, context.commitMs);
       // parent_room_id is fixed at creation; a submitted value is ignored.
       const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
@@ -8460,8 +8492,8 @@ export class Store {
     }
     const created = roomIdParam === undefined;
     // Delivery fields describe a client's view and are not logged.
-    const { latest_log_id: _latest, history_log_id: _history, archived: _archived, ...logged } = this.roomRecord(row, floor);
-    void _latest; void _history; void _archived;
+    const { latest_log_id: _latest, history_log_id: _history, ...logged } = this.roomRecord(row, floor);
+    void _latest; void _history;
     this.rawExec(
       "INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES (?, ?, ?, 'room', ?)",
       row.room_id, logId, context.commitMs, JSON.stringify(logged),
@@ -8483,12 +8515,12 @@ export class Store {
   }
 
   /**
-   * The head (a commit time) below which a thread or private room is
-   * archived (roomArchiveMs): 0, which no head is below, when rooms never
-   * archive. Top-level public rooms never archive.
+   * The creation log ID (a commit time) from which a room counts against
+   * the thread and private-room caps (roomCreationWindowMs): 0, which every
+   * room is at or past, when every room that exists counts.
    */
-  private archiveCutoff(now: number): number {
-    return this.config.roomArchiveMs > 0 ? Math.max(0, now - this.config.roomArchiveMs) : 0;
+  private creationCutoff(now: number): number {
+    return this.config.roomCreationWindowMs > 0 ? Math.max(0, now - this.config.roomCreationWindowMs) : 0;
   }
 
   /** Rows the rooms table holds (`general`, the public rooms counted by thread_count, the private ones): what a scan of every room reads. */
@@ -8496,114 +8528,79 @@ export class Store {
     return 1 + this.metaNumber("thread_count") + this.metaNumber("private_count");
   }
 
-  /** Whether a room is archived: a thread or private room whose head is older than roomArchiveMs. */
-  private isArchived(row: Pick<RawRoomRow, "room_id" | "parent_room_id" | "latest_log_id">, now: number): boolean {
-    return (row.parent_room_id !== null || isPrivateRoomId(row.room_id)) && row.latest_log_id < this.archiveCutoff(now);
-  }
-
   /**
-   * The rooms counted against a cap (ROOM_SLOT_READS): `public`, the public
-   * rooms besides `general` (top-level ones always, threads while not
-   * archived), against maxThreads; `private`, the private rooms not
-   * archived, against maxPrivateRooms. One scan of the range.
+   * The rooms counted against a cap (ROOM_COUNT_READS): those created within
+   * roomCreationWindowMs. `public`, the top-level rooms and threads besides
+   * `general`, against maxThreads; `private`, the private rooms, against
+   * maxPrivateRooms. Each a range of ROOM_CREATED_INDEX.
    */
-  private activeRoomCount(kind: "public" | "private", now: number): number {
-    const cutoff = this.archiveCutoff(now);
+  private recentRoomCount(kind: "public" | "private", now: number): number {
+    const cutoff = this.creationCutoff(now);
     const count = (sql: string, ...bindings: unknown[]) => integerColumn(this.rawRows<{ count: number }>(sql, ...bindings)[0]?.count);
-    if (kind === "private") return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND latest_log_id >= ?`, cutoff);
-    // Top-level rooms never archive; threads count while live. Each a range of ROOM_KIND_INDEX.
-    return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(0)} AND room_id != ?`, ROOM_ID) +
-      count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND latest_log_id >= ?`, cutoff);
+    if (kind === "private") return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND created_log_id >= ?`, cutoff);
+    return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(0)} AND created_log_id >= ? AND room_id != ?`, cutoff, ROOM_ID) +
+      count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND created_log_id >= ?`, cutoff);
   }
 
-  /**
-   * Whether a room of `kind` may be created, restored active or made active
-   * again: fewer are active than the cap. Archived rooms take no slot, and
-   * however many there are, none is refused for them.
-   */
+  /** Whether a room of `kind` may be created (or restored as created within the window): fewer were created within it than the cap. */
   private roomSlotFree(kind: "public" | "private", now: number): boolean {
     const cap = kind === "public" ? this.config.maxThreads : this.config.maxPrivateRooms;
-    return this.activeRoomCount(kind, now) < cap;
+    return this.recentRoomCount(kind, now) < cap;
+  }
+
+  /** The refusal when the private-room cap is full. */
+  private privateRoomLimitMessage(): string {
+    return this.config.roomCreationWindowMs > 0
+      ? `This server starts at most ${this.config.maxPrivateRooms} private rooms in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
+      : "The demo holds as many private rooms as it can; one frees up when everyone has left it";
   }
 
   /**
    * `/status`: the public rooms (besides `general`) and private rooms
-   * counted against their caps, and those archived (roomArchiveMs). Two
-   * scans of each range.
+   * created within roomCreationWindowMs, which the caps count, and those
+   * kept besides.
    */
-  roomCounts(now = this.clock.now()): { public: { active: number; archived: number }; private: { active: number; archived: number } } {
+  roomCounts(now = this.clock.now()): { public: { recent: number; older: number }; private: { recent: number; older: number } } {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * ROOM_REVIVE_READS }, false, now, () => {
-      const publicActive = this.activeRoomCount("public", now);
-      const privateActive = this.activeRoomCount("private", now);
+    return this.reserved({ reads: 16 + 2 * ROOM_COUNT_READS }, false, now, () => {
+      const publicRecent = this.recentRoomCount("public", now);
+      const privateRecent = this.recentRoomCount("private", now);
       return {
-        public: { active: publicActive, archived: Math.max(0, this.metaNumber("thread_count") - publicActive) },
-        private: { active: privateActive, archived: Math.max(0, this.metaNumber("private_count") - privateActive) },
+        public: { recent: publicRecent, older: Math.max(0, this.metaNumber("thread_count") - publicRecent) },
+        private: { recent: privateRecent, older: Math.max(0, this.metaNumber("private_count") - privateRecent) },
       };
     });
   }
 
   /**
-   * Whether a mutation's record would land in an archived room, so that its
-   * reservation counts the active rooms (ROOM_REVIVE_READS): the room a
-   * message, a move or a room save names, and the room of the message a
-   * move or a reaction set names. A few key lookups, reserved apart.
+   * The rooms a registered user is a member of, through the user index,
+   * those awaiting purge included: at most MAX_MEMBERSHIP_ROWS rows read
+   * (MEMBERSHIP_COUNT_READS), the count stopping there.
    */
-  private touchesArchivedRoom(method: string, params: Record<string, unknown>, now: number): boolean {
-    if (this.config.roomArchiveMs <= 0) return false;
-    return this.reserved({ reads: 12 }, false, now, () => {
-      const ids: string[] = [];
-      if (typeof params.room_id === "string") ids.push(params.room_id);
-      if ((method === "message" || method === "reactions") && typeof params.message_id === "string") {
-        const message = this.rawRows<{ room_id: string }>("SELECT room_id FROM message_state WHERE message_id = ? LIMIT 1", params.message_id)[0];
-        if (message) ids.push(message.room_id);
-      }
-      return ids.some((id) => {
-        const row = this.roomRow(id);
-        return row !== null && this.isArchived(row, now);
-      });
-    });
-  }
-
-  /**
-   * Makes the archived rooms this commit logs in active again: each takes a
-   * slot, refused as a new room of its kind is (`thread_limit`, or
-   * PRIVATE_ROOM_LIMIT_MESSAGE) when as many are active as the cap. Before
-   * finishCommit, which moves their heads.
-   */
-  private reviveArchivedRooms(context: CommitContext, now: number): void {
-    for (const roomId of context.touched.keys()) {
-      const row = this.roomRow(roomId);
-      if (row) this.reviveArchivedRoom(row, now);
-    }
-  }
-
-  /** One room's part of reviveArchivedRooms: nothing for a room that is not archived. */
-  private reviveArchivedRoom(row: RawRoomRow, now: number): void {
-    if (!this.isArchived(row, now)) return;
-    const kind = isPrivateRoomId(row.room_id) ? "private" : "public";
-    const cap = kind === "public" ? this.config.maxThreads : this.config.maxPrivateRooms;
-    if (this.activeRoomCount(kind, now) >= cap) throw new StoreError("denied", kind === "public" ? "thread_limit" : PRIVATE_ROOM_LIMIT_MESSAGE);
-  }
-
-  /** Thread rooms `userId` created that are still live: not removed, and with a head at or past `floor` (retained, and not archived). One scan of the capped rooms table's public range. */
-  private liveThreadsCreatedBy(userId: string, floor: number): number {
+  private membershipCount(userId: string): number {
     return integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
-      floor, userId,
+      "SELECT COUNT(*) AS count FROM (SELECT 1 FROM memberships INDEXED BY memberships_user_idx WHERE user_id = ? LIMIT ?)", userId, MAX_MEMBERSHIP_ROWS,
+    )[0]?.count);
+  }
+
+  /** Thread rooms `userId` created within roomCreationWindowMs (`cutoff`): ROOM_CREATED_INDEX's range of them, the creator read from each row. */
+  private recentThreadsCreatedBy(userId: string, cutoff: number): number {
+    return integerColumn(this.rawRows<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND created_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
+      cutoff, userId,
     )[0]?.count);
   }
 
   /**
-   * For a private room's creation (PRIVATE_ROOM_COUNT_READS): the live
-   * private rooms `userId` created, as liveThreadsCreatedBy counts threads,
-   * from the capped private range; and the private rooms they are in, from
-   * their memberships.
+   * For a private room's creation (PRIVATE_ROOM_COUNT_READS): the private
+   * rooms `userId` created within roomCreationWindowMs (`cutoff`), as
+   * recentThreadsCreatedBy counts threads; and the private rooms they are
+   * in, from their memberships.
    */
-  private privateRoomCounts(userId: string, floor: number): { created: number; memberships: number } {
+  private privateRoomCounts(userId: string, cutoff: number): { created: number; memberships: number } {
     const created = integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
-      floor, userId,
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND created_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
+      cutoff, userId,
     )[0]?.count);
     return { created, memberships: this.privateMembershipCount(userId) };
   }
@@ -8611,8 +8608,8 @@ export class Store {
   /**
    * The private rooms a registered user is in. Their membership rows,
    * through the user index, joined with `rooms` so the rows of a removed
-   * room awaiting purge do not count: at most MAX_USER_ROOMS and
-   * MAX_PURGE_ROOMS rows, and a room lookup each.
+   * room awaiting purge do not count: at most MAX_MEMBERSHIP_ROWS rows, and
+   * a room lookup each.
    */
   private privateMembershipCount(userId: string): number {
     return integerColumn(this.rawRows<{ count: number }>(
@@ -8661,8 +8658,8 @@ export class Store {
     const before = existing ? excess(utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))) : 0;
     if (added === 0 || added <= before) return;
     // The rooms a listing names (listedRoomRows) past the minimum, with what
-    // each holds past it: archived rooms past those listed never reach a listing.
-    const rows = this.listedRoomRows(this.clock.now(), true)
+    // each holds past it: older rooms, which no listing names, never reach one.
+    const rows = this.listedRoomRows(true)
       .filter((row) => row.room_id !== existing?.room_id)
       .map((row) => {
         const stored = clientRoomFields(row.fields_json);
@@ -8834,12 +8831,10 @@ export class Store {
     // private room's counts the private range and the creator's memberships
     // (privateRoomCounts). Any mutation may check a private room's membership.
     const creating = method === "room_set" && input.params.room_id === undefined;
-    // A record in an archived room makes it active again, counting the
-    // active rooms of its kind against the cap (reviveArchivedRooms).
-    const reviving = !creating && this.touchesArchivedRoom(method, input.params, operationNow);
-    // Creating a thread scans the public range twice (the creator's live
-    // threads, and the active ones against the cap).
-    const roomScan = (!creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : 2 * PUBLIC_ROOM_ROWS + MAX_CREATED_ROOMS + 2) + (reviving ? ROOM_REVIVE_READS : 0) +
+    // Creating a thread reads the public rooms created within the window
+    // twice (the creator's, and all of them against the cap), and joins its
+    // creator, counting their memberships.
+    const roomScan = (!creating ? 0 : (input.params.private === true ? PRIVATE_ROOM_COUNT_READS : 2 * ROOM_COUNT_READS + MAX_CREATED_ROOMS + 2) + MEMBERSHIP_COUNT_READS) +
       (method === "room_set" ? ROOM_FIELDS_TOTAL_READS : 0);
     // A move or an editor's save also raises the retired markers of the
     // users it logs again (noteRetiredRelog): its author, last editor and
@@ -8883,7 +8878,6 @@ export class Store {
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
           if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
-          this.reviveArchivedRooms(context, effective);
           this.finishCommit(context, startLogId);
         }
         this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);
@@ -9415,7 +9409,7 @@ export class Store {
     // idempotent job. Commit times are nondecreasing in log order, so the
     // expired set is always a prefix of the one server-wide log.
     this.transaction(() => {
-      this.ensureRoomKindIndex();
+      this.ensureRoomKindIndexes();
       const pending = this.rawRows<{ log_id: number }>(
         "SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor,
       );

@@ -219,19 +219,19 @@ export interface Limits {
 	databaseHardTargetBytes: number;
 	databaseResumeLowWaterBytes: number;
 	cleanupBatch: number;
-	/** Active public rooms and threads that may exist at once (`general` aside); archived threads do not count (roomArchiveSeconds). */
+	/** Public rooms and threads (`general` aside) that may be started within roomCreationWindowSeconds. */
 	threadLimit: number;
-	/** Active threads one registered user may have created; removed and archived ones do not count. */
+	/** Threads one registered user may start within roomCreationWindowSeconds. */
 	threadsPerUser: number;
 	/**
-	 * A thread or private room whose newest record is older than this is
-	 * archived: still listed and readable through every history tier, but no
-	 * longer counted against `threadLimit`, `threadsPerUser`,
-	 * `privateRoomLimit` or `privateRoomsPerUser`. A new post in it makes it
-	 * active again, taking a slot. 0 never archives a room: rooms count until
-	 * they are removed.
+	 * The window the room caps (`threadLimit`, `threadsPerUser`,
+	 * `privateRoomLimit`, `privateRoomsPerUser`) count rooms started in, by
+	 * their creation: they limit how fast rooms are started, not how many
+	 * exist, so posting in, joining or leaving an older room never needs a
+	 * slot, and rooms are kept for as long as their history. 0 counts every
+	 * room that exists.
 	 */
-	roomArchiveSeconds: number;
+	roomCreationWindowSeconds: number;
 	/** One room's serialized client fields (`title`, `description`, `ext`). */
 	roomMetadataLimit: number;
 	/**
@@ -248,9 +248,9 @@ export interface Limits {
 	 * grow the total past it is refused.
 	 */
 	roomMetadataTotalLimit: number;
-	/** Private rooms (§4.2.4) that may exist at once; they do not count against threadLimit. */
+	/** Private rooms (§4.2.4) that may be started within roomCreationWindowSeconds; they do not count against threadLimit. */
 	privateRoomLimit: number;
-	/** Active private rooms one registered user may have created; removed and archived ones do not count. */
+	/** Private rooms one registered user may start within roomCreationWindowSeconds. */
 	privateRoomsPerUser: number;
 	/** Private rooms one registered user may be a member of at once, the ones others added them to included. */
 	privateMembershipsPerUser: number;
@@ -632,6 +632,11 @@ export const MAX_ROOM_METADATA_TOTAL_LIMIT = MAX_HISTORY_RESPONSE_BYTES;
 // the private range, and the per-user ceiling the rooms one user can be in.
 export const MAX_PRIVATE_ROOM_LIMIT = 200;
 export const MAX_PRIVATE_MEMBERSHIPS_PER_USER = 50;
+// The most rooms one registered user may be a member of, private ones
+// included (store.ts, MEMBERSHIP_LIMIT_MESSAGE). Rooms are kept as long as
+// their history, so without it the reads of a user's own rooms (their
+// listing, a purge or rename of them) would grow without bound.
+export const MAX_MEMBERSHIPS_PER_USER = 1_000;
 // A move re-logs every reaction set of the moved message in one record, so the
 // per-message cap bounds that record, its SQL work, and its history response.
 export const MAX_REACTION_USERS_PER_MESSAGE = 64;

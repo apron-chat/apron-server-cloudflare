@@ -89,11 +89,11 @@ LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_COLD_RECORDS = "0"
-# A thread or private room quiet for 30 days is archived: still listed and
-# readable through every tier, but no longer counted against the thread and
-# private-room caps; a new post makes it active again (docs/configuration.md,
-# Rooms). 0 never archives.
-LIMIT_ROOM_ARCHIVE_SECONDS = "2592000"
+# The thread and private-room caps count the rooms started in the last 30
+# days: they limit how fast rooms are started, not how many exist, and rooms
+# are kept as long as their history (docs/configuration.md, Rooms). 0 counts
+# every room that exists.
+LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
 # Backups to HISTORY_BLOB under backups/: one a day (and an admin's
 # `/history export`), the newest 14 of each kind kept, private rooms
 # included, gzip-compressed. They are not encrypted: the bucket being

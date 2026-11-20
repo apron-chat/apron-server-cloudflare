@@ -57,7 +57,7 @@ export interface RestoreStore {
 
 /** What an export needs of the Store. */
 export interface ExportStore {
-	/** Every room, archived ones included (an export names every room, however many). */
+	/** Every room, those no listing names included (an export names every room, however many). */
 	allRooms(now?: number): Array<{ room_id: string }>;
 	getIdentity(userId: string): { userId: string; name: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> } | null;
 	exportMembers(roomId: string, limit: number): { members: string[]; count: number };

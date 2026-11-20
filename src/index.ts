@@ -1166,7 +1166,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxEmbeds: limits.maxEmbeds,
 		maxThreads: limits.threadLimit,
 		maxThreadsPerUser: limits.threadsPerUser,
-		roomArchiveMs: limits.roomArchiveSeconds * 1_000,
+		roomCreationWindowMs: limits.roomCreationWindowSeconds * 1_000,
 		roomMetadataLimit: limits.roomMetadataLimit,
 		roomMetadataMinLimit: limits.roomMetadataMinLimit,
 		roomMetadataTotalLimit: limits.roomMetadataTotalLimit,
@@ -9590,16 +9590,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `/status`'s room lines: the public rooms and threads, and the private
-	 * rooms, counted against their caps, and those archived (quiet for
-	 * roomArchiveSeconds), which no longer count.
+	 * rooms, started within roomCreationWindowSeconds (what the caps count),
+	 * and the older ones kept besides.
 	 */
 	private roomCountLines(now: number): string[] {
 		const limits = this.config.limits;
 		const rooms = this.store.roomCounts(now);
-		const archived = (n: number) => (n ? `, ${n.toLocaleString("en-US")} archived` : "");
+		const window = limits.roomCreationWindowSeconds > 0 ? ` started in ${Math.round(limits.roomCreationWindowSeconds / 86_400)} days` : "";
+		const older = (n: number) => (n ? `, ${n.toLocaleString("en-US")} older` : "");
 		return [
-			`- Rooms and threads: ${rooms.public.active.toLocaleString("en-US")} / ${limits.threadLimit.toLocaleString("en-US")} active${archived(rooms.public.archived)}`,
-			...(limits.privateRoomLimit > 0 ? [`- Private rooms: ${rooms.private.active.toLocaleString("en-US")} / ${limits.privateRoomLimit.toLocaleString("en-US")} active${archived(rooms.private.archived)}`] : []),
+			`- Rooms and threads: ${rooms.public.recent.toLocaleString("en-US")} / ${limits.threadLimit.toLocaleString("en-US")}${window}${older(rooms.public.older)}`,
+			...(limits.privateRoomLimit > 0 ? [`- Private rooms: ${rooms.private.recent.toLocaleString("en-US")} / ${limits.privateRoomLimit.toLocaleString("en-US")}${window}${older(rooms.private.older)}`] : []),
 		];
 	}
 

@@ -104,7 +104,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// So one account cannot take every thread slot: a quarter of them.
 		threadsPerUser: 25,
 		// A quiet thread or private room stops counting after 30 days.
-		roomArchiveSeconds: 30 * 24 * 60 * 60,
+		roomCreationWindowSeconds: 30 * 24 * 60 * 60,
 		// Room notes: a description long enough for an evergreen document;
 		// every room may hold 1 KiB whatever the total, and what rooms hold
 		// past it is bounded together, so a listing of every room stays bounded.
