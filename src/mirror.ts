@@ -235,6 +235,14 @@ export class RemoteRooms {
 		state.rooms.push({ room_id: room.room_id, server: invite.server, owner_room: invite.room, token: invite.token, start, threads: {} });
 		state.servers[invite.server] ??= { cursor: start };
 		this.store.setMirrorState(state, this.now());
+		// This mirror already read that owner past the room's start: records of the room it read
+		// before the mirror room existed went nowhere, so it reads them again (rereadRoom).
+		const readTo = state.servers[invite.server].cursor;
+		if (readTo > start) {
+			void this.rereadRoom(invite.server, invite.room, start, readTo).catch((error) => {
+				console.warn(JSON.stringify({ event: "remote_reread_failed", server: invite.server, owner_room: invite.room, error: error instanceof Error ? error.message : String(error) }));
+			});
+		}
 		// A private mirror room has no threads here (copyRoom leaves them out).
 		for (const thread of threads) await this.applyRecord(invite.server, "rooms", thread);
 		await this.seedThreads(invite.server, threads, threadUsers);
@@ -733,6 +741,38 @@ export class RemoteRooms {
 			const last = Number(page.result.last_log_id);
 			if (Number.isFinite(last)) this.advance(session.server, last);
 			if (page.result.more !== true) return;
+		}
+	}
+
+	/**
+	 * The records of a newly mirrored owner room from its start up to `readTo`
+	 * (inclusive), which this mirror read before the mirror room existed:
+	 * read again with `history` for that room. Live records wait meanwhile, as
+	 * in a catch-up, so an older snapshot read here never lands after a newer one.
+	 */
+	private async rereadRoom(server: string, ownerRoom: string, start: number, readTo: number): Promise<void> {
+		const session = this.session(server);
+		session.inflight += 1;
+		try {
+			const connection = await this.ensure(server);
+			session.buffer ??= [];
+			try {
+				for (let after = start + 1; after <= readTo;) {
+					const page = await connection.call("history", { room_id: ownerRoom, after: String(after), before: String(readTo), limit: HISTORY_PAGE }, `mirror-reread:${ownerRoom}:${after}:${this.now()}`);
+					if (page.error || !page.result) throw new Error(`history: ${page.error?.message ?? "no result"}`);
+					for (const { kind, record } of pageRecords(page.result)) await this.applyRecord(server, kind, record);
+					const last = Number(page.result.last_log_id);
+					if (page.result.more !== true || !Number.isFinite(last)) break;
+					after = last + 1;
+				}
+			} finally {
+				const held = session.buffer ?? [];
+				session.buffer = undefined;
+				for (const frame of held) await this.apply(server, frame);
+			}
+		} finally {
+			session.inflight -= 1;
+			this.touch(server);
 		}
 	}
 

@@ -718,3 +718,41 @@ it('a mirror reads from the owner\'s history bound once it has passed its place'
 		} finally { vi.restoreAllMocks(); }
 	});
 });
+
+it('a mirror reads again the records of a new mirror room that it read before the room existed', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-reread-${crypto.randomUUID()}`), async (_instance, state) => {
+		const store = new Store(state, {});
+		store.initialize();
+		const server = 'ws://a.example/ws';
+		// The mirror room starts at 10, but this mirror had read the owner up to 50 for its other rooms.
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 10, threads: {} }], servers: { [server]: { cursor: 50 } } });
+		const host = { store, self: 'wss://demo.test/ws', storage: state.storage, lingerMs: 60_000, mayDial: () => true, runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, userChanged: () => undefined } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { rereadRoom(server: string, ownerRoom: string, start: number, readTo: number): Promise<void>; sessions: Map<string, unknown> };
+		const pair = new WebSocketPair();
+		const owner = pair[1];
+		owner.accept();
+		const asked: Array<Record<string, unknown>> = [];
+		owner.addEventListener('message', (event) => {
+			const frame = JSON.parse(String(event.data));
+			if (frame.method === 'auth') return owner.send(JSON.stringify({ id: frame.id, result: { you: { user_id: 'link_1' } } }));
+			asked.push(frame.params);
+			owner.send(JSON.stringify({ id: frame.id, result: {
+				latest_log_id: '60', history_log_id: '1', first_log_id: '20', last_log_id: '20', more: false,
+				messages: [{ message_id: '20', log_id: '20', room_id: 'ops', from: { user_id: 'carol', name: 'Carol' }, body: { text: 'missed' } }],
+			} }));
+		});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			setTimeout(() => owner.send(JSON.stringify({ method: 'server', params: { apron: 10 } })), 0);
+			return new Response(null, { status: 101, webSocket: pair[0] });
+		});
+		try {
+			const connection = await LinkConnection.open(server, 't');
+			mirror.sessions.set(server, { server, connection, inflight: 0 });
+			await mirror.rereadRoom(server, 'ops', 10, 50);
+			expect(asked).toEqual([{ room_id: 'ops', after: '11', before: '50', limit: 100 }]);
+			const copy = store.copyOf(server, '20')!;
+			expect(store.pushedMessage(copy)?.body?.text).toBe('missed');
+			connection.close();
+		} finally { vi.restoreAllMocks(); }
+	});
+});
