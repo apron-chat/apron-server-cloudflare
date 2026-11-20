@@ -283,16 +283,17 @@ first.
 
 | Cap | Limit |
 | --- | ---: |
-| Active threads a user has started | 25 |
-| Active threads on the server (`thread_limit`) | 100 |
-| Private rooms a user has started / is a member of | 5 / 20 |
-| Private rooms on the server | 100 |
+| Threads a user has started in 30 days | 25 |
+| Threads started on the server in 30 days (`thread_limit`) | 100 |
+| Private rooms a user has started in 30 days / is a member of | 5 / 20 |
+| Private rooms started on the server in 30 days | 100 |
+| Rooms a user is a member of | 1,000 |
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
 | Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
-A thread or private room stops counting when everyone has left it, or when it has been quiet for 30 days: it is then archived, still listed (`archived: true`) and readable, and a new post makes it active again, taking a slot (refused with `thread_limit` while the cap is full; leaving is always allowed). Archived rooms are kept for good, however many there are: only live rooms count against the caps. A room list names the 100 most recently active archived threads; an older one is still there by its `room_id`.
+The thread and private-room caps count the rooms started in the last 30 days: they limit how fast rooms are started, not how many exist. A room stops counting 30 days after it was started, or as soon as everyone has left it; posting in, joining or leaving a room never needs a slot, however old. Rooms are kept as long as their history. A room list names every top-level room and the 200 most recently active threads; an older one is still there by its `room_id`. A user may be in at most 1,000 rooms; leave one to join another.
 
 ## Checklist: a well-behaved client
 

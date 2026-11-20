@@ -785,41 +785,47 @@ of it) stays readable in some tier, and a new account given the same ID would
 take it over. Registration picks another ID instead (registered IDs are
 `<name>_<digits>` or `u_…`), so a retired ID costs nothing but its name.
 
-### Rooms that go quiet
+### Rooms and the caps
 
-A thread or private room whose newest record is older than
-`roomArchiveSeconds` (`LIMIT_ROOM_ARCHIVE_SECONDS`, 30 days on both plans; 0
-never archives) is archived. It stays in `room_list`, marked
-`archived: true`, and its whole history stays readable through every tier,
-but it no longer counts against `threadLimit`, `threadsPerUser`,
-`privateRoomLimit` or `privateRoomsPerUser`, so quiet rooms free their slots
-without losing anything. A new post, reaction, move, room save or join in it
-makes it active again and takes a slot; while the cap is full that request is
-refused as a new room would be (`thread_limit`). Leaving is never refused.
+The thread and private-room caps (`threadLimit`, `threadsPerUser`,
+`privateRoomLimit`, `privateRoomsPerUser`) count the rooms started within
+`roomCreationWindowSeconds` (`LIMIT_ROOM_CREATION_WINDOW_SECONDS`, 30 days on
+both plans), by their creation log ID: they limit how fast rooms are started,
+not how many exist. Posting in, reacting in, saving, moving into or out of,
+joining and leaving a room never needs a slot, however old the room. 0 counts
+every room that exists instead.
 
-Archived rooms are kept for good, however many there are: only the live
-rooms are bounded, by the caps. A room is removed only when its whole log has
-left every tier (with keep-everything in the cold tier, never), or by an
-explicit removal (its last member leaving, `/purge`). Counting and listing
-rooms reads an index of the rooms table by kind and head
-(`rooms_kind_head_idx`), so their cost follows the live rooms, not the
-archived ones. An object made before this version gets the index from its
-first cleanup after the deploy (an additive index, no schema version change);
-until then the same queries scan the table instead.
+Rooms are kept for as long as their history: a room is removed only when its
+whole log has left every tier (with keep-everything in the cold tier, never),
+or by an explicit removal (its last member leaving, `/purge`). Counting reads
+an index of the rooms table by kind and creation (`rooms_kind_created_idx`),
+so it follows the rooms started within the window, not how many the table
+holds; listings read one by kind and head (`rooms_kind_head_idx`). Both are
+additive: an object made before this version gets them from its first
+cleanup after the deploy (no schema version change); until then the same
+queries scan the table instead.
 
-What still grows with archived rooms:
+What grows with the rooms kept, and its bounds:
 
-- A `room_list` names every top-level room, every live thread and the 100
-  archived threads most recently active; an older archived thread is still
-  listed by its `room_id` (`room_list` with `room_id`) and read by `history`.
-  A user's joined rooms are listed the same way: their most recently active
-  rooms, at most the live ones plus 100 archived threads and their private
-  rooms.
+- A `room_list` names every top-level room and the 200 threads most recently
+  active (`LISTED_THREADS`); a maintenance listing the 400 most recently
+  active private rooms. An older thread is still listed by its `room_id`
+  (`room_list` with `room_id`) and read by `history`, and an export names
+  every room (`Store.allRooms`, read in pages).
+- A registered user may be a member of at most 1,000 rooms
+  (`MAX_MEMBERSHIPS_PER_USER`, in `src/budget.ts`): a join past it, or
+  creating a room, which joins its creator, is `denied` ("A user may be in at
+  most 1000 rooms; leave one to join another"). An import that would make
+  someone a member of more of its rooms is refused at planning. So the reads
+  of a user's own rooms stay bounded: their joined rooms are listed newest
+  first, at most `MAX_USER_ROOMS` (351), read in the membership index's order
+  so the read stops there, and a `/purge` or `/rename` of them reserves for
+  at most that many memberships.
 - `/purge`, `/rename` and idle-account pruning read every room row for its
   creator; their reservations count the rows the table holds.
-- An export names every room (`Store.allRooms`), read in pages.
 
-`/status` shows the active and archived counts.
+`/status` shows the rooms started within the window against each cap, and
+the older ones kept besides.
 
 ### History tiers
 
@@ -1031,10 +1037,10 @@ the first daily cleanup that finds more than `retentionRecords`' share):
   records that were never copied and that it would itself have kept.
 - It removes thread and private rooms whose whole log is below its SQLite
   floor, with their memberships, where this version keeps them because their
-  records are in D1 or R2, archived or not.
-- It counts every thread row against `threadLimit`, archived ones included,
-  so it refuses new threads until its own cleanup removes old ones (threads
-  whose whole log is below its SQLite floor). It ignores `rooms_kind_head_idx`,
+  records are in D1 or R2.
+- It counts every thread row against `threadLimit`, however old, so it
+  refuses new threads until its own cleanup removes old ones (threads whose
+  whole log is below its SQLite floor). It ignores the rooms' kind indexes,
   which SQLite keeps up to date for it.
 
 Records already in D1 and R2 survive a rollback, and come back into history
@@ -1054,9 +1060,10 @@ camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
 `Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
 `retentionSeconds`, `historyD1Records`, `historyColdRecords` and
-`roomArchiveSeconds` also take `0`, which turns that bound off (for
+`roomCreationWindowSeconds` also take `0`, which turns that bound off (for
 `historyD1Records`, the D1 tier; for `historyColdRecords`, the cold tier
-keeps everything; for `roomArchiveSeconds`, rooms never archive).
+keeps everything; for `roomCreationWindowSeconds`, the room caps count every
+room that exists).
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -1390,8 +1397,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 - History: `retentionRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
   `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
 - Durations: `minRetentionSeconds` and `retentionSeconds` ([History
-  retention](#history-retention)), `roomArchiveSeconds` ([Rooms that go
-  quiet](#rooms-that-go-quiet)), `cleanupSeconds`, `challengeTtlSeconds`,
+  retention](#history-retention)), `roomCreationWindowSeconds` ([Rooms and
+  the caps](#rooms-and-the-caps)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
   resume), `idleAccountSeconds` (account upkeep, above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
@@ -1535,7 +1542,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `cleanupBatch` | 100 |  |
 | `threadLimit` | 100 |  |
 | `threadsPerUser` | 25 |  |
-| `roomArchiveSeconds` | 2592000 |  |
+| `roomCreationWindowSeconds` | 2592000 |  |
 | `roomMetadataLimit` | 8192 |  |
 | `roomMetadataMinLimit` | 1024 |  |
 | `roomMetadataTotalLimit` | 262144 |  |
