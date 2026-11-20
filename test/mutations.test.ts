@@ -373,14 +373,13 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		});
 		expect(errorCode(() => store.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
 
-		// Any participant may save a thread's metadata; omitted fields are
-		// cleared but `ext`, which merges (§4.13), the server supplies a title,
-		// and parent_room_id and private are fixed.
+		// Any participant may save a thread's metadata. A save merges (§4.2.4,
+		// §3.3.1): fields left out stay, and so does `ext`, which merges
+		// (§4.13); parent_room_id and private are fixed.
 		const saved = store.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
 		expect(saved.result).toEqual({ room_id: roomId });
 		expect(saved.created).toBe(false);
-		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Thread" });
-		expect(saved.room?.description).toBeUndefined();
+		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(saved.room).not.toHaveProperty("private");
 		expect(saved.room?.ext).toEqual({ demo: { color: "blue" } });
 		expect(Number(saved.room?.log_id)).toBeGreaterThan(Number(roomId));
@@ -393,6 +392,14 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		// Room records are logged in their own room.
 		const history = store.historyPage({ roomId, after: "0", limit: 50, now: clock.value });
 		expect(history.rooms?.map((room) => room.log_id)).toEqual([roomId, saved.room?.log_id]);
+
+		// A description alone keeps the title; a title alone keeps the description; an empty one clears it,
+		// a thread's title back to the server's.
+		const fields = (room: StoreMutationResult["room"]) => ({ title: room?.title, description: room?.description });
+		expect(fields(store.mutate(op(clock, "alice", "describe", "room_set", { room_id: roomId, description: "Only the description" })).room)).toEqual({ title: "Deploy", description: "Only the description" });
+		expect(fields(store.mutate(op(clock, "alice", "retitle", "room_set", { room_id: roomId, title: "Deploys" })).room)).toEqual({ title: "Deploys", description: "Only the description" });
+		expect(fields(store.mutate(op(clock, "alice", "clear-description", "room_set", { room_id: roomId, description: "" })).room)).toEqual({ title: "Deploys", description: undefined });
+		expect(fields(store.mutate(op(clock, "alice", "clear-title", "room_set", { room_id: roomId, title: " " })).room)).toEqual({ title: "Thread", description: undefined });
 		expect(history.rooms?.[0]).toMatchObject({ title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(history.messages).toBeUndefined();
 		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general", roomId]);

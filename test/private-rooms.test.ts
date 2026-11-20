@@ -55,11 +55,13 @@ it("creates a private room for a registered user only: top-level, untitled unles
 		expect(created.membership?.params.members).toEqual([{ user: { user_id: "ada", name: "ada" }, joined: true }]);
 		expect(meta(state, "private_count")).toBe(1);
 		expect(meta(state, "thread_count")).toBe(0);
-		// A named one keeps its name; a member's save may clear it.
+		// A named one keeps its name, also through a save without one; a member's empty title clears it.
 		const named = create(store, clock, "ada", { title: "Plans", description: "Who brings what" });
 		expect(store.getRoom(named)).toMatchObject({ private: true, title: "Plans", description: "Who brings what" });
-		const saved = store.mutate(op(clock, "ada", "room_set", { room_id: named, private: false }));
-		expect(saved.room).toMatchObject({ room_id: named, private: true });
+		const kept = store.mutate(op(clock, "ada", "room_set", { room_id: named, private: false }));
+		expect(kept.room).toMatchObject({ room_id: named, private: true, title: "Plans", description: "Who brings what" });
+		const saved = store.mutate(op(clock, "ada", "room_set", { room_id: named, title: "" }));
+		expect(saved.room).toMatchObject({ room_id: named, private: true, description: "Who brings what" });
 		expect(saved.room).not.toHaveProperty("title");
 		// Guests have no private rooms, and none is a thread or has one.
 		expect(errorCode(() => store.mutate(op(clock, "guest_1", "room_set", { private: true })))).toBe("denied");

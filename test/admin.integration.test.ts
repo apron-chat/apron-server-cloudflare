@@ -1190,7 +1190,7 @@ it("shows general's description as server.welcome while it has one", async () =>
 		} finally { greeted.close(); plain.close(); }
 	} finally {
 		// Without a description, the generated sign-in welcome comes back.
-		expect((await exchange(admin, 'undescribe', 'room_set', { room_id: 'general', title: 'General' })).frame.result).toEqual({ room_id: 'general' });
+		expect((await exchange(admin, 'undescribe', 'room_set', { room_id: 'general', description: '' })).frame.result).toEqual({ room_id: 'general' });
 		admin.close();
 	}
 	const after = await connect();
@@ -1206,7 +1206,8 @@ it("falls back to general's description as server.description, re-announced whil
 		runtime.config = { ...runtime.config, server };
 	});
 	// Request ids are unique: a room_set retried with an id already used is deduplicated.
-	const describe = (id: string, description?: string) => exchange(admin, unique(id), 'room_set', { room_id: 'general', title: 'General', ...(description !== undefined ? { description } : {}) });
+	// Without a description, an empty one clears it (a save merges, §4.2.4).
+	const describe = (id: string, description?: string) => exchange(admin, unique(id), 'room_set', { room_id: 'general', title: 'General', description: description ?? '' });
 	const serverFrames = (skipped: Frame[]) => skipped.filter((frame) => frame.method === 'server');
 	const fresh = async () => { const peer = await connect(); try { return (await peer.next()).params; } finally { peer.close(); } };
 	try {

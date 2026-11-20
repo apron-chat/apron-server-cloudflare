@@ -7836,11 +7836,15 @@ export class Store {
     // description is no description.
     const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
     const fallbackTitle = isPrivate ? undefined : existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
-    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle;
-    const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
-    // `ext` merges into the room's current one (§4.13, §4.2.4); the size check runs on the result.
-    const roomFields = (stored: unknown): Record<string, unknown> => {
-      const ext = mergeExt(stored, write);
+    // A save merges (§4.2.4, §3.3.1): a field given replaces the stored one,
+    // an empty one clears it (a title back to the fallback), and one left out
+    // stays. `ext` merges into the room's current one (§4.13); the size check
+    // runs on the result.
+    const roomFields = (stored: { title?: unknown; description?: unknown; ext?: unknown }): Record<string, unknown> => {
+      const given = (param: string | undefined, kept: unknown) => param === undefined ? (typeof kept === "string" ? kept : undefined) : param.trim() !== "" ? param : undefined;
+      const title = given(titleParam, stored.title) ?? fallbackTitle;
+      const description = given(descriptionParam, stored.description);
+      const ext = mergeExt(stored.ext, write);
       return { ...(title !== undefined ? { title } : {}), ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
     };
 
@@ -7880,7 +7884,7 @@ export class Store {
       }
       const counter = makePrivate ? "private_count" : "thread_count";
       if (!makePrivate && this.metaNumber(counter) >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
-      const fields = roomFields(undefined);
+      const fields = roomFields({});
       this.checkRoomFields(fields);
       this.checkRoomFieldsTotal(fields);
       logId = this.allocateLogId(context);
@@ -7905,11 +7909,11 @@ export class Store {
         throw new StoreError("denied", "Only an admin or mod may edit a room; anyone may edit a thread");
       }
       // parent_room_id is fixed at creation; a submitted value is ignored.
-      const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
+      const fields = roomFields(parseJson<{ title?: unknown; description?: unknown; ext?: unknown }>(existing.fields_json, {}));
       this.checkRoomFields(fields);
       this.checkRoomFieldsTotal(fields, existing);
       logId = this.allocateLogId(context);
-      // A save replaces the client fields; the creator stays.
+      // A save merges into the client fields (roomFields); the creator stays.
       const creator = storedCreator(existing.fields_json);
       const fieldsJson = JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator });
       this.rawExec(
