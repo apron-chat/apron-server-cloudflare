@@ -443,11 +443,11 @@ export class RemoteRooms {
 	// ─────────────────────────── mirror: reading ───────────────────────────
 
 	/** The mirror room (or a thread of one) that `roomId` is, with the owner's room or thread it shows. */
-	private mirrorOf(roomId: string): { room: MirrorRoom; ownerRoom: string; thread: boolean } | undefined {
+	private mirrorOf(roomId: string): { room: MirrorRoom; ownerRoom: string; thread: boolean; stopped: boolean } | undefined {
 		for (const room of this.store.mirrorState(this.now()).rooms) {
-			if (room.room_id === roomId) return { room, ownerRoom: room.owner_room, thread: false };
+			if (room.room_id === roomId) return { room, ownerRoom: room.owner_room, thread: false, stopped: !!room.unshared };
 			const thread = Object.entries(room.threads).find(([, local]) => local === roomId);
-			if (thread) return { room, ownerRoom: thread[0], thread: true };
+			if (thread) return { room, ownerRoom: thread[0], thread: true, stopped: !!room.unshared || !!room.stopped?.includes(thread[0]) };
 		}
 		return undefined;
 	}
@@ -457,7 +457,7 @@ export class RemoteRooms {
 		for (const mirror of state.rooms) {
 			if (mirror.server !== server || mirror.unshared) continue;
 			if (mirror.owner_room === ownerRoom) return { roomId: mirror.room_id, mirror };
-			if (mirror.threads[ownerRoom]) return { roomId: mirror.threads[ownerRoom], mirror };
+			if (mirror.threads[ownerRoom] && !mirror.stopped?.includes(ownerRoom)) return { roomId: mirror.threads[ownerRoom], mirror };
 		}
 		return undefined;
 	}
@@ -555,7 +555,10 @@ export class RemoteRooms {
 		const rooms = (listed.result.joined as Array<Record<string, unknown>> | undefined) ?? [];
 		const joined = new Set(rooms.map((room) => room.room_id));
 		for (const room of this.store.mirrorState(this.now()).rooms) {
-			if (room.server === server && !room.unshared && !joined.has(room.owner_room)) this.markUnshared(server, room.owner_room);
+			if (room.server !== server || room.unshared) continue;
+			if (!joined.has(room.owner_room)) this.markUnshared(server, room.owner_room);
+			// `joined` holds threads too (§4.2.1): a thread the link left stops alone.
+			else for (const thread of Object.keys(room.threads)) if (!joined.has(thread)) this.markUnshared(server, thread);
 		}
 		for (const room of rooms) this.checkPrivacy(server, room);
 	}
@@ -655,7 +658,7 @@ export class RemoteRooms {
 	private forwardMembership(record: Broadcast): void {
 		const roomId = record.params.room_id;
 		const mirror = typeof roomId === "string" ? this.mirrorOf(roomId) : undefined;
-		if (!mirror || mirror.room.unshared) return;
+		if (!mirror || mirror.stopped) return;
 		for (const member of (record.params.members as Array<Record<string, unknown>> | undefined) ?? []) {
 			const user = member.user as Record<string, unknown> | undefined;
 			const userId = user?.user_id;
@@ -885,13 +888,26 @@ export class RemoteRooms {
 		return typeof you?.user_id === "string" ? you.user_id : undefined;
 	}
 
+	/**
+	 * Stops mirroring the owner's room or thread `ownerRoom` (the link left
+	 * it): a mirror room takes no more records or writes, and keeps its
+	 * copies. For a thread, only that mirror thread stops (threads of
+	 * threads are not mirrored here).
+	 */
 	private markUnshared(server: string, ownerRoom: string): void {
 		const state = this.store.mirrorState(this.now());
 		const room = state.rooms.find((candidate) => candidate.server === server && candidate.owner_room === ownerRoom && !candidate.unshared);
-		if (!room) return;
-		room.unshared = true;
+		if (room) {
+			room.unshared = true;
+			this.store.setMirrorState(state, this.now());
+			console.log(JSON.stringify({ event: "remote_mirror_unshared", server, owner_room: ownerRoom, room_id: room.room_id }));
+			return;
+		}
+		const parent = state.rooms.find((candidate) => candidate.server === server && !candidate.unshared && candidate.threads[ownerRoom] !== undefined);
+		if (!parent || parent.stopped?.includes(ownerRoom)) return;
+		parent.stopped = [...(parent.stopped ?? []), ownerRoom];
 		this.store.setMirrorState(state, this.now());
-		console.log(JSON.stringify({ event: "remote_mirror_unshared", server, owner_room: ownerRoom, room_id: room.room_id }));
+		console.log(JSON.stringify({ event: "remote_mirror_thread_stopped", server, owner_room: ownerRoom, room_id: parent.threads[ownerRoom] }));
 	}
 
 	/**
@@ -1077,6 +1093,7 @@ export class RemoteRooms {
 		const fields = { title: typeof record.title === "string" ? record.title : "", description: typeof record.description === "string" ? record.description : "" };
 		const local = mirror.threads[ownerThread];
 		if (!local && mirror.room_id.startsWith("private_")) return;
+		if (mirror.stopped?.includes(ownerThread)) return;
 		await this.host.runMutation(async () => {
 			const result = this.store.mutate({
 				userId: "~room", ipKey: MIRROR_IP_KEY, method: "room_set", now: this.now(), system: true,
@@ -1112,7 +1129,7 @@ export class RemoteRooms {
 		// An admin or mod here hides another user's copy for this server only: a local delete (copyMessage leaves it hidden).
 		if (request.method === "message" && request.params.deleted === true && typeof request.params.message_id === "string" && client.userId &&
 			this.store.messageAuthor(request.params.message_id, this.now()) !== client.userId && this.store.mayDeleteAny(client.userId, this.now())) return false;
-		if (mirror.room.unshared) throw { name: "denied", message: "This room is no longer shared by its owner; it takes no more writes" } satisfies ProtocolError;
+		if (mirror.stopped) throw { name: "denied", message: `This ${mirror.room.unshared ? "room" : "thread"} is no longer shared by its owner; it takes no more writes` } satisfies ProtocolError;
 		if (client.tier !== "registered" || !client.userId) throw { name: "denied", message: "Sign in to write in a shared room" } satisfies ProtocolError;
 		// A private mirror room has no threads here, so the owner's thread would have nowhere to go.
 		if (request.method === "room_set" && typeof request.params.room_id !== "string" && mirror.room.room_id.startsWith("private_")) throw { name: "denied", message: "A private room has no threads" } satisfies ProtocolError;

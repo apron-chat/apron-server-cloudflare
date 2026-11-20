@@ -1280,6 +1280,8 @@ export interface MirrorRoom {
   seeded?: true;
   /** The owner's threads of the room, each with its local thread. */
   threads: Record<string, string>;
+  /** The owner's threads that the link left: their mirror threads take no more records or writes. */
+  stopped?: string[];
 }
 
 /** What this server mirrors (META_REMOTE_MIRROR): its mirror rooms, and per owner its place in the log and its wake. */

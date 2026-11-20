@@ -673,6 +673,47 @@ it('a mirror thread takes its first members from the room_update that joins the 
 	});
 });
 
+it('a mirror stops only the mirror thread of an owner thread that the link left', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-thread-stop-${crypto.randomUUID()}`), async (_instance, state) => {
+		const now = Date.now();
+		const store = new Store(state, {});
+		store.initialize();
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('bob', '', 'Bob', 'registered', ?, ?, '[]')", now, now);
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
+		const host = {
+			store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, roomChanged: () => undefined, userChanged: () => undefined,
+			addMember: async () => undefined,
+		} as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as {
+			apply(server: string, frame: Record<string, unknown>): Promise<void>;
+			forward(socket: unknown, client: Record<string, unknown>, request: Record<string, unknown>): Promise<boolean>;
+		};
+		await mirror.apply(server, { method: 'room_update', params: { updated: [{ room_id: '5000', parent_room_id: 'ops', title: 'Plans', log_id: '5000' }] } });
+		const thread = store.mirrorState().rooms[0].threads['5000'];
+		expect(thread).toBeDefined();
+		// The owner takes the link out of the thread alone: a room_update `left` names the thread.
+		await mirror.apply(server, { method: 'room_update', params: { left: [{ room_id: '5000' }] } });
+		expect(store.mirrorState().rooms[0]).toMatchObject({ stopped: ['5000'] });
+		expect(store.mirrorState().rooms[0].unshared).toBeUndefined();
+		// The thread takes no more records, the room does.
+		let logId = 6_000;
+		const message = (roomId: string, messageId: string) => mirror.apply(server, { method: 'message', params: {
+			message_id: messageId, log_id: String(++logId), room_id: roomId, from: { user_id: 'carol', name: 'Carol' }, body: { text: messageId },
+		} });
+		await message('5000', 'in-thread');
+		await message('ops', 'in-room');
+		expect(store.copyOf(server, 'in-thread')).toBeUndefined();
+		expect(store.copyOf(server, 'in-room')).toBeDefined();
+		// A write in the stopped thread is refused here, before the owner is dialed.
+		await expect(mirror.forward({}, { userId: 'bob', tier: 'registered', ipKey: 'ip' }, { id: 'w1', method: 'message', params: { room_id: thread, body: { text: 'x' } } }))
+			.rejects.toMatchObject({ name: 'denied' });
+		// A later record of the thread does not bring it back.
+		await mirror.apply(server, { method: 'room_update', params: { updated: [{ room_id: '5000', parent_room_id: 'ops', title: 'Plans v2', log_id: '5000' }] } });
+		expect(store.getRoom(thread)?.title).toBe('Plans');
+	});
+});
+
 it('a mirror maps an owner\'s user without remote by the form of its ID, and never makes one with an @', async () => {
 	await runInDurableObject(env.DEMO.getByName(`mirror-form-${crypto.randomUUID()}`), async (_instance, state) => {
 		const store = new Store(state, {});
