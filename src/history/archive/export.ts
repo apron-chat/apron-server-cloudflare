@@ -27,11 +27,17 @@ export interface ExportOptions extends Omit<ArchiveExportOptions, "exportedAt"> 
 /** Log IDs an export reads a page. */
 const PAGE_SIZE = 500;
 
-/** Every record of one room from the published floor on, through the chain, oldest first, a page at a time. */
-async function* roomRecords(chain: HistoryChain, roomId: string): AsyncGenerator<ChatRecord[]> {
+/**
+ * Every record of one room from the published floor on, through the chain,
+ * oldest first, a page at a time. `purged` is the export's: the messages of
+ * purged users found so far in a tier that keeps its rewrites (the cold
+ * tier), so the reaction sets on them go wherever they are
+ * (HistoryChain.read).
+ */
+async function* roomRecords(chain: HistoryChain, roomId: string, purged: Set<string>): AsyncGenerator<ChatRecord[]> {
 	let lower = await chain.publishedFloor();
 	for (;;) {
-		const page = (await chain.read({ roomIds: [roomId], lower, upper: Number.MAX_SAFE_INTEGER, forward: true, limit: PAGE_SIZE })).filter((record) => record.room_id === roomId);
+		const page = (await chain.read({ roomIds: [roomId], lower, upper: Number.MAX_SAFE_INTEGER, forward: true, limit: PAGE_SIZE }, { purged })).filter((record) => record.room_id === roomId);
 		if (!page.length) return;
 		yield page;
 		lower = page[page.length - 1].log_id + 1;
@@ -40,10 +46,11 @@ async function* roomRecords(chain: HistoryChain, roomId: string): AsyncGenerator
 
 /** An export's source: the server's rooms and users (`server`), records across every tier, history from the published floor. */
 function chainSource(chain: HistoryChain, server: ExportPort): ArchiveSource {
+	const purged = new Set<string>();
 	return {
 		rooms: () => server.rooms(),
 		users: (userIds) => server.users(userIds),
-		records: (roomId) => roomRecords(chain, roomId),
+		records: (roomId) => roomRecords(chain, roomId, purged),
 		floor: () => chain.publishedFloor(),
 	};
 }

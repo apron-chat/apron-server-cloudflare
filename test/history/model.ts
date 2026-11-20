@@ -5,7 +5,7 @@
  * fast-check command sequences (chain.test.ts).
  */
 
-import { type ChatRecord, type Rewrite, byLog, rewritten } from "../../src/history/records";
+import { type ChatRecord, type Rewrite, authoredMessages, byLog, rewritten, withKept } from "../../src/history/records";
 
 export class Model {
 	private records = new Map<string, ChatRecord>();
@@ -16,18 +16,23 @@ export class Model {
 	}
 
 	/**
-	 * /purge or /rename, applied to the records still held (from `floor` on)
-	 * but those `kept`: a tier that takes no rewrites (the cold tier) keeps
-	 * what it holds as it was. A purge knows a message's author only from
-	 * the records it rewrites, as the tiers do: a reaction can outlive the
-	 * message it is on, and stays when that message's sender is purged.
+	 * /purge or /rename, applied to the records still held (from `floor` on).
+	 * The tiers that take rewrites rewrite what they hold: a purge knows a
+	 * message's author only from the records it rewrites, as the tiers do, so
+	 * a reaction can outlive the message it is on, and stays when that
+	 * message's sender is purged. What a tier that takes none (the cold tier)
+	 * serves (`kept`) has the rewrite applied record by record when it is
+	 * read (withKept), the purge naming the messages the tiers above found.
 	 */
 	apply(rewrite: Rewrite, options: { floor?: number; kept?: (record: ChatRecord) => boolean } = {}): void {
 		const floor = options.floor ?? 0;
 		const kept = options.kept ?? (() => false);
 		const reached = this.all().filter((record) => record.log_id >= floor && !kept(record));
-		const left = this.all().filter((record) => record.log_id < floor || kept(record));
-		const next = [...left, ...rewritten(reached, [rewrite])];
+		const held = this.all().filter((record) => record.log_id >= floor && kept(record));
+		const expired = this.all().filter((record) => record.log_id < floor);
+		const messages = rewrite.into === null ? [...new Set([...(rewrite.messages ?? []), ...authoredMessages(reached, [rewrite.user])])] : undefined;
+		const read = withKept(held, [{ seq: 0, rewrite: messages ? { ...rewrite, messages } : rewrite, through: Number.MAX_SAFE_INTEGER }]);
+		const next = [...expired, ...read, ...rewritten(reached, [rewrite])];
 		this.records = new Map(next.map((record) => [`${record.log_id}\u0000${record.room_id}`, record]));
 	}
 

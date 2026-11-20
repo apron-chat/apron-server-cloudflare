@@ -185,8 +185,9 @@ function build(composition: Composition, options: { faults?: () => boolean } = {
 		}
 		return call();
 	}) })) : stages;
-	const chain = new HistoryChain({ head, headRetention: composition.headRetention, stages: wrapped, state: new MemoryChainStateStore(), clock, batch: 3, trimBatch: 4 });
-	return { clock, head, stages, chain };
+	const state = new MemoryChainStateStore();
+	const chain = new HistoryChain({ head, headRetention: composition.headRetention, stages: wrapped, state, clock, batch: 3, trimBatch: 4 });
+	return { clock, head, stages, chain, state };
 }
 
 /** The chain's state, and what the invariants need besides. */
@@ -225,7 +226,7 @@ async function history(chain: HistoryChain, roomId: string, size: number): Promi
 /**
  * What the tiers that take no rewrites hold of the history served, once
  * settled: the log IDs below the floor of the deepest tier that does. A
- * rewrite does not reach them (the known limitation, chain.ts).
+ * rewrite reaches them only as it is read (withKept).
  */
 async function unreached(chain: HistoryChain): Promise<(record: ChatRecord) => boolean> {
 	const view = await chain.view();
@@ -725,12 +726,12 @@ describe("model-based regressions", () => {
 		expect((await history(chain, "random", 1)).map((record) => record.log_id)).toEqual([ada.log_id]);
 	});
 
-	// The known limitation: a tier that takes no rewrites (the cold tier)
-	// keeps what it holds as it was. Its link acknowledges the rewrites, so
-	// the log empties, the tiers above lose the purged user's records, and
-	// what the cold tier serves keeps them.
-	it("keeps what a tier that takes no rewrites holds, and acknowledges the rewrites", async () => {
-		const { clock, head, stages, chain } = build(compositions[2]);
+	// A tier that takes no rewrites (the cold tier) keeps what it holds as it
+	// was, and keeps the rewrites it is delivered: the log empties, the tiers
+	// above lose the purged user's records, and every read of the cold tier
+	// applies the kept rewrites, so nothing served names the purged user.
+	it("keeps the rewrites a tier that takes none was delivered, and applies them on every read", async () => {
+		const { clock, head, stages, chain, state } = build(compositions[2]);
 		const model = new Model();
 		for (let index = 0; index < 30; index += 1) {
 			clock.time += 1;
@@ -746,10 +747,45 @@ describe("model-based regressions", () => {
 		await head.purge(["cy"]);
 		await settle(chain);
 		expect(await namesCy(recent)).toBe(false);
+		// Still in the cold tier's chunks, but kept as a rewrite and applied on every read.
 		expect(await namesCy(coldTier)).toBe(true);
 		expect(await head.rewrites.list()).toEqual([]);
 		expect((await chain.view()).links.map((each) => each.delivered)).toEqual([1, 1]);
+		expect((await state.kept("cold")).map((entry) => entry.rewrite.user)).toEqual(["cy"]);
 		model.apply({ user: "cy", into: null }, { floor: await chain.publishedFloor(), kept });
-		expect(show(await history(chain, "general", 3))).toEqual(show(model.room("general", await chain.publishedFloor())));
+		const served = await history(chain, "general", 3);
+		expect(served.some((record) => record.record_json.includes('"cy"'))).toBe(false);
+		expect(show(served)).toEqual(show(model.room("general", await chain.publishedFloor())));
+		// A rename after it is kept too, after the purge, and follows a chain of renames.
+		await head.rename("ada", "ada-2");
+		await settle(chain);
+		await head.rename("ada-2", "ada-3");
+		await settle(chain);
+		expect((await state.kept("cold")).map((entry) => `${entry.rewrite.user}>${entry.rewrite.into}`)).toEqual(["cy>null", "ada>ada-2", "ada-2>ada-3"]);
+		const renamed = await history(chain, "general", 4);
+		expect(renamed.some((record) => record.record_json.includes('"ada"') || record.record_json.includes('"ada-2"'))).toBe(false);
+		expect(renamed.filter((record) => record.record_json.includes('"ada-3"')).length).toBe(20);
+	});
+
+	// A kept rewrite reaches only what the cold tier held when it was
+	// delivered: it is forgotten once the tier's floor passes that, and a
+	// later user given the purged ID is not hidden by it.
+	it("forgets a kept rewrite once the cold tier trims past what it held then", async () => {
+		const { clock, head, chain, state } = build(compositions[3]);
+		const post = (index: number, from: string) => {
+			clock.time += 1;
+			return head.commit("general", "message", { message_id: `m${index}`, from: { user_id: from }, body: { text: `${index}` } });
+		};
+		for (let index = 0; index < 20; index += 1) post(index, index % 2 ? "ada" : "cy");
+		await settle(chain);
+		await head.purge(["cy"]);
+		await settle(chain);
+		const [entry] = await state.kept("cold");
+		expect(entry.rewrite.user).toBe("cy");
+		// Enough later posts that the cold tier (30 records, by count) trims past the purge's reach.
+		for (let index = 20; index < 120; index += 1) post(index, "ada");
+		await settle(chain);
+		expect((await chain.view()).tiers[2].floor).toBeGreaterThan(entry.through);
+		expect(await state.kept("cold")).toEqual([]);
 	});
 });

@@ -99,6 +99,38 @@ export interface QueuedRewrite {
 	rewrite: Rewrite;
 }
 
+/**
+ * A rewrite delivered to a tier that takes none (the cold tier): kept, and
+ * applied to what that tier holds whenever it is read, up to `through`, the
+ * newest log ID it held when the rewrite reached it. What it took later came
+ * from a tier that had applied the rewrite already.
+ */
+export interface KeptRewrite extends QueuedRewrite {
+	through: number;
+}
+
+/**
+ * Records of a tier that takes no rewrites, with the rewrites it kept
+ * applied in order, each record by itself: a purged user's message
+ * snapshots, reaction sets and memberships go, and reaction sets on the
+ * messages the purge names (those the tiers above found); a renamed user's
+ * ID changes. Nothing is inferred across records, so a page shows the same
+ * whatever records share it (a reaction set on a purged message only this
+ * tier holds stays, unless the purge names that message). Only records at
+ * or below each rewrite's `through` are touched.
+ */
+export function withKept(records: readonly ChatRecord[], kept: readonly KeptRewrite[]): ChatRecord[] {
+	let out = [...records];
+	for (const { rewrite, through } of kept) {
+		out = out.flatMap((record) => {
+			if (record.log_id > through) return [record];
+			const json = rewrite.into === null ? purgedRecord(record, [rewrite.user], rewrite.messages ?? []) : renamedRecord(record, rewrite.user, rewrite.into);
+			return json === null ? [] : [json === record.record_json ? record : { ...record, record_json: json }];
+		});
+	}
+	return out;
+}
+
 /** The records a count keeps under a threshold: `percent` of `limit`, at least one; 0 without a limit. */
 export function thresholdCount(limit: number | undefined, percent: number): number {
 	return limit && limit > 0 ? Math.max(1, Math.floor((limit * percent) / 100)) : 0;

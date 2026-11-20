@@ -312,6 +312,19 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect((await tiers.loadLink("hot")).stall).toEqual(alerted);
 		await tiers.saveLink("hot", { stall: NOT_STALLED });
 		expect((await tiers.loadLink("hot")).stall).toEqual(NOT_STALLED);
+		// A tier that takes no rewrites keeps those it is delivered, each under its own key, in log order, until its floor passes them.
+		await tiers.keep("cold", { seq: 12, rewrite: { user: "dee", into: "dee-2" }, through: 900 });
+		await tiers.keep("cold", { seq: 3, rewrite: { user: "cy", into: null, messages: ["m1"] }, through: 400 });
+		await tiers.keep("recent", { seq: 5, rewrite: { user: "zed", into: null }, through: 1 });
+		expect((await tiers.kept("cold")).map((entry) => entry.seq)).toEqual([3, 12]);
+		expect((await tiers.kept("cold"))[0]).toEqual({ seq: 3, rewrite: { user: "cy", into: null, messages: ["m1"] }, through: 400 });
+		await tiers.forgetKept("cold", 500);
+		expect((await tiers.kept("cold")).map((entry) => entry.seq)).toEqual([12]);
+		expect((await tiers.kept("recent")).map((entry) => entry.seq)).toEqual([5]);
+		await tiers.forgetKept("cold", 1_000);
+		await tiers.forgetKept("recent", 2);
+		expect(await tiers.kept("cold")).toEqual([]);
+		expect(await tiers.kept("recent")).toEqual([]);
 		due();
 		const moved = store.runCleanup(clock.value);
 		expect(moved.deleted_records).toBe(6);

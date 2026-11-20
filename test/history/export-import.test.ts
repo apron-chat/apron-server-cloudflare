@@ -102,6 +102,48 @@ describe("export and import", () => {
 		}
 	}
 
+	// The cold tier keeps what it holds, but a /purge or /rename it was
+	// delivered goes with every export of it: a backup restored brings back
+	// neither the purged user nor a renamed user's old ID.
+	it("exports none of a purged user's records and only renamed users' new IDs, though the cold tier still holds them", async () => {
+		const source = chainOf("head+recent+cold");
+		populate(source.head, source.clock);
+		for (let index = 0; index < 12; index += 1) {
+			source.clock.time += 7;
+			source.head.commit("general", "message", { message_id: `later-${index}`, from: { user_id: "ada" }, body: { format: "plain", text: `later ${index}` } });
+		}
+		await settle(source.chain);
+		const cold = source.chain.tiers[2];
+		const held = (await cold.scan(0, 1_000)).records;
+		const coldText = JSON.stringify(held);
+		expect(held.some((record) => record.record_json.includes('"user_id":"bob"'))).toBe(true);
+		await source.head.purge(["bob"]);
+		await source.head.rename("ada", "ada-2");
+		await settle(source.chain);
+		await source.head.rename("ada-2", "ada-3");
+		await settle(source.chain);
+		// Still held as it was.
+		expect(JSON.stringify((await cold.scan(0, 1_000)).records)).toBe(coldText);
+		const text = await exported(source.chain, source.clock);
+		const archive = await collectArchive(jsonlReader(linesOf(text)));
+		const named = new Set(archive.records.flatMap((record) => [...record.record_json.matchAll(/"user_id":"([^"]+)"/g)].map((match) => match[1])));
+		expect(named.has("bob")).toBe(false);
+		expect(named.has("ada")).toBe(false);
+		expect(named.has("ada-2")).toBe(false);
+		expect(named.has("ada-3")).toBe(true);
+		expect(archive.users.map((user) => user.user_id)).not.toContain("bob");
+		// No reaction set is left on a message of bob's, whichever tier holds it.
+		const bobs = new Set(held.filter((record) => record.kind === "message" && record.record_json.includes('"user_id":"bob"')).map((record) => (JSON.parse(record.record_json) as { message_id: string }).message_id));
+		expect(bobs.size).toBeGreaterThan(0);
+		for (const record of archive.records) {
+			if (record.kind === "reactions") expect(bobs.has((JSON.parse(record.record_json) as { message_id: string }).message_id)).toBe(false);
+		}
+		// Imported, it makes no account for bob or the old IDs.
+		const target = chainOf("head+recent+cold", new TestClock(5_000_000));
+		const report = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(Object.keys(report.users).sort()).toEqual(["ada-3"]);
+	});
+
 	it("adds nothing when the same archive is imported again", async () => {
 		const source = chainOf("head");
 		populate(source.head, source.clock);

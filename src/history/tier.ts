@@ -7,7 +7,7 @@
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import type { ChatRecord, HistoryQuery, QueuedRewrite, RecordRange, Retention, Rewrite, TierStats } from "./records";
+import type { ChatRecord, HistoryQuery, KeptRewrite, QueuedRewrite, RecordRange, Retention, Rewrite, TierStats } from "./records";
 import type { Stall } from "./stall";
 
 /** What floorFor may count against: the floor of the tier above (records at or past it are only copies) and the time. */
@@ -199,4 +199,10 @@ export interface ChainStateStore {
 	saveTier(name: string, update: Partial<TierFloor>): Promise<void>;
 	/** Saves the link out of tier `from`. */
 	saveLink(from: string, update: Partial<LinkState>): Promise<void>;
+	/** The rewrites tier `name`, which takes none, was delivered and keeps (KeptRewrite), in log order. */
+	kept(name: string): Promise<KeptRewrite[]>;
+	/** Keeps a rewrite tier `name` was delivered (the same `seq` again replaces it). */
+	keep(name: string, entry: KeptRewrite): Promise<void>;
+	/** Forgets the kept rewrites of tier `name` that reach nothing it holds now: `through` below its floor. */
+	forgetKept(name: string, floor: number): Promise<void>;
 }

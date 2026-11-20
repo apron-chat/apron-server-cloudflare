@@ -300,8 +300,9 @@ leaves the server's own storage. Without the tiers below it, only those
 4,000 are kept and older records expire; 24 hours on Workers Free. Messages
 below the server's own storage can be read in history but not edited,
 reacted to or replied to. An admin's `/purge` or `/rename` reaches the
-server's own storage and the D1 tier, but not history already in the cold
-tier, which keeps it as it was. Cleanup runs once a day
+server's own storage and the D1 tier, and is applied to everything read or
+exported from the cold tier, whose stored chunks keep the old records until
+they are trimmed. Cleanup runs once a day
 (hourly on Free), so up to a day's records more may show; quota exhaustion may
 delay physical deletion. Uploaded files are kept 120 days, so a message older
 than that shows without them. The `general` room ID, the top-level rooms admins

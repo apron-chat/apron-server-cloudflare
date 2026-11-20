@@ -12,12 +12,15 @@
  *   which the head's cleanup stops at (the port's, never lowered). A link
  *   with no state yet holds nothing and has delivered nothing: it delivers
  *   what the head's log still has, which costs nothing on an empty tier.
+ * - A tier that takes no rewrites keeps those it was delivered (KeptRewrite),
+ *   each under its own key, until its floor passes what it held then.
  *
- * Persisted as JSON under `history:tier:<name>` and `history:link:<from>`
- * (a stall as its fields, stall.ts).
+ * Persisted as JSON under `history:tier:<name>`, `history:link:<from>` (a
+ * stall as its fields, stall.ts) and `history:kept:<name>:<seq>`.
  */
 
 import { type StallFields, stallFromFields, stallToFields } from "./stall";
+import type { KeptRewrite } from "./records";
 import type { ChainStateStore, LinkState, TierFloor } from "./tier";
 
 /** What the chain's state needs of the head's storage. */
@@ -34,10 +37,22 @@ export interface ChainStatePort {
 	copyMarker(): number;
 	/** Raises the copy marker (never lowers it). */
 	raiseCopyMarker(through: number): void;
+	/** The values whose keys start with `prefix` (`history:kept:…`), by key, in key order. */
+	entries(prefix: string): Array<[string, string]>;
 }
 
 export const TIER_STATE_KEY = "history:tier:";
 export const LINK_STATE_KEY = "history:link:";
+/**
+ * The most rewrites a tier that takes none keeps at once (each a /purge or
+ * /rename of what it still holds): past it, delivering another fails, and
+ * the link stalls (and alerts) rather than serve what it would change.
+ */
+export const MAX_KEPT_REWRITES = 4_096;
+/** A kept rewrite (KeptRewrite) of a tier that takes none: `history:kept:<tier>:<seq, 16 digits>`. */
+export const KEPT_STATE_KEY = "history:kept:";
+
+const keptKey = (name: string, seq: number) => `${KEPT_STATE_KEY}${name}:${String(seq).padStart(16, "0")}`;
 
 interface StoredLink extends StallFields {
 	through?: number;
@@ -104,6 +119,21 @@ export function chainStateStore(port: ChainStatePort, head: string): ChainStateS
 				...stallToFields(stall),
 			};
 			port.setValue(LINK_STATE_KEY + from, JSON.stringify(next));
+		},
+		async kept(name) {
+			return port.entries(`${KEPT_STATE_KEY}${name}:`).flatMap(([, text]) => {
+				const entry = parse<KeptRewrite>(text);
+				return entry && typeof entry.seq === "number" && typeof entry.through === "number" && typeof entry.rewrite?.user === "string" ? [entry] : [];
+			});
+		},
+		async keep(name, entry) {
+			port.setValue(keptKey(name, entry.seq), JSON.stringify(entry));
+		},
+		async forgetKept(name, floor) {
+			for (const [key, text] of port.entries(`${KEPT_STATE_KEY}${name}:`)) {
+				const entry = parse<KeptRewrite>(text);
+				if (!entry || entry.through < floor) port.setValue(key, null);
+			}
 		},
 	};
 }

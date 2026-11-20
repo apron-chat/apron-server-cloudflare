@@ -816,10 +816,12 @@ cannot be edited, reacted to or replied to.
 `/purge` and `/rename` reach the D1 tier too: the links deliver them down
 the chain in order, on an alarm a second later, and D1 applies each in one
 step; until it has, history pages that read it apply them in memory. The
-cold tier does not take them: its link acknowledges them, and the history it
-holds keeps the users, messages and reactions a `/purge` or `/rename`
-changed, served as they were. Purge a user before their history reaches the
-cold tier where that matters. At most 200 of them wait for the links at
+cold tier does not take them: it keeps each one (`history:kept:` in
+`_meta`) and applies them to everything read or exported from it, record by
+record, until its floor passes what it held then. Its chunks still hold the
+purged user's records until they are trimmed; exports and history leave them
+out (a history page may still show a reaction set on a purged message only
+the cold tier holds; exports drop those too). At most 200 of them wait for the links at
 once: past that, `/purge` and `/rename` answer `retry_after` until the links
 catch up.
 

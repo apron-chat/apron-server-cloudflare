@@ -9,13 +9,17 @@
  * it in log order, and copies records down only from a tier that holds
  * every rewrite: a rewrite never overtakes a copy it affects, and a copy
  * never carries what a rewrite on its way would change. A tier that cannot
- * take rewrites (no HistoryTier.rewrite: the cold tier) has them
- * acknowledged: what it holds keeps the users and messages a /purge or
- * /rename changed above it (unrewrittenFilter is where a filter would go).
+ * take rewrites (no HistoryTier.rewrite: the cold tier) keeps the ones it is
+ * delivered (KeptRewrite, with the newest log ID it held then) until its
+ * floor passes them, and every read of it applies them (withKept): what it
+ * holds still names a purged or renamed user, but nothing read or exported
+ * from it does.
  */
 
+import { authoredMessages, purgedRecord } from "@apron/archive";
 import { type ChainSnapshot, type ChainView, type ReadPart, type Step, type WorkStep, arrivedThrough, chainView, copyNow, mergePages, planRead, planStep } from "./link";
-import { type ChatRecord, type Clock, type HistoryQuery, type QueuedRewrite, type Retention, type Rewrite, type TierStats, logIds, rewritten, toRange } from "./records";
+import { type ChatRecord, type Clock, type HistoryQuery, type KeptRewrite, type QueuedRewrite, type Retention, type Rewrite, type TierStats, logIds, rewritten, toRange, withKept } from "./records";
+import { MAX_KEPT_REWRITES } from "./state";
 import { type Stall, stallAlert, stallCleared, stallFailed } from "./stall";
 import { type ChainStateStore, type HistoryHead, type HistoryTier, type LinkState, TIER_METHODS, type TierFloor } from "./tier";
 
@@ -64,13 +68,29 @@ const DEFAULT_TRIM_BATCH = 500;
 const TARGET_REFRESH_MS = 3_600_000;
 
 /**
- * The rewrites to apply to a page part read from a tier that does not take
- * them: none. The extension point for hiding what a /purge or /rename
- * changed above a tier that keeps it (a read filter over the rewrites
- * delivered so far); today such a tier serves what it holds.
+ * What a read across the chain may carry besides its query: `purged`, the
+ * messages of purged users seen so far, for a reader that goes oldest first
+ * over everything (an export). Each part read from a tier that takes no
+ * rewrites adds the messages its kept purges drop, and every part drops the
+ * reaction sets on any of them: a reaction comes after its message, so an
+ * export drops each reaction set on a purged message, whichever tier or page
+ * holds it. Pages for clients go without (withKept alone, so a page is the
+ * same whatever records share it).
  */
-function unrewrittenFilter(_tier: HistoryTier): Rewrite[] {
-	return [];
+export interface ReadOptions {
+	skipHead?: boolean;
+	purged?: Set<string>;
+}
+
+/** Records with the reaction sets on `messages` dropped (a record left empty goes). */
+function withoutReactionsOn(records: readonly ChatRecord[], messages: ReadonlySet<string>): ChatRecord[] {
+	if (!messages.size) return [...records];
+	const ids = [...messages];
+	return records.flatMap((record) => {
+		if (record.kind !== "reactions") return [record];
+		const json = purgedRecord(record, [], ids);
+		return json === null ? [] : [json === record.record_json ? record : { ...record, record_json: json }];
+	});
 }
 
 export class HistoryChain {
@@ -91,6 +111,8 @@ export class HistoryChain {
 	}
 	/** What each lower tier's last target was found from (what the tier above held then), and when. */
 	private readonly targetBasis = new Map<number, { basis: string; at: number }>();
+	/** The kept rewrites of each tier that takes none, as last read (this instance alone changes them). */
+	private readonly keptCache = new Map<number, KeptRewrite[]>();
 
 	constructor(options: ChainOptions) {
 		this.head = options.head;
@@ -130,6 +152,7 @@ export class HistoryChain {
 		const report: CycleReport = { steps: [], copied: 0, trimmed: 0 };
 		const round = this.round;
 		await this.forgetDelivered();
+		await this.forgetKept();
 		for (let count = 0; count < budget.steps; count += 1) {
 			const snapshot = await this.snapshot();
 			const step = planStep(snapshot);
@@ -244,7 +267,9 @@ export class HistoryChain {
 
 	/**
 	 * Link `link` delivers rewrite `seq` to the tier below it: applied where
-	 * the tier takes rewrites, acknowledged where it does not. A purge's
+	 * the tier takes rewrites, kept where it does not (KeptRewrite: applied
+	 * to what it holds now, through the link's copy marker, whenever it is
+	 * read; a tier holding nothing yet keeps nothing). A purge's
 	 * messages that tier finds go with the rewrite from now on (the log's
 	 * amend), for the tiers below and pages read from them; the tiers above,
 	 * which had it already, drop the reaction sets on them now.
@@ -265,9 +290,41 @@ export class HistoryChain {
 				const drop: Rewrite = { user: rewrite.user, into: null, messages: fresh };
 				for (const above of this.tiers.slice(1, below)) await above.rewrite?.(drop, async () => undefined);
 			});
+		} else if (entry) {
+			const view = await this.view();
+			const through = view.links[link].through;
+			if (through >= view.tiers[below].floor) {
+				const kept = await this.kept(below);
+				if (!kept.some((each) => each.seq === seq) && kept.length >= MAX_KEPT_REWRITES) {
+					throw new Error(`${tier.name} keeps ${MAX_KEPT_REWRITES} rewrites already: it must trim before it takes another /purge or /rename`);
+				}
+				await this.state.keep(tier.name, { seq, rewrite: entry.rewrite, through });
+				this.keptCache.delete(below);
+			}
 		}
 		await this.state.saveLink(this.tiers[link].name, { delivered: seq });
 		await this.forgetDelivered();
+	}
+
+	/** The kept rewrites of tier `index` (one that takes none), read once and cached. */
+	private async kept(index: number): Promise<KeptRewrite[]> {
+		const cached = this.keptCache.get(index);
+		if (cached) return cached;
+		const kept = (await this.state.kept(this.tiers[index].name)).sort((a, b) => a.seq - b.seq);
+		this.keptCache.set(index, kept);
+		return kept;
+	}
+
+	/** Forgets each tier's kept rewrites that reach nothing it holds now (`through` below its floor). */
+	private async forgetKept(): Promise<void> {
+		const view = await this.view();
+		for (const [index, tier] of this.tiers.entries()) {
+			if (index === 0 || tier.rewrite) continue;
+			const floor = view.tiers[index].floor;
+			if (!(await this.kept(index)).some((each) => each.through < floor)) continue;
+			await this.state.forgetKept(tier.name, floor);
+			this.keptCache.delete(index);
+		}
 	}
 
 	/** Forgets the rewrites every link delivered (all of them, with no tier below the head). */
@@ -288,11 +345,13 @@ export class HistoryChain {
 	 * tiers winning. A part read from a tier that takes rewrites has those
 	 * its link has yet to deliver applied: the log is read after the links'
 	 * state, so a rewrite delivered meanwhile is either among them or already
-	 * in the tier when it is read (applying one twice changes nothing).
-	 * `skipHead` reads only the tiers below the head, for a head (the Store)
-	 * that read its own.
+	 * in the tier when it is read (applying one twice changes nothing). A
+	 * part read from a tier that takes no rewrites has those it keeps
+	 * applied, and those its link has yet to deliver, record by record
+	 * (withKept). `skipHead` reads only the tiers below the head, for a head
+	 * (the Store) that read its own; `purged` is for an export (ReadOptions).
 	 */
-	async read(query: HistoryQuery, options: { skipHead?: boolean } = {}): Promise<ChatRecord[]> {
+	async read(query: HistoryQuery, options: ReadOptions = {}): Promise<ChatRecord[]> {
 		if (!query.roomIds.length || query.lower > query.upper || query.limit <= 0) return [];
 		const [view, published] = await Promise.all([this.view(), this.head.publishedFloor()]);
 		const parts = planRead(query, view.tiers, published, options);
@@ -301,37 +360,61 @@ export class HistoryChain {
 		let found = new Set<number>();
 		for (const part of parts) {
 			if (found.size >= query.limit) break;
-			const rewrites = part.tier === 0 ? [] : this.rewritesFor(part.tier, view, pending);
-			const records = await this.readPart(part, query.limit - found.size, rewrites);
+			const applied = part.tier === 0 ? undefined : await this.applyFor(part.tier, view, pending, options.purged);
+			// Forward, the deepest part comes first: the purged messages it holds are known before the reactions above.
+			const purged = options.purged;
+			const apply = purged ? (records: ChatRecord[]) => withoutReactionsOn(applied ? applied(records) : records, purged) : applied;
+			const records = await this.readPart(part, query.limit - found.size, apply);
 			pages.push({ tier: part.tier, records });
 			found = new Set([...found, ...logIds(records)]);
 		}
 		return mergePages(pages, query);
 	}
 
-	/** What a page part read from tier `index` has applied: what its link has yet to deliver. */
-	private rewritesFor(index: number, view: ChainView, pending: readonly QueuedRewrite[]): Rewrite[] {
+	/**
+	 * What a page part read from tier `index` has applied: where the tier
+	 * takes rewrites, those its link has yet to deliver; where it does not,
+	 * those it keeps and those on their way, record by record. With
+	 * `purged`, the messages each kept purge drops are noted in it first.
+	 */
+	private async applyFor(index: number, view: ChainView, pending: readonly QueuedRewrite[], purged?: Set<string>): Promise<((records: ChatRecord[]) => ChatRecord[]) | undefined> {
 		const tier = this.tiers[index];
-		if (!tier.rewrite) return unrewrittenFilter(tier);
-		return pending.filter((entry) => entry.seq > view.links[index - 1].delivered).map((entry) => entry.rewrite);
+		const coming = pending.filter((entry) => entry.seq > view.links[index - 1].delivered);
+		if (tier.rewrite) {
+			const rewrites = coming.map((entry) => entry.rewrite);
+			return rewrites.length ? (records) => rewritten(records, rewrites) : undefined;
+		}
+		const kept: KeptRewrite[] = [...await this.kept(index), ...coming.map((entry) => ({ ...entry, through: Number.MAX_SAFE_INTEGER }))];
+		if (!kept.length) return undefined;
+		return (records) => {
+			if (purged) {
+				// Each purge's messages as this tier holds them, its earlier rewrites applied (a rename may come first).
+				for (const [at, entry] of kept.entries()) {
+					if (entry.rewrite.into !== null) continue;
+					const held = withKept(records, kept.slice(0, at)).filter((record) => record.log_id <= entry.through);
+					for (const id of authoredMessages(held, [entry.rewrite.user])) purged.add(id);
+				}
+			}
+			return withKept(records, kept);
+		};
 	}
 
 	/**
-	 * A tier's part of a page, with `rewrites` applied: read on past what
-	 * they drop until the part has `limit` log IDs or the tier has no more in
+	 * A tier's part of a page, with `apply` applied: read on past what it
+	 * drops until the part has `limit` log IDs or the tier has no more in
 	 * its window, so a page whose records were all purged is not taken for
 	 * the end of history.
 	 */
-	private async readPart(part: ReadPart, limit: number, rewrites: readonly Rewrite[]): Promise<ChatRecord[]> {
+	private async readPart(part: ReadPart, limit: number, apply?: (records: ChatRecord[]) => ChatRecord[]): Promise<ChatRecord[]> {
 		const tier = this.tiers[part.tier];
 		const kept: ChatRecord[] = [];
 		let query = { ...part.query, limit };
 		for (;;) {
 			const records = await tier.read(query);
-			kept.push(...(rewrites.length ? rewritten(records, rewrites) : records));
+			kept.push(...(apply ? apply(records) : records));
 			const ids = logIds(records);
 			if (ids.length < query.limit || logIds(kept).length >= limit) return kept;
-			// The tier filled the page, but the rewrites dropped some: on from past what it read.
+			// The tier filled the page, but what was applied dropped some: on from past what it read.
 			query = query.forward ? { ...query, lower: Math.max(...ids) + 1 } : { ...query, upper: Math.min(...ids) - 1 };
 			if (query.lower > query.upper) return kept;
 		}

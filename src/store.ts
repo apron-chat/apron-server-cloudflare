@@ -27,7 +27,7 @@ import { hostListAllowed } from "./config";
 import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryQuery, QueuedRewrite, Rewrite } from "./history/records";
-import type { ChainStatePort } from "./history/state";
+import { type ChainStatePort, MAX_KEPT_REWRITES } from "./history/state";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
 import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./content/output-ref";
@@ -985,6 +985,8 @@ const META_HISTORY_OPS = "history:ops";
 const META_HISTORY_OPS_SEQ = "history:ops_seq";
 const META_HISTORY_TIER = "history:tier:";
 const META_HISTORY_LINK = "history:link:";
+/** `_meta` key prefix: the rewrites a tier that takes none keeps (src/history/state.ts, KeptRewrite). */
+const META_HISTORY_KEPT = "history:kept:";
 /** Backups' schedule state (historyMetaNumber, setHistoryMeta), kept when tiers are off. */
 const META_HISTORY_EXPORT = "history:export:";
 /** The running import's journal: its archive, user mapping and rooms still to finish (importArchive). */
@@ -3754,13 +3756,14 @@ export class Store {
 
   /**
    * The history chain's state, as plain values (src/history/state.ts keeps
-   * its rules): values under `history:tier:` and `history:link:`, the hot
+   * its rules): values under `history:tier:`, `history:link:` and
+   * `history:kept:` (at most MAX_KEPT_REWRITES read a call), the hot
    * and published floors, and the copy marker, which cleanup stops at
    * (runCleanup).
    */
   historyStatePort(): ChainStatePort {
     const owned = (key: string) => {
-      if (!key.startsWith(META_HISTORY_TIER) && !key.startsWith(META_HISTORY_LINK)) throw new Error(`not a history chain state key: ${key}`);
+      if (!key.startsWith(META_HISTORY_TIER) && !key.startsWith(META_HISTORY_LINK) && !key.startsWith(META_HISTORY_KEPT)) throw new Error(`not a history chain state key: ${key}`);
       return key;
     };
     return {
@@ -3785,6 +3788,13 @@ export class Store {
         this.reserved({ reads: 4, writes: 4 }, true, this.clock.now(), () => {
           if (through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(through));
         });
+      },
+      entries: (prefix) => {
+        this.ensureReady();
+        const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+        return this.reserved({ reads: 16 + MAX_KEPT_REWRITES }, true, this.clock.now(), () => this.rawRows<{ key: string; value: string }>(
+          "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", owned(prefix), end, MAX_KEPT_REWRITES,
+        ).map((row) => [row.key, row.value] as [string, string]));
       },
     };
   }

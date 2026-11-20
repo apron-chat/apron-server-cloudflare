@@ -6,7 +6,7 @@
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import { type ChatRecord, type Clock, type HistoryQuery, type QueuedRewrite, type RecordRange, type Retention, type Rewrite, type TierStats, authoredMessages, thresholdCount, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
+import { type ChatRecord, type Clock, type HistoryQuery, type KeptRewrite, type QueuedRewrite, type RecordRange, type Retention, type Rewrite, type TierStats, authoredMessages, thresholdCount, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
 import { NOT_STALLED } from "../../../src/history/stall";
 import type { Cell, ChainState, ChainStateStore, ExportPort, FloorContext, HistoryHead, HistoryTier, LinkState, RestorePort, RestoreResult, RewriteLog, TierFloor } from "../../../src/history/tier";
 
@@ -307,5 +307,17 @@ export class MemoryChainStateStore implements ChainStateStore {
 	}
 	async saveLink(from: string, update: Partial<LinkState>): Promise<void> {
 		this.links.set(from, { ...this.link(from), ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== undefined)) });
+	}
+	private readonly keeps = new Map<string, Map<number, KeptRewrite>>();
+	async kept(name: string): Promise<KeptRewrite[]> {
+		return [...(this.keeps.get(name)?.values() ?? [])].sort((a, b) => a.seq - b.seq).map((entry) => structuredClone(entry));
+	}
+	async keep(name: string, entry: KeptRewrite): Promise<void> {
+		const entries = this.keeps.get(name) ?? new Map<number, KeptRewrite>();
+		entries.set(entry.seq, structuredClone(entry));
+		this.keeps.set(name, entries);
+	}
+	async forgetKept(name: string, floor: number): Promise<void> {
+		for (const [seq, entry] of this.keeps.get(name) ?? []) if (entry.through < floor) this.keeps.get(name)!.delete(seq);
 	}
 }
