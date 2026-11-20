@@ -70,11 +70,6 @@ describe("remapRecord", () => {
 		expect(JSON.parse(out.record_json)).toEqual(setAt(base, path, to));
 	});
 
-	it("leaves a field without a mapped ID alone", () => {
-		const input = record(base);
-		expect(remapRecord(input, sampleMap())).toBe(input);
-	});
-
 	it("maps the room and log ID columns", () => {
 		const out = remapRecord(record(base, { room_id: "private_101", log_id: 100, commit_ms: 100 }), sampleMap());
 		expect(out.room_id).toBe("private_201");
@@ -98,11 +93,11 @@ describe("remapRecord", () => {
 		expect(map.logIdString("ada")).toBe("ada");
 	});
 
-	it("leaves every record untouched under an identity map", () => {
-		const records = [record(setAt(base, ["log_id"], "100"), { log_id: 100, commit_ms: 100, room_id: "100" })];
-		for (const map of [new IdMap(), new IdMap(new Map([[100, 100]]), new Map([["ada", "ada"]]))]) {
-			for (const input of records) expect(remapRecord(input, map)).toBe(input);
-		}
+	it("returns the same record when no ID in it is mapped, or under an identity map", () => {
+		const input = record(base);
+		expect(remapRecord(input, sampleMap())).toBe(input);
+		const mapped = record(setAt(base, ["log_id"], "100"), { log_id: 100, commit_ms: 100, room_id: "100" });
+		for (const map of [new IdMap(), new IdMap(new Map([[100, 100]]), new Map([["ada", "ada"]]))]) expect(remapRecord(mapped, map)).toBe(mapped);
 	});
 });
 
@@ -130,28 +125,8 @@ describe("remapListing and remapUser", () => {
 });
 
 describe("nudging log IDs", () => {
-	it("finds the next free ID at or after a start", () => {
-		const taken = new Set([5, 6, 8]);
-		expect(nextFree((id) => taken.has(id), 5)).toBe(7);
-		expect(nextFree((id) => taken.has(id), 8)).toBe(9);
-		expect(nextFree((id) => taken.has(id), 4)).toBe(4);
-	});
-
-	it("leaves free IDs where they are", () => {
-		expect(nudgeLogIds([1, 2, 3], () => false).size).toBe(0);
-	});
-
-	it("moves a collision to the next free millisecond, and later IDs it reaches with it", () => {
-		const taken = new Set([10, 11, 13]);
-		// 10 → 12 (11 is taken); 12 is then reached and moves to 14 (13 is taken); 20 stays.
-		expect(nudgeLogIds([10, 12, 20], (id) => taken.has(id))).toEqual(new Map([[10, 12], [12, 14]]));
-	});
-
-	it("keeps order through a run of collisions", () => {
-		const taken = new Set([1, 2, 3, 4, 5, 7]);
-		expect(nudgeLogIds([1, 2, 3, 6], (id) => taken.has(id))).toEqual(new Map([[1, 6], [2, 8], [3, 9], [6, 10]]));
-	});
-
+	// The property fixes the answer for any input: a collision moves to the next free
+	// millisecond, later IDs it reaches move with it, and free IDs stay put.
 	it("keeps order, avoids taken IDs and moves as little as it can (property)", () => {
 		fc.assert(fc.property(
 			fc.uniqueArray(fc.nat({ max: 39 }), { maxLength: 40 }),
@@ -176,8 +151,15 @@ describe("nudging log IDs", () => {
 	});
 });
 
-describe("freeUserId", () => {
-	it("numbers a taken ID from 2", () => {
+describe("nextFree and freeUserId", () => {
+	it("finds the next free ID at or after a start", () => {
+		const taken = new Set([5, 6, 8]);
+		expect(nextFree((id) => taken.has(id), 5)).toBe(7);
+		expect(nextFree((id) => taken.has(id), 8)).toBe(9);
+		expect(nextFree((id) => taken.has(id), 4)).toBe(4);
+	});
+
+	it("numbers a taken user ID from 2", () => {
 		expect(freeUserId("ada", () => false)).toBe("ada");
 		expect(freeUserId("ada", (id) => id === "ada")).toBe("ada-2");
 		const taken = new Set(["ada", "ada-2", "ada-3"]);

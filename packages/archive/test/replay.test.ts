@@ -129,18 +129,6 @@ describe("replayRecords", () => {
 	});
 });
 
-describe("replayRecords of the scenes", () => {
-	for (const name of Object.keys(sceneArchives).sort()) {
-		it(`renders something in every kind scene ${name} holds`, async () => {
-			const archive = await collectArchive(jsonlReader(linesOf(sceneArchives[name])));
-			const full = replayRecords(archive.records, archive.rooms, archive.users);
-			expect(full.rooms.size).toBeGreaterThan(0);
-			expect(full.messages.size).toBeGreaterThan(0);
-			expect(full.users.size).toBeGreaterThan(0);
-		});
-	}
-});
-
 describe("compareReplayed", () => {
 	it("reports readable differences", () => {
 		const changed: ChatRecord[] = [
@@ -232,10 +220,11 @@ describe("compareReplayed", () => {
 		]);
 	});
 
-	it("compares every scene with itself as equal, and finds a change in it", async () => {
+	it("replays every scene to rooms, messages and users, equal to itself, and finds a change in it", async () => {
 		for (const name of Object.keys(sceneArchives)) {
 			const archive = await collectArchive(jsonlReader(linesOf(sceneArchives[name])));
 			const state = replayRecords(archive.records, archive.rooms, archive.users);
+			expect([state.rooms.size, state.messages.size, state.users.size].every((size) => size > 0), name).toBe(true);
 			expect(compareReplayed(state, replayRecords([...archive.records].reverse(), archive.rooms, archive.users)).equal).toBe(true);
 			const last = archive.records.filter((entry) => entry.kind === "message").pop()!;
 			const value = JSON.parse(last.record_json);
