@@ -720,6 +720,30 @@ it('a mirror sends a rename made while disconnected on its next connection', asy
 	});
 });
 
+it('a mirror mentions its user that the owner does not know yet by its remote user ID, without a me', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-mention-${crypto.randomUUID()}`), async (_instance, state) => {
+		const now = Date.now();
+		const store = new Store(state, {});
+		store.initialize();
+		for (const [id, name] of [['bob', 'Bob'], ['dave', 'Dave']]) {
+			state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, 'registered', ?, ?, '[]')", id, name, now, now);
+		}
+		const server = 'ws://a.example/ws';
+		// The owner knows Bob, from an earlier me; Dave has not written there yet.
+		await state.storage.put(`remote-user:${server}|bob`, { id: 'bob@demo.test:8443', name: 'Bob' });
+		const host = { store, self: 'wss://demo.test:8443/ws', storage: state.storage } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { mapOut(server: string, request: Record<string, unknown>, ownerRoom: string, userId: string): Promise<Record<string, any>> };
+		const fetched = vi.spyOn(globalThis, 'fetch');
+		try {
+			const params = await mirror.mapOut(server, { id: 'c1', method: 'message', params: { room_id: 'general', body: { text: '@bob @dave', mentions: ['bob', 'dave'] } } }, 'ops', 'bob');
+			expect(params.body).toEqual({ text: '@bob@demo.test:8443 @dave@demo.test:8443', mentions: ['bob@demo.test:8443', 'dave@demo.test:8443'] });
+			// Nothing was sent: no connection, and no me for Dave.
+			expect(fetched).not.toHaveBeenCalled();
+			expect(await state.storage.get(`remote-user:${server}|dave`)).toBeUndefined();
+		} finally { vi.restoreAllMocks(); }
+	});
+});
+
 it('a mirror reads from the owner\'s history bound once it has passed its place', async () => {
 	await runInDurableObject(env.DEMO.getByName(`mirror-bound-${crypto.randomUUID()}`), async (_instance, state) => {
 		const store = new Store(state, {});

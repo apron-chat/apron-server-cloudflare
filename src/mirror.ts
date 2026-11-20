@@ -1129,7 +1129,7 @@ export class RemoteRooms {
 			const userId = client.userId;
 			// The user's remote user exists on the owner before their first write.
 			await this.ownerUser(connection, server, userId, client.name ?? "");
-			const params = await this.mapOut(connection, server, request, mirror.ownerRoom, userId);
+			const params = await this.mapOut(server, request, mirror.ownerRoom, userId);
 			const answer = await connection.call(request.method, params, await requestId(`${userId}:${request.id ?? this.now()}`), FORWARD_TIMEOUT_MS);
 			await connection.settled();
 			if (answer.error) throw this.ownerError(server, mirror.ownerRoom, answer.error);
@@ -1237,7 +1237,7 @@ export class RemoteRooms {
 	}
 
 	/** A local request's params with its IDs mapped to the owner's: rooms, messages (from the copies), users. */
-	private async mapOut(connection: LinkConnection, server: string, request: RequestFrame, ownerRoom: string, userId: string): Promise<Record<string, unknown>> {
+	private async mapOut(server: string, request: RequestFrame, ownerRoom: string, userId: string): Promise<Record<string, unknown>> {
 		const params = request.params;
 		// The act-as user is this server's `user_id` (§ext:remote); the owner shows it as `<user_id>@<this host>`.
 		const ext = { remote: { user_id: userId } };
@@ -1272,7 +1272,7 @@ export class RemoteRooms {
 			const ids = new Map<string, string>();
 			for (const id of Array.isArray(body.mentions) ? body.mentions : []) {
 				if (typeof id !== "string") continue;
-				const mapped = await this.ownerIdOf(connection, server, id);
+				const mapped = await this.ownerIdOf(server, id);
 				if (mapped) ids.set(id, mapped);
 			}
 			out.body = {
@@ -1284,16 +1284,22 @@ export class RemoteRooms {
 		return out;
 	}
 
-	/** A local user ID as the owner knows the user: the owner's own user, a third server's, or this server's (through `me`). */
-	private async ownerIdOf(connection: LinkConnection, server: string, userId: string): Promise<string | undefined> {
+	/**
+	 * A mentioned local user ID as the owner knows the user: the owner's own
+	 * user, a third server's, or this server's, by its ID on the owner (from
+	 * an earlier `me`), or else its remote user ID, `<user_id>@<this host>`,
+	 * which the owner gives it. A mention sends no `me`.
+	 */
+	private async ownerIdOf(server: string, userId: string): Promise<string | undefined> {
+		const identity = this.store.getIdentity(userId);
 		if (isShadowUserId(userId)) {
-			const remote = this.store.getIdentity(userId)?.ext?.remote as Record<string, unknown> | undefined;
+			const remote = identity?.ext?.remote as Record<string, unknown> | undefined;
 			if (sameAddress(remote?.server as string | undefined, server) && typeof remote?.user_id === "string") return remote.user_id;
 			return remote ? userId : undefined;
 		}
-		const name = this.store.getIdentity(userId)?.name;
-		if (name === undefined) return undefined;
-		return this.ownerUser(connection, server, userId, name);
+		if (!identity) return undefined;
+		const known = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.host.storage.get<OwnerUser>(`${USER_KEY_PREFIX}${server}|${userId}`));
+		return known?.id ?? shadowUserId(this.host.self, userId);
 	}
 
 	/**
