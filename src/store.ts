@@ -7738,7 +7738,7 @@ export class Store {
     const params = input.params;
     const messageIdParam = params.message_id;
     if (typeof messageIdParam !== "string" || messageIdParam.length === 0) throw new StoreError("invalid_params", "message_id must be a non-empty string");
-    const emojis = this.normalizedEmojis(params.emojis);
+    let emojis = this.normalizedEmojis(params.emojis);
     // A mirror's copy of a reaction set is the server's to write (ext:remote).
     const message = input.copy
       ? this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor)
@@ -7756,6 +7756,8 @@ export class Store {
     // already in the user's current set on this message: a request carries
     // the whole set, so a removed emoji must not stop the user from changing
     // their other reactions. Only a key not already in the set reads the catalog.
+    // A mirror's copy of the owner's set leaves out the keys this server lacks (ext:remote).
+    if (input.copy) emojis = emojis.filter((emoji) => !isEmojiKey(emoji) || currentSet.includes(emoji) || this.loadEmojiCatalog().keys.has(emoji));
     for (const emoji of emojis) {
       if (isEmojiKey(emoji) && !currentSet.includes(emoji) && !this.loadEmojiCatalog().keys.has(emoji)) {
         throw new StoreError("invalid_params", `${emoji} is not a custom emoji here`.slice(0, 200));

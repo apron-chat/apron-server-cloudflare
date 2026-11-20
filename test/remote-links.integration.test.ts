@@ -559,6 +559,13 @@ it('a mirror takes the owner\'s restore of a deleted message, but keeps a copy i
 		expect(copyState(hidden)).toBe('deleted');
 		// Still found by its original, so no second copy is made.
 		expect(store.copyOf(server, '901')).toBe(hidden);
+
+		// The owner's reactions: a custom key this server lacks is left out, and the rest of the set kept.
+		await (mirror as unknown as { copyReactions(server: string, record: Record<string, unknown>): Promise<void> }).copyReactions(server, {
+			message_id: '900', room_id: 'ops', log_id: String(++logId), reactions: [{ from: { user_id: 'dave', name: 'Dave' }, emojis: ['👍', ':party_parrot:'] }],
+		});
+		const sets = state.storage.sql.exec<{ emojis_json: string }>("SELECT emojis_json FROM reaction_state WHERE message_id = ? AND user_id = 'dave@a.example'", copy).toArray();
+		expect(sets.map((row) => JSON.parse(row.emojis_json))).toEqual([['👍']]);
 	});
 });
 

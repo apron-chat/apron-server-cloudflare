@@ -1003,7 +1003,7 @@ export class RemoteRooms {
 					});
 					for (const broadcast of result.broadcasts) this.host.broadcastRecord(broadcast);
 				} catch (error) {
-					// A custom emoji this server lacks, and the like: that set stays as it was.
+					// A set this server refuses all the same (unknown custom keys are left out by the store): it stays as it was.
 					if (!(error instanceof StoreError)) throw error;
 				}
 			});
