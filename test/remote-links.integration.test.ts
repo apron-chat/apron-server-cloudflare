@@ -410,6 +410,11 @@ it('makes and saves a thread of a shared room as a remote user, and joins the li
 		// Only threads: no top-level room, no private room; no thread under a private room here.
 		expect((await request(link, unique('top'), 'room_set', { title: 'x', ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
 		expect((await request(link, unique('priv'), 'room_set', { private: true, ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
+		// `private` is ignored: a thread asked to be private is an ordinary one.
+		const asked = await request(link, unique('privflag'), 'room_set', { parent_room_id: roomId, title: 'Open', private: true, ext: { remote: { user_id: carol } } });
+		expect(asked.result.room_id).toMatch(/^\d+$/);
+		// The link's own room_set is refused: it acts as its remote users.
+		expect((await request(link, unique('own'), 'room_set', { parent_room_id: roomId, title: 'Mine' })).error.code).toBe(DENIED);
 		expect((await request(link, unique('privthread'), 'room_set', { parent_room_id: privateRoom, title: 'x', ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
 		const general = await request(link, unique('general'), 'room_set', { parent_room_id: 'general', title: 'x', ext: { remote: { user_id: carol } } });
 		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });

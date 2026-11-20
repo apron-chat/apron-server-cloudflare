@@ -5320,6 +5320,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const method = request.method;
 		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave" && method !== "room_set" && method !== "room_join") return false;
 		const remoteUserId = actAsUserId(request.params);
+		// A link makes and saves threads only as its remote users.
+		if (remoteUserId === undefined && method === "room_set") throw { name: "denied", message: "A link's own room_set is refused; it acts as its remote users" } satisfies ProtocolError;
 		if (remoteUserId === undefined) return false;
 		const problem = remoteUserIdError(remoteUserId);
 		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
@@ -5379,8 +5381,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * MAX_REMOTE_THREADS live threads, so one partner cannot take every slot.
 	 */
 	private async shadowRoomSet(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
-		const params = request.params;
-		if (params.private !== undefined && params.private !== false) throw { name: "denied", message: "A link creates and saves threads only" } satisfies ProtocolError;
+		// `private` is ignored: a link's thread is seen by every member of its room.
+		const { private: _private, ...params } = request.params;
+		void _private;
 		const roomId = optionalString(params, "room_id");
 		const parentId = roomId === undefined ? optionalString(params, "parent_room_id") : this.parentOf(roomId) ?? undefined;
 		if (parentId === undefined) throw { name: "denied", message: "A link creates and saves threads only" } satisfies ProtocolError;
