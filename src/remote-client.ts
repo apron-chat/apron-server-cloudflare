@@ -33,9 +33,8 @@ export function rewriteMentions(text: string, ids: ReadonlyMap<string, string>, 
 			// A run of backticks opens code that the same run closes; unclosed, it is text.
 			let run = 1;
 			while (text[index + run] === "`") run += 1;
-			const fence = "`".repeat(run);
-			const close = text.indexOf(fence, index + run);
-			const end = close < 0 ? index + run : close + run;
+			const close = closingTicks(text, index + run, run);
+			const end = close < 0 ? index + run : close;
 			out += text.slice(index, end);
 			index = end;
 			continue;
@@ -56,10 +55,73 @@ export function rewriteMentions(text: string, ids: ReadonlyMap<string, string>, 
 	return out;
 }
 
-/** Links in text without `server` refer to their server (Appendix A.4): gives them this one's. */
-export function addServerToLinks(text: string, self: string): string {
-	return text.replace(/(https:\/\/link\.apron\.chat\/#|apron:\?)([^\s<>`)\]]*)/g, (whole, lead: string, keys: string) =>
-		/(^|&)server=/.test(keys) ? whole : `${lead}server=${self}${keys ? `&${keys}` : ""}`);
+/** The prefixes of the links of Appendix A.4. */
+const LINK_PREFIXES = ["https://link.apron.chat/#", "apron:?"];
+
+/**
+ * A value of a link's keys (Appendix A.4): `application/x-www-form-urlencoded`
+ * (a space is `+`; only letters, digits and `-._~` stay as they are), with
+ * `:` and `/` left as they are.
+ */
+export function linkValue(value: string): string {
+	return encodeURIComponent(value)
+		.replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+		.replace(/%20/g, "+").replace(/%3A/g, ":").replace(/%2F/g, "/");
+}
+
+/**
+ * Links in text without `server` refer to their server (Appendix A.4):
+ * gives each the `server` key with `self`, form-encoded, first. In
+ * Markdown text (`markdown`), code spans and fenced code stay as they are,
+ * as for mentions (rewriteMentions).
+ */
+export function addServerToLinks(text: string, self: string, markdown = true): string {
+	if (!text.includes("apron")) return text;
+	let out = "";
+	let index = 0;
+	while (index < text.length) {
+		if (markdown && text[index] === "`") {
+			let run = 1;
+			while (text[index + run] === "`") run += 1;
+			const close = closingTicks(text, index + run, run);
+			const end = close < 0 ? index + run : close;
+			out += text.slice(index, end);
+			index = end;
+			continue;
+		}
+		const prefix = LINK_PREFIXES.find((candidate) => text.startsWith(candidate, index));
+		if (!prefix) {
+			out += text[index];
+			index += 1;
+			continue;
+		}
+		const start = index + prefix.length;
+		let end = start;
+		while (end < text.length && !" \t\r\n<>\"'`)]".includes(text[end]!)) end += 1;
+		const keys = text.slice(start, end);
+		const hasServer = keys.split("&").some((pair) => pair.split("=", 1)[0] === "server");
+		out += prefix + (hasServer ? "" : `server=${linkValue(self)}${keys ? "&" : ""}`) + keys;
+		index = end;
+	}
+	return out;
+}
+
+/**
+ * Where code opened by a run of `run` backticks before `from` ends: just
+ * after the next run of exactly as many (CommonMark), or -1 when none does.
+ */
+function closingTicks(text: string, from: number, run: number): number {
+	for (let index = from; index < text.length;) {
+		if (text[index] !== "`") {
+			index += 1;
+			continue;
+		}
+		let length = 1;
+		while (text[index + length] === "`") length += 1;
+		if (length === run) return index + length;
+		index += length;
+	}
+	return -1;
 }
 
 /** The recipe's suggested pacing of a link's connection: at most this many requests awaiting their answers… */

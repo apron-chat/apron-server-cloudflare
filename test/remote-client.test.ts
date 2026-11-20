@@ -11,11 +11,22 @@ describe('text', () => {
 		expect(rewriteMentions('@ada, @ada. x@ada `@ada` ```\n@ada\n``` @adam', ids)).toBe('@ada@a.example, @ada@a.example. x@ada `@ada` ```\n@ada\n``` @adam');
 		// Plain text has no code: a backtick is a character.
 		expect(rewriteMentions('`@ada`', ids, false)).toBe('`@ada@a.example`');
+		// Code closes only at a run of as many backticks.
+		expect(rewriteMentions('``a```b`@ada`', ids)).toBe('``a```b`@ada`');
 	});
 
 	it('gives links without server the owner\'s', () => {
 		expect(addServerToLinks('see apron:?room=ops&message=1 and https://link.apron.chat/#room=x and apron:?server=ws://b/ws&room=y', 'ws://a.example/ws'))
 			.toBe('see apron:?server=ws://a.example/ws&room=ops&message=1 and https://link.apron.chat/#server=ws://a.example/ws&room=x and apron:?server=ws://b/ws&room=y');
+		// Code spans and fenced code stay as they are in Markdown, as for mentions; plain text has none.
+		expect(addServerToLinks('apron:?room=a `apron:?room=b` ```\napron:?room=c\n``` ``x`apron:?room=d`` apron:?room=e', 'ws://a.example/ws'))
+			.toBe('apron:?server=ws://a.example/ws&room=a `apron:?room=b` ```\napron:?room=c\n``` ``x`apron:?room=d`` apron:?server=ws://a.example/ws&room=e');
+		expect(addServerToLinks('`apron:?room=b`', 'ws://a.example/ws', false)).toBe('`apron:?server=ws://a.example/ws&room=b`');
+		// The value is form-encoded, with `:` and `/` left as they are.
+		expect(addServerToLinks('apron:?room=a', 'wss://a.example:8443/ws path?x=1&y')).toBe('apron:?server=wss://a.example:8443/ws+path%3Fx%3D1%26y&room=a');
+		expect(addServerToLinks('apron:?', 'ws://a.example/ws')).toBe('apron:?server=ws://a.example/ws');
+		// A link ends at a quote or a closing bracket, as in Markdown and HTML.
+		expect(addServerToLinks('[x](apron:?room=a) "apron:?room=b"', 'ws://a.example/ws', false)).toBe('[x](apron:?server=ws://a.example/ws&room=a) "apron:?server=ws://a.example/ws&room=b"');
 	});
 
 	it('reads the reason of a link\'s refusal', () => {
