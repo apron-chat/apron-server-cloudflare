@@ -37,10 +37,6 @@ export interface PipelineOptions {
 	batch?: number;
 	/** Records per trim step. */
 	trimBatch?: number;
-	/** How long an applied op still applies to pages read below the head (a page may have read before it applied). */
-	recentOpsMs?: number;
-	/** The head's label for /status. */
-	headLabel?: string;
 }
 
 export interface TierReport {
@@ -55,7 +51,8 @@ export interface TierReport {
 
 const DEFAULT_BATCH = 100;
 const DEFAULT_TRIM_BATCH = 500;
-const DEFAULT_RECENT_OPS_MS = 60_000;
+/** How long an applied op still applies to pages read below the head (a page may have read before it applied). */
+const RECENT_OPS_MS = 60_000;
 /** How long a lower tier's target stands while nothing above it changed (age retention moves it with time). */
 const TARGET_REFRESH_MS = 3_600_000;
 
@@ -69,7 +66,6 @@ export class HistoryPipeline {
 	private readonly clock: Clock;
 	private readonly batch: number;
 	private readonly trimBatch: number;
-	private readonly recentOpsMs: number;
 	/** The floor each tier was last trimmed below, completely, in this instance. */
 	private readonly trimmed = new Map<number, number>();
 	/** What the running round of cycles has done: it ends when a cycle finds nothing to do. */
@@ -87,12 +83,11 @@ export class HistoryPipeline {
 		this.tiers = [options.head, ...options.stages.map((stage) => stage.tier)];
 		this.retentions = [options.headRetention, ...options.stages.map((stage) => stage.retention)];
 		this.readable = [true, ...options.stages.map((stage) => stage.readable ?? typeof stage.tier.read === "function")];
-		this.labels = [options.headLabel ?? "SQLite", ...options.stages.map((stage) => stage.label ?? stage.tier.name)];
+		this.labels = ["SQLite", ...options.stages.map((stage) => stage.label ?? stage.tier.name)];
 		this.state = options.state;
 		this.clock = options.clock;
 		this.batch = options.batch ?? DEFAULT_BATCH;
 		this.trimBatch = options.trimBatch ?? DEFAULT_TRIM_BATCH;
-		this.recentOpsMs = options.recentOpsMs ?? DEFAULT_RECENT_OPS_MS;
 	}
 
 	/** The tiers as the planner sees them, with their saved state. */
@@ -261,7 +256,7 @@ export class HistoryPipeline {
 
 	private noteRecent(op: HistoryOp): void {
 		const now = this.clock.now();
-		this.recent = [...this.recent.filter((entry) => entry.at > now - this.recentOpsMs), { op, at: now }];
+		this.recent = [...this.recent.filter((entry) => entry.at > now - RECENT_OPS_MS), { op, at: now }];
 	}
 
 	/**
@@ -337,7 +332,7 @@ export class HistoryPipeline {
 	/** The ops a tier has yet to apply, after those applied lately (applying one twice changes nothing). */
 	private opsFor(state: TierState, pending: readonly QueuedOp[]): HistoryOp[] {
 		const now = this.clock.now();
-		const recent = this.recent.filter((entry) => entry.at > now - this.recentOpsMs).map((entry) => entry.op);
+		const recent = this.recent.filter((entry) => entry.at > now - RECENT_OPS_MS).map((entry) => entry.op);
 		return [...recent, ...pending.filter((entry) => entry.seq > state.ops).map((entry) => entry.op)];
 	}
 

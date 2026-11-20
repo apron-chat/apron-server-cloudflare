@@ -144,7 +144,7 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
 /** A pipeline of the Store's head and `stages`. */
 function headPipeline(options: Pick<BuildOptions, "store" | "limits" | "clock">, stages: PipelineStage[]): HistoryPipeline {
 	const head = new StoreHead(HEAD_TIER, options.store);
-	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages, state: head.stateStore(), clock: options.clock, headLabel: "SQLite" });
+	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages, state: head.stateStore(), clock: options.clock });
 }
 
 /**
