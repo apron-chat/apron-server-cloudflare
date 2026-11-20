@@ -39,6 +39,12 @@ export interface ImportTarget {
 	 * Library validation does not replace it.
 	 */
 	normalize?(record: ChatRecord): ChatRecord | null;
+	/**
+	 * The accounts there: those in use, and the most it may hold. Each new
+	 * placeholder takes one, so an import that would make more than there
+	 * is room for is refused before anything is written.
+	 */
+	accounts?(): Promise<{ used: number; limit: number }>;
 }
 
 /** Which archive user IDs may stand at the target as themselves. */
@@ -75,7 +81,20 @@ export interface ImportState {
 	rooms: Array<{ archive: string; target: string }>;
 }
 
-/** An ImportState from its JSON (a journal), or undefined for text that is not one. */
+/**
+ * An ImportState as JSON for a journal, compact: a user that stays itself is
+ * `"="` (a placeholder of its own ID) or `"@"` (matched to its own ID), so
+ * an archive of many users keeps a journal a fraction of their number in
+ * bytes. parseImportState reads it back.
+ */
+export function importStateJson(state: ImportState): string {
+	const users = Object.fromEntries(Object.entries(state.users).map(([id, target]) => [
+		id, "placeholder" in target && target.placeholder === id ? "=" : "matched" in target && target.matched === id ? "@" : target,
+	]));
+	return JSON.stringify({ ...state, users });
+}
+
+/** An ImportState from its JSON (a journal, importStateJson), or undefined for text that is not one. */
 export function parseImportState(text: string): ImportState | undefined {
 	let value: unknown;
 	try {
@@ -84,6 +103,14 @@ export function parseImportState(text: string): ImportState | undefined {
 		return undefined;
 	}
 	if (!isObject(value) || typeof value.archive !== "string" || !isObject(value.users) || !isObject(value.ids) || !Array.isArray(value.rooms)) return undefined;
+	const users: Record<string, UserTarget> = {};
+	for (const [id, target] of Object.entries(value.users)) {
+		if (target === "=") users[id] = { placeholder: id };
+		else if (target === "@") users[id] = { matched: id };
+		else if (isObject(target) && (typeof target.placeholder === "string" || typeof target.matched === "string")) users[id] = target as UserTarget;
+		else return undefined;
+	}
+	value.users = users;
 	const ids = value.ids;
 	const idsOk = (ids.mode === "renumber" && typeof ids.base === "number") || (ids.mode === "original" && Array.isArray(ids.moved) && ids.moved.every((pair) => Array.isArray(pair) && pair.length === 2 && pair.every((id) => typeof id === "number")));
 	const roomsOk = value.rooms.every((room) => isObject(room) && typeof room.archive === "string" && typeof room.target === "string");
@@ -153,6 +180,8 @@ export interface ImportReport {
 	resumed: boolean;
 	/** The rooms an abandoned import of another archive had begun, left as far as it got. */
 	abandoned?: string[];
+	/** The target's accounts before this import, where it says (ImportTarget.accounts): `placeholders` must fit in `limit - used`. */
+	accounts?: { used: number; limit: number };
 	/** Why this import would be refused. */
 	refused?: string;
 }
@@ -311,7 +340,11 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 		if (mapped !== id) report.remapped.users[id] = mapped;
 	}
 	report.placeholders = placeholders.length;
-	if (!resume && options.maxPlaceholders !== undefined && placeholders.length > options.maxPlaceholders) {
+	if (target.accounts) report.accounts = await target.accounts();
+	if (!resume && report.accounts && placeholders.length > report.accounts.limit - report.accounts.used) {
+		const { used, limit } = report.accounts;
+		report.refused = `this archive would make ${placeholders.length} placeholder accounts, but there is room for ${Math.max(0, limit - used)} more (${used} of ${limit} accounts are in use)`;
+	} else if (!resume && options.maxPlaceholders !== undefined && placeholders.length > options.maxPlaceholders) {
 		report.refused = `this archive would make ${placeholders.length} placeholder accounts, more than the ${options.maxPlaceholders} one import may make`;
 	}
 

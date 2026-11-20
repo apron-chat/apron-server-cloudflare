@@ -120,6 +120,8 @@ export interface RestorePort {
 	normalize(record: ChatRecord): ChatRecord | null;
 	/** Adds placeholder users, marked unclaimed. */
 	restoreUsers(users: readonly ArchivedUser[]): Promise<void>;
+	/** The accounts here, in use and at most (registeredIdentityCount): each placeholder takes one. */
+	accounts(): Promise<{ used: number; limit: number }>;
 	/**
 	 * Adds a new room (listing and records at or above the head's floor) and
 	 * rebuilds its current state. `context.rooms` are the rooms this import

@@ -727,7 +727,7 @@ function importNotice(report: ImportReport): string {
 		report.rejected ? `Dropped ${report.rejected} records no client could have sent.` : "",
 		report.collisions ? `Left ${report.collisions} messages as they are here: another message holds their ID.` : "",
 		Object.keys(report.remapped.logIds).length ? `Moved ${Object.keys(report.remapped.logIds).length} log IDs that other records hold.` : "",
-		report.placeholders ? `${report.dryRun ? "Would make" : "Made"} ${report.placeholders} placeholder accounts.` : "",
+		report.placeholders ? `${report.dryRun ? "Would make" : "Made"} ${report.placeholders} placeholder accounts${report.accounts ? ` (${report.accounts.used} of ${report.accounts.limit} accounts were in use)` : ""}.` : "",
 		report.membersJoined ? `Joined ${report.membersJoined} members the rooms' listings name.` : "",
 		report.membersSkipped ? `Left out ${report.membersSkipped} listed members: no account here, or past a cap.` : "",
 		users.length ? `Users: ${users.join(", ")}.` : "",

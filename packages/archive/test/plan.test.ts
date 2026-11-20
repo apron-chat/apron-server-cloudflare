@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type ImportTarget, type PlanOptions, type UserIdRules, planImport } from "../src/plan.ts";
+import { type ImportTarget, type PlanOptions, type UserIdRules, importStateJson, parseImportState, planImport } from "../src/plan.ts";
 import type { CollectedArchive } from "../src/format.ts";
 import type { ChatRecord } from "../src/records.ts";
 import type { ArchivedRoom, ArchivedUser } from "../src/types.ts";
@@ -169,6 +169,33 @@ describe("planImport", () => {
 	it("reports a placeholder cap rather than throwing", async () => {
 		const plan = await planImport(archive([message(10, "a", "ada"), message(11, "a", "bob")], [room("a")]), memoryTarget(), options({ maxPlaceholders: 1 }));
 		expect(plan.report.refused).toMatch(/2 placeholder accounts, more than the 1/);
+	});
+
+	it("refuses more placeholders than the target has room for, saying how many fit", async () => {
+		const input = archive([message(10, "a", "ada"), message(11, "a", "bob"), message(12, "a", "cy")], [room("a")]);
+		const full = { ...memoryTarget(), accounts: async () => ({ used: 8, limit: 10 }) };
+		const refused = await planImport(input, full, options());
+		expect(refused.report.accounts).toEqual({ used: 8, limit: 10 });
+		expect(refused.report.refused).toBe("this archive would make 3 placeholder accounts, but there is room for 2 more (8 of 10 accounts are in use)");
+		const roomy = { ...memoryTarget(), accounts: async () => ({ used: 7, limit: 10 }) };
+		expect((await planImport(input, roomy, options())).report.refused).toBeUndefined();
+		// A resumed plan made its placeholders already: its run decides, not the count now.
+		const resumed = await planImport(input, full, options({ resume: (await planImport(input, roomy, options())).state }));
+		expect(resumed.report.refused).toBeUndefined();
+	});
+
+	it("journals users that stay themselves compactly, and reads the journal back as the plan's state", async () => {
+		const users = Array.from({ length: 50 }, (_, index) => `user${index}`);
+		const input = archive(users.map((user, index) => message(10 + index, "a", user)), [room("a")]);
+		const plan = await planImport(input, memoryTarget({ users: ["user3"] }), options({ users: "new" }));
+		const text = importStateJson(plan.state);
+		// user3 is taken here: it is the one with a target of its own.
+		expect(plan.state.users.user3).toEqual({ placeholder: "user3-2" });
+		expect(text).toContain('"user0":"="');
+		expect(text.length).toBeLessThan(JSON.stringify(plan.state).length / 2);
+		expect(parseImportState(text)).toEqual(plan.state);
+		expect(parseImportState(JSON.stringify(plan.state))).toEqual(plan.state);
+		expect(parseImportState(JSON.stringify({ ...plan.state, users: { a: "?" } }))).toBeUndefined();
 	});
 
 	it("drops what the target's normalize refuses, after the prepare step", async () => {

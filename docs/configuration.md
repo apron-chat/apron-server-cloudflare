@@ -941,8 +941,9 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   roles are not imported, and `unclaimed` alone does not raise posting
   limits), renamed (`ada-2`) where the `user_id` is taken or retired, and
   `imported-<id>` where it cannot be an account here (a guest's, a bot's, a
-  `~` notice's, or `admin`). One import makes at most 2,000 placeholders.
-  Holding a role, placeholders are never removed as idle (account upkeep),
+  `~` notice's, or `admin`). An import that would make more placeholders
+  than `registeredIdentityCount` has room for is refused, and a dry run
+  shows the accounts in use. Holding a role, placeholders are never removed as idle (account upkeep),
   and they count toward `registeredIdentityCount`. Kept log IDs may be at
   most five minutes past the clock; a file with later ones is refused:
   `renumber` gives every record a new log ID

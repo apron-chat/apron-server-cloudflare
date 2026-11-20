@@ -20,7 +20,7 @@
  */
 
 import {
-	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, type RoomListing, archiveIdentity, collectArchive, parseImportState, planImport,
+	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, type RoomListing, archiveIdentity, collectArchive, importStateJson, parseImportState, planImport, utf8Length,
 } from "@apron/archive";
 import { withoutOutputRefs } from "../../content/output-ref";
 import { USER_ID_RULES } from "../../user-ids";
@@ -61,16 +61,23 @@ export interface ImportOptions {
 	entries?: number;
 	/** Abandon an unfinished earlier import of another archive, and plan this one afresh. */
 	restart?: boolean;
-	/** New placeholder accounts one import may make (default MAX_IMPORT_PLACEHOLDERS). */
+	/**
+	 * New placeholder accounts one import may make, besides the room the
+	 * server has for accounts (RestorePort.accounts), which always bounds it.
+	 */
 	maxPlaceholders?: number;
+	/** The largest journal, in UTF-8 bytes (default MAX_JOURNAL_BYTES). */
+	maxJournalBytes?: number;
 }
 
-/** New placeholder accounts one import makes at most: past it, the import is refused before anything is written. */
-export const MAX_IMPORT_PLACEHOLDERS = 2_000;
 /** How far past the clock an imported log ID may be (`original` IDs): further, and the import is refused, as it would hold back every later commit. */
 export const FUTURE_LOG_ID_MS = 5 * 60_000;
-/** The largest journal an import keeps (Store.setHistoryImportJournal's cap). */
-export const MAX_JOURNAL_BYTES = 256 * 1024;
+/**
+ * The largest journal an import keeps, in UTF-8 bytes (the Store keeps it in
+ * one `_meta` value, well under SQLite's 2 MB a value): about 50,000 users of
+ * their own IDs (importStateJson), or 60,000 moved log IDs.
+ */
+export const MAX_JOURNAL_BYTES = 1024 * 1024;
 /** Log IDs looked up a call. */
 const LOOKUP_BATCH = 500;
 
@@ -140,6 +147,8 @@ function importTarget(chain: HistoryChain, restore: RestorePort): ImportTarget {
 		},
 		// Records as a client could have sent them (Store.restorableRecord).
 		normalize: (record) => restore.normalize(record),
+		// Placeholders count against the server's accounts (registeredIdentityCount).
+		accounts: () => restore.accounts(),
 	};
 }
 
@@ -186,7 +195,7 @@ export async function importArchive(chain: HistoryChain, restore: RestorePort, i
 		...(options.server !== undefined ? { server: options.server } : {}),
 		now: () => options.clock.now(),
 		userIds: USER_ID_RULES,
-		maxPlaceholders: options.maxPlaceholders ?? MAX_IMPORT_PLACEHOLDERS,
+		...(options.maxPlaceholders !== undefined ? { maxPlaceholders: options.maxPlaceholders } : {}),
 		futureMs: FUTURE_LOG_ID_MS,
 		...(resume ? { resume } : {}),
 		// An `output_ref` names this server's own storage: never taken from a file (Store.normalizedBody drops a client's).
@@ -213,9 +222,10 @@ export async function importArchive(chain: HistoryChain, restore: RestorePort, i
 
 	// The journal, checked before anything is written: an import too large to
 	// resume is refused whole.
-	const journalText = JSON.stringify(plan.state);
-	if (!resume && !report.refused && journalText.length > MAX_JOURNAL_BYTES) {
-		report.refused = `this import maps ${Object.keys(report.users).length} users and moves ${plan.map.logIds.size} log IDs, too many to resume from if it fails: import it with renumber, or in parts`;
+	const journalText = importStateJson(plan.state);
+	if (!resume && !report.refused && utf8Length(journalText) > (options.maxJournalBytes ?? MAX_JOURNAL_BYTES)) {
+		const moved = plan.state.ids.mode === "original" ? plan.state.ids.moved.length : 0;
+		report.refused = `this import maps ${Object.keys(report.users).length} users and moves ${moved} log IDs, too many to resume from if it fails: ${moved > Object.keys(report.users).length ? "import it with renumber" : "import it in parts"}`;
 	}
 	if (options.dryRun) return report;
 	if (report.refused) throw new Error(report.refused);

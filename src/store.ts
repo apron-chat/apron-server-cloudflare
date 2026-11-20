@@ -5136,6 +5136,12 @@ export class Store {
     return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.metaNumber("identity_count"));
   }
 
+  /** The accounts in use and the most there may be (registeredIdentityCount): an import's placeholders must fit (restoreUsers). */
+  accountCapacity(now = this.clock.now()): { used: number; limit: number } {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, true, now, () => ({ used: this.metaNumber("identity_count"), limit: this.config.registeredIdentityCount }));
+  }
+
   private dedupRow(userId: string, requestId: string, now: number): RawDedupRow | null {
     const rows = this.rawRows<RawDedupRow>(
       "SELECT user_id, request_id, digest, result_json, transition_json, expires_ms FROM accepted_requests WHERE user_id = ? AND request_id = ? AND expires_ms > ? LIMIT 1",

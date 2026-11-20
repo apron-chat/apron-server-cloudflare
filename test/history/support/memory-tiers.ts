@@ -279,7 +279,16 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 	}
 
 	async restoreUsers(users: readonly ArchivedUser[]): Promise<void> {
-		for (const user of users) if (!this.people.has(user.user_id)) this.people.set(user.user_id, { ...user, roles: ["unclaimed"] });
+		const fresh = users.filter((user) => !this.people.has(user.user_id));
+		if (this.people.size + fresh.length > this.accountLimit) throw new Error(`registration_closed: ${fresh.length} new users would pass ${this.accountLimit} accounts`);
+		for (const user of fresh) this.people.set(user.user_id, { ...user, roles: ["unclaimed"] });
+	}
+
+	/** The most accounts this head holds (Store: registeredIdentityCount). */
+	accountLimit = 10_000;
+
+	async accounts(): Promise<{ used: number; limit: number }> {
+		return { used: this.people.size, limit: this.accountLimit };
 	}
 }
 

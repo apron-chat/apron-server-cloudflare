@@ -64,8 +64,10 @@ means; the server says what is true there (`ImportTarget`,
   a move's copy in the room it left, user mapping (match, new, overrides,
   free IDs, placeholders under `UserIdRules`), duplicates and collisions
   (looked up through the target, nudged to free log IDs), renumbering, and
-  the remapped records and listings. Returns a report and a JSON `state`
-  from which a retry makes the same plan (`resume`).
+  the remapped records and listings. Placeholders must fit the room the
+  target has for accounts, where it says (`ImportTarget.accounts`).
+  Returns a report and a `state` from which a retry makes the same plan
+  (`resume`), kept as compact JSON (`importStateJson`, `parseImportState`).
 - `export.ts`: `exportArchive(source, writer, options)`, a history as one
   archive from any `ArchiveSource` (rooms, users, paged records, a floor):
   listings with their members (bounded by `MAX_LISTING_MEMBERS` and

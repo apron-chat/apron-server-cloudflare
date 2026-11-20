@@ -45,6 +45,7 @@ export interface RestoreStore {
 	historyFloors(): { latest: number };
 	readonly content: { record(record: ChatRecord): { ok: true; value: ChatRecord } | { ok: false } };
 	restoreUsers(users: readonly ArchivedUser[]): void;
+	accountCapacity(): { used: number; limit: number };
 	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
 	restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): { joined: number; left: number; skipped: number };
 	historyImportJournal(): string | undefined;
@@ -98,6 +99,7 @@ export function storeRestore(store: RestoreStore): RestorePort {
 			return checked.ok ? checked.value : null;
 		},
 		restoreUsers: async (users) => store.restoreUsers(users),
+		accounts: async () => store.accountCapacity(),
 		restoreRoom: async (room: ArchivedRoom, records: readonly ChatRecord[], context: RestoreContext) => store.restoreRoom(room, records, undefined, { rooms: context.rooms }),
 		restoreMembers: async (roomId, changes) => store.restoreMembers(roomId, changes),
 		journal: {

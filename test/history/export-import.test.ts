@@ -410,7 +410,9 @@ describe("export and import", () => {
 	});
 
 	it("journals a renumbered import by its first ID, and refuses one in original IDs too large to resume before writing", async () => {
+		// More moved IDs than a journal of 256 KiB holds (MAX_JOURNAL_BYTES, 1 MiB, holds about 60,000).
 		const many = 25_000;
+		const maxJournalBytes = 256 * 1024;
 		const message = (logId: number) => ({ room_id: "lobby", log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: "lobby", from: { user_id: "zed" }, body: { text: "x" } }) });
 		const records = Array.from({ length: many }, (_, index) => message(1_000 + index));
 		const text = await writeArchiveToString(async (writer) => {
@@ -421,9 +423,11 @@ describe("export and import", () => {
 		// Every ID taken here by another record: each would move.
 		const target = chainOf("head", new TestClock(100_000));
 		for (const record of records) target.head.records.set(`${record.log_id}\u0000elsewhere`, { ...record, room_id: "elsewhere", record_json: record.record_json.replace('"x"', '"other"') });
-		const dry = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true });
-		expect(dry.refused).toMatch(/moves 25000 log IDs, too many to resume from/);
-		await expect(importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/import it with renumber/);
+		const dry = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true, maxJournalBytes });
+		expect(dry.refused).toMatch(/moves 25000 log IDs, too many to resume from if it fails: import it with renumber/);
+		// Under the real cap, the same import's journal fits.
+		expect((await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true })).refused).toBeUndefined();
+		await expect(importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, maxJournalBytes })).rejects.toThrow(/import it with renumber/);
 		expect(await target.head.journal.get()).toBeUndefined();
 		// Renumbered: the journal holds the first ID, not every one, and a failed run resumes with the same IDs.
 		const journals: string[] = [];
@@ -448,6 +452,52 @@ describe("export and import", () => {
 		expect(again.resumed).toBe(true);
 		expect(again.logIdRange).toEqual({ first: 100_000, last: 100_000 + many - 1 });
 		expect(target.head.all().filter((record) => record.room_id === "lobby")).toHaveLength(many);
+	});
+
+	// The account cap the import is bounded by is the server's own: 2,500
+	// users (past the 2,000 a single import once made at most) import in
+	// bounded batches, and a failure partway is finished by running it again.
+	it("imports more users than the old placeholder cap, in batches and resumably, and refuses more than the server has room for", async () => {
+		const users = Array.from({ length: 2_500 }, (_, index) => `user${index}`);
+		const text = await writeArchiveToString(async (writer) => {
+			await writer.header({ apron_archive: 1, server: "wss://elsewhere.test/" });
+			await writer.listing({ not_joined: [{ room_id: "crowd", log_id: "1000" }], users: users.map((user_id) => ({ user_id, name: user_id })) });
+			await writer.records(users.map((user, index) => ({ room_id: "crowd", log_id: 1_001 + index, commit_ms: 1_001 + index, kind: "message", record_json: JSON.stringify({ message_id: `m${index}`, log_id: String(1_001 + index), room_id: "crowd", from: { user_id: user }, body: { text: "hi" } }) })));
+		});
+		// Too little room: the dry run says how much there is, and nothing is written.
+		const small = chainOf("head", new TestClock(5_000_000));
+		small.head.accountLimit = 2_000;
+		small.head.people.set("admin", { user_id: "admin" });
+		const dry = await importArchive(small.chain, small.head, jsonlReader(linesOf(text)), { clock: small.clock, dryRun: true });
+		expect(dry.accounts).toEqual({ used: 1, limit: 2_000 });
+		expect(dry.refused).toBe("this archive would make 2500 placeholder accounts, but there is room for 1999 more (1 of 2000 accounts are in use)");
+		await expect(importArchive(small.chain, small.head, jsonlReader(linesOf(text)), { clock: small.clock })).rejects.toThrow(/room for 1999 more/);
+		expect(small.head.people.size).toBe(1);
+		// Room enough: placeholders in batches of 200; the run fails partway, and runs again to the end.
+		const target = chainOf("head", new TestClock(5_000_000));
+		target.head.accountLimit = 5_000;
+		const batches: number[] = [];
+		const restoreUsers = target.head.restoreUsers.bind(target.head);
+		let fail = true;
+		target.head.restoreUsers = async (batch) => {
+			batches.push(batch.length);
+			if (fail && batches.length === 4) {
+				fail = false;
+				throw new Error("the budget ran out");
+			}
+			return restoreUsers(batch);
+		};
+		await expect(importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
+		expect(target.head.people.size).toBe(600);
+		const journal = await target.head.journal.get();
+		expect(journal).toBeDefined();
+		expect(journal!.length).toBeLessThan(2_500 * 16);
+		const again = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(again.resumed).toBe(true);
+		expect(Math.max(...batches)).toBe(200);
+		expect(target.head.people.size).toBe(2_500);
+		expect(target.head.all().filter((record) => record.room_id === "crowd")).toHaveLength(2_500);
+		expect(await target.head.journal.get()).toBeUndefined();
 	});
 
 	it("finishes a failed import when run again, whatever restart says, with the same users and log IDs; abandons another's only with restart, naming its rooms", async () => {
