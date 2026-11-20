@@ -44,6 +44,20 @@ const records = [message(10, "general", "ada"), message(11, "general", "bob"), m
 const users: ArchivedUser[] = [{ user_id: "ada", name: "Ada" }, { user_id: "bob", name: "Bob" }, { user_id: "cy", name: "Cy" }];
 
 describe("exportArchive", () => {
+	it("writes a move once, though both rooms' histories serve it", async () => {
+		const moved = { ...message(30, "general", "ada"), record_json: JSON.stringify({ room_id: "later", log_id: "30", message_id: "10", prev_log_id: "10", prev_room_id: "general", from: { user_id: "ada" }, body: { text: "moved" } }) };
+		const both: ArchivedRoom[] = [{ listing: { room_id: "general" }, joined: false }, { listing: { room_id: "later" }, joined: false }];
+		// The source serves the move in both rooms' histories, as a server does.
+		const source = memorySource(both, [message(10, "general", "ada"), moved, { ...moved, room_id: "later" }], users);
+		const all = readArchive((await exported(source)).text);
+		expect(all.records.filter((record) => record.log_id === 30).map((record) => record.room_id)).toEqual(["later"]);
+		// Either room alone still has it.
+		for (const roomIds of [["general"], ["later"]]) {
+			const one = readArchive((await exported(source, { roomIds })).text);
+			expect(one.records.filter((record) => record.log_id === 30)).toHaveLength(1);
+		}
+	});
+
 	it("writes the header, every room's listing, then records with the users each page names first", async () => {
 		const source = memorySource(rooms, records, users);
 		const { text, report } = await exported(source, { header: { server: "wss://here" }, exportedAt: "2026-01-01T00:00:00.000Z" });

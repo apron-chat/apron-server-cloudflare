@@ -170,7 +170,11 @@ export function splitReferences(archive: Pick<CollectedArchive, "rooms" | "recor
 	for (const room of archive.rooms) rooms.set(room.listing.room_id, room);
 	const content: ChatRecord[] = [];
 	const references: ChatRecord[] = [];
-	for (const record of archive.records) {
+	// A record repeated (a move a writer took from both rooms' histories, each
+	// naming the room it went to) is read once: the last one stands.
+	const once = new Map<string, ChatRecord>();
+	for (const record of archive.records) once.set(`${record.room_id}\u0000${record.log_id}`, record);
+	for (const record of once.values()) {
 		const room = rooms.get(record.room_id);
 		const listed = room?.listing.history_log_id;
 		const start = listed === null ? Number.POSITIVE_INFINITY : listed === undefined ? undefined : Number(listed);

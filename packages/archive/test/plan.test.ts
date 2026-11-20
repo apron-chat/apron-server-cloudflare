@@ -61,6 +61,11 @@ describe("planImport", () => {
 	it("makes a moved message's copy again in the new room it left", async () => {
 		const plan = await planImport(archive([message(10, "b", "ada", "moved", { prev_room_id: "a" })], [room("a"), room("b")]), memoryTarget(), options());
 		expect(plan.records.map((record) => `${record.log_id}@${record.room_id}`)).toEqual(["10@a", "10@b"]);
+		// A writer that took the move from both rooms' histories gives it twice, both naming the room it went to: read once.
+		const twice = message(10, "b", "ada", "moved", { prev_room_id: "a" });
+		const again = await planImport(archive([twice, twice], [room("a"), room("b")]), memoryTarget(), options());
+		expect(again.records.map((record) => `${record.log_id}@${record.room_id}`)).toEqual(["10@a", "10@b"]);
+		expect(again.report.records).toBe(plan.report.records);
 	});
 
 	it("maps users: new placeholders, free IDs past taken and retired ones, the rules' base for IDs that cannot stand", async () => {

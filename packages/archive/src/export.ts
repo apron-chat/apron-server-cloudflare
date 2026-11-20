@@ -7,6 +7,8 @@
  * one listing part with every room as `not_joined`, then each room's
  * records in log order, a page at a time, each page preceded by the users
  * it names that no earlier part did. Nothing past a page is held in memory.
+ * A move is logged in both rooms, and each may serve it in its history,
+ * naming the room it went to: it is written once, the first time it comes.
  */
 
 import { type ChatRecord, namedUsers } from "./records.ts";
@@ -49,6 +51,26 @@ export function isPrivateRoom(room: ArchivedRoom): boolean {
 	return room.listing.private === true || room.listing.room_id.startsWith("private_");
 }
 
+/**
+ * Whether a record is a move written already: a moved message's snapshot (it
+ * names `prev_room_id`) at a log ID and room already written, as the history
+ * of the room it left and of the room it went to both serve it.
+ */
+function repeatedMove(record: ChatRecord, written: Set<string>): boolean {
+	if (record.kind !== "message" || !record.record_json.includes("prev_room_id")) return false;
+	let value: { room_id?: unknown; prev_room_id?: unknown };
+	try {
+		value = JSON.parse(record.record_json) as typeof value;
+	} catch {
+		return false;
+	}
+	if (typeof value.prev_room_id !== "string") return false;
+	const key = `${record.log_id}\u0000${String(value.room_id)}`;
+	if (written.has(key)) return true;
+	written.add(key);
+	return false;
+}
+
 /** Writes a history's parts: rooms, the users they name, and their records. */
 async function writeHistory(source: ArchiveSource, out: ArchiveWriter, options: ExportOptions): Promise<{ rooms: number; users: number; records: number }> {
 	const all = await source.rooms();
@@ -76,9 +98,11 @@ async function writeHistory(source: ArchiveSource, out: ArchiveWriter, options: 
 	};
 	await out.listing({ not_joined: listings, users: await userPart(named) });
 	let records = 0;
+	const moves = new Set<string>();
 	for (const room of rooms) {
 		for await (const read of source.records(room.listing.room_id)) {
-			const page = options.prepare ? await options.prepare(read) : read;
+			const page = (options.prepare ? await options.prepare(read) : read).filter((record) => !repeatedMove(record, moves));
+			if (!page.length) continue;
 			const users = await userPart(page.flatMap(namedUsers));
 			if (users.length) await out.listing({ users });
 			await out.records(page);
