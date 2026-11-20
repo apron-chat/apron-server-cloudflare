@@ -8,12 +8,13 @@
 
 import { type PipelineSnapshot, type ReadPart, type Step, type TierView, mergePages, planRead, planStep } from "./plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type Retention, type TierStats, applyOps, logIds, toRange } from "./records";
-import type { HistoryHead, HistoryTier, LowerTier, TierState, TierStateStore } from "./tier";
+import { type Stall, type StallStep, stallAlert, stallCleared, stallFailed } from "./stall";
+import { type HistoryHead, type HeadStateUpdate, type HistoryTier, type LowerTier, TIER_METHODS, type TierState, type TierStateStore } from "./tier";
 
 export interface PipelineStage {
 	tier: LowerTier;
 	retention: Retention;
-	/** Whether history pages read it (default: when it has `read`). */
+	/** Whether history pages read it (default true). */
 	readable?: boolean;
 	/** A label for /status, e.g. "D1". */
 	label?: string;
@@ -84,7 +85,7 @@ export class HistoryPipeline {
 		this.lower = options.stages.map((stage) => stage.tier);
 		this.tiers = [options.head, ...this.lower];
 		this.retentions = [options.headRetention, ...options.stages.map((stage) => stage.retention)];
-		this.readable = [true, ...options.stages.map((stage) => stage.readable ?? typeof stage.tier.read === "function")];
+		this.readable = [true, ...options.stages.map((stage) => stage.readable ?? true)];
 		this.labels = ["SQLite", ...options.stages.map((stage) => stage.label ?? stage.tier.name)];
 		this.state = options.state;
 		this.clock = options.clock;
@@ -103,7 +104,7 @@ export class HistoryPipeline {
 	}
 
 	async snapshot(progress: Pick<PipelineSnapshot, "targeted" | "advanced"> = { targeted: new Set(), advanced: new Map() }): Promise<PipelineSnapshot> {
-		const [tiers, published, ops] = await Promise.all([this.views(), this.head.publishedFloor(), this.head.ops()]);
+		const [tiers, published, ops] = await Promise.all([this.views(), this.head.publishedFloor(), this.head.opLog.list()]);
 		return { tiers, published, opsSeq: ops.length ? ops[ops.length - 1].seq : 0, trimmed: this.trimmed, ...progress };
 	}
 
@@ -134,14 +135,11 @@ export class HistoryPipeline {
 			} catch (error) {
 				report.failure = { step, error };
 				// Whatever fails below the head stalls the copy into it: noted for /status and the alert.
-				if (hop !== undefined && snapshot.tiers[hop].state.stalledSince === undefined) {
-					await this.state.save(this.tiers[hop].name, { stalledSince: this.clock.now() });
-				}
+				if (hop !== undefined) await this.saveStall(hop, snapshot.tiers[hop].state.stall, (stall) => stallFailed(stall, this.clock.now(), step.kind as StallStep));
 				return { more: false, report };
 			}
-			if (hop !== undefined && step.kind !== "copy" && snapshot.tiers[hop].state.stalledSince !== undefined) {
-				await this.state.save(this.tiers[hop].name, { stalledSince: undefined, alertedAt: undefined });
-			}
+			// A copy clears its hop's stall as it saves its marker (execute); another step only the stall it started.
+			if (hop !== undefined && step.kind !== "copy") await this.saveStall(hop, snapshot.tiers[hop].state.stall, (stall) => stallCleared(stall, step.kind as StallStep));
 		}
 		const idle = planStep(await this.snapshot(progress)).kind === "idle";
 		if (idle) this.round = HistoryPipeline.newRound();
@@ -169,7 +167,7 @@ export class HistoryPipeline {
 				}
 				const target = await tier.floorFor(this.retentions[step.tier], { now, below });
 				if (step.tier > 0) this.targetBasis.set(step.tier, { basis, at: now });
-				if (target !== undefined && target > state.target) await this.state.save(tier.name, { target });
+				if (target !== undefined && target > state.target) await this.saveState(step.tier, { target });
 				progress.targeted.add(step.tier);
 				return;
 			}
@@ -184,13 +182,13 @@ export class HistoryPipeline {
 				const exhausted = logIds(range.records).length < batch || records.length < range.records.length;
 				const through = exhausted ? step.below - 1 : records[records.length - 1].log_id;
 				const state = snapshot.tiers[step.from].state;
-				await this.state.save(from.name, { through: Math.max(state.through, through), stalledSince: undefined, alertedAt: undefined });
+				await this.saveState(step.from, { through: Math.max(state.through, through), stall: stallCleared(state.stall, "copy") });
 				report.copied += records.length;
 				if (records.length) progress.worked = true;
 				return;
 			}
 			case "advance":
-				await this.state.save(this.tiers[step.tier].name, { floor: step.floor });
+				await this.saveState(step.tier, { floor: step.floor });
 				progress.advanced.set(step.tier, step.floor);
 				// A floor that moved may move the targets below it. (The Store's head
 				// floor moves later, by its own cleanup, and reads back unmoved.)
@@ -219,7 +217,7 @@ export class HistoryPipeline {
 	private async applyOps(index: number): Promise<boolean> {
 		const tier = this.tiers[index] as LowerTier;
 		const views = await this.views();
-		const ops = await this.head.ops();
+		const ops = await this.head.opLog.list();
 		const state = views[index].state;
 		let applied = state.ops;
 		let cursor = state.opCursor;
@@ -227,17 +225,17 @@ export class HistoryPipeline {
 			if (seq <= applied) continue;
 			const next = await tier.applyOp(op, { cursor, found: (messageIds) => this.carryFound(index, seq, op, messageIds) });
 			if (next !== undefined) {
-				await this.state.save(tier.name, { opCursor: next });
+				await this.state.saveLower(tier.name, { opCursor: next });
 				return false;
 			}
 			applied = seq;
 			cursor = undefined;
-			await this.state.save(tier.name, { ops: seq, opCursor: undefined });
+			await this.state.saveLower(tier.name, { ops: seq, opCursor: null });
 			this.noteRecent(op);
 		}
 		const cursors = views.slice(1).map((view, offset) => offset + 1 === index ? applied : view.state.ops);
 		const done = Math.min(...cursors);
-		if (ops.length && ops[0].seq <= done) await this.head.dropOps(done);
+		if (ops.length && ops[0].seq <= done) await this.head.opLog.drop(done);
 		return true;
 	}
 
@@ -254,7 +252,7 @@ export class HistoryPipeline {
 		if (op.op !== "purge") return;
 		const fresh = messageIds.filter((id) => !op.messageIds.includes(id));
 		if (!fresh.length) return;
-		await this.head.amendPurge(seq, fresh);
+		await this.head.opLog.amend(seq, fresh);
 		await this.head.dropReactionsOn(fresh);
 		const drop: HistoryOp = { op: "purge", userIds: [], messageIds: fresh };
 		for (const above of this.lower.slice(0, index - 1)) {
@@ -267,8 +265,8 @@ export class HistoryPipeline {
 	/** A pipeline with no tier below the head: the op log has no one to wait for. */
 	private async forgetOpsWithoutTiers(): Promise<void> {
 		if (this.lower.length) return;
-		const ops = await this.head.ops();
-		if (ops.length) await this.head.dropOps(ops[ops.length - 1].seq);
+		const ops = await this.head.opLog.list();
+		if (ops.length) await this.head.opLog.drop(ops[ops.length - 1].seq);
 	}
 
 	private noteRecent(op: HistoryOp): void {
@@ -323,7 +321,7 @@ export class HistoryPipeline {
 		if (!query.roomIds.length || query.lower > query.upper || query.limit <= 0) return [];
 		const [views, published] = await Promise.all([this.views(), this.head.publishedFloor()]);
 		const parts = planRead(query, views, published, options);
-		const pending = parts.some((part) => part.tier > 0) ? await this.head.ops() : [];
+		const pending = parts.some((part) => part.tier > 0) ? await this.head.opLog.list() : [];
 		const pages: Array<{ tier: number; records: ChatRecord[] }> = [];
 		let found = new Set<number>();
 		for (const part of parts) {
@@ -344,7 +342,6 @@ export class HistoryPipeline {
 	 */
 	private async readPart(part: ReadPart, limit: number, ops: readonly HistoryOp[]): Promise<ChatRecord[]> {
 		const tier = this.tiers[part.tier];
-		if (!tier.read) return [];
 		const kept: ChatRecord[] = [];
 		let query = { ...part.query, limit };
 		for (;;) {
@@ -369,7 +366,7 @@ export class HistoryPipeline {
 	async lookup(ids: readonly number[]): Promise<ChatRecord[]> {
 		if (!ids.length) return [];
 		const found: ChatRecord[] = [];
-		for (const tier of this.tiers) if (tier.lookup) found.push(...await tier.lookup(ids));
+		for (const tier of this.tiers) found.push(...await tier.lookup(ids));
 		return found;
 	}
 
@@ -393,26 +390,60 @@ export class HistoryPipeline {
 		const views = await this.views();
 		const due: Array<{ from: string; to: string; since: number }> = [];
 		for (let index = 0; index < views.length - 1; index += 1) {
-			const state = views[index].state;
-			if (state.stalledSince === undefined || state.alertedAt !== undefined || now - state.stalledSince < afterMs) continue;
-			due.push({ from: views[index].name, to: views[index + 1].name, since: state.stalledSince });
-			await this.state.save(views[index].name, { alertedAt: now });
+			const alerted = stallAlert(views[index].state.stall, now, afterMs);
+			if (!alerted) continue;
+			due.push({ from: views[index].name, to: views[index + 1].name, since: alerted.since });
+			await this.saveState(index, { stall: alerted });
 		}
 		return due;
+	}
+
+	/** Whether tier `name` has state saved: it has held history here, whether or not it is in this pipeline. */
+	async hasTierState(name: string): Promise<boolean> {
+		return this.state.has(name);
+	}
+
+	/**
+	 * The copy from the head is blocked by a tier this pipeline cannot reach
+	 * (the D1 tier holding history while it is off): stalled from now, as a
+	 * failing copy would be. Returns the stall once it has lasted `afterMs`,
+	 * to alert of, once.
+	 */
+	async noteHeadBlocked(now: number, afterMs: number): Promise<{ since: number } | undefined> {
+		const stall = (await this.state.load([this.head.name]))[this.head.name].stall;
+		const failing = stallFailed(stall, now, "copy");
+		const alerted = stallAlert(failing, now, afterMs);
+		const next = alerted ?? failing;
+		if (next !== stall) await this.state.saveHead({ stall: next });
+		return alerted ? { since: alerted.since } : undefined;
+	}
+
+	/** Saves tier `index`'s state: the head's takes no ops. */
+	private async saveState(index: number, update: HeadStateUpdate): Promise<void> {
+		if (index > 0) return this.state.saveLower(this.tiers[index].name, update);
+		await this.state.saveHead(update);
+	}
+
+	/** Moves hop `index`'s stall by `change`, saving it only when it changed. */
+	private async saveStall(index: number, stall: Stall, change: (stall: Stall) => Stall): Promise<void> {
+		const next = change(stall);
+		if (next !== stall) await this.saveState(index, { stall: next });
 	}
 }
 
 /**
- * A tier whose every method goes through `wrap` (named by the method): for
+ * A tier whose methods (TIER_METHODS) go through `wrap` (named by the method): for
  * timing and stall tracking (the runtime's `stalls.track`) and, in tests,
  * fault injection. Properties pass through.
  */
 export function instrument<T extends HistoryTier>(tier: T, wrap: <R>(method: string, call: () => Promise<R>) => Promise<R>): T {
+	const wrapped = new Set<string>(TIER_METHODS);
 	return new Proxy(tier, {
 		get(target, property, receiver) {
 			const value = Reflect.get(target, property, receiver);
-			if (typeof value !== "function" || typeof property !== "string") return value;
-			return (...args: unknown[]) => wrap(property, () => (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)) ;
+			// Only the tier's own (asynchronous) methods: anything else it has passes through as it is.
+			if (typeof value !== "function" || typeof property !== "string" || !wrapped.has(property)) return value;
+			return (...args: unknown[]) => wrap(property, () => (value as (...a: unknown[]) => Promise<unknown>).apply(target, args));
 		},
 	}) as T;
 }

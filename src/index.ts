@@ -5,11 +5,12 @@ import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllo
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
 import { openArchive } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
-import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Enabled, HEAD_TIER, HISTORY_CODECS, hasLowerTiers } from "./history/config";
+import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
+import { type D1Off, detailLines, statusLines } from "./history/status";
+import { storeExport, storeRestore } from "./history/store-head";
 import { type BackupKind, writeBackup } from "./history/exports";
 import { storedChain } from "./history/storage/encoding";
 import type { BlobStore } from "./history/storage/store";
-import { checkInvariants } from "./history/plan";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryPipeline } from "./history/pipeline";
 import type { ChatRecord } from "./history/records";
@@ -2687,8 +2688,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * wanted, backing off after failures.
 	 */
 	private readonly historySchedule = new HistorySchedule();
-	/** Whether the D1 tier holds history but is off in this deploy (unboundD1), once read; undefined until then. */
-	private d1Unbound: boolean | undefined;
+	/** Whether the D1 tier has held history here (d1Missing), once read; undefined until then. */
+	private d1Held: boolean | undefined;
 	/** Whether this wake has warned that the scheduled backup has no store (runScheduledBackup). */
 	private backupUnboundWarned = false;
 	private terminalOutputCacheBytes = 0;
@@ -2793,15 +2794,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.config = loadConfig(env);
 		// Records past this SQLite's limits go to the tiers below where they are
 		// bound: D1 (HISTORY_D1), then the cold tier (HISTORY_BLOB).
-		const tiered = hasLowerTiers(env, this.config.limits);
-		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered });
-		this.history = tiered ? buildHistoryPipeline({
-			env, limits: this.config.limits, store: this.store, clock: { now: nowMs },
+		// The layout first: the Store is tiered exactly when the pipeline has tiers below it.
+		const layout = historyLayout(env, this.config.limits);
+		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered: layoutTiered(layout) });
+		this.history = buildHistoryPipeline({
+			layout, limits: this.config.limits, store: this.store, clock: { now: nowMs },
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
 			chunkIndex: (tier) => this.store.chunkIndex(tier),
 			server: this.config.rpId,
 			serverUrl: this.archiveHeader().server,
-		}) : undefined;
+		});
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
@@ -5171,7 +5173,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				let rows: ChatRecord[];
 				try {
 					// What the unbound D1 tier holds is nowhere else to read.
-					if (this.unboundD1(nowMs())) throw new Error("the D1 tier is unbound");
+					if (await this.d1Missing()) throw new Error("the D1 tier is off");
 					rows = await this.history!.read(found.below, { skipHead: true });
 				}
 				catch { throw { name: "retry_after", message: "Older history is unavailable for now", data: { retry_after: 60, ...limitData("read") } } satisfies ProtocolError; }
@@ -5196,33 +5198,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * keeps what it holds until HISTORY_D1 is bound again. Read once; an
 	 * unreadable state counts as unbound for now.
 	 */
-	private unboundD1(now: number): boolean {
-		if (!this.history || d1Enabled(this.runtimeEnv, this.config.limits)) return false;
-		if (this.d1Unbound === undefined) {
+	private async d1Missing(): Promise<D1Off | undefined> {
+		const off = d1Off(this.runtimeEnv, this.config.limits);
+		if (!this.history || !off) return undefined;
+		if (this.d1Held === undefined) {
 			try {
-				this.d1Unbound = this.store.hasHistoryTierState(D1_TIER, now);
+				this.d1Held = await this.history.hasTierState(D1_TIER);
 			} catch {
-				return true;
+				return off;
 			}
-			if (this.d1Unbound) console.warn(JSON.stringify({ event: "history_tier_unbound", tier: D1_TIER, missing: "HISTORY_D1" }));
+			if (this.d1Held) console.warn(JSON.stringify({ event: "history_tier_unbound", tier: D1_TIER, missing: off === "unbound" ? "HISTORY_D1" : "LIMIT_HISTORY_D1_RECORDS" }));
 		}
-		return this.d1Unbound;
+		return this.d1Held ? off : undefined;
 	}
 
 	/**
-	 * The D1 tier is unbound (unboundD1): the copy into it counts as failing
-	 * from the first wake that sees it, and once that has lasted
-	 * HISTORY_STALL_ALERT_MS, admins get the history_stall alert, once, as for
-	 * any stalled copy. Bound again, the pipeline's first good copy clears it.
+	 * The D1 tier is off while it holds history (d1Missing): the copy into it
+	 * counts as failing from the first wake that sees it, and once that has
+	 * lasted HISTORY_STALL_ALERT_MS, admins get the history_stall alert, once,
+	 * as for any stalled copy (src/history/stall.ts). On again, the pipeline's
+	 * first good copy clears it.
 	 */
-	private noteUnboundD1(now: number): void {
+	private async noteD1Missing(now: number): Promise<void> {
 		try {
-			const state = this.store.historyState([HEAD_TIER], HEAD_TIER, now)[HEAD_TIER];
-			if (state.stalledSince === undefined) this.store.saveHistoryState(HEAD_TIER, HEAD_TIER, { stalledSince: now }, now);
-			else if (state.alertedAt === undefined && now - state.stalledSince >= HISTORY_STALL_ALERT_MS) {
-				this.store.saveHistoryState(HEAD_TIER, HEAD_TIER, { alertedAt: now }, now);
-				this.announce({ kind: "history_stall", from: HEAD_TIER, to: D1_TIER, hours: (now - state.stalledSince) / 3_600_000 });
-			}
+			const alert = await this.history!.noteHeadBlocked(now, HISTORY_STALL_ALERT_MS);
+			if (alert) this.announce({ kind: "history_stall", from: HEAD_TIER, to: D1_TIER, hours: (now - alert.since) / 3_600_000 });
 		} catch {
 			// The maintenance budget: noted on a later wake.
 		}
@@ -5241,10 +5241,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const history = this.history!;
 		const schedule = this.historySchedule;
 		if (!schedule.mayRun(now)) return;
-		if (this.unboundD1(now)) {
-			// Nothing runs until D1 is bound: no cycle or queued op is due meanwhile.
+		if (await this.d1Missing()) {
+			// Nothing runs until D1 is on: no cycle or queued op is due meanwhile.
 			schedule.idle();
-			this.noteUnboundD1(now);
+			await this.noteD1Missing(now);
 			return;
 		}
 		// Held by a job: the cycle is left due, and the job's release asks for it.
@@ -9119,7 +9119,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(store: BlobStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
-		return writeBackup(this.archivePipeline(), store, this.config.backups, kind, {
+		return writeBackup(this.archivePipeline(), storeExport(this.store), store, this.config.backups, kind, {
 			server: this.config.rpId, clock: { now: nowMs }, codecs: HISTORY_CODECS, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
@@ -9144,17 +9144,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		switch (args.action) {
-			case "status": {
-				const lines = await this.historyStatus(now);
-				const pipeline = this.archivePipeline();
-				const views = await pipeline.views();
-				lines.push(...views.map((view) => `- \`${view.name}\`: floor ${view.state.floor}${views.indexOf(view) < views.length - 1 ? `, copied through ${view.state.through}` : ""}${view.state.ops ? `, ops through ${view.state.ops}` : ""}${view.state.opCursor !== undefined ? `, applying op ${view.state.ops + 1} from ${view.state.opCursor}` : ""}`));
-				lines.push(`- Published floor: ${await pipeline.publishedFloor()}`);
-				const violations = checkInvariants(views, await pipeline.publishedFloor());
-				lines.push(violations.length ? `- **Invariants broken:** ${violations.join("; ")}` : "- Invariants hold.");
-				done(lines.join("\n"));
+			case "status":
+				done([...await this.historyStatus(now), ...await detailLines(this.archivePipeline())].join("\n"));
 				return;
-			}
 		}
 	}
 
@@ -9162,7 +9154,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async historyJob(cap: AdminCapability, args: Extract<HistoryArgs, { action: "export" | "import" }>, done: (text: string) => void): Promise<void> {
 		assertAdmin(cap);
 		// Without D1, an export would miss what it holds, and an import would place records wrongly.
-		if (this.unboundD1(nowMs())) throw { name: "invalid_params", message: `History tier ${D1_TIER} (D1) holds history but HISTORY_D1 is unbound in this deploy: exports and imports wait until it is bound` } satisfies ProtocolError;
+		const off = await this.d1Missing();
+		if (off) throw { name: "invalid_params", message: off === "unbound" ? `History tier ${D1_TIER} (D1) holds history but HISTORY_D1 is unbound in this deploy: exports and imports wait until it is bound` : `History tier ${D1_TIER} (D1) holds history but LIMIT_HISTORY_D1_RECORDS is 0 in this deploy: exports and imports wait until it is above 0` } satisfies ProtocolError;
 		switch (args.action) {
 			case "export": {
 				const store = this.backupStore();
@@ -9186,7 +9179,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				try {
 					// Read back through the codecs it went through, bounded decoded too: a small file may decode to a great deal.
 					const reader = openArchive(await object.stream(), { codecs: storedChain(key, object), maxBytes: MAX_IMPORT_BYTES });
-					report = await importArchive(this.archivePipeline(), reader, {
+					report = await importArchive(this.archivePipeline(), storeRestore(this.store), reader, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
 						// Only an authenticating codec, read to the end, makes a file this server's own.
 						authenticated: () => reader.verified(),
@@ -9219,12 +9212,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const last = this.store.historyMetaNumber(META_SCHEDULED_BACKUP, now);
 			if (now < last + everySeconds * 1_000) return;
 			const store = blobStoreOf(this.runtimeEnv);
-			const unboundD1 = this.unboundD1(now);
-			if (!store || unboundD1) {
+			const missing = await this.d1Missing();
+			if (!store || missing) {
 				// Said once a wake: a backup that silently never runs is no backup.
 				if (!this.backupUnboundWarned) {
 					this.backupUnboundWarned = true;
-					console.warn(JSON.stringify({ event: "history_export_unbound", reason: store ? "the D1 history tier is unbound" : "no backup store: bind HISTORY_BLOB" }));
+					console.warn(JSON.stringify({ event: "history_export_unbound", reason: store ? `the D1 history tier is off (${missing === "unbound" ? "HISTORY_D1 unbound" : "LIMIT_HISTORY_D1_RECORDS is 0"})` : "no backup store: bind HISTORY_BLOB" }));
 				}
 				return;
 			}
@@ -9578,51 +9571,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * throws; the tiers below give up after 5 seconds.
 	 */
 	private async historyStatus(now: number): Promise<string[]> {
-		const limits = this.config.limits;
-		const count = (value: number) => Math.round(value).toLocaleString("en-US");
-		// Against the limit, with what cleanup keeps of it (cleanupThresholdPercent).
-		const against = (value: number, limit: number | undefined, percent: number) => limit && limit > 0
-			? `${count(value)} / ${count(limit)} records (${Math.round((100 * value) / limit)}%; cleanup keeps ${count(thresholdRecords(limit, percent))})`
-			: `${count(value)} records (${limit === undefined ? "kept by age" : "kept"})`;
-		if (this.unboundD1(now)) {
-			let hot = "unknown";
-			try { hot = against(this.store.hotRecords(now), limits.retentionRecords > 0 ? limits.retentionRecords : undefined, limits.cleanupThresholdPercent); } catch { /* unknown */ }
-			return [
-				`- History in SQLite: ${hot}`,
-				`- History in D1: **unbound** (it holds history; needs the \`HISTORY_D1\` binding): no history moves below SQLite until it is bound`,
-			];
-		}
-		if (!this.history) {
-			let hot: string;
-			try {
-				const records = this.store.hotRecords(now);
-				hot = limits.retentionRecords > 0 ? against(records, limits.retentionRecords, limits.cleanupThresholdPercent) : `${count(records)} records (kept by age)`;
-			} catch {
-				hot = "unknown";
-			}
-			return [`- History in SQLite: ${hot}`, `- History in D1: off${limits.historyD1Records > 0 ? " (no `HISTORY_D1` binding)" : ""}`];
-		}
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const tiers = await Promise.race([
-				this.history.stats(),
-				new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), 5_000); }),
-			]).finally(() => clearTimeout(timer));
-			const lines: string[] = [];
-			for (const [index, tier] of tiers.entries()) {
-				const limit = index === 0 ? (limits.retentionRecords > 0 ? limits.retentionRecords : undefined) : tier.retention.records ?? 0;
-				lines.push(`- History in ${tier.label}: ${against(tier.stats.records, limit, tier.retention.thresholdPercent)}`);
-				const next = tiers[index + 1];
-				if (next && tier.state.stalledSince !== undefined) {
-					lines.push(`- History copy ${tier.label} → ${next.label}: failing since ${new Date(tier.state.stalledSince).toISOString()}`);
-				}
-			}
-			return lines;
-		} catch {
-			let hot = "unknown";
-			try { hot = against(this.store.hotRecords(now), limits.retentionRecords > 0 ? limits.retentionRecords : undefined, limits.cleanupThresholdPercent); } catch { /* unknown */ }
-			return [`- History in SQLite: ${hot}`, "- History below SQLite: unavailable"];
-		}
+		const d1Off = await this.d1Missing();
+		return statusLines({ limits: this.config.limits, hotRecords: () => this.store.hotRecords(now), ...(this.history ? { pipeline: this.history } : {}), ...(d1Off ? { d1Off } : {}) });
 	}
 
 	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */

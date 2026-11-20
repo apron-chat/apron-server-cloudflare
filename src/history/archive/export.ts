@@ -9,6 +9,7 @@
 import { type ArchiveSource, type ArchiveWriter, type ChatRecord, type ExportOptions as ArchiveExportOptions, type ExportReport, exportArchive as writeArchive } from "@apron/archive";
 import type { HistoryPipeline } from "../pipeline";
 import type { Clock } from "../records";
+import type { ExportPort } from "../tier";
 
 export type { ExportReport };
 
@@ -36,19 +37,18 @@ async function* roomRecords(pipeline: HistoryPipeline, roomId: string): AsyncGen
 	}
 }
 
-/** The pipeline as an export's source: its head's rooms and users, records across every tier, history from the published floor. */
-function pipelineSource(pipeline: HistoryPipeline): ArchiveSource {
-	const head = pipeline.head;
+/** An export's source: the server's rooms and users (`server`), records across every tier, history from the published floor. */
+function pipelineSource(pipeline: HistoryPipeline, server: ExportPort): ArchiveSource {
 	return {
-		rooms: async () => (head.rooms ? head.rooms() : []),
-		users: async (userIds) => (head.users ? head.users(userIds) : []),
+		rooms: () => server.rooms(),
+		users: (userIds) => server.users(userIds),
 		records: (roomId) => roomRecords(pipeline, roomId),
 		floor: () => pipeline.publishedFloor(),
 	};
 }
 
 /** Writes the pipeline's history as one ARCHIVE.md v1 file. The writer is closed at the end. */
-export async function exportArchive(pipeline: HistoryPipeline, out: ArchiveWriter, options: ExportOptions): Promise<ExportReport> {
+export async function exportArchive(pipeline: HistoryPipeline, server: ExportPort, out: ArchiveWriter, options: ExportOptions): Promise<ExportReport> {
 	const { clock, ...rest } = options;
-	return writeArchive(pipelineSource(pipeline), out, { ...rest, exportedAt: new Date(clock.now()).toISOString() });
+	return writeArchive(pipelineSource(pipeline, server), out, { ...rest, exportedAt: new Date(clock.now()).toISOString() });
 }

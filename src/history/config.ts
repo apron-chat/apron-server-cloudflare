@@ -23,7 +23,9 @@ import { HistoryPipeline, type PipelineStage, instrument } from "./pipeline";
 import type { Clock, Retention } from "./records";
 import { R2BlobStore } from "./storage/r2";
 import type { BlobStore } from "./storage/store";
-import { type StorePort, StoreHead } from "./store-head";
+import { type TierStatePort, tierStateStore } from "./state";
+import type { D1Off } from "./status";
+import { type HeadStore, storeHead } from "./store-head";
 
 /** The history limits (src/budget.ts Limits). */
 export interface HistoryLimits {
@@ -73,10 +75,43 @@ export interface BlobStoreChoice {
 	blobProvider?: string;
 }
 
-export interface BuildOptions extends BlobStoreChoice {
-	env: HistoryEnv;
+/** The Store as the pipeline needs it: the head's records and its tier state. */
+export interface PipelineStore extends HeadStore {
+	historyStatePort(): TierStatePort;
+}
+
+/**
+ * Which tiers below the head exist in this deploy, from the bindings and
+ * limits alone: the D1 database where the D1 tier is on (d1Enabled), and
+ * the blob store where one is bound. Resolved once, before the Store: the
+ * Store is `tiered` when there is any (layoutTiered), and the pipeline is
+ * built from the same layout, so the two cannot disagree.
+ */
+export interface HistoryLayout {
+	d1?: D1Database;
+	blobs?: BlobStore;
+	/** The blob store's provider, for /status ("R2"). */
+	blobLabel?: string;
+}
+
+export function historyLayout(env: HistoryEnv, limits: Pick<HistoryLimits, "historyD1Records">, choice: BlobStoreChoice = {}): HistoryLayout {
+	const blobs = blobStoreOf(env, choice);
+	const provider = choice.blobProvider ?? BLOB_PROVIDER;
+	return {
+		...(d1Enabled(env, limits) ? { d1: env.HISTORY_D1! } : {}),
+		...(blobs ? { blobs, blobLabel: provider === "r2" ? "R2" : provider } : {}),
+	};
+}
+
+/** Whether a layout has any tier below the head. */
+export function layoutTiered(layout: HistoryLayout): boolean {
+	return Boolean(layout.d1 || layout.blobs);
+}
+
+export interface BuildOptions {
+	layout: HistoryLayout;
 	limits: HistoryLimits;
-	store: StorePort;
+	store: PipelineStore;
 	clock: Clock;
 	track?: HistoryTrack;
 	/** The cold tier's chunk index (the Store's SQLite in the Durable Object); without it, no cold tier. */
@@ -101,6 +136,11 @@ export function blobStoreOf(env: HistoryEnv, choice: BlobStoreChoice = {}): Blob
 	return providers[name](env);
 }
 
+/** Why the D1 tier is off: HISTORY_D1 is unbound, or LIMIT_HISTORY_D1_RECORDS is 0; undefined when it is on. */
+export function d1Off(env: HistoryEnv, limits: Pick<HistoryLimits, "historyD1Records">): D1Off | undefined {
+	return !env.HISTORY_D1 ? "unbound" : limits.historyD1Records > 0 ? undefined : "disabled";
+}
+
 /** Whether the D1 tier is on: HISTORY_D1 bound, and a count to keep there (D1 cannot keep everything). */
 export function d1Enabled(env: HistoryEnv, limits: Pick<HistoryLimits, "historyD1Records">): boolean {
 	return Boolean(env.HISTORY_D1) && limits.historyD1Records > 0;
@@ -116,36 +156,30 @@ export function headRetention(limits: HistoryLimits): Retention {
 	};
 }
 
-/** Whether any tier below the head would be built: the Store needs to know before the pipeline exists. */
-export function hasLowerTiers(env: HistoryEnv, limits: HistoryLimits, choice: BlobStoreChoice = {}): boolean {
-	return d1Enabled(env, limits) || blobStoreOf(env, choice) !== undefined;
-}
-
 const tracker = (options: BuildOptions): HistoryTrack => options.track ?? ((_kind, _method, call) => call());
 
-/** The pipeline: SQLite, then D1 and the cold tier where bound. Undefined when there is no tier below the head. */
+/** The pipeline: SQLite, then D1 and the cold tier where the layout has them. Undefined when there is no tier below the head. */
 export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | undefined {
-	const { env, limits } = options;
+	const { layout, limits } = options;
 	const track = tracker(options);
 	const stages: PipelineStage[] = [];
-	if (d1Enabled(env, limits)) {
+	if (layout.d1) {
 		stages.push({
-			tier: instrument(new D1HistoryTier(D1_TIER, env.HISTORY_D1!), (method, call) => track("d1", method, call)),
+			tier: instrument(new D1HistoryTier(D1_TIER, layout.d1), (method, call) => track("d1", method, call)),
 			retention: { records: limits.historyD1Records, thresholdPercent: limits.cleanupThresholdPercent },
 			label: "D1",
 		});
 	}
-	const blobs = options.chunkIndex ? blobStoreOf(env, options) : undefined;
-	if (blobs && options.chunkIndex) {
+	if (layout.blobs && options.chunkIndex) {
 		const tier = new ColdHistoryTier({
-			name: COLD_TIER, store: blobs, index: options.chunkIndex(COLD_TIER), codecs: options.codecs ?? HISTORY_CODECS,
+			name: COLD_TIER, store: layout.blobs, index: options.chunkIndex(COLD_TIER), codecs: options.codecs ?? HISTORY_CODECS,
 			prefix: `${CHUNK_PREFIX}${options.server ?? "server"}/`, clock: options.clock,
 			header: { ...(options.serverUrl ?? options.server ? { server: options.serverUrl ?? options.server } : {}) },
 		});
 		stages.push({
 			tier: instrument(tier, (method, call) => track("r2", method, call)),
 			retention: { ...(limits.historyColdRecords > 0 ? { records: limits.historyColdRecords } : {}), thresholdPercent: limits.cleanupThresholdPercent },
-			label: (options.blobProvider ?? BLOB_PROVIDER) === "r2" ? "R2" : options.blobProvider,
+			label: layout.blobLabel ?? "blobs",
 		});
 	}
 	return stages.length ? headPipeline(options, stages) : undefined;
@@ -153,8 +187,8 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
 
 /** A pipeline of the Store's head and `stages`. */
 function headPipeline(options: Pick<BuildOptions, "store" | "limits" | "clock">, stages: PipelineStage[]): HistoryPipeline {
-	const head = new StoreHead(HEAD_TIER, options.store);
-	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages, state: head.stateStore(), clock: options.clock });
+	const head = storeHead(HEAD_TIER, options.store);
+	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages, state: tierStateStore(options.store.historyStatePort(), HEAD_TIER), clock: options.clock });
 }
 
 /**

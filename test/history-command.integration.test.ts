@@ -116,14 +116,14 @@ type Runtime = {
 	historySchedule: HistorySchedule;
 	deadlines: { maintenance: { at?: number; clear(): void; soonest(at: number): boolean } };
 	runHistory(now: number): Promise<void>;
-	d1Unbound?: boolean;
+	d1Held?: boolean;
 	backupUnboundWarned: boolean;
 	announce(alert: Record<string, unknown>): void;
-	unboundD1(now: number): boolean;
-	noteUnboundD1(now: number): void;
+	d1Missing(): Promise<'unbound' | 'disabled' | undefined>;
+	noteD1Missing(now: number): Promise<void>;
 	runScheduledBackup(now: number): Promise<void>;
 	backupStore(): unknown;
-	store: { historyMetaNumber(key: string): number; setHistoryMeta(key: string, value: string | null): void };
+	store: { historyMetaNumber(key: string): number; setHistoryMeta(key: string, value: string | null): void; historyStatePort(): { setValue(key: string, value: string | null): void } };
 };
 
 /** Runs `fn` on the runtime, then puts back what it changed of it. */
@@ -131,7 +131,7 @@ async function changed(change: (runtime: Runtime) => void, fn: () => Promise<voi
 	let saved: Partial<Runtime> = {};
 	await runInDurableObject(stub(), (instance) => {
 		const runtime = instance as unknown as Runtime;
-		saved = { config: runtime.config, runtimeEnv: runtime.runtimeEnv, history: runtime.history, d1Unbound: runtime.d1Unbound, backupUnboundWarned: runtime.backupUnboundWarned };
+		saved = { config: runtime.config, runtimeEnv: runtime.runtimeEnv, history: runtime.history, d1Held: runtime.d1Held, backupUnboundWarned: runtime.backupUnboundWarned };
 		change(runtime);
 	});
 	try {
@@ -298,56 +298,62 @@ it('does not poll while a job holds the history lock: the cycle waits, and the j
 	expect(result).toEqual({ polled: false, wanted: 'due', released: { cycleSoon: true } });
 });
 
-it('takes the D1 tier for unbound only once it holds history: no other composition runs in its place', async () => {
-	const fresh = await runInDurableObject(stub(), (instance, state) => {
-		const runtime = instance as unknown as Runtime & { store: { saveHistoryState(name: string, head: string, update: Record<string, unknown>): void } };
+it('takes the D1 tier for off only once it holds history, and says why: unbound, or no count to keep', async () => {
+	const fresh = await runInDurableObject(stub(), async (instance, state) => {
+		const runtime = instance as unknown as Runtime;
 		const known = state.storage.sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key = 'history:tier:recent'").toArray().length > 0;
 		const env = runtime.runtimeEnv;
-		const cached = runtime.d1Unbound;
+		const config = runtime.config;
+		const cached = runtime.d1Held;
+		const port = runtime.store.historyStatePort();
 		try {
 			runtime.runtimeEnv = { ...env, HISTORY_D1: undefined };
 			if (known) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'history:tier:recent'");
-			runtime.d1Unbound = undefined;
-			// Bound, never unbound; unbound with no state, a deploy without D1 that simply never had it.
-			const unused = runtime.unboundD1(Date.now());
-			runtime.store.saveHistoryState('recent', 'hot', {});
-			runtime.d1Unbound = undefined;
-			const held = runtime.unboundD1(Date.now());
+			runtime.d1Held = undefined;
+			// Unbound with no state: a deploy without D1 that simply never had it.
+			const unused = await runtime.d1Missing();
+			port.setValue('history:tier:recent', '{}');
+			runtime.d1Held = undefined;
+			const held = await runtime.d1Missing();
+			// Bound, but with no count to keep: off as well, and said so.
 			runtime.runtimeEnv = env;
-			runtime.d1Unbound = undefined;
-			return { unused, held, bound: runtime.unboundD1(Date.now()) };
+			runtime.config = { ...config, limits: { ...(config as unknown as { limits: Record<string, unknown> }).limits, historyD1Records: 0 } } as never;
+			const disabled = await runtime.d1Missing();
+			runtime.config = config;
+			return { unused, held, disabled, bound: await runtime.d1Missing() };
 		} finally {
 			runtime.runtimeEnv = env;
-			runtime.d1Unbound = cached;
-			if (!known) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'history:tier:recent'");
+			runtime.config = config;
+			runtime.d1Held = cached;
+			if (!known) port.setValue('history:tier:recent', null);
 		}
 	});
-	expect(fresh).toEqual({ unused: false, held: true, bound: false });
+	expect(fresh).toEqual({ unused: undefined, held: 'unbound', disabled: 'disabled', bound: undefined });
 });
 
 it('while the D1 tier is unbound, it shows in /history status, exports wait, and admins are alerted after six hours', async () => {
 	const admin = await signedInAdmin();
 	try {
 		await changed((runtime) => {
-			runtime.d1Unbound = true;
+			runtime.d1Held = true;
 			runtime.runtimeEnv = { ...runtime.runtimeEnv, HISTORY_D1: undefined };
 		}, async () => {
 			const status = await command(admin, 'unbound-status', '/history status');
 			expect(status.notice).toContain('- History in D1: **unbound** (it holds history; needs the `HISTORY_D1` binding): no history moves below SQLite until it is bound');
 			const refused = await command(admin, 'unbound-export', '/history export');
 			expect(refused.frame.error?.message).toMatch(/^History tier recent \(D1\) holds history but HISTORY_D1 is unbound in this deploy/);
-			const alerts = await runInDurableObject(stub(), (instance) => {
+			const alerts = await runInDurableObject(stub(), async (instance) => {
 				const runtime = instance as unknown as Runtime;
 				const seen: Array<Record<string, unknown>> = [];
 				const announce = runtime.announce;
 				runtime.announce = (alert) => { seen.push(alert); };
 				try {
 					const now = Date.now();
-					runtime.noteUnboundD1(now);
-					runtime.noteUnboundD1(now + 60_000);
+					await runtime.noteD1Missing(now);
+					await runtime.noteD1Missing(now + 60_000);
 					const early = seen.length;
-					runtime.noteUnboundD1(now + 7 * 3_600_000);
-					runtime.noteUnboundD1(now + 8 * 3_600_000);
+					await runtime.noteD1Missing(now + 7 * 3_600_000);
+					await runtime.noteD1Missing(now + 8 * 3_600_000);
 					return { early, alerts: seen };
 				} finally {
 					runtime.announce = announce;
@@ -357,9 +363,16 @@ it('while the D1 tier is unbound, it shows in /history status, exports wait, and
 			expect(alerts.alerts).toEqual([expect.objectContaining({ kind: 'history_stall', from: 'hot', to: 'recent' })]);
 			// Bound again, the pipeline's first good copy clears the stall.
 			await runInDurableObject(stub(), (instance) => {
-				const store = (instance as unknown as { store: { saveHistoryState(name: string, head: string, update: Record<string, unknown>): void } }).store;
-				store.saveHistoryState('hot', 'hot', { stalledSince: undefined, alertedAt: undefined });
+				(instance as unknown as Runtime).store.historyStatePort().setValue('history:head:stall', null);
 			});
+		});
+		// With no count to keep (LIMIT_HISTORY_D1_RECORDS 0), off as well, and the message says so.
+		await changed((runtime) => {
+			runtime.d1Held = true;
+			runtime.config = { ...runtime.config, limits: { ...(runtime.config as unknown as { limits: Record<string, unknown> }).limits, historyD1Records: 0 } } as never;
+		}, async () => {
+			const refused = await command(admin, 'disabled-export', '/history export');
+			expect(refused.frame.error?.message).toMatch(/^History tier recent \(D1\) holds history but LIMIT_HISTORY_D1_RECORDS is 0 in this deploy/);
 		});
 	} finally {
 		admin.close();

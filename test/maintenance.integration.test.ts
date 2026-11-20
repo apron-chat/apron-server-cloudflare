@@ -1,5 +1,7 @@
 import { expect, it } from "vitest";
 import { Store, type StoreConfig, type StoreMutationInput } from "../src/store";
+import { tierStateStore } from "../src/history/state";
+import { NOT_STALLED } from "../src/history/stall";
 import { BY_AGE, expectRetryAfter, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 const DAY_MS = 86_400_000;
@@ -277,7 +279,7 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		tiered: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, cleanupThresholdPercent: 100,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
-	await withStore("history-floors", tiered, (store, clock, state) => {
+	await withStore("history-floors", tiered, async (store, clock, state) => {
 		const general = BigInt(store.getRoomState().log_id);
 		const logs = Array.from({ length: 8 }, (_, index) => {
 			clock.value += 1_000;
@@ -298,16 +300,18 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect(store.historyTarget(clock.value)).toBe(Number(logs[5]));
 		const scanned = store.historyScan(Number(general), 100, clock.value).filter((row) => row.log_id < Number(logs[5]));
 		expect(scanned.map((row) => BigInt(row.log_id))).toEqual([general, ...logs.slice(0, 5)]);
-		store.saveHistoryState("hot", "hot", { through: Number(logs[4]) }, clock.value);
-		expect(store.historyState(["hot", "recent"], "hot", clock.value)).toEqual({
-			hot: { floor: 1, target: 1, through: Number(logs[4]), ops: 0 },
-			recent: { floor: 1, target: 1, through: 0, ops: 0 },
+		const tiers = tierStateStore(store.historyStatePort(), "hot");
+		await tiers.saveHead({ through: Number(logs[4]) });
+		expect(await tiers.load(["hot", "recent"])).toEqual({
+			hot: { floor: 1, target: 1, through: Number(logs[4]), ops: 0, stall: NOT_STALLED },
+			recent: { floor: 1, target: 1, through: 0, ops: 0, stall: NOT_STALLED },
 		});
 		// A failing copy from SQLite is kept, for /status and the admins' alert, until one succeeds.
-		store.saveHistoryState("hot", "hot", { stalledSince: 123, alertedAt: 456 }, clock.value);
-		expect(store.historyState(["hot"], "hot", clock.value).hot).toMatchObject({ stalledSince: 123, alertedAt: 456 });
-		store.saveHistoryState("hot", "hot", { stalledSince: undefined, alertedAt: undefined }, clock.value);
-		expect(store.historyState(["hot"], "hot", clock.value).hot.stalledSince).toBeUndefined();
+		const alerted = { kind: "alerted", since: 123, step: "copy", at: 456 } as const;
+		await tiers.saveHead({ stall: alerted });
+		expect((await tiers.load(["hot"])).hot.stall).toEqual(alerted);
+		await tiers.saveHead({ stall: NOT_STALLED });
+		expect((await tiers.load(["hot"])).hot.stall).toEqual(NOT_STALLED);
 		due();
 		const moved = store.runCleanup(clock.value);
 		expect(moved.deleted_records).toBe(6);

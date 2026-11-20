@@ -27,7 +27,7 @@ import { hostListAllowed } from "./config";
 import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/records";
-import type { TierState } from "./history/tier";
+import type { TierStatePort } from "./history/state";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
 import type { ChunkIndex, ChunkRef } from "./history/cold/chunks";
@@ -4006,67 +4006,44 @@ export class Store {
   }
 
   /**
-   * The pipeline's tier state (TierStateStore), kept in `_meta`: the head's
-   * floor is the hot floor and its `through` cleanup's ceiling; a lower
-   * tier with no state yet starts at the published floor, holding nothing,
-   * with every op so far behind it.
+   * The history pipeline's tier state, as plain values (src/history/state.ts
+   * keeps its rules): values under `history:tier:` and `history:head:stall`,
+   * the hot and published floors, the op log's last seq, and the copy
+   * marker, which cleanup stops at (runCleanup).
    */
-  historyState(names: readonly string[], head: string, now = this.clock.now()): Record<string, TierState> {
-    this.ensureReady();
-    return this.reserved({ reads: 16 + 4 * names.length }, true, now, () => {
-      const state = this.logState();
-      const published = this.publishedFloor();
-      const out: Record<string, TierState> = {};
-      for (const name of names) {
-        if (name === head) {
-          const through = this.metaNumber(META_HISTORY_THROUGH);
-          // A failing copy to the next tier: since when, and when admins were told.
-          const stall = this.metaJson<{ stalledSince?: number; alertedAt?: number }>(META_HISTORY_HEAD_STALL, (value) => value as { stalledSince?: number; alertedAt?: number }, {});
-          out[name] = {
-            floor: state.history_floor, target: state.history_floor, through: through > 0 ? through : state.history_floor - 1, ops: 0,
-            ...(typeof stall.stalledSince === "number" ? { stalledSince: stall.stalledSince } : {}),
-            ...(typeof stall.alertedAt === "number" ? { alertedAt: stall.alertedAt } : {}),
-          };
-          continue;
-        }
-        const fresh: TierState = { floor: published, target: published, through: published - 1, ops: this.metaNumber(META_HISTORY_OPS_SEQ) };
-        out[name] = this.metaJson<TierState>(META_HISTORY_TIER + name, (value) => {
-          const saved = value as Partial<TierState>;
-          return typeof saved.floor === "number" && typeof saved.through === "number" ? { ...fresh, ...saved } : undefined;
-        }, fresh);
-      }
-      return out;
-    });
-  }
-
-  /** Whether a lower tier has saved state (historyState): it has held history here since tiers were last on. */
-  hasHistoryTierState(name: string, now = this.clock.now()): boolean {
-    this.ensureReady();
-    if (!this.config.tiered) return false;
-    return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_TIER + name) !== "");
-  }
-
-  /** Saves a tier's state (historyState); for the head only `through`, which never falls. */
-  saveHistoryState(name: string, head: string, update: Partial<TierState>, now = this.clock.now()): void {
-    this.ensureReady();
-    if (!this.config.tiered) return;
-    this.reserved({ reads: 16, writes: 4 }, true, now, () => {
-      if (name === head) {
-        if (update.through !== undefined && update.through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(update.through));
-        if ("stalledSince" in update || "alertedAt" in update) {
-          const stall = { ...this.metaJson<Record<string, unknown>>(META_HISTORY_HEAD_STALL, (value) => value as Record<string, unknown>, {}), ...update };
-          const kept = { ...(typeof stall.stalledSince === "number" ? { stalledSince: stall.stalledSince } : {}), ...(typeof stall.alertedAt === "number" ? { alertedAt: stall.alertedAt } : {}) };
-          this.writeMeta(META_HISTORY_HEAD_STALL, Object.keys(kept).length ? JSON.stringify(kept) : null);
-        }
-        return;
-      }
-      const published = this.publishedFloor();
-      const fresh = { floor: published, target: published, through: published - 1, ops: this.metaNumber(META_HISTORY_OPS_SEQ) };
-      const current = this.metaJson<Record<string, unknown>>(META_HISTORY_TIER + name, (value) => value as Record<string, unknown>, fresh);
-      const merged: Record<string, unknown> = { ...fresh, ...current, ...update };
-      for (const [key, value] of Object.entries(update)) if (value === undefined) delete merged[key];
-      this.writeMeta(META_HISTORY_TIER + name, JSON.stringify(merged));
-    });
+  historyStatePort(): TierStatePort {
+    const owned = (key: string) => {
+      if (!key.startsWith(META_HISTORY_TIER) && key !== META_HISTORY_HEAD_STALL) throw new Error(`not a history tier state key: ${key}`);
+      return key;
+    };
+    return {
+      value: (key) => {
+        this.ensureReady();
+        return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaValue(owned(key)) || undefined);
+      },
+      setValue: (key, value) => {
+        this.ensureReady();
+        if (!this.config.tiered) return;
+        this.reserved({ reads: 4, writes: 4 }, true, this.clock.now(), () => this.writeMeta(owned(key), value));
+      },
+      hotFloor: () => this.historyFloors().hot,
+      publishedFloor: () => this.historyFloors().published,
+      opsSeq: () => {
+        this.ensureReady();
+        return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_OPS_SEQ));
+      },
+      copyMarker: () => {
+        this.ensureReady();
+        return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_THROUGH));
+      },
+      raiseCopyMarker: (through) => {
+        this.ensureReady();
+        if (!this.config.tiered) return;
+        this.reserved({ reads: 4, writes: 4 }, true, this.clock.now(), () => {
+          if (through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(through));
+        });
+      },
+    };
   }
 
   /**

@@ -8,7 +8,8 @@
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import { retentionFloor } from "../../../src/history/plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
-import type { FloorContext, HistoryHead, LowerTier, OpStep, TierState, TierStateStore } from "../../../src/history/tier";
+import { NOT_STALLED } from "../../../src/history/stall";
+import type { Cell, ExportPort, FloorContext, HeadStateUpdate, HistoryHead, LowerStateUpdate, LowerTier, OpLog, OpStep, RestorePort, RestoreResult, TierState, TierStateStore } from "../../../src/history/tier";
 
 const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id}\u0000${record.room_id}`;
 
@@ -92,10 +93,11 @@ export class MemoryHistoryTier implements LowerTier {
 
 /**
  * A head in memory: the records, the op log, the published floor, rooms and
- * users. Commits come through `commit` (tests make the log); its retention
- * is its tier's (floorFor), as the pipeline asks.
+ * users; also what imports and exports need of a server (RestorePort,
+ * ExportPort). Commits come through `commit` (tests make the log); its
+ * retention is its tier's (floorFor), as the pipeline asks.
  */
-export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
+export class MemoryHead extends MemoryHistoryTier implements HistoryHead, RestorePort, ExportPort {
 	published = 1;
 	queued: QueuedOp[] = [];
 	private seq = 0;
@@ -103,8 +105,8 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	readonly people = new Map<string, ArchivedUser>();
 	readonly retired = new Set<string>();
 	private last = 0;
-	/** Import: what a client could have sent of a record (HistoryHead.normalizeRecord); unset, every record is taken as it is. */
-	normalizeRecord?: (record: ChatRecord) => ChatRecord | null;
+	/** Import: what a client could have sent of a record (RestorePort.normalize); unset, every record is taken as it is. */
+	normalizer?: (record: ChatRecord) => ChatRecord | null;
 
 	constructor(name: string, private readonly clock: Clock) {
 		super(name);
@@ -138,16 +140,18 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 		if (floor > this.published) this.published = floor;
 	}
 
-	async ops(): Promise<QueuedOp[]> {
-		return this.queued.map((entry) => ({ ...entry }));
-	}
+	readonly opLog: OpLog = {
+		list: async () => this.queued.map((entry) => ({ ...entry })),
+		drop: async (seq) => {
+			this.queued = this.queued.filter((entry) => entry.seq > seq);
+		},
+		amend: async (seq, messageIds) => {
+			this.queued = this.queued.map((entry) => entry.seq === seq && entry.op.op === "purge" ? { seq, op: { ...entry.op, messageIds: [...new Set([...entry.op.messageIds, ...messageIds])] } } : entry);
+		},
+	};
 
-	async dropOps(seq: number): Promise<void> {
-		this.queued = this.queued.filter((entry) => entry.seq > seq);
-	}
-
-	async amendPurge(seq: number, messageIds: readonly string[]): Promise<void> {
-		this.queued = this.queued.map((entry) => entry.seq === seq && entry.op.op === "purge" ? { seq, op: { ...entry.op, messageIds: [...new Set([...entry.op.messageIds, ...messageIds])] } } : entry);
+	normalize(record: ChatRecord): ChatRecord | null {
+		return this.normalizer ? this.normalizer(record) : record;
 	}
 
 	async queueOp(op: HistoryOp): Promise<void> {
@@ -195,10 +199,11 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 		return this.retired.has(userId);
 	}
 
-	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<void> {
+	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<RestoreResult> {
 		this.rooms_.set(room.listing.room_id, room);
 		await this.append(toRange(records));
 		for (const record of records) this.last = Math.max(this.last, record.log_id);
+		return {};
 	}
 
 	async rooms(): Promise<ArchivedRoom[]> {
@@ -215,13 +220,12 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 
 	journalText: string | undefined;
 
-	async journal(): Promise<string | undefined> {
-		return this.journalText;
-	}
-
-	async setJournal(value: string | null): Promise<void> {
-		this.journalText = value ?? undefined;
-	}
+	readonly journal: Cell<string> = {
+		get: async () => this.journalText,
+		set: async (value) => {
+			this.journalText = value ?? undefined;
+		},
+	};
 
 	async roomIsEmpty(roomId: string): Promise<boolean> {
 		return this.rooms_.has(roomId) && !this.all().some((record) => record.room_id === roomId);
@@ -232,16 +236,24 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	}
 }
 
-/** A TierStateStore in memory. */
+/** A TierStateStore in memory; the head is `head` (default "hot"). */
 export class MemoryTierStateStore implements TierStateStore {
 	readonly states = new Map<string, TierState>();
-	constructor(private readonly initial: () => TierState = () => ({ floor: 1, target: 1, through: 0, ops: 0 })) {}
+	constructor(private readonly initial: () => TierState = () => ({ floor: 1, target: 1, through: 0, ops: 0, stall: NOT_STALLED }), private readonly head = "hot") {}
 	async load(names: readonly string[]): Promise<Record<string, TierState>> {
 		return Object.fromEntries(names.map((name) => [name, { ...(this.states.get(name) ?? this.initial()) }]));
 	}
-	async save(name: string, state: Partial<TierState>): Promise<void> {
-		const merged: TierState = { ...(this.states.get(name) ?? this.initial()), ...state };
-		for (const key of Object.keys(state) as Array<keyof TierState>) if (state[key] === undefined) delete merged[key];
+	async has(name: string): Promise<boolean> {
+		return this.states.has(name);
+	}
+	async saveHead(update: HeadStateUpdate): Promise<void> {
+		await this.saveLower(this.head, update);
+	}
+	async saveLower(name: string, update: LowerStateUpdate): Promise<void> {
+		const { opCursor, ...rest } = update;
+		const merged: TierState = { ...(this.states.get(name) ?? this.initial()), ...Object.fromEntries(Object.entries(rest).filter(([, value]) => value !== undefined)) };
+		if (opCursor === null) delete merged.opCursor;
+		else if (opCursor !== undefined) merged.opCursor = opCursor;
 		this.states.set(name, merged);
 	}
 }

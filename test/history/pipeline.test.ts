@@ -9,10 +9,11 @@ import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/m
 import { type TierView, checkInvariants, mergePages, planRead, planStep, retentionFloor } from "../../src/history/plan";
 import { HistoryPipeline, type PipelineStage, instrument } from "../../src/history/pipeline";
 import type { ChatRecord, Retention } from "../../src/history/records";
+import { NOT_STALLED } from "../../src/history/stall";
 import type { TierState } from "../../src/history/tier";
 import { Model, show } from "./model";
 
-const state = (floor: number, target = floor, through = floor - 1, ops = 0): TierState => ({ floor, target, through, ops });
+const state = (floor: number, target = floor, through = floor - 1, ops = 0): TierState => ({ floor, target, through, ops, stall: NOT_STALLED });
 const view = (name: string, tierState: TierState, extra: Partial<TierView> = {}): TierView => ({ name, readable: true, state: tierState, ...extra });
 const progress = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>() });
 
@@ -228,7 +229,7 @@ describe("HistoryPipeline over memory tiers", () => {
 		await settle(pipeline);
 		expect((await coldTier.scan(0, 100)).records.some((record) => record.record_json.includes("bob"))).toBe(false);
 		expect((await pipeline.views())[2].state.opCursor).toBeUndefined();
-		expect(await head.ops()).toEqual([]);
+		expect(await head.opLog.list()).toEqual([]);
 	});
 
 	it("applies an op a tier has yet to apply to pages read from it", async () => {
@@ -242,7 +243,7 @@ describe("HistoryPipeline over memory tiers", () => {
 		await head.purge(["eve"]);
 		expect((await history(pipeline, "general", 50)).some((record) => record.record_json.includes("eve"))).toBe(false);
 		await settle(pipeline);
-		expect(await head.ops()).toEqual([]);
+		expect(await head.opLog.list()).toEqual([]);
 	});
 
 	it("records a stalled copy, alerts once, and catches up when the tier recovers", async () => {
@@ -260,7 +261,7 @@ describe("HistoryPipeline over memory tiers", () => {
 		// The head copies to recent, which works: the failing hop was recent → older (its floorFor failed first, at target).
 		expect((await pipeline.stallsToAlert(6 * 3_600_000)).length).toBeLessThanOrEqual(1);
 		await settle(pipeline);
-		expect((await pipeline.views()).every((tier) => tier.state.stalledSince === undefined)).toBe(true);
+		expect((await pipeline.views()).every((tier) => tier.state.stall.kind === "ok")).toBe(true);
 	});
 });
 
@@ -271,9 +272,9 @@ describe("HistoryPipeline upkeep", () => {
 		const pipeline = new HistoryPipeline({ head, headRetention: { records: 5, thresholdPercent: 100 }, stages: [], state: new MemoryTierStateStore(), clock });
 		head.commit("general", "message", { message_id: "m1", from: { user_id: "ada" } });
 		await head.purge(["ada"]);
-		expect((await head.ops()).length).toBe(1);
+		expect((await head.opLog.list()).length).toBe(1);
 		await pipeline.cycle({ steps: 10 });
-		expect(await head.ops()).toEqual([]);
+		expect(await head.opLog.list()).toEqual([]);
 	});
 
 	it("notes a stall when the tier below fails at any step, not only at a copy", async () => {
@@ -291,12 +292,12 @@ describe("HistoryPipeline upkeep", () => {
 		}
 		const failed = await pipeline.cycle({ steps: 10 });
 		expect(failed.report.failure?.step.kind).toBe("target");
-		expect((await pipeline.views())[0].state.stalledSince).toBe(clock.time);
+		expect((await pipeline.views())[0].state.stall).toEqual({ kind: "stalled", since: clock.time, step: "target" });
 		clock.time += 7 * 3_600_000;
 		expect(await pipeline.stallsToAlert(6 * 3_600_000)).toEqual([{ from: "hot", to: "recent", since: clock.time - 7 * 3_600_000 }]);
 		down = false;
 		await settle(pipeline);
-		expect((await pipeline.views())[0].state.stalledSince).toBeUndefined();
+		expect((await pipeline.views())[0].state.stall).toEqual(NOT_STALLED);
 	});
 
 	it("does not read a lower tier's count again while nothing above it changed", async () => {

@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { buildHistoryPipeline } from '../src/history/config';
+import { buildHistoryPipeline, historyLayout } from '../src/history/config';
 import { D1HistoryTier } from '../src/history/d1';
 import type { HistoryPipeline } from '../src/history/pipeline';
 import { applyOps, purgedRecord, renamedRecord } from '../src/history/records';
@@ -37,7 +37,7 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 			};
 			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };
 			// The pipeline takes its tiers' limits when built.
-			runtime.history = buildHistoryPipeline({ env, limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
+			runtime.history = buildHistoryPipeline({ layout: historyLayout(env, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
 			const logs: string[] = [];
 			for (let index = 0; index < 10; index += 1) {
 				// One sender's message among those the archive will hold, for /purge below.

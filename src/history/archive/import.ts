@@ -25,6 +25,7 @@ import { USER_ID_RULES } from "../../user-ids";
 import type { HistoryPipeline } from "../pipeline";
 import type { TierView } from "../plan";
 import { type Clock, toRange } from "../records";
+import type { RestorePort } from "../tier";
 
 export type { ImportReport };
 
@@ -111,22 +112,21 @@ function withoutOutputRefs(record: ChatRecord): ChatRecord {
 	return { ...record, record_json: JSON.stringify(value) };
 }
 
-/** The pipeline as planImport's target: its head's rooms and users, and records across every tier. */
-function importTarget(pipeline: HistoryPipeline): ImportTarget {
-	const head = pipeline.head;
+/** planImport's target: the server's rooms and users (`restore`), and records across every tier of the pipeline. */
+function importTarget(pipeline: HistoryPipeline, restore: RestorePort): ImportTarget {
 	return {
-		hasRoom: (roomId) => head.hasRoom(roomId),
-		...(head.roomIsEmpty ? { roomIsEmpty: (roomId: string) => head.roomIsEmpty!(roomId) } : {}),
-		hasUser: (userId) => head.hasUser(userId),
-		...(head.isRetired ? { isRetired: (userId: string) => head.isRetired!(userId) } : {}),
-		...(head.latest ? { latest: () => head.latest!() } : {}),
+		hasRoom: (roomId) => restore.hasRoom(roomId),
+		roomIsEmpty: (roomId) => restore.roomIsEmpty(roomId),
+		hasUser: (userId) => restore.hasUser(userId),
+		isRetired: (userId) => restore.isRetired(userId),
+		latest: () => restore.latest(),
 		async lookup(ids) {
 			const found: ChatRecord[] = [];
 			for (let start = 0; start < ids.length; start += LOOKUP_BATCH) found.push(...await pipeline.lookup(ids.slice(start, start + LOOKUP_BATCH)));
 			return found;
 		},
 		// Records as a client could have sent them (Store.restorableRecord).
-		...(head.normalizeRecord ? { normalize: (record: ChatRecord) => head.normalizeRecord!(record) } : {}),
+		normalize: (record) => restore.normalize(record),
 	};
 }
 
@@ -147,16 +147,15 @@ export function place(id: number, tiers: readonly Pick<TierView, "state">[], pub
 	return out;
 }
 
-/** Reads, plans (@apron/archive planImport) and, unless a dry run, writes an archive into the pipeline. */
-export async function importArchive(pipeline: HistoryPipeline, input: ArchiveReader | CollectedArchive, options: ImportOptions): Promise<ImportReport> {
+/** Reads, plans (@apron/archive planImport) and, unless a dry run, writes an archive into the pipeline, through `restore`. */
+export async function importArchive(pipeline: HistoryPipeline, restore: RestorePort, input: ArchiveReader | CollectedArchive, options: ImportOptions): Promise<ImportReport> {
 	const archive = "parts" in input ? await collectArchive(input) : input;
-	const head = pipeline.head;
 	// An earlier run of this import that failed partway is finished with its
 	// own plan (its journal), whatever this run asks. An unfinished import of
 	// another archive stops this one, unless `restart` abandons it.
 	let resume: ImportState | undefined;
 	let abandoned: string[] | undefined;
-	const saved = head.journal ? await head.journal() : undefined;
+	const saved = await restore.journal.get();
 	if (saved) {
 		const parsed = JSON.parse(saved) as ImportState;
 		const begun = parsed.targetRooms;
@@ -164,7 +163,7 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 		else if (options.restart) abandoned = begun;
 		else throw new Error(`another import is unfinished${begun.length ? ` (rooms ${begun.join(", ")})` : ""}: run it again to finish it, or import this one with restart to abandon it`);
 	}
-	const plan = await planImport(archive, importTarget(pipeline), {
+	const plan = await planImport(archive, importTarget(pipeline, restore), {
 		...(options.users ? { users: options.users } : {}),
 		authenticated: typeof options.authenticated === "function" ? options.authenticated() : options.authenticated === true,
 		...(options.userMap ? { userMap: options.userMap } : {}),
@@ -208,25 +207,25 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	// Write, after noting the plan (a retry finishes it): placeholders, then
 	// each room at the head, then the tiers below, oldest first. Every write
 	// may be repeated without harm.
-	if (!resume && head.setJournal) await head.setJournal(journalText);
+	if (!resume) await restore.journal.set(journalText);
 	const batch = options.batch ?? 200;
-	for (let start = 0; start < plan.placeholders.length; start += batch) await head.restoreUsers(plan.placeholders.slice(start, start + batch));
+	for (let start = 0; start < plan.placeholders.length; start += batch) await restore.restoreUsers(plan.placeholders.slice(start, start + batch));
 	const context = { rooms: report.roomsAdded };
 	for (const { room, listing } of plan.rooms) {
 		const own = perTier[0].filter((record) => record.room_id === listing.room_id);
 		const batches = restoreBatches(own, { records: batch, entries: options.entries ?? 1_000 });
 		const results = [];
-		if (!batches.length) results.push(await head.restoreRoom({ ...room, listing }, [], context));
-		for (const records of batches) results.push(await head.restoreRoom({ ...room, listing }, records, context));
+		if (!batches.length) results.push(await restore.restoreRoom({ ...room, listing }, [], context));
+		for (const records of batches) results.push(await restore.restoreRoom({ ...room, listing }, records, context));
 		for (const result of results) {
-			report.collisions += result?.collided ?? 0;
-			report.rejected += result?.rejected ?? 0;
+			report.collisions += result.collided ?? 0;
+			report.rejected += result.rejected ?? 0;
 		}
 	}
 	for (let index = 1; index < views.length; index += 1) {
 		const tier = pipeline.tiers[index];
 		for (let start = 0; start < perTier[index].length; start += batch) await tier.append(toRange(perTier[index].slice(start, start + batch)));
 	}
-	await head.setJournal?.(null);
+	await restore.journal.set(null);
 	return report;
 }

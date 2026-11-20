@@ -8,6 +8,7 @@ import { CODECS_METADATA } from "../../src/history/storage/encoding";
 import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
 import { HISTORY_CODECS } from "../../src/history/config";
+import { NOT_STALLED } from "../../src/history/stall";
 import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/memory-tiers";
 import { HistoryPipeline, type PipelineStage } from "../../src/history/pipeline";
 import { sceneArchives } from "../../packages/archive/test/fixtures/scenes";
@@ -70,7 +71,7 @@ function populate(head: MemoryHead, clock: TestClock): void {
 
 async function exported(pipeline: HistoryPipeline, clock: TestClock, options: { server?: string } = {}): Promise<string> {
 	const lines: string[] = [];
-	await exportArchive(pipeline, jsonlWriter(async (line) => { lines.push(line); }), { clock, header: { server: options.server ?? "source.test" } });
+	await exportArchive(pipeline, pipeline.head as MemoryHead, jsonlWriter(async (line) => { lines.push(line); }), { clock, header: { server: options.server ?? "source.test" } });
 	return lines.join("");
 }
 
@@ -88,7 +89,7 @@ describe("export and import", () => {
 				await settle(source.pipeline);
 				const first = await exported(source.pipeline, source.clock);
 				const target = pipelineOf(to, new TestClock(5_000_000));
-				const report = await importArchive(target.pipeline, jsonlReader(linesOf(first)), { clock: target.clock, server: "target.test" });
+				const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(first)), { clock: target.clock, server: "target.test" });
 				expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
 				expect(report.expired).toBe(0);
 				// With a tier that keeps everything, upkeep loses nothing; SQLite alone would expire by its count.
@@ -105,9 +106,9 @@ describe("export and import", () => {
 		populate(source.head, source.clock);
 		const text = await exported(source.pipeline, source.clock);
 		const target = pipelineOf("head+recent", new TestClock(5_000_000));
-		const first = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		const first = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(first.records).toBeGreaterThan(0);
-		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		const again = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(again).toMatchObject({ roomsAdded: [], records: 0 });
 		expect(again.roomsSkipped.sort()).toEqual(["general", "random"]);
 	});
@@ -122,7 +123,7 @@ describe("export and import", () => {
 			target.clock.time += 7;
 			target.head.commit("lobby", "message", { message_id: `own-${index}`, from: { user_id: "zed" }, body: { text: "mine" } });
 		}
-		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(Object.keys(report.remapped.logIds).length).toBeGreaterThan(0);
 		// Nudged IDs are free, and in the same order.
 		const moved = Object.entries(report.remapped.logIds).map(([from, to]) => [Number(from), Number(to)]);
@@ -147,17 +148,17 @@ describe("export and import", () => {
 		const target = pipelineOf("head", new TestClock(5_000_000));
 		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
 		target.head.retired.add("bob");
-		const foreign = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "elsewhere.test", dryRun: true });
+		const foreign = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "elsewhere.test", dryRun: true });
 		expect(foreign.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
 		expect(foreign.dryRun).toBe(true);
 		expect(target.head.all()).toEqual([]);
 		// Matched only when the archive is authenticated (verified by an authenticating codec): a file's header is anyone's.
-		const unsealed = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
+		const unsealed = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
 		expect(unsealed.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match needs an archive verified as this server's own/);
-		const own = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, authenticated: true });
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match needs an archive verified as this server's own/);
+		const own = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, authenticated: true });
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob-2" } });
-		const chosen = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, userMap: { bob: { placeholder: "robert" }, ada: { existing: "ada" } } });
+		const chosen = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, userMap: { bob: { placeholder: "robert" }, ada: { existing: "ada" } } });
 		expect(chosen.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "robert" } });
 		// Placeholders carry the unclaimed role, not the archive's roles.
 		expect(target.head.people.get("robert")?.roles).toEqual(["unclaimed"]);
@@ -166,7 +167,7 @@ describe("export and import", () => {
 	});
 
 	it("drops records older than the published floor, and places the rest in the tier that serves them", async () => {
-		const tiers = [{ state: { floor: 100, target: 100, through: 120, ops: 0 } }, { state: { floor: 50, target: 50, through: 70, ops: 0 } }, { state: { floor: 20, target: 20, through: 0, ops: 0 } }];
+		const tiers = [{ state: { floor: 100, target: 100, through: 120, ops: 0, stall: NOT_STALLED } }, { state: { floor: 50, target: 50, through: 70, ops: 0, stall: NOT_STALLED } }, { state: { floor: 20, target: 20, through: 0, ops: 0, stall: NOT_STALLED } }];
 		expect(place(10, tiers, 20)).toEqual([]);
 		expect(place(30, tiers, 20)).toEqual([2]);
 		expect(place(60, tiers, 20)).toEqual([1, 2]);
@@ -180,7 +181,7 @@ describe("export and import", () => {
 		for (const [name, text] of Object.entries(sceneArchives)) {
 			// A clock past the scenes' log IDs, which an import keeping them requires.
 			const target = pipelineOf("head+recent+cold", new TestClock(2_000_000_000_000));
-			const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+			const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 			expect(report.expired, name).toBe(0);
 			await settle(target.pipeline);
 			const back = await exported(target.pipeline, target.clock);
@@ -195,7 +196,7 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const store = new MemoryBlobStore();
-		const { key } = await writeBackup(source.pipeline, store, { keep: 14, privateRooms: true }, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
+		const { key } = await writeBackup(source.pipeline, source.head, store, { keep: 14, privateRooms: true }, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
 		expect(key).toBe("backups/srv-manual-20261119-120000.jsonl.gz");
 		expect(store.contentType(key)).toBe("application/octet-stream");
 		const object = (await store.get(key))!;
@@ -205,7 +206,7 @@ describe("export and import", () => {
 		expect([bytes[0], bytes[1]]).toEqual([0x1f, 0x8b]);
 		const reader = openArchive(await (await store.get(key))!.stream(), { codecs: [gzip] });
 		const target = pipelineOf("head", new TestClock(5_000_000));
-		const report = await importArchive(target.pipeline, reader, { clock: target.clock, authenticated: () => reader.verified() });
+		const report = await importArchive(target.pipeline, target.head, reader, { clock: target.clock, authenticated: () => reader.verified() });
 		expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
 		expect(reader.verified()).toBe(false);
 		const plain = await exported(source.pipeline, source.clock);
@@ -226,11 +227,11 @@ describe("export and import", () => {
 		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
 		const reader = openArchive(bytesOf(), { codecs: [sealed] });
 		expect(reader.verified()).toBe(false);
-		const own = await importArchive(target.pipeline, reader, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => reader.verified() });
+		const own = await importArchive(target.pipeline, target.head, reader, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => reader.verified() });
 		expect(reader.verified()).toBe(true);
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob" } });
 		const plain = openArchive(bytesOf());
-		const unverified = await importArchive(target.pipeline, plain, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => plain.verified() });
+		const unverified = await importArchive(target.pipeline, target.head, plain, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => plain.verified() });
 		expect(unverified.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob" } });
 	});
 
@@ -240,7 +241,7 @@ describe("export and import", () => {
 		const text = await exported(source.pipeline, source.clock);
 		const target = pipelineOf("head+recent", new TestClock(9_000_000));
 		target.head.commit("lobby", "message", { message_id: "x", from: { user_id: "zed" } });
-		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber" });
+		const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber" });
 		const ids = Object.values(report.remapped.logIds).map(Number);
 		expect(Math.min(...ids)).toBeGreaterThan(9_000_000);
 		expect(report.placed).toEqual({ hot: report.records });
@@ -253,7 +254,7 @@ describe("export and import", () => {
 		const text = await exported(source.pipeline, source.clock);
 		expect(text).toContain('"admin"');
 		const target = pipelineOf("head", new TestClock(5_000_000));
-		await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(target.head.people.get("ada")?.roles).toEqual(["unclaimed"]);
 	});
 
@@ -270,16 +271,16 @@ describe("export and import", () => {
 			if (calls === 2) throw new Error("the budget ran out");
 			return restore(room, records);
 		};
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
-		expect(await target.head.journal()).toBeDefined();
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
+		expect(await target.head.journal.get()).toBeDefined();
 		// Another archive waits for this one.
 		const other = pipelineOf("head", new TestClock(7_000_000));
 		populate(other.head, other.clock);
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(await exported(other.pipeline, other.clock, { server: "other.test" }))), { clock: target.clock })).rejects.toThrow(/another import is unfinished/);
-		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(await exported(other.pipeline, other.clock, { server: "other.test" }))), { clock: target.clock })).rejects.toThrow(/another import is unfinished/);
+		const again = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(again.resumed).toBe(true);
 		expect(again.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob" } });
-		expect(await target.head.journal()).toBeUndefined();
+		expect(await target.head.journal.get()).toBeUndefined();
 		expect(compareReplayed(await stateOf(text), await stateOf(await exported(target.pipeline, target.clock)), { idMap: { userId: (id) => id === "ada" ? "ada-2" : id } }).differences.filter((line) => !line.startsWith("user "))).toEqual([]);
 	});
 
@@ -297,7 +298,7 @@ describe("export and import", () => {
 		// `general` exists, empty, as on a new server; `random`, where a message moved to, holds this server's own.
 		target.head.rooms_.set("general", { listing: { room_id: "general" }, joined: false });
 		target.head.commit("random", "message", { message_id: "own", from: { user_id: "zed" } });
-		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(report.roomsAdded).toEqual(["general"]);
 		expect(report.roomsSkipped).toEqual(["random"]);
 		const state = await stateOf(await exported(target.pipeline, target.clock));
@@ -321,7 +322,7 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		for (let day = 0; day < 3; day += 1) {
-			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, store, settings, kind, { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
+			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, source.head, store, settings, kind, { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
 		}
 		const keys = (await store.list("backups/")).keys.map((entry) => entry.key);
 		expect(keys).toEqual([
@@ -344,7 +345,7 @@ describe("export and import", () => {
 			]);
 		});
 		const target = pipelineOf("head", new TestClock(1));
-		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(report).toMatchObject({ roomsAdded: ["lobby"], records: 1, references: 2 });
 		const stored = target.head.all().filter((record) => record.kind === "message");
 		expect(stored.map((record) => record.log_id)).toEqual([150]);
@@ -361,19 +362,19 @@ describe("export and import", () => {
 		const target = pipelineOf("head", new TestClock(1_000_000));
 		// A listing's head far in the future, or a record past the clock and five minutes.
 		for (const text of [await archive(String(Number.MAX_SAFE_INTEGER), [100, 200]), await archive("200", [100, 200, 1_000_000 + 5 * 60_000 + 1])]) {
-			await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/later than this server's clock: import it with renumber/);
-			await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true })).rejects.toThrow(/renumber/);
+			await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/later than this server's clock: import it with renumber/);
+			await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true })).rejects.toThrow(/renumber/);
 			expect(target.head.all()).toEqual([]);
-			expect(await target.head.journal()).toBeUndefined();
+			expect(await target.head.journal.get()).toBeUndefined();
 		}
 		// Within the clock's five minutes, the IDs are kept, and the range is reported.
-		const near = await importArchive(target.pipeline, jsonlReader(linesOf(await archive("200", [100, 200]))), { clock: target.clock, dryRun: true });
+		const near = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(await archive("200", [100, 200]))), { clock: target.clock, dryRun: true });
 		expect(near.logIdRange).toEqual({ first: 100, last: 200 });
 		// Renumbered, the records take IDs at the clock, and the listing's head is theirs, not the file's.
 		const text = await archive(String(Number.MAX_SAFE_INTEGER), [100, 200, 9_000_000_000_000]);
-		const dry = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", dryRun: true });
+		const dry = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", dryRun: true });
 		expect(dry.logIdRange).toEqual({ first: 1_000_000, last: 1_000_002 });
-		await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber" });
+		await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber" });
 		expect(target.head.rooms_.get("lobby")?.listing).toMatchObject({ log_id: "1000000", latest_log_id: "1000002", history_log_id: "1000000" });
 		expect(Math.max(...target.head.all().map((record) => record.log_id))).toBe(1_000_002);
 	});
@@ -395,19 +396,19 @@ describe("export and import", () => {
 		const target = pipelineOf("head", new TestClock(1_000_000));
 		target.head.people.set("admin", { user_id: "admin", name: "Admin" });
 		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
-		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", dryRun: true });
+		const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", dryRun: true });
 		expect(report.users).toEqual({
 			"admin": { placeholder: "imported-admin" }, "~private": { placeholder: "imported-private" }, "guest_7": { placeholder: "imported-guest_7" },
 			"bot_ada": { placeholder: "imported-bot_ada" }, "ada": { placeholder: "ada-2" },
 		});
 		expect(report.placeholders).toBe(5);
 		// Capped: a dry run says it would be refused; the import is, before writing anything.
-		const capped = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true, maxPlaceholders: 4 });
+		const capped = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true, maxPlaceholders: 4 });
 		expect(capped.refused).toMatch(/5 placeholder accounts, more than the 4/);
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, maxPlaceholders: 4 })).rejects.toThrow(/more than the 4/);
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, maxPlaceholders: 4 })).rejects.toThrow(/more than the 4/);
 		expect(target.head.all()).toEqual([]);
 		// Authenticated (one of this server's backups), `admin` and `ada` are matched; the others never are.
-		const sealed = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", authenticated: true });
+		const sealed = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", authenticated: true });
 		expect(sealed.users).toMatchObject({ admin: { matched: "admin" }, ada: { matched: "ada" }, guest_7: { placeholder: "imported-guest_7" } });
 		// Recorded users keep their ID and name only.
 		const froms = target.head.all().filter((record) => record.kind === "message").map((record) => JSON.parse(record.record_json).from);
@@ -422,8 +423,8 @@ describe("export and import", () => {
 		populate(source.head, source.clock);
 		const text = await exported(source.pipeline, source.clock);
 		const target = pipelineOf("head", new TestClock(5_000_000));
-		target.head.normalizeRecord = (record) => record.record_json.includes("hello 4") ? null : record;
-		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		target.head.normalizer = (record) => record.record_json.includes("hello 4") ? null : record;
+		const report = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(report.rejected).toBe(1);
 		expect(target.head.all().some((record) => record.record_json.includes("hello 4"))).toBe(false);
 		expect(target.head.all().some((record) => record.record_json.includes("hello 5"))).toBe(true);
@@ -441,14 +442,14 @@ describe("export and import", () => {
 		// Every ID taken here by another record: each would move.
 		const target = pipelineOf("head", new TestClock(100_000));
 		for (const record of records) target.head.records.set(`${record.log_id}\u0000elsewhere`, { ...record, room_id: "elsewhere", record_json: record.record_json.replace('"x"', '"other"') });
-		const dry = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true });
+		const dry = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true });
 		expect(dry.refused).toMatch(/moves 25000 log IDs, too many to resume from/);
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/import it with renumber/);
-		expect(await target.head.journal()).toBeUndefined();
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/import it with renumber/);
+		expect(await target.head.journal.get()).toBeUndefined();
 		// Renumbered: the journal holds the first ID, not every one, and a failed run resumes with the same IDs.
 		const journals: string[] = [];
-		const setJournal = target.head.setJournal.bind(target.head);
-		target.head.setJournal = async (value) => {
+		const setJournal = target.head.journal.set;
+		target.head.journal.set = async (value) => {
 			if (value) journals.push(value);
 			return setJournal(value);
 		};
@@ -461,10 +462,10 @@ describe("export and import", () => {
 			}
 			return append(range);
 		};
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", batch: 256 })).rejects.toThrow(/budget/);
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", batch: 256 })).rejects.toThrow(/budget/);
 		expect(journals[0].length).toBeLessThan(1_000);
 		expect(JSON.parse(journals[0])).toMatchObject({ renumber: 100_000, moved: [] });
-		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		const again = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(again.resumed).toBe(true);
 		expect(again.logIdRange).toEqual({ first: 100_000, last: 100_000 + many - 1 });
 		expect(target.head.all().filter((record) => record.room_id === "lobby")).toHaveLength(many);
@@ -482,9 +483,9 @@ describe("export and import", () => {
 			if (calls === 2) throw new Error("the budget ran out");
 			return restore(room, records);
 		};
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
 		// The same archive with restart: resumed, so the room it began is finished, not skipped.
-		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, restart: true });
+		const again = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, restart: true });
 		expect(again).toMatchObject({ resumed: true, roomsAdded: ["general", "random"], roomsSkipped: [] });
 		expect(again.abandoned).toBeUndefined();
 		// Another archive's unfinished import: refused, or with restart abandoned, its rooms named.
@@ -493,9 +494,9 @@ describe("export and import", () => {
 		other.head.commit("lobby", "message", { message_id: "m", from: { user_id: "zed" }, body: { text: "a" } });
 		other.head.commit("hall", "message", { message_id: "n", from: { user_id: "zed" }, body: { text: "b" } });
 		const otherText = await exported(other.pipeline, other.clock, { server: "other.test" });
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(otherText)), { clock: new TestClock(8_000_000) })).rejects.toThrow(/budget/);
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/another import is unfinished \(rooms hall, lobby\)/);
-		const abandoned = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, restart: true, dryRun: true });
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(otherText)), { clock: new TestClock(8_000_000) })).rejects.toThrow(/budget/);
+		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/another import is unfinished \(rooms hall, lobby\)/);
+		const abandoned = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, restart: true, dryRun: true });
 		expect(abandoned.abandoned).toEqual(["hall", "lobby"]);
 		expect(abandoned.resumed).toBe(false);
 	});
@@ -506,9 +507,9 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const at = Date.UTC(2026, 10, 19, 12);
-		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at } });
-		await expect(writeBackup(source.pipeline, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
-		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 1_000 } });
+		await writeBackup(source.pipeline, source.head, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at } });
+		await expect(writeBackup(source.pipeline, source.head, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
+		await writeBackup(source.pipeline, source.head, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 1_000 } });
 		expect((await store.list("backups/")).keys).toHaveLength(2);
 	});
 
@@ -521,7 +522,7 @@ describe("export and import", () => {
 		const store = new MemoryBlobStore();
 		const lines = async (privateRooms: boolean) => {
 			const settings: BackupSettings = { keep: 14, privateRooms };
-			const { key } = await writeBackup(source.pipeline, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", codecs: HISTORY_CODECS, clock: source.clock });
+			const { key } = await writeBackup(source.pipeline, source.head, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", codecs: HISTORY_CODECS, clock: source.clock });
 			return new Response((await (await store.get(key))!.stream()).pipeThrough(gzip.decoder())).text();
 		};
 		expect(await lines(true)).toContain("between us");

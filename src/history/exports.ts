@@ -20,6 +20,7 @@ import { ARCHIVE_CODECS, type ArchiveCodec, type ArchiveHeader, archiveName, enc
 import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
 import type { HistoryPipeline } from "./pipeline";
 import type { Clock } from "./records";
+import type { ExportPort } from "./tier";
 import { storedOptions } from "./storage/encoding";
 import type { BlobStore } from "./storage/store";
 
@@ -71,7 +72,7 @@ export interface BackupResult extends ExportReport {
  * then deletes this kind's backups past the newest `keep`.
  * A backup of this kind made in the same second (its key) fails it.
  */
-export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; codecs: readonly ArchiveCodec[]; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare?: ExportOptions["prepare"] }): Promise<BackupResult> {
+export async function writeBackup(pipeline: HistoryPipeline, server: ExportPort, store: BlobStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; codecs: readonly ArchiveCodec[]; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare?: ExportOptions["prepare"] }): Promise<BackupResult> {
 	const now = options.clock.now();
 	const key = backupKey(kind, options.server, now, options.codecs);
 	// Keys are to the second: a second backup within it would replace the first.
@@ -82,7 +83,7 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 	const archive = encodedArchiveWriter((bytes) => writer.write(bytes), options.codecs);
 	let report: ExportReport;
 	try {
-		report = await exportArchive(pipeline, archive, {
+		report = await exportArchive(pipeline, server, archive, {
 			clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
 			privateRooms: settings.privateRooms,
 			...(options.prepare ? { prepare: options.prepare } : {}),
