@@ -581,6 +581,12 @@ it('a mirror thread takes its first members from the room_update that joins the 
 		} });
 		const thread = store.mirrorState().rooms[0].threads['5000'];
 		expect(thread).toBeDefined();
+		// A later record of the thread is whole: the description it lacks is cleared on the mirror thread too.
+		await mirror.apply(server, { method: 'room_update', params: { updated: [{ room_id: '5000', parent_room_id: 'ops', title: 'Plans', description: 'Who brings what', log_id: '5001' }] } });
+		expect(store.getRoom(thread)).toMatchObject({ title: 'Plans', description: 'Who brings what' });
+		await mirror.apply(server, { method: 'room_update', params: { updated: [{ room_id: '5000', parent_room_id: 'ops', title: 'Plans v2', log_id: '5002' }] } });
+		expect(store.getRoom(thread)).toMatchObject({ title: 'Plans v2' });
+		expect(store.getRoom(thread)?.description).toBeUndefined();
 		// Bob as himself, Carol as a remote user of the owner; never the link.
 		expect(store.roomMembers([thread], 10).get(thread)?.map((member) => member.user_id).sort()).toEqual(['bob', 'carol@a.example']);
 	});

@@ -988,7 +988,8 @@ export class RemoteRooms {
 		const state = this.store.mirrorState(this.now());
 		const mirror = state.rooms.find((room) => room.server === server && room.owner_room === parent && !room.unshared);
 		if (!mirror) return;
-		const fields = { ...(typeof record.title === "string" ? { title: record.title } : {}), ...(typeof record.description === "string" ? { description: record.description } : {}) };
+		// A room record is whole: a field it lacks is cleared here too (a save merges, §4.2.4).
+		const fields = { title: typeof record.title === "string" ? record.title : "", description: typeof record.description === "string" ? record.description : "" };
 		const local = mirror.threads[ownerThread];
 		if (!local && mirror.room_id.startsWith("private_")) return;
 		await this.host.runMutation(async () => {
