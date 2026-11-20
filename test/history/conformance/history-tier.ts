@@ -1,15 +1,16 @@
 /*
  * The HistoryTier conformance suite: what every tier must do,
- * whatever it keeps records in. Run on MemoryHistoryTier and on
- * BlobHistoryTier over MemoryBlobStore and R2 (test/history/blob-tier.test.ts).
+ * whatever it keeps records in. Run on MemoryHistoryTier, on the D1 tier
+ * (test/history/d1-tier.test.ts), and on ColdHistoryTier over
+ * MemoryBlobStore and R2 (test/history/cold-tier.test.ts).
  *
  * Records are written as valid wire records (an archive drops invalid ones),
- * with `commit_ms` equal to `log_id`, as the blob tier reads them back. The
+ * with `commit_ms` equal to `log_id`, as the cold tier reads them back. The
  * tests of retention and trimming append one record at a time, so a tier
- * that keeps whole segments (the blob tier) keeps one record per segment
- * and its floors fall where a per-record tier's do. Stats are compared
- * without moves, since a per-record tier counts log IDs and the blob tier
- * each room's copy.
+ * that keeps whole chunks (the cold tier) keeps one record per chunk and
+ * its floors fall where a per-record tier's do. Stats are compared without
+ * moves, since a per-record tier counts log IDs and the cold tier each
+ * room's copy.
  *
  * The caller passes its `describe`, `it` and `expect`, as for the BlobStore
  * suite (conformance/blob-store.ts).

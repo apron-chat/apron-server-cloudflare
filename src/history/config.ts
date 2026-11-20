@@ -2,9 +2,12 @@
  * Builds the history pipeline from the Worker's bindings and the
  * LIMIT_* history limits, in a fixed order: the head over the Store's
  * SQLite, then D1 where HISTORY_D1 is bound (and LIMIT_HISTORY_D1_RECORDS is
- * above 0), then the blob tier where HISTORY_BLOB is. There is no tier list
+ * above 0), then the cold tier where HISTORY_BLOB is. There is no tier list
  * to configure: a tier exists where its binding does. Every tier is wrapped
  * for stall tracking.
+ *
+ * HISTORY_CODECS is the codec chain everything history stores in the blob
+ * store goes through (cold chunks and backups): the one place it is named.
  *
  * Blob stores come from a registry the caller passes in
  * (BlobStoreProviders): the Worker's has `r2` alone (WORKER_BLOB_STORES);
@@ -12,13 +15,14 @@
  * (test/history/support/). What a registry lacks cannot be named.
  */
 
-import { R2BlobStore } from "./blob/r2";
-import type { SegmentIndex } from "./blob/segments";
-import type { BlobStore } from "./blob/store";
-import { BlobHistoryTier } from "./blob/tier";
+import { type ArchiveCodec, gzip } from "@apron/archive";
+import type { ChunkIndex } from "./cold/chunks";
+import { ColdHistoryTier } from "./cold/tier";
 import { D1HistoryTier } from "./d1";
 import { HistoryPipeline, type PipelineStage, instrument } from "./pipeline";
 import type { Clock, Retention } from "./records";
+import { R2BlobStore } from "./storage/r2";
+import type { BlobStore } from "./storage/store";
 import { type StorePort, StoreHead } from "./store-head";
 
 /** The history limits (src/budget.ts Limits). */
@@ -27,7 +31,7 @@ export interface HistoryLimits {
 	retentionSeconds: number;
 	minRetentionSeconds: number;
 	historyD1Records: number;
-	historyBlobRecords: number;
+	historyColdRecords: number;
 	cleanupThresholdPercent: number;
 }
 
@@ -37,7 +41,7 @@ export interface HistoryEnv {
 	HISTORY_BLOB?: R2Bucket;
 }
 
-/** Makes the history blob store (segments and backups) from the env; undefined where it is not bound. */
+/** Makes the history blob store (cold chunks and backups) from the env; undefined where it is not bound. */
 export type BlobStoreProvider = (env: HistoryEnv) => BlobStore | undefined;
 
 /** Blob store providers by name, as a caller registers them. */
@@ -56,9 +60,12 @@ export type HistoryTrack = <R>(kind: "d1" | "r2", method: string, call: () => Pr
 
 export const HEAD_TIER = "hot";
 export const D1_TIER = "recent";
-export const BLOB_TIER = "cold";
-/** Where blob segments live in the store, before the server's name (`history/<server>/`). */
-export const SEGMENT_PREFIX = "history/";
+export const COLD_TIER = "cold";
+/** Where cold chunks live in the store, before the server's name (`history/<server>/`). */
+export const CHUNK_PREFIX = "history/";
+
+/** The codec chain history's stored archives go through, in order: cold chunks and backups. */
+export const HISTORY_CODECS: readonly ArchiveCodec[] = [gzip];
 
 /** Where blob stores come from: a registry and the name of the provider to use (default: the Worker's `r2`). */
 export interface BlobStoreChoice {
@@ -72,11 +79,13 @@ export interface BuildOptions extends BlobStoreChoice {
 	store: StorePort;
 	clock: Clock;
 	track?: HistoryTrack;
-	/** The blob tier's segment index (the Store's SQLite in the Durable Object); without it, no blob tier. */
-	segmentIndex?: (tier: string) => SegmentIndex;
-	/** This server's name, in blob segments' keys. */
+	/** The cold tier's chunk index (the Store's SQLite in the Durable Object); without it, no cold tier. */
+	chunkIndex?: (tier: string) => ChunkIndex;
+	/** The codec chain cold chunks are stored through (default HISTORY_CODECS). */
+	codecs?: readonly ArchiveCodec[];
+	/** This server's name, in cold chunks' keys. */
 	server?: string;
-	/** This server's WebSocket URL, in blob segments' headers (ARCHIVE.md §2). */
+	/** This server's WebSocket URL, in cold chunks' headers (ARCHIVE.md §2). */
 	serverUrl?: string;
 }
 
@@ -114,7 +123,7 @@ export function hasLowerTiers(env: HistoryEnv, limits: HistoryLimits, choice: Bl
 
 const tracker = (options: BuildOptions): HistoryTrack => options.track ?? ((_kind, _method, call) => call());
 
-/** The pipeline: SQLite, then D1 and the blob tier where bound. Undefined when there is no tier below the head. */
+/** The pipeline: SQLite, then D1 and the cold tier where bound. Undefined when there is no tier below the head. */
 export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | undefined {
 	const { env, limits } = options;
 	const track = tracker(options);
@@ -126,15 +135,16 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
 			label: "D1",
 		});
 	}
-	const blobs = options.segmentIndex ? blobStoreOf(env, options) : undefined;
-	if (blobs && options.segmentIndex) {
-		const tier = new BlobHistoryTier({
-			name: BLOB_TIER, store: blobs, index: options.segmentIndex(BLOB_TIER), prefix: `${SEGMENT_PREFIX}${options.server ?? "server"}/`,
-			header: { ...(options.serverUrl ?? options.server ? { server: options.serverUrl ?? options.server } : {}) }, clock: options.clock,
+	const blobs = options.chunkIndex ? blobStoreOf(env, options) : undefined;
+	if (blobs && options.chunkIndex) {
+		const tier = new ColdHistoryTier({
+			name: COLD_TIER, store: blobs, index: options.chunkIndex(COLD_TIER), codecs: options.codecs ?? HISTORY_CODECS,
+			prefix: `${CHUNK_PREFIX}${options.server ?? "server"}/`, clock: options.clock,
+			header: { ...(options.serverUrl ?? options.server ? { server: options.serverUrl ?? options.server } : {}) },
 		});
 		stages.push({
 			tier: instrument(tier, (method, call) => track("r2", method, call)),
-			retention: { ...(limits.historyBlobRecords > 0 ? { records: limits.historyBlobRecords } : {}), thresholdPercent: limits.cleanupThresholdPercent },
+			retention: { ...(limits.historyColdRecords > 0 ? { records: limits.historyColdRecords } : {}), thresholdPercent: limits.cleanupThresholdPercent },
 			label: (options.blobProvider ?? BLOB_PROVIDER) === "r2" ? "R2" : options.blobProvider,
 		});
 	}

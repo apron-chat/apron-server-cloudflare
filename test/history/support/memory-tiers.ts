@@ -1,5 +1,5 @@
 /*
- * History tiers in memory: a rewritable tier and a head, for tests and the
+ * History tiers in memory: a tier below the head and a head, for tests and the
  * reference model's runs; never in the Worker. They keep records
  * as the SQLite and D1 tiers do, one per room and log ID, and rewrite them
  * with the same functions (records.ts).
@@ -8,13 +8,12 @@
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import { retentionFloor } from "../../../src/history/plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
-import type { FloorContext, HistoryHead, PurgeResult, RewritableTier, TierState, TierStateStore } from "../../../src/history/tier";
+import type { FloorContext, HistoryHead, LowerTier, OpStep, TierState, TierStateStore } from "../../../src/history/tier";
 
 const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id}\u0000${record.room_id}`;
 
-export class MemoryHistoryTier implements RewritableTier {
+export class MemoryHistoryTier implements LowerTier {
 	readonly records = new Map<string, ChatRecord>();
-	multiRoom = true;
 
 	constructor(readonly name: string) {}
 
@@ -62,7 +61,17 @@ export class MemoryHistoryTier implements RewritableTier {
 		return removed;
 	}
 
-	async purge(userIds: readonly string[], messageIds: readonly string[] = []): Promise<PurgeResult> {
+	/** /purge and /rename in one step; a purge tells the messages of its users found here first. */
+	async applyOp(op: HistoryOp, step: OpStep): Promise<undefined> {
+		if (op.op === "purge") {
+			await step.found(authoredMessages(this.all(), op.userIds));
+			this.purgeHere(op.userIds, op.messageIds);
+		} else this.renameHere(op.from, op.to);
+		return undefined;
+	}
+
+	/** Purges the records here: returns the messages of the users found here. */
+	protected purgeHere(userIds: readonly string[], messageIds: readonly string[]): string[] {
 		const authored = authoredMessages(this.all(), userIds);
 		const messages = [...new Set([...messageIds, ...authored])];
 		for (const record of this.all()) {
@@ -70,10 +79,10 @@ export class MemoryHistoryTier implements RewritableTier {
 			if (json === null) this.records.delete(key(record));
 			else if (json !== record.record_json) this.records.set(key(record), { ...record, record_json: json });
 		}
-		return { messageIds: authored };
+		return authored;
 	}
 
-	async rename(from: string, to: string): Promise<void> {
+	protected renameHere(from: string, to: string): void {
 		for (const record of this.all()) {
 			const json = renamedRecord(record, from, to);
 			if (json !== record.record_json) this.records.set(key(record), { ...record, record_json: json });
@@ -146,18 +155,17 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 		this.queued.push({ seq: this.seq, op });
 	}
 
-	override async purge(userIds: readonly string[], messageIds: readonly string[] = []): Promise<PurgeResult> {
-		const result = await super.purge(userIds, messageIds);
+	async purge(userIds: readonly string[]): Promise<void> {
+		const authored = this.purgeHere(userIds, []);
 		for (const id of userIds) {
 			this.people.delete(id);
 			this.retired.add(id);
 		}
-		await this.queueOp({ op: "purge", userIds: [...userIds], messageIds: [...new Set([...messageIds, ...result.messageIds])] });
-		return result;
+		await this.queueOp({ op: "purge", userIds: [...userIds], messageIds: authored });
 	}
 
-	override async rename(from: string, to: string): Promise<void> {
-		await super.rename(from, to);
+	async rename(from: string, to: string): Promise<void> {
+		this.renameHere(from, to);
 		const user = this.people.get(from);
 		if (user) {
 			this.people.delete(from);

@@ -15,7 +15,7 @@ export interface Limits {
 	minRetentionSeconds: number;
 	/**
 	 * Records past the limits above that the D1 history tier (binding
-	 * HISTORY_D1) keeps, newest first, before they go on to the blob tier or
+	 * HISTORY_D1) keeps, newest first, before they go on to the cold tier or
 	 * expire. Records there stay in history but become read-only: they leave
 	 * the object's SQLite, the hot log, and history pages still serve them
 	 * from D1, but their messages can no longer be edited, reacted to or
@@ -24,10 +24,10 @@ export interface Limits {
 	 */
 	historyD1Records: number;
 	/**
-	 * Records the blob history tier (binding HISTORY_BLOB) keeps, newest
+	 * Records the cold history tier (chunks in HISTORY_BLOB) keeps, newest
 	 * first, past those above; 0 keeps everything it is given.
 	 */
-	historyBlobRecords: number;
+	historyColdRecords: number;
 	/**
 	 * The share, in percent, of each history count limit that cleanup keeps:
 	 * the limits are ceilings, and each daily cleanup trims each back to this

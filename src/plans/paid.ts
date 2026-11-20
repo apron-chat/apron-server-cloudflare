@@ -54,7 +54,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// (below): 84,000, about two years at the demo's traffic (above).
 		// D1's share stays within its included 5 GB even were every record
 		// there a maximum-size snapshot (80,000 × 24 KiB, about 1.9 GB). The
-		// blob tier (R2), where it is bound, keeps everything past that.
+		// cold tier (R2), where it is bound, keeps everything past that.
 		// Records younger than three days stay whatever the count, so a flood
 		// cannot push out the last few days before an admin purges it; the
 		// database watermarks still bound what the flood itself stores. No age
@@ -64,10 +64,11 @@ export const PAID_PLAN: Plan = Object.freeze({
 		minRetentionSeconds: 3 * 24 * 60 * 60,
 		retentionSeconds: 0,
 		historyD1Records: 100_000,
-		historyBlobRecords: 0,
+		historyColdRecords: 0,
 		// Those are ceilings: each daily cleanup moves what is past 80% of
-		// SQLite's to D1, and expires what is past 80% of D1's (4,000 and
-		// 80,000 kept), so the rest is headroom for a day's records.
+		// SQLite's to D1, and what is past 80% of D1's to the cold tier
+		// (4,000 and 80,000 kept), which keeps everything; the rest is
+		// headroom for a day's records.
 		cleanupThresholdPercent: 80,
 		// Room for a long writeup in one message (about 2,500 words) rather
 		// than Free's 4 KiB. A post is kept once, as its record (message_state

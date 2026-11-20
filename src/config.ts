@@ -327,7 +327,7 @@ function envName(name: string): string {
 }
 
 /** Limits where 0 turns the bound off (docs/configuration.md, History retention); every other limit is positive. */
-const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds", "historyD1Records", "historyBlobRecords"]);
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds", "historyD1Records", "historyColdRecords"]);
 
 function limitError(name: string): ConfigError {
 	return new ConfigError(`${name} must be a ${OPTIONAL_LIMITS.has(name) ? "non-negative" : "positive"} safe integer`);

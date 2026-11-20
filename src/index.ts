@@ -3,11 +3,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { codecChain, codecsFromName, openArchive, parseCodecNames } from "@apron/archive";
+import { openArchive } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
-import type { BlobStore } from "./history/blob/store";
-import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Enabled, HEAD_TIER, hasLowerTiers } from "./history/config";
-import { type BackupKind, CODECS_METADATA, writeBackup } from "./history/exports";
+import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Enabled, HEAD_TIER, HISTORY_CODECS, hasLowerTiers } from "./history/config";
+import { type BackupKind, writeBackup } from "./history/exports";
+import { storedChain } from "./history/storage/encoding";
+import type { BlobStore } from "./history/storage/store";
 import { checkInvariants } from "./history/plan";
 import type { HistoryPipeline } from "./history/pipeline";
 import type { ChatRecord } from "./history/records";
@@ -706,7 +707,7 @@ function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limit
 
 /** `/history`'s arguments, one form each (historyCommand). */
 type HistoryArgs =
-	| { action: "status" | "rebuild-index" }
+	| { action: "status" }
 	| { action: "export"; roomIds: RoomIdArg[] }
 	| { action: "import"; key: string; dryRun: boolean; users?: "match" | "new"; renumber: boolean; restart: boolean };
 
@@ -739,12 +740,12 @@ function importNotice(report: ImportReport): string {
 
 /** Why a history job cannot start now (Runtime.historyBusy). */
 function historyBusyMessage(busy: "cycle" | "job"): string {
-	return busy === "cycle" ? "History upkeep is running; try again in a moment" : "Another history export, import or index rebuild is running; try again when it ends";
+	return busy === "cycle" ? "History upkeep is running; try again in a moment" : "Another history export or import is running; try again when it ends";
 }
 
 function historyArgs(words: readonly string[], usage: string, busy: "cycle" | "job" | undefined): HistoryArgs {
 	const action = words[1];
-	if (busy && (action === "export" || action === "import" || action === "rebuild-index")) throw usageError(historyBusyMessage(busy));
+	if (busy && (action === "export" || action === "import")) throw usageError(historyBusyMessage(busy));
 	if (action === "export" || action === "import") {
 		if (action === "export") return { action, roomIds: roomIdArgs(words.slice(2)) };
 		const key = words[2];
@@ -753,7 +754,7 @@ function historyArgs(words: readonly string[], usage: string, busy: "cycle" | "j
 		const users = flags.has("match") ? "match" : flags.has("new") ? "new" : undefined;
 		return { action, key, dryRun: flags.has("dry-run"), ...(users ? { users } : {}), renumber: flags.has("renumber"), restart: flags.has("restart") };
 	}
-	if ((action === "status" || action === "rebuild-index") && words.length === 2) return { action };
+	if (action === "status" && words.length === 2) return { action };
 	throw usageError(`Usage: ${usage}`);
 }
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
@@ -2678,14 +2679,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly terminalOutputs = new Map<string, string>();
 	/**
 	 * The history tiers below this object's SQLite (src/history/config.ts:
-	 * D1, then the blob tier, each where it is bound), where records past its
+	 * D1, then the cold tier, each where it is bound), where records past its
 	 * limits go first (runHistory); none without one.
 	 */
 	private readonly history?: HistoryPipeline;
 	/**
 	 * What history work is running, one at a time: a pipeline cycle
-	 * (runHistory), or an admin's or a schedule's job (an import, an export,
-	 * an index rebuild). A cycle waits for a job, so tiers do not move under
+	 * (runHistory), or an admin's or a schedule's job (an import, an
+	 * export). A cycle waits for a job, so tiers do not move under
 	 * its plan; a job is refused while a cycle or another job runs, so it
 	 * never writes between a cycle's copy and its saving of the copy marker.
 	 */
@@ -2803,13 +2804,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		// Records past this SQLite's limits go to the tiers below where they are
-		// bound: D1 (HISTORY_D1), then the blob tier (HISTORY_BLOB).
+		// bound: D1 (HISTORY_D1), then the cold tier (HISTORY_BLOB).
 		const tiered = hasLowerTiers(env, this.config.limits);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered });
 		this.history = tiered ? buildHistoryPipeline({
 			env, limits: this.config.limits, store: this.store, clock: { now: nowMs },
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
-			segmentIndex: (tier) => this.store.segmentIndex(tier),
+			chunkIndex: (tier) => this.store.chunkIndex(tier),
 			server: this.config.rpId,
 			serverUrl: this.archiveHeader().server,
 		}) : undefined;
@@ -5211,8 +5212,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Whether the D1 tier is off in this deploy (HISTORY_D1 unbound, or
 	 * LIMIT_HISTORY_D1_RECORDS 0) while it holds history: the Store has its
-	 * state, and a tier below (the blob tier) is still bound. Then nothing
-	 * moves below SQLite, nor is exported or imported: the blob tier in its
+	 * state, and a tier below (the cold tier) is still bound. Then nothing
+	 * moves below SQLite, nor is exported or imported: the cold tier in its
 	 * place would skip what D1 holds (the copy marker describes D1), so SQLite
 	 * keeps what it holds until HISTORY_D1 is bound again. Read once; an
 	 * unreadable state counts as unbound for now.
@@ -7885,7 +7886,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: (scope) => scope.runtime.sendHelp(scope),
 		}),
 		adminCommand({
-			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, gzip-compressed or not) from it (running a failed import again finishes it; restart abandons another file's); repair the blob tier's index", usageErrors: "reply",
+			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart]", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, as written or through the codecs its name or metadata gives) from it (running a failed import again finishes it; restart abandons another file's)", usageErrors: "reply",
 			parse: ({ words, usage }, runtime) => historyArgs(words, usage, runtime.historyBusy),
 			audit: (args) => ({ action: args.action, target: args.action === "import" ? args.key : args.action === "export" ? args.roomIds.join(" ") : undefined }),
 			run: ({ cap, runtime, socket, request, roomId }, args) => runtime.historyCommand(cap, socket, request, roomId, args),
@@ -9133,7 +9134,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(store: BlobStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
 		return writeBackup(this.archivePipeline(), store, this.config.backups, kind, {
-			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
+			server: this.config.rpId, clock: { now: nowMs }, codecs: HISTORY_CODECS, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
 	}
@@ -9143,8 +9144,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * invariants; `export [<room_id>...]` writes a backup to the backup store
 	 * and names its key; `import <key> [dry-run] [match|new] [renumber]` reads
 	 * a backup or an ARCHIVE.md file from it (decoded through the codecs it
-	 * names: gzip) and reports what it added, or would; `rebuild-index`
-	 * lists the blob tiers' stores to rebuild their segment indexes.
+	 * names) and reports what it added, or would.
 	 */
 	private async historyCommand(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, args: HistoryArgs): Promise<void> {
 		assertAdmin(cap);
@@ -9153,13 +9153,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.sendNotice(socket, roomId, text);
 			this.reply(socket, request, {});
 		};
-		if (args.action === "export" || args.action === "import" || args.action === "rebuild-index") {
+		if (args.action === "export" || args.action === "import") {
 			// historyArgs refused it already while one runs; nothing awaited since.
 			if (this.historyBusy) throw { name: "invalid_params", message: historyBusyMessage(this.historyBusy) } satisfies ProtocolError;
 			this.historyBusy = "job";
 			try {
-				if (args.action === "export" || args.action === "import") await this.historyJob(cap, args, done);
-				else await this.rebuildIndexes(done);
+				await this.historyJob(cap, args, done);
 			} finally {
 				this.historyBusy = undefined;
 			}
@@ -9170,7 +9169,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const lines = await this.historyStatus(now);
 				const pipeline = this.archivePipeline();
 				const views = await pipeline.views();
-				lines.push(...views.map((view) => `- \`${view.name}\`: floor ${view.state.floor}${views.indexOf(view) < views.length - 1 ? `, copied through ${view.state.through}` : ""}${view.state.ops ? `, ops through ${view.state.ops}` : ""}`));
+				lines.push(...views.map((view) => `- \`${view.name}\`: floor ${view.state.floor}${views.indexOf(view) < views.length - 1 ? `, copied through ${view.state.through}` : ""}${view.state.ops ? `, ops through ${view.state.ops}` : ""}${view.state.opCursor !== undefined ? `, applying op ${view.state.ops + 1} from ${view.state.opCursor}` : ""}`));
 				lines.push(`- Published floor: ${await pipeline.publishedFloor()}`);
 				const violations = checkInvariants(views, await pipeline.publishedFloor());
 				lines.push(violations.length ? `- **Invariants broken:** ${violations.join("; ")}` : "- Invariants hold.");
@@ -9178,18 +9177,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			}
 		}
-	}
-
-	/** `/history rebuild-index`: lists the blob tiers' stores to add what their segment indexes lack. */
-	private async rebuildIndexes(done: (text: string) => void): Promise<void> {
-		const rebuilt: string[] = [];
-		for (const tier of this.history?.tiers ?? []) {
-			// Adds what the index lacks, from the tier's floor up: a failure partway leaves it no worse.
-			const blob = tier as unknown as { rebuildIndex?: (options: { keep: boolean; floor: number }) => Promise<number> };
-			const floor = (await this.history!.views()).find((view) => view.name === tier.name)?.state.floor ?? 0;
-			if (typeof blob.rebuildIndex === "function") rebuilt.push(`\`${tier.name}\`: ${await blob.rebuildIndex({ keep: true, floor })} segments added`);
-		}
-		done(rebuilt.length ? `Rebuilt ${rebuilt.join(", ")}.` : "No blob tier to rebuild.");
 	}
 
 	/** `/history export` and `/history import` (historyCommand), one at a time. */
@@ -9218,14 +9205,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (object.size > MAX_IMPORT_BYTES) throw { name: "invalid_params", message: `${key} is ${object.size} bytes; an import reads at most ${MAX_IMPORT_BYTES}` } satisfies ProtocolError;
 				let report: ImportReport;
 				try {
-					// The codecs it went through: as its metadata records them, else as its name says (`.jsonl.gz`), else none.
-					const recorded = object.metadata?.[CODECS_METADATA];
-					const codecs = recorded !== undefined ? codecChain(parseCodecNames(recorded)) : codecsFromName(key) ?? [];
-					// Bounded decoded too: a small compressed file may decode to a great deal.
-					const reader = openArchive(await object.stream(), { codecs, maxBytes: MAX_IMPORT_BYTES });
+					// Read back through the codecs it went through, bounded decoded too: a small file may decode to a great deal.
+					const reader = openArchive(await object.stream(), { codecs: storedChain(key, object), maxBytes: MAX_IMPORT_BYTES });
 					report = await importArchive(this.archivePipeline(), reader, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
-						// Only an authenticating codec, read to the end, makes a file this server's own; gzip is none.
+						// Only an authenticating codec, read to the end, makes a file this server's own.
 						authenticated: () => reader.verified(),
 						users: args.users ?? "auto",
 						ids: args.renumber ? "renumber" : "original",

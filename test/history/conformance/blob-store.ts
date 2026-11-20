@@ -14,7 +14,7 @@
  * (one R2 bucket) needs no cleanup between them.
  */
 
-import type { BlobStore } from "../../../src/history/blob/store";
+import type { BlobStore } from "../../../src/history/storage/store";
 
 /** The matchers the suite uses; vitest's `expect` has them, and Node gets a shim. */
 export interface Expect {

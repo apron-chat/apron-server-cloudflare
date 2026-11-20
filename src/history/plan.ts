@@ -11,8 +11,6 @@ import type { TierState } from "./tier";
 export interface TierView {
 	name: string;
 	readable: boolean;
-	rewritable: boolean;
-	multiRoom: boolean;
 	state: TierState;
 }
 
@@ -46,13 +44,6 @@ export type Step =
 	| { kind: "publish"; floor: number }
 	| { kind: "idle" };
 
-/** The rewritable tiers /purge and /rename reach: the head and each following one, up to the first that is not. */
-export function rewritableReach(tiers: readonly Pick<TierView, "rewritable">[]): number {
-	let reach = 0;
-	while (reach < tiers.length && tiers[reach].rewritable) reach += 1;
-	return reach;
-}
-
 /** The deepest readable tier: history is published from its floor. */
 export function deepestReadable(tiers: readonly Pick<TierView, "readable">[]): number {
 	for (let index = tiers.length - 1; index > 0; index -= 1) if (tiers[index].readable) return index;
@@ -69,16 +60,16 @@ export function allowedFloor(tiers: readonly TierView[], index: number): number 
 }
 
 /**
- * The next step of a cycle: first the op log for the rewritable
- * tiers below the head; then bottom-up, so space is made before it is
+ * The next step of a cycle: first the op log for each tier below the
+ * head, in order (an op reaches a tier once every tier above it applied
+ * it); then bottom-up, so space is made before it is
  * filled, each tier's target, copy of what is below it to the next tier,
  * advance and trim; then the published floor.
  */
 export function planStep(snapshot: PipelineSnapshot): Step {
 	const { tiers } = snapshot;
 	const last = tiers.length - 1;
-	const reach = rewritableReach(tiers);
-	for (let index = 1; index < reach; index += 1) {
+	for (let index = 1; index <= last; index += 1) {
 		if (tiers[index].state.ops < snapshot.opsSeq) return { kind: "ops", tier: index, after: tiers[index].state.ops };
 	}
 	const deepest = deepestReadable(tiers);
@@ -143,18 +134,16 @@ export interface ReadPart {
  * Which tier serves which part of a page's window: each readable
  * tier the log IDs from its floor up to the floor of the readable tier
  * above it (records it holds past that are copies, served above), none
- * below the published floor. A joined-rooms page stops at the first tier
- * that cannot serve several rooms. In fill order: a forward page reads the
+ * below the published floor. In fill order: a forward page reads the
  * oldest first, a backward page the newest.
  */
-export function planRead(query: HistoryQuery, tiers: readonly Pick<TierView, "readable" | "multiRoom" | "state">[], published: number, options: { skipHead?: boolean } = {}): ReadPart[] {
+export function planRead(query: HistoryQuery, tiers: readonly Pick<TierView, "readable" | "state">[], published: number, options: { skipHead?: boolean } = {}): ReadPart[] {
 	const parts: ReadPart[] = [];
 	const deepest = deepestReadable(tiers);
 	let above = Number.POSITIVE_INFINITY;
 	for (let index = 0; index < tiers.length; index += 1) {
 		const tier = tiers[index];
 		if (!tier.readable) continue;
-		if (index > 0 && query.joined && !tier.multiRoom) break;
 		// The deepest readable tier serves down to the published floor, which its trimming waits for.
 		const lower = Math.max(query.lower, index === deepest ? published : tier.state.floor, published);
 		const upper = Math.min(query.upper, above - 1);

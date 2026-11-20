@@ -21,11 +21,11 @@ import { mkdir, open, readdir, readFile, rename, rmdir, stat, unlink, writeFile 
 import { dirname, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
-/** @typedef {import('../src/history/blob/store.ts').BlobStore} BlobStore */
-/** @typedef {import('../src/history/blob/store.ts').BlobObject} BlobObject */
-/** @typedef {import('../src/history/blob/store.ts').BlobWriter} BlobWriter */
-/** @typedef {import('../src/history/blob/store.ts').BlobListing} BlobListing */
-/** @typedef {import('../src/history/blob/store.ts').BlobListOptions} BlobListOptions */
+/** @typedef {import('../src/history/storage/store.ts').BlobStore} BlobStore */
+/** @typedef {import('../src/history/storage/store.ts').BlobObject} BlobObject */
+/** @typedef {import('../src/history/storage/store.ts').BlobWriter} BlobWriter */
+/** @typedef {import('../src/history/storage/store.ts').BlobListing} BlobListing */
+/** @typedef {import('../src/history/storage/store.ts').BlobListOptions} BlobListOptions */
 /** @typedef {import('../src/history/config.ts').BlobStoreProviders} BlobStoreProviders */
 
 /** Temporary files start with this; keys may not, and listings skip them. */

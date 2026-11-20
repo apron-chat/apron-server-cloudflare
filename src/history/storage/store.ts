@@ -1,14 +1,14 @@
 /*
- * Blob storage: the small interface the blob tier and the
- * backups write through, so the same code runs over R2 in the Worker
- * (blob/r2.ts), over memory in tests (test/history/support/), and over a
- * directory in Node scripts (scripts/fs-blob-store.mjs). Each caller
- * registers the providers it has (history/config.ts, BlobStoreProviders).
+ * Blob storage: the small interface the cold tier and the backups write
+ * through, so the same code runs over R2 in the Worker (storage/r2.ts),
+ * over memory in tests (test/history/support/), and over a directory in
+ * Node scripts (scripts/fs-blob-store.mjs). Each caller registers the
+ * providers it has (history/config.ts, BlobStoreProviders).
  *
  * Keys are plain strings with `/` as a separator by convention. Listings are
- * sorted by key, so zero-padded names (segment keys, dated exports) list in
- * order. Bodies are text (segments are JSON Lines) or, written through a
- * writer, bytes (a backup encoded through @apron/archive codecs, gzip).
+ * sorted by key, so zero-padded names (chunk keys, dated exports) list in
+ * order. Bodies are text or, written through a writer, bytes (an archive
+ * encoded through a codec chain, storage/encoding.ts).
  *
  * Every implementation passes the same conformance suite
  * (test/history/conformance/blob-store.ts).

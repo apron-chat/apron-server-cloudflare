@@ -7,7 +7,7 @@
  * (src/history/config.ts, WORKER_BLOB_STORES), so it never reaches one.
  */
 
-import type { BlobListing, BlobListOptions, BlobObject, BlobPutOptions, BlobStore, BlobWriter } from "../../../src/history/blob/store";
+import type { BlobListing, BlobListOptions, BlobObject, BlobPutOptions, BlobStore, BlobWriter } from "../../../src/history/storage/store";
 import type { BlobStoreProviders } from "../../../src/history/config";
 
 interface Stored {

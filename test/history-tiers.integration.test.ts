@@ -9,7 +9,7 @@ import { connect, greeting, request } from './helpers/socket';
 
 // The tests bind a local D1 database as HISTORY_D1 (wrangler.toml), so the
 // object's D1 history tier is on: records past SQLite's count go there,
-// kept for historyD1Records more (no blob tier: the pipeline below is built without one).
+// kept for historyD1Records more (no cold tier: the pipeline below is built without one).
 
 const stub = () => env.DEMO.getByName('public-demo-v1');
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

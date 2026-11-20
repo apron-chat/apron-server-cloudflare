@@ -5,8 +5,8 @@ import { exportArchive } from "../../src/history/archive/export";
 import { type ArchivedRoom, type ArchivedUser, collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "@apron/archive";
 import { importArchive } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { BlobHistoryTier } from "../../src/history/blob/tier";
-import { archivePipeline } from "../../src/history/config";
+import { ColdHistoryTier } from "../../src/history/cold/tier";
+import { HISTORY_CODECS, archivePipeline } from "../../src/history/config";
 import { HistoryPipeline } from "../../src/history/pipeline";
 import { MemoryHead } from "./support/memory-tiers";
 import { MemoryTierStateStore } from "./support/memory-tiers";
@@ -300,22 +300,23 @@ it("never lets the idle prune remove an unclaimed placeholder, until the claim t
 	});
 });
 
-it("keeps a blob tier's segment index and the backups' schedule in SQLite, within their reservations", async () => {
-	await withStore("segment-index", CONFIG, async (store, clock, state) => {
+it("keeps a cold tier's chunk index and the backups' schedule in SQLite, within their reservations", async () => {
+	await withStore("chunk-index", CONFIG, async (store, clock, state) => {
 		const overruns = watched(store);
-		const index = store.segmentIndex("Cold-1");
-		expect(store.segmentIndex("Cold-1")).toBe(index);
-		const ref = (roomId: string, first: number, last: number) => ({ roomId, first, last, key: `${roomId}/${first}-${last}`, records: last - first + 1, bytes: 100 });
-		await index.add([ref("general", 10, 20), ref("lobby", 15, 30), ref("general", 21, 40)]);
-		expect(state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'history_segments%'").toArray()).toEqual([{ name: "history_segments__x43_old_d1" }]);
-		expect((await index.find(["general"], 18, 25)).map((segment) => segment.first)).toEqual([10, 21]);
-		expect((await index.after(0, 2)).map((segment) => segment.first)).toEqual([10, 15]);
-		expect((await index.oldest(1))[0].last).toBe(20);
-		expect(await index.rooms()).toEqual(["general", "lobby"]);
-		await index.remove([ref("lobby", 15, 30)]);
-		expect(await index.forRoom("lobby")).toEqual([]);
-		await index.clear();
-		expect(await index.overlapping(0, 100)).toEqual([]);
+		const index = store.chunkIndex("cold");
+		const ref = (first: number, last: number, rooms: string[]) => ({ first, last, key: `history/x/${first}.jsonl`, records: last - first + 1, bytes: 100, rooms, users: ["ada"] });
+		await index.update({ put: [ref(10, 20, ["general"]), ref(21, 40, ["general", "lobby"])] });
+		expect((await index.list()).map((chunk) => chunk.first).sort()).toEqual([10, 21]);
+		// One row a chunk, by tier and first; another tier's chunks are its own.
+		expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = 'cold'").one().count).toBe(2);
+		await store.chunkIndex("colder").update({ put: [ref(5, 6, ["general"])] });
+		expect((await index.list()).length).toBe(2);
+		// Removes, then puts, as one change: a chunk cut from 21 to 30 is listed at 30.
+		await index.update({ put: [ref(30, 40, ["lobby"])], remove: [21] });
+		expect((await index.list()).map((chunk) => [chunk.first, chunk.rooms])).toEqual([[10, ["general"]], [30, ["lobby"]]]);
+		expect(JSON.parse(state.storage.sql.exec<{ ref: string }>("SELECT ref FROM history_chunks WHERE tier = 'cold' AND first = 30").one().ref)).toEqual(ref(30, 40, ["lobby"]));
+		await index.update({ remove: [10, 30] });
+		expect(await index.list()).toEqual([]);
 
 		expect(store.historyMetaNumber("history:export:nightly", clock.value)).toBe(0);
 		store.setHistoryMeta("history:export:nightly", "1234", clock.value);
@@ -333,7 +334,7 @@ function messageRecord(roomId: string, logId: number, value: Record<string, unkn
 	return { room_id: roomId, log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: roomId, from: { user_id: "ada", name: "Ada" }, body: { text: `m${logId}` }, ...value }) };
 }
 
-const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, historyD1Records: 0, historyBlobRecords: 0, cleanupThresholdPercent: 80 };
+const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 
 it("refuses records past the clock, and raises the log head only by records it stores, never by a listing", async () => {
 	await withStore("restore-future", CONFIG, (store, clock) => {
@@ -455,26 +456,21 @@ it("exports a room's whole history after a retitle: the listing's creation, not 
 	expect(archive.records.filter((record) => record.kind === "message")).toHaveLength(2);
 });
 
-it("reads a blob tier's segment index a bounded page at a time, however many segments it holds", async () => {
-	await withStore("segment-bounds", CONFIG, async (store, clock, state) => {
+it("runs the cold tier over the Store's chunk index within its reservations, however many chunks it lists", async () => {
+	await withStore("chunk-bounds", CONFIG, async (store, clock) => {
 		const overruns = watched(store);
-		const index = store.segmentIndex("cold");
-		await index.oldest(1);
-		const segments = 6_000;
-		for (let i = 0; i < segments; i += 1) {
-			state.storage.sql.exec(`INSERT INTO history_segments_cold (room_id, "first", "last", key, records, bytes) VALUES (?, ?, ?, ?, 1, 100)`, `r${i % 5}`, i * 10 + 1, i * 10 + 5, `k${i}`);
-		}
-		const tier = new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index, prefix: "history/", clock: clock.clock });
-		// Keep the newest 100 records (a segment each): the floor is the 100th newest segment's first.
-		expect(await tier.floorFor({ records: 100, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBe((segments - 100) * 10 + 1);
+		const chunks = 3_000;
+		const refs = Array.from({ length: chunks }, (_, i) => ({ first: i * 10 + 1, last: i * 10 + 5, key: `history/x/${i}.jsonl`, records: 1, bytes: 100, rooms: [`r${i % 5}`], users: ["ada"] }));
+		for (let i = 0; i < chunks; i += 500) await store.chunkIndex("cold").update({ put: refs.slice(i, i + 500) });
+		const tier = new ColdHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: store.chunkIndex("cold"), codecs: HISTORY_CODECS, prefix: "history/x/", clock: clock.clock });
+		// Keep the newest 100 records (a chunk each): the floor is the 100th newest chunk's first.
+		expect(await tier.floorFor({ records: 100, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBe((chunks - 100) * 10 + 1);
 		expect(await tier.floorFor({ records: 10_000, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBeUndefined();
-		expect((await tier.stats()).records).toBeGreaterThan(0);
+		expect((await tier.stats()).records).toBe(chunks);
 		expect(await tier.trimBelow(201, 1_000)).toBe(20);
-		expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM history_segments_cold").one().count).toBe(segments - 20);
-		// The objects are missing here, so reads find nothing (and drop those segments from the index).
+		expect((await store.chunkIndex("cold").list()).length).toBe(chunks - 20);
+		// The objects are missing here, so reads find nothing.
 		expect(await tier.read({ roomIds: ["r0"], lower: 1, upper: Number.MAX_SAFE_INTEGER, forward: false, limit: 10 })).toEqual([]);
-		expect((await tier.scan(1, 10)).records).toEqual([]);
-		expect(await tier.lookup([segments * 5])).toEqual([]);
 		expect(overruns).toEqual([]);
 	});
 });

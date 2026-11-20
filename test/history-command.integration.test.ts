@@ -49,7 +49,7 @@ it('backs history up to the backup store, and imports a foreign archive as a new
 		const object = await env.HISTORY_BLOB!.get(key!);
 		// gzip-compressed, the codec recorded with it (not encrypted).
 		expect(object!.customMetadata).toEqual({ codecs: 'gzip' });
-		expect(object!.httpMetadata?.contentType).toBe('application/gzip');
+		expect(object!.httpMetadata?.contentType).toBe('application/octet-stream');
 		const archive = await collectArchive(openArchive(object!.body, { codecs: [gzip] }));
 		// ARCHIVE.md §2: the server's WebSocket URL, and the origins its media loads from.
 		expect(archive.header).toMatchObject({ apron_archive: 1, server: 'wss://demo.test/', media: ['https://demo.test', 'https://media.test'] });
@@ -229,11 +229,11 @@ it('refuses a file larger than an import reads, before reading it', async () => 
 	}
 });
 
-it('runs one history job at a time: an import, export or index rebuild waits for a running cycle', async () => {
+it('runs one history job at a time: an import or export waits for a running cycle', async () => {
 	const admin = await signedInAdmin();
 	try {
 		await changed((runtime) => { runtime.historyBusy = 'cycle'; }, async () => {
-			for (const [id, text] of [['busy-import', '/history import backups/none.jsonl'], ['busy-export', '/history export'], ['busy-index', '/history rebuild-index']]) {
+			for (const [id, text] of [['busy-import', '/history import backups/none.jsonl'], ['busy-export', '/history export']]) {
 				const refused = await command(admin, id, text);
 				expect(refused.frame.error, text).toMatchObject({ code: -32602, message: 'History upkeep is running; try again in a moment' });
 			}

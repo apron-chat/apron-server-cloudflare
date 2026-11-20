@@ -2,23 +2,26 @@ import { env } from "cloudflare:test";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { MemorySegmentIndex } from "./support/memory-segment-index";
-import { BlobHistoryTier } from "../../src/history/blob/tier";
+import { MemoryChunkIndex } from "./support/memory-chunk-index";
+import { ColdHistoryTier } from "../../src/history/cold/tier";
+import { HISTORY_CODECS } from "../../src/history/config";
 import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/memory-tiers";
 import { type TierView, checkInvariants, mergePages, planRead, planStep, retentionFloor } from "../../src/history/plan";
 import { HistoryPipeline, type PipelineStage, instrument } from "../../src/history/pipeline";
 import type { ChatRecord, Retention } from "../../src/history/records";
-import type { HistoryTier, TierState } from "../../src/history/tier";
+import type { TierState } from "../../src/history/tier";
 import { Model, show } from "./model";
 
 const state = (floor: number, target = floor, through = floor - 1, ops = 0): TierState => ({ floor, target, through, ops });
-const view = (name: string, tierState: TierState, extra: Partial<TierView> = {}): TierView => ({ name, readable: true, rewritable: true, multiRoom: true, state: tierState, ...extra });
+const view = (name: string, tierState: TierState, extra: Partial<TierView> = {}): TierView => ({ name, readable: true, state: tierState, ...extra });
 const progress = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>() });
 
 describe("planStep", () => {
-	it("applies the op log first, to each rewritable tier below the head in turn", () => {
-		const tiers = [view("hot", state(10)), view("recent", state(5)), view("cold", state(1), { rewritable: false })];
+	it("applies the op log first, to each tier below the head in turn", () => {
+		const tiers = [view("hot", state(10)), view("recent", state(5)), view("cold", state(1))];
 		expect(planStep({ tiers, published: 1, opsSeq: 2, ...progress() })).toEqual({ kind: "ops", tier: 1, after: 0 });
+		tiers[1].state.ops = 2;
+		expect(planStep({ tiers, published: 1, opsSeq: 2, ...progress() })).toEqual({ kind: "ops", tier: 2, after: 0 });
 	});
 
 	it("works bottom-up: target, copy, advance and trim each tier, then publishes", () => {
@@ -75,17 +78,13 @@ describe("checkInvariants", () => {
 });
 
 describe("planRead and mergePages", () => {
-	const tiers = [view("hot", state(100)), view("recent", state(50)), view("cold", state(10), { multiRoom: false })];
+	const tiers = [view("hot", state(100)), view("recent", state(50)), view("cold", state(10))];
 
 	it("gives each tier the window between its floor and the floor above, none below the published floor", () => {
 		const query = { roomIds: ["a"], lower: 1, upper: 200, forward: false, limit: 10 };
 		expect(planRead(query, tiers, 20).map((part) => [part.tier, part.query.lower, part.query.upper])).toEqual([[0, 100, 200], [1, 50, 99], [2, 20, 49]]);
 		expect(planRead({ ...query, forward: true }, tiers, 20).map((part) => part.tier)).toEqual([2, 1, 0]);
 		expect(planRead(query, tiers, 20, { skipHead: true }).map((part) => part.tier)).toEqual([1, 2]);
-	});
-
-	it("stops a joined-rooms page at a tier that serves one room at a time", () => {
-		expect(planRead({ roomIds: ["a", "b"], lower: 1, upper: 200, forward: false, limit: 10, joined: true }, tiers, 20).map((part) => part.tier)).toEqual([0, 1]);
 	});
 
 	it("merges by log ID, a move once, with the upper tier winning", () => {
@@ -119,38 +118,30 @@ class TestClock {
 	now(): number { return this.time; }
 }
 
-/** A tier /purge does not reach: a memory tier without purge and rename, serving one room at a time. */
-function appendOnly(name: string): HistoryTier & { inner: MemoryHistoryTier } {
-	const inner = new MemoryHistoryTier(name);
-	return {
-		name, inner, multiRoom: false,
-		append: (range) => inner.append(range), scan: (from, limit) => inner.scan(from, limit), read: (query) => inner.read(query),
-		lookup: (ids) => inner.lookup(ids), stats: (context) => inner.stats(context), floorFor: (retention, context) => inner.floorFor(retention, context),
-		trimBelow: (floor, max) => inner.trimBelow(floor, max),
-	};
-}
-
 interface Composition {
 	name: string;
 	headRetention: Retention;
 	stages: () => PipelineStage[];
-	rewritableOnly: boolean;
+}
+
+/** A cold tier over memory: chunks of `chunkLogIds` log IDs, a /purge or /rename step reading one chunk, so its sweeps take several steps. */
+function cold(chunkLogIds: number): ColdHistoryTier {
+	return new ColdHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemoryChunkIndex(), codecs: HISTORY_CODECS, prefix: "history/model/", clock: { now: () => 0 }, chunkLogIds, opChunks: 1 });
 }
 
 const compositions: Composition[] = [
-	{ name: "head only", headRetention: { records: 12, thresholdPercent: 100 }, stages: () => [], rewritableOnly: true },
-	{ name: "head → recent → older (all rewritable)", headRetention: { records: 6, thresholdPercent: 100 }, rewritableOnly: true, stages: () => [
+	{ name: "head only", headRetention: { records: 12, thresholdPercent: 100 }, stages: () => [] },
+	{ name: "head → recent → older (memory)", headRetention: { records: 6, thresholdPercent: 100 }, stages: () => [
 		{ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } },
 		{ tier: new MemoryHistoryTier("older"), retention: { records: 10, thresholdPercent: 100 } },
 	] },
-	{ name: "head → recent → cold (cold append-only, kept forever)", headRetention: { records: 6, thresholdPercent: 80 }, rewritableOnly: false, stages: () => [
+	{ name: "head → recent → cold (chunks, kept forever)", headRetention: { records: 6, thresholdPercent: 80 }, stages: () => [
 		{ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } },
-		{ tier: appendOnly("cold"), retention: { thresholdPercent: 100 } },
+		{ tier: cold(4), retention: { thresholdPercent: 100 } },
 	] },
-	// Small segments (one per room per copied batch), trimmed by count.
-	{ name: "head → recent (memory) → cold (blob over MemoryBlobStore)", headRetention: { records: 6, thresholdPercent: 80 }, rewritableOnly: false, stages: () => [
+	{ name: "head → recent → cold (chunks, trimmed by count)", headRetention: { records: 6, thresholdPercent: 80 }, stages: () => [
 		{ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } },
-		{ tier: new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemorySegmentIndex(), prefix: "history/model/", clock: { now: () => 0 } }), retention: { records: 30, thresholdPercent: 100 } },
+		{ tier: cold(3), retention: { records: 30, thresholdPercent: 100 } },
 	] },
 ];
 
@@ -219,24 +210,24 @@ describe("HistoryPipeline over memory tiers", () => {
 		expect((stages[1].tier as MemoryHistoryTier).all()[0].log_id).toBe(made[6].log_id);
 	});
 
-	it("carries /purge to each rewritable tier, and stops at the first that is not", async () => {
+	it("carries /purge to every tier, the cold tier's sweep a chunk a step", async () => {
 		const { clock, head, stages, pipeline } = build(compositions[2]);
 		for (let index = 0; index < 30; index += 1) {
 			clock.time += 10;
 			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "bob" }, body: { text: `${index}` } });
 		}
 		await settle(pipeline);
+		const coldTier = stages[1].tier as ColdHistoryTier;
+		expect((await coldTier.scan(0, 100)).records.some((record) => record.record_json.includes("bob"))).toBe(true);
 		const { reached } = await pipeline.purge(["bob"]);
+		// The cold tier holds several chunks naming bob: its sweep goes on in the next steps.
 		expect(reached).toEqual(["hot", "recent"]);
-		const served = await history(pipeline, "general", 7);
-		const cold = (stages[1].tier as ReturnType<typeof appendOnly>).inner;
-		const recentFloor = (await pipeline.views())[1].state.floor;
-		// bob's messages are gone where purge reached; the cold tier still serves its own.
-		for (const record of served) {
-			const from = (JSON.parse(record.record_json) as { from: { user_id: string } }).from.user_id;
-			if (record.log_id >= recentFloor) expect(from).toBe("ada");
-		}
-		expect(cold.all().some((record) => record.record_json.includes("bob"))).toBe(true);
+		expect((await pipeline.views())[2].state.opCursor).toBeDefined();
+		// Pages read from it meanwhile have the op applied.
+		expect((await history(pipeline, "general", 7)).some((record) => record.record_json.includes("bob"))).toBe(false);
+		await settle(pipeline);
+		expect((await coldTier.scan(0, 100)).records.some((record) => record.record_json.includes("bob"))).toBe(false);
+		expect((await pipeline.views())[2].state.opCursor).toBeUndefined();
 		expect(await head.ops()).toEqual([]);
 	});
 
@@ -274,10 +265,10 @@ describe("HistoryPipeline over memory tiers", () => {
 });
 
 describe("HistoryPipeline upkeep", () => {
-	it("forgets the op log when no tier below the head is rewritable", async () => {
+	it("forgets the op log when there is no tier below the head", async () => {
 		const clock = new TestClock();
 		const head = new MemoryHead("hot", clock);
-		const pipeline = new HistoryPipeline({ head, headRetention: { records: 5, thresholdPercent: 100 }, stages: [{ tier: appendOnly("cold"), retention: { thresholdPercent: 100 } }], state: new MemoryTierStateStore(), clock });
+		const pipeline = new HistoryPipeline({ head, headRetention: { records: 5, thresholdPercent: 100 }, stages: [], state: new MemoryTierStateStore(), clock });
 		head.commit("general", "message", { message_id: "m1", from: { user_id: "ada" } });
 		await head.purge(["ada"]);
 		expect((await head.ops()).length).toBe(1);
@@ -353,7 +344,6 @@ interface World {
 	messages: Array<{ id: string; room: string; from: string }>;
 	step: number;
 	renamed: number;
-	rewritableOnly: boolean;
 }
 
 /** The pipeline under test, and the fault pattern a faulty cycle draws from (none otherwise). */
@@ -452,16 +442,22 @@ class Settle extends Step {
 	}
 }
 
-/** /purge, once settled, so every tier holds exactly what it serves. A purged ID is retired: it never posts again, and no one acts on its messages. */
+/**
+ * /purge, once settled, so every tier holds exactly what it serves, and
+ * carried through every tier before the check: until the cold tier's sweep
+ * reaches a purged user's message, others' reactions on it can still show
+ * above (pages during a sweep are checked apart, below). A purged ID is
+ * retired: it never posts again, and no one acts on its messages.
+ */
 class Purge extends Step {
 	constructor(dt: number, page: number, readonly user: number) { super(dt, page); }
-	check(world: Readonly<World>) { return world.rewritableOnly; }
 	label() { return `purge(user ${this.user})`; }
 	async act(world: World, real: Real) {
 		const index = this.user % world.users.length;
 		const user = world.users[index];
 		await settle(real.pipeline);
 		await real.pipeline.purge([user]);
+		await settle(real.pipeline);
 		world.model.apply({ op: "purge", userIds: [user], messageIds: [] }, await real.pipeline.publishedFloor());
 		world.users[index] = `new${world.step}`;
 		world.messages = world.messages.filter((message) => message.from !== user);
@@ -470,7 +466,6 @@ class Purge extends Step {
 
 class Rename extends Step {
 	constructor(dt: number, page: number, readonly user: number) { super(dt, page); }
-	check(world: Readonly<World>) { return world.rewritableOnly; }
 	label() { return `rename(user ${this.user})`; }
 	async act(world: World, real: Real) {
 		const index = this.user % world.users.length;
@@ -499,7 +494,7 @@ async function verify(world: World, real: Real, page: number): Promise<void> {
 }
 
 /** The commands, weighted as a busy room is: mostly posts and pipeline work, sometimes reactions, moves, purges and renames. */
-function commandsFor(composition: Composition) {
+function commands() {
 	const dt = fc.integer({ min: 1, max: 5 });
 	const page = fc.integer({ min: 1, max: 6 });
 	const room = fc.integer({ min: 0, max: ROOMS.length - 1 });
@@ -514,10 +509,8 @@ function commandsFor(composition: Composition) {
 		{ weight: 16, arbitrary: fc.tuple(dt, page, fc.integer({ min: 1, max: 8 })).map(([d, p, s]) => new Cycle(d, p, s, undefined)) },
 		{ weight: 6, arbitrary: fc.tuple(dt, page, fc.integer({ min: 1, max: 8 }), faults).map(([d, p, s, f]) => new Cycle(d, p, s, f)) },
 		{ weight: 4, arbitrary: fc.tuple(dt, page).map(([d, p]) => new Settle(d, p)) },
-		...(composition.rewritableOnly ? [
-			{ weight: 5, arbitrary: fc.tuple(dt, page, user).map(([d, p, u]) => new Purge(d, p, u)) },
-			{ weight: 5, arbitrary: fc.tuple(dt, page, user).map(([d, p, u]) => new Rename(d, p, u)) },
-		] : []),
+		{ weight: 5, arbitrary: fc.tuple(dt, page, user).map(([d, p, u]) => new Purge(d, p, u)) },
+		{ weight: 5, arbitrary: fc.tuple(dt, page, user).map(([d, p, u]) => new Rename(d, p, u)) },
 	];
 	return fc.commands([fc.oneof(...weighted)], { maxCommands: 120, size: "max" });
 }
@@ -540,7 +533,7 @@ const PROPERTY_TIMEOUT = (env as unknown as Record<string, string | undefined>).
 describe("model-based runs", () => {
 	for (const composition of compositions) {
 		it(composition.name, async () => {
-			await fc.assert(fc.asyncProperty(commandsFor(composition), async (commands) => {
+			await fc.assert(fc.asyncProperty(commands(), async (sequence) => {
 				let real: Real | undefined;
 				await fc.asyncModelRun(() => {
 					const fault = () => {
@@ -551,10 +544,10 @@ describe("model-based runs", () => {
 					const built = build(composition, { faults: fault });
 					real = { clock: built.clock, head: built.head, pipeline: built.pipeline, faults: undefined, previous: { tiers: [], published: 0 } };
 					return {
-						model: { model: new Model(), users: ["ada", "bob", "cy", "dee"], messages: [], step: 0, renamed: 0, rewritableOnly: composition.rewritableOnly },
+						model: { model: new Model(), users: ["ada", "bob", "cy", "dee"], messages: [], step: 0, renamed: 0 },
 						real,
 					};
-				}, commands);
+				}, sequence);
 				// I3, once settled: no tier holds a record below its floor.
 				const { pipeline } = real!;
 				await settle(pipeline);
@@ -611,7 +604,7 @@ describe("model-based regressions", () => {
 	it("drops reactions below the tier that found a purged user's message", async () => {
 		const built = build(compositions[1]);
 		const real: Real = { clock: built.clock, head: built.head, pipeline: built.pipeline, faults: undefined, previous: { tiers: [], published: 0 } };
-		const world: World = { model: new Model(), users: ["ada", "bob", "cy", "dee"], messages: [], step: 0, renamed: 0, rewritableOnly: true };
+		const world: World = { model: new Model(), users: ["ada", "bob", "cy", "dee"], messages: [], step: 0, renamed: 0 };
 		const post = (user: number) => new Post(1, 1, 0, user);
 		const react = () => new React(1, 1, 0, 0);
 		const leave = () => new Membership(1, 1, 0, 0, false);
@@ -622,4 +615,59 @@ describe("model-based regressions", () => {
 		];
 		for (const step of steps) await step.run(world, real);
 	});
+
+	// Found by the model runs: /purge of dee, whose one message is the newest
+	// record in the cold tier, sweeps that tier over two steps. Between them,
+	// a page read from it held only dee's message, which the pending op then
+	// dropped: an empty page, taken for the end of history, so ada's older
+	// message stopped being served (HistoryPipeline.readPart now reads on).
+	it("reads on past records a pending op drops, rather than ending history early", async () => {
+		const built = build(compositions[2]);
+		const { clock, head, pipeline } = built;
+		const general = (id: string, from = "ada") => {
+			clock.time += 1;
+			head.commit("general", "message", { message_id: id, from: { user_id: from }, body: { text: id } });
+		};
+		const ada = head.commit("random", "message", { message_id: "m1", from: { user_id: "ada" }, body: { text: "1" } });
+		for (let index = 0; index < 4; index += 1) general(`g${index}`);
+		clock.time += 1;
+		head.commit("random", "message", { message_id: "m2", from: { user_id: "dee" }, body: { text: "2" } });
+		for (let index = 4; index < 16; index += 1) general(`g${index}`);
+		// One of dee's messages is still in the head: the op names it, so the sweep starts at the oldest chunk.
+		general("d1", "dee");
+		await settle(pipeline);
+		await pipeline.purge(["dee"]);
+		// The sweep is under way: the cold tier has yet to apply the op.
+		expect((await pipeline.views())[2].state.ops).toBe(0);
+		const served = await history(pipeline, "random", 1);
+		expect(served.map((record) => record.log_id)).toEqual([ada.log_id]);
+	});
+
+	// What a page shows while the cold tier sweeps a /purge: nothing of the
+	// purged users' own (their messages, reaction sets and memberships, dropped
+	// from pages by the pending op); others' reactions on their messages show
+	// until the sweep finds those messages, and are gone once it ends.
+	it("hides the purged users' own records during a sweep, and the rest once it ends", async () => {
+		const built = build(compositions[2]);
+		const { clock, head, pipeline } = built;
+		const model = new Model();
+		const post = (id: string, from: string) => model.add(head.commit("general", "message", { message_id: id, from: { user_id: from }, body: { text: id } }));
+		const react = (id: string, from: string) => model.add(head.commit("general", "reactions", { message_id: id, reactions: [{ from: { user_id: from }, emojis: ["👍"] }] }));
+		for (let index = 0; index < 20; index += 1) {
+			clock.time += 1;
+			if (index % 4 === 0) post(`c${index}`, "cy");
+			else if (index % 4 === 1) react(`c${index - 1}`, "ada");
+			else post(`a${index}`, "ada");
+			clock.time += 1;
+			if (index % 5 === 0) react(`a${index + 2}`, "cy");
+		}
+		await settle(pipeline);
+		await pipeline.purge(["cy"]);
+		const during = await history(pipeline, "general", 3);
+		for (const record of during) expect(record.record_json.includes('"cy"')).toBe(false);
+		await settle(pipeline);
+		model.apply({ op: "purge", userIds: ["cy"], messageIds: [] }, await pipeline.publishedFloor());
+		expect(show(await history(pipeline, "general", 3))).toEqual(show(model.room("general", await pipeline.publishedFloor())));
+	});
 });
+

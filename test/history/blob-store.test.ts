@@ -9,7 +9,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { R2BlobStore } from "../../src/history/blob/r2";
+import { R2BlobStore } from "../../src/history/storage/r2";
 import { describeBlobStore } from "./conformance/blob-store";
 
 describeBlobStore("MemoryBlobStore", () => new MemoryBlobStore(), { describe, it, expect });

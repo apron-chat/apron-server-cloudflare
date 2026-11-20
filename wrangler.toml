@@ -25,10 +25,10 @@ new_sqlite_classes = ["ApronDemoServer"]
 binding = "MEDIA"
 bucket_name = "apron-media-dev"
 
-# The blob history tier and backups (docs/configuration.md, History tiers,
+# The cold history tier and backups (docs/configuration.md, History tiers,
 # Backups and imports): a private bucket, no public access. Used by the
 # tests and `wrangler dev` (miniflare's local R2): bound, it is the tier
-# below D1, keeping segments under history/, and backups go under backups/.
+# below D1, keeping chunks under history/, and backups go under backups/.
 [[r2_buckets]]
 binding = "HISTORY_BLOB"
 bucket_name = "apron-history-dev"
@@ -38,7 +38,7 @@ bucket_name = "apron-history-dev"
 # LIMIT_RETENTION_RECORDS, the oldest move from the object's SQLite to D1,
 # where history pages still read them but their messages can no longer be
 # edited, reacted to or replied to; past LIMIT_HISTORY_D1_RECORDS more, they
-# go on to the blob tier (HISTORY_BLOB, above). Local development and the
+# go on to the cold tier (HISTORY_BLOB, above). Local development and the
 # tests use a local database; the id is a placeholder.
 [[d1_databases]]
 binding = "HISTORY_D1"
@@ -68,7 +68,7 @@ LIMIT_MIN_RETENTION_SECONDS = "259200"
 LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
-LIMIT_HISTORY_BLOB_RECORDS = "0"
+LIMIT_HISTORY_COLD_RECORDS = "0"
 # Backups on demand only (`/history export`, no schedule) to the local
 # HISTORY_BLOB bucket, the newest 14 of each kind kept, private rooms
 # included, gzip-compressed (not encrypted).

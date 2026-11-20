@@ -3,9 +3,11 @@ import { exportArchive } from "../../src/history/archive/export";
 import { type ArchiveCodec, type ArchivedUser, collectArchive, compareReplayed, gzip, jsonlReader, jsonlWriter, linesOf, openArchive, replayRecords, writeArchiveToString } from "@apron/archive";
 import { importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { type BackupSettings, CODECS_METADATA, backupFamily, writeBackup } from "../../src/history/exports";
-import { MemorySegmentIndex } from "./support/memory-segment-index";
-import { BlobHistoryTier } from "../../src/history/blob/tier";
+import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
+import { CODECS_METADATA } from "../../src/history/storage/encoding";
+import { MemoryChunkIndex } from "./support/memory-chunk-index";
+import { ColdHistoryTier } from "../../src/history/cold/tier";
+import { HISTORY_CODECS } from "../../src/history/config";
 import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/memory-tiers";
 import { HistoryPipeline, type PipelineStage } from "../../src/history/pipeline";
 import { sceneArchives } from "../../packages/archive/test/fixtures/scenes";
@@ -22,7 +24,7 @@ function pipelineOf(composition: Composition, clock = new TestClock()) {
 	const stages: PipelineStage[] = [];
 	if (composition !== "head") stages.push({ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } });
 	if (composition === "head+recent+cold") {
-		stages.push({ tier: new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemorySegmentIndex(), prefix: "history/test/", clock }), retention: { thresholdPercent: 100 } });
+		stages.push({ tier: new ColdHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemoryChunkIndex(), codecs: HISTORY_CODECS, prefix: "history/test/", clock, chunkLogIds: 4 }), retention: { thresholdPercent: 100 } });
 	}
 	const pipeline = new HistoryPipeline({ head, headRetention: { records: 6, thresholdPercent: 100 }, stages, state: new MemoryTierStateStore(), clock, batch: 4 });
 	return { head, pipeline, clock };
@@ -193,9 +195,9 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const store = new MemoryBlobStore();
-		const { key } = await writeBackup(source.pipeline, store, { keep: 14, privateRooms: true }, "manual", { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
+		const { key } = await writeBackup(source.pipeline, store, { keep: 14, privateRooms: true }, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
 		expect(key).toBe("backups/srv-manual-20261119-120000.jsonl.gz");
-		expect(store.contentType(key)).toBe("application/gzip");
+		expect(store.contentType(key)).toBe("application/octet-stream");
 		const object = (await store.get(key))!;
 		expect(object.metadata).toEqual({ [CODECS_METADATA]: "gzip" });
 		const bytes = new Uint8Array(await new Response(await object.stream()).arrayBuffer());
@@ -319,7 +321,7 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		for (let day = 0; day < 3; day += 1) {
-			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, store, settings, kind, { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
+			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, store, settings, kind, { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
 		}
 		const keys = (await store.list("backups/")).keys.map((entry) => entry.key);
 		expect(keys).toEqual([
@@ -504,9 +506,9 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const at = Date.UTC(2026, 10, 19, 12);
-		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock: { now: () => at } });
-		await expect(writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
-		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock: { now: () => at + 1_000 } });
+		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at } });
+		await expect(writeBackup(source.pipeline, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
+		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 1_000 } });
 		expect((await store.list("backups/")).keys).toHaveLength(2);
 	});
 
@@ -519,7 +521,7 @@ describe("export and import", () => {
 		const store = new MemoryBlobStore();
 		const lines = async (privateRooms: boolean) => {
 			const settings: BackupSettings = { keep: 14, privateRooms };
-			const { key } = await writeBackup(source.pipeline, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", clock: source.clock });
+			const { key } = await writeBackup(source.pipeline, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", codecs: HISTORY_CODECS, clock: source.clock });
 			return new Response((await (await store.get(key))!.stream()).pipeThrough(gzip.decoder())).text();
 		};
 		expect(await lines(true)).toContain("between us");

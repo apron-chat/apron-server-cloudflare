@@ -1,15 +1,15 @@
 /*
  * The D1 history tier (binding HISTORY_D1): records that left the head,
  * kept in the same shape (one row per room and log ID) until its own
- * retention lets them go. Rewritable: /purge and /rename reach it,
- * and it serves joined-rooms pages.
+ * retention lets them go. /purge and /rename reach it (applyOp), each in
+ * one step.
  *
  * Every write may be repeated without harm, so a failure is retried by a
  * later cycle.
  */
 
-import { type ChatRecord, type HistoryQuery, type RecordRange, type Retention, type TierStats, purgedRecord, renamedRecord, thresholdCount, toRange } from "./records";
-import type { FloorContext, PurgeResult, RewritableTier } from "./tier";
+import { type ChatRecord, type HistoryOp, type HistoryQuery, type RecordRange, type Retention, type TierStats, purgedRecord, renamedRecord, thresholdCount, toRange } from "./records";
+import type { FloorContext, LowerTier, OpStep } from "./tier";
 
 /** Statements one D1 batch carries at most. */
 const BATCH_STATEMENTS = 50;
@@ -24,8 +24,7 @@ interface Row {
 
 const toRecord = (row: Row): ChatRecord => ({ ...row, log_id: Number(row.log_id), commit_ms: Number(row.commit_ms) });
 
-export class D1HistoryTier implements RewritableTier {
-	readonly multiRoom = true;
+export class D1HistoryTier implements LowerTier {
 	private ready?: Promise<void>;
 
 	/** The table it keeps records in: one per tier sharing a database (the tests run several). */
@@ -182,21 +181,32 @@ export class D1HistoryTier implements RewritableTier {
 		return result.meta.changes ?? 0;
 	}
 
+	/** /purge and /rename, each in one step: a few statements over the whole table. */
+	async applyOp(op: HistoryOp, step: OpStep): Promise<undefined> {
+		if (op.op === "purge") await this.purge(op.userIds, op.messageIds, step);
+		else await this.rename(op.from, op.to);
+		return undefined;
+	}
+
 	/**
 	 * /purge (Store.purgeUsers) of what is here: the users' message
 	 * snapshots go, with every reaction set on their messages (`messageIds`,
 	 * their current ones, and those whose snapshots are here), and their
 	 * reaction sets and memberships are taken out of the records listing
-	 * them, a record left empty going. Returns the messages of theirs found here.
+	 * them, a record left empty going. The messages of theirs found here are
+	 * told (`step.found`) before anything is rewritten.
 	 */
-	async purge(userIds: readonly string[], messageIds: readonly string[] = []): Promise<PurgeResult> {
+	private async purge(userIds: readonly string[], messageIds: readonly string[], step: OpStep): Promise<void> {
 		await this.schema();
 		const ids = JSON.stringify(userIds);
 		const authored = await this.db.prepare(
 			`SELECT DISTINCT json_extract(record_json, '$.message_id') AS message_id FROM ${this.table}
 			 WHERE kind = 'message' AND json_extract(record_json, '$.from.user_id') IN (SELECT value FROM json_each(?1))`,
 		).bind(ids).all<{ message_id: string }>();
-		const messages = [...new Set([...messageIds, ...authored.results.map((row) => row.message_id)])];
+		const mine = authored.results.map((row) => row.message_id);
+		// Told before anything is rewritten: the rewrite removes what found them.
+		await step.found(mine);
+		const messages = [...new Set([...messageIds, ...mine])];
 		const listing = await this.db.prepare(
 			`SELECT room_id, log_id, kind, record_json FROM ${this.table} WHERE
 			   (kind = 'reactions' AND (json_extract(record_json, '$.message_id') IN (SELECT value FROM json_each(?2)) OR EXISTS (
@@ -209,11 +219,10 @@ export class D1HistoryTier implements RewritableTier {
 			`DELETE FROM ${this.table} WHERE kind = 'message' AND json_extract(record_json, '$.from.user_id') IN (SELECT value FROM json_each(?1))`,
 		).bind(ids));
 		await this.run(statements);
-		return { messageIds: authored.results.map((row) => row.message_id) };
 	}
 
 	/** /rename (Store.renameIdentity) of what is here: every record naming `from` names `to`. */
-	async rename(from: string, to: string): Promise<void> {
+	private async rename(from: string, to: string): Promise<void> {
 		await this.schema();
 		const listing = await this.db.prepare(
 			`SELECT room_id, log_id, kind, record_json FROM ${this.table} WHERE

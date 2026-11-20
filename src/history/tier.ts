@@ -7,7 +7,7 @@
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import type { ChatRecord, HistoryQuery, QueuedOp, RecordRange, Retention, TierStats } from "./records";
+import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp, RecordRange, Retention, TierStats } from "./records";
 
 /** What floorFor may count against: the floor of the tier above (records at or past it are only copies) and the time. */
 export interface FloorContext {
@@ -20,8 +20,12 @@ export interface FloorContext {
 export interface HistoryTier {
 	/** Stable: names its state. */
 	readonly name: string;
-	/** Serves joined-rooms pages, which read several rooms at once. Default true. */
-	readonly multiRoom?: boolean;
+	/**
+	 * Log IDs a copy into this tier takes at once (the pipeline scans the tier
+	 * above with it): a tier that stores records in large pieces (the cold
+	 * tier's chunks) asks for a piece's worth. Default: the pipeline's batch.
+	 */
+	readonly appendBatch?: number;
 	/** INSERT OR REPLACE semantics. */
 	append(range: RecordRange): Promise<void>;
 	/** Oldest first from `from`, at most `limit` distinct log IDs, every room's copy of each. */
@@ -33,27 +37,37 @@ export interface HistoryTier {
 	stats(context?: { lower?: number; upper?: number }): Promise<TierStats>;
 	/** The floor its retention allows: records below it may leave. Undefined: nothing need leave. */
 	floorFor(retention: Retention, context: FloorContext): Promise<number | undefined>;
-	/** Deletes records below `floor`, at most `max` (blob tiers: whole segments only); returns how many went. */
+	/** Deletes records below `floor`, at most `max` (or a little more, where it keeps records in pieces); returns how many went. */
 	trimBelow(floor: number, max: number): Promise<number>;
 }
 
-/** What a purge found that the tiers above may still refer to. */
-export interface PurgeResult {
-	/** Messages of the purged users this tier held: reaction sets on them elsewhere go too. */
-	messageIds: string[];
+/** What a tier is given to apply one op with (LowerTier.applyOp). */
+export interface OpStep {
+	/** Where a previous step of this op stopped (what applyOp returned), or undefined to start. */
+	cursor?: string;
+	/**
+	 * Called with the messages of a purge's users this tier holds that the op
+	 * does not name yet, before the tier rewrites anything: the pipeline adds
+	 * them to the op (HistoryHead.amendPurge) for the tiers below and pages
+	 * read from them, and drops their reactions above. Called before a
+	 * rewrite, so a crash after it loses nothing the rewrite removed.
+	 */
+	found(messageIds: readonly string[]): Promise<void>;
 }
 
-/** A tier /purge and /rename reach. */
-export interface RewritableTier extends HistoryTier {
-	/** Removes the users' message snapshots, every reaction set on those messages (and on `messageIds`), and their reaction sets and memberships elsewhere. */
-	purge(userIds: readonly string[], messageIds?: readonly string[]): Promise<PurgeResult>;
-	/** Every record naming `from` names `to`. */
-	rename(from: string, to: string): Promise<void>;
-}
-
-export function isRewritable(tier: HistoryTier): tier is RewritableTier {
-	return typeof (tier as Partial<RewritableTier>).purge === "function" &&
-		typeof (tier as Partial<RewritableTier>).rename === "function";
+/**
+ * A tier below the head: /purge and /rename reach every one, through the
+ * head's op log (HistoryPipeline.applyOps).
+ */
+export interface LowerTier extends HistoryTier {
+	/**
+	 * Applies `op` (a purge: drop the users' message snapshots, every reaction
+	 * set on those messages and on `op.messageIds`, and their reaction sets and
+	 * memberships elsewhere; a rename: every record naming `from` names `to`),
+	 * or a bounded part of it. Returns the cursor to continue from in the next
+	 * step, or undefined once the op is applied. Repeating a step does no harm.
+	 */
+	applyOp(op: HistoryOp, step: OpStep): Promise<string | undefined>;
 }
 
 /**
@@ -61,22 +75,26 @@ export function isRewritable(tier: HistoryTier): tier is RewritableTier {
  * trimming is its own (Store.runCleanup, with the copy marker as a ceiling);
  * the pipeline asks for it through trimBelow.
  */
-export interface HistoryHead extends RewritableTier {
+export interface HistoryHead extends HistoryTier {
+	/** /purge here: the users' records and state go, and the op is queued for the tiers below (ops). */
+	purge(userIds: readonly string[]): Promise<void>;
+	/** /rename here: every record naming `from` names `to`, and the op is queued for the tiers below. */
+	rename(from: string, to: string): Promise<void>;
 	/** The floor history is published from: the deepest readable tier's. */
 	publishedFloor(): Promise<number>;
 	/** Raises the published floor (never past the head's own floor). */
 	publish(floor: number): Promise<void>;
-	/** The op log: `/purge` and `/rename` done here, for the rewritable tiers below. */
+	/** The op log: `/purge` and `/rename` done here, for the tiers below. */
 	ops(): Promise<QueuedOp[]>;
-	/** Forgets ops through `seq`, once every rewritable tier applied them. */
+	/** Forgets ops through `seq`, once every tier below applied them. */
 	dropOps(seq: number): Promise<void>;
 	/**
 	 * Adds `messageIds` to queued purge `seq`: messages of its users that a
-	 * tier below found (PurgeResult.messageIds), so the tiers below that one,
+	 * tier below found (OpStep.found), so the tiers below that one,
 	 * and pages read from them meanwhile, drop those messages' records too.
 	 */
 	amendPurge(seq: number, messageIds: readonly string[]): Promise<void>;
-	/** Drops the head's reaction records on messages only a lower tier held (PurgeResult.messageIds). */
+	/** Drops the head's reaction records on messages only a lower tier held (OpStep.found). */
 	dropReactionsOn(messageIds: readonly string[]): Promise<void>;
 	hasRoom(roomId: string): Promise<boolean>;
 	hasUser(userId: string): Promise<boolean>;
@@ -133,8 +151,10 @@ export interface TierState {
 	target: number;
 	/** The newest log ID the NEXT tier holds a copy of (unused on the last tier). */
 	through: number;
-	/** The last op (QueuedOp.seq) this tier applied (rewritable tiers below the head). */
+	/** The last op (QueuedOp.seq) this tier applied (tiers below the head). */
 	ops: number;
+	/** Where this tier's application of the next op (`ops` + 1) stopped, while it takes several steps (LowerTier.applyOp). */
+	opCursor?: string;
 	/** When the copy to the next tier first failed, since its last success. */
 	stalledSince?: number;
 	/** When admins were alerted of this stall. */

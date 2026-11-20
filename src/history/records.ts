@@ -32,8 +32,6 @@ export interface HistoryQuery {
 	upper: number;
 	forward: boolean;
 	limit: number;
-	/** A joined-rooms page (PROTOCOL §4.3.3): only tiers that serve several rooms at once take part. */
-	joined?: boolean;
 }
 
 /**
@@ -105,7 +103,7 @@ export function toRange(records: readonly ChatRecord[]): RecordRange {
 }
 
 /**
- * Records with `/purge` and `/rename` applied in order, as a rewritable tier
+ * Records with `/purge` and `/rename` applied in order, as a tier below the head
  * applies them to what it holds: a purged user's message snapshots go, with
  * every reaction set on those messages (the op's own, and those found among
  * `records`), and their reaction sets and memberships; a record left empty

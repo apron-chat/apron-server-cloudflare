@@ -2,16 +2,16 @@
  * HistoryPipeline: the head and the tiers below it, in
  * order, and every rule between them. It runs bounded maintenance cycles
  * (copy down, mark, advance, trim, publish), serves history pages across
- * tiers, and carries /purge and /rename down to each rewritable tier.
+ * tiers, and carries /purge and /rename down to each tier below the head.
  * Planning is pure (plan.ts); this file only executes.
  */
 
-import { type PipelineSnapshot, type ReadPart, type Step, type TierView, mergePages, planRead, planStep, rewritableReach } from "./plan";
+import { type PipelineSnapshot, type ReadPart, type Step, type TierView, mergePages, planRead, planStep } from "./plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type Retention, type TierStats, applyOps, logIds, toRange } from "./records";
-import { type HistoryHead, type HistoryTier, type RewritableTier, type TierState, type TierStateStore, isRewritable } from "./tier";
+import type { HistoryHead, HistoryTier, LowerTier, TierState, TierStateStore } from "./tier";
 
 export interface PipelineStage {
-	tier: HistoryTier;
+	tier: LowerTier;
 	retention: Retention;
 	/** Whether history pages read it (default: when it has `read`). */
 	readable?: boolean;
@@ -33,7 +33,7 @@ export interface PipelineOptions {
 	stages: readonly PipelineStage[];
 	state: TierStateStore;
 	clock: Clock;
-	/** Log IDs per copy step. */
+	/** Log IDs per copy step, where the tier copied into does not ask for its own (HistoryTier.appendBatch). */
 	batch?: number;
 	/** Records per trim step. */
 	trimBatch?: number;
@@ -46,7 +46,6 @@ export interface TierReport {
 	state: TierState;
 	retention: Retention;
 	readable: boolean;
-	rewritable: boolean;
 }
 
 const DEFAULT_BATCH = 100;
@@ -59,6 +58,8 @@ const TARGET_REFRESH_MS = 3_600_000;
 export class HistoryPipeline {
 	readonly head: HistoryHead;
 	readonly tiers: readonly HistoryTier[];
+	/** The tiers below the head, by their index in `tiers` less one. */
+	private readonly lower: readonly LowerTier[];
 	private readonly retentions: readonly Retention[];
 	private readonly readable: readonly boolean[];
 	private readonly labels: readonly string[];
@@ -80,7 +81,8 @@ export class HistoryPipeline {
 
 	constructor(options: PipelineOptions) {
 		this.head = options.head;
-		this.tiers = [options.head, ...options.stages.map((stage) => stage.tier)];
+		this.lower = options.stages.map((stage) => stage.tier);
+		this.tiers = [options.head, ...this.lower];
 		this.retentions = [options.headRetention, ...options.stages.map((stage) => stage.retention)];
 		this.readable = [true, ...options.stages.map((stage) => stage.readable ?? typeof stage.tier.read === "function")];
 		this.labels = ["SQLite", ...options.stages.map((stage) => stage.label ?? stage.tier.name)];
@@ -96,8 +98,6 @@ export class HistoryPipeline {
 		return this.tiers.map((tier, index) => ({
 			name: tier.name,
 			readable: this.readable[index],
-			rewritable: isRewritable(tier),
-			multiRoom: tier.multiRoom ?? true,
 			state: states[tier.name],
 		}));
 	}
@@ -116,11 +116,7 @@ export class HistoryPipeline {
 	async cycle(budget: { steps: number }): Promise<{ more: boolean; report: CycleReport }> {
 		const report: CycleReport = { steps: [], copied: 0, trimmed: 0 };
 		const progress = this.round;
-		// No rewritable tier below the head: the op log has no one to wait for.
-		if (rewritableReach(await this.views()) <= 1) {
-			const ops = await this.head.ops();
-			if (ops.length) await this.head.dropOps(ops[ops.length - 1].seq);
-		}
+		await this.forgetOpsWithoutTiers();
 		for (let count = 0; count < budget.steps; count += 1) {
 			const snapshot = await this.snapshot(progress);
 			const step = planStep(snapshot);
@@ -180,11 +176,12 @@ export class HistoryPipeline {
 			case "copy": {
 				const from = this.tiers[step.from];
 				const to = this.tiers[step.to];
-				const range = await from.scan(step.start, this.batch);
+				const batch = to.appendBatch ?? this.batch;
+				const range = await from.scan(step.start, batch);
 				const records = range.records.filter((record) => record.log_id < step.below);
 				if (records.length) await to.append(toRange(records));
 				// The tier holds everything below the target once a scan came short of a batch or reached it.
-				const exhausted = logIds(range.records).length < this.batch || records.length < range.records.length;
+				const exhausted = logIds(range.records).length < batch || records.length < range.records.length;
 				const through = exhausted ? step.below - 1 : records[records.length - 1].log_id;
 				const state = snapshot.tiers[step.from].state;
 				await this.state.save(from.name, { through: Math.max(state.through, through), stalledSince: undefined, alertedAt: undefined });
@@ -213,45 +210,65 @@ export class HistoryPipeline {
 	}
 
 	/**
-	 * Applies the op log to tier `index` (a rewritable tier below the head),
-	 * in order, each op once; then forgets the ops every such tier applied.
-	 * Messages of purged users that the tiers above did not know have their
-	 * records dropped above (reactions) and below (the amended op).
+	 * Applies the op log to tier `index` (below the head), in order, each op
+	 * once, a bounded step at a time: a tier that needs several steps for an
+	 * op (the cold tier's sweep) returns a cursor, kept in its state, and the
+	 * next "ops" step goes on from it. Then forgets the ops every tier below
+	 * the head applied. Returns whether the tier holds every op.
 	 */
-	private async applyOps(index: number): Promise<void> {
-		const tier = this.tiers[index];
-		if (!isRewritable(tier)) return;
+	private async applyOps(index: number): Promise<boolean> {
+		const tier = this.tiers[index] as LowerTier;
 		const views = await this.views();
 		const ops = await this.head.ops();
-		let applied = views[index].state.ops;
+		const state = views[index].state;
+		let applied = state.ops;
+		let cursor = state.opCursor;
 		for (const { seq, op } of ops) {
 			if (seq <= applied) continue;
-			if (op.op === "purge") {
-				const result = await tier.purge(op.userIds, op.messageIds);
-				// Messages the tiers above did not know as the users': their
-				// records can be anywhere. Reactions on them can be above, in
-				// tiers that already applied the op, and also below: a message's
-				// latest snapshot (an edit, a move) can be here while reactions
-				// made before it went further down and its first snapshot is gone.
-				// The op takes them with it for the tiers below (and pages read
-				// from them meanwhile); the tiers above drop them now.
-				const fresh = result.messageIds.filter((id) => !op.messageIds.includes(id));
-				if (fresh.length) {
-					await this.head.amendPurge(seq, fresh);
-					await this.head.dropReactionsOn(fresh);
-					for (let above = 1; above < index; above += 1) await (this.tiers[above] as RewritableTier).purge([], fresh);
-				}
-			} else {
-				await tier.rename(op.from, op.to);
+			const next = await tier.applyOp(op, { cursor, found: (messageIds) => this.carryFound(index, seq, op, messageIds) });
+			if (next !== undefined) {
+				await this.state.save(tier.name, { opCursor: next });
+				return false;
 			}
 			applied = seq;
-			await this.state.save(tier.name, { ops: seq });
+			cursor = undefined;
+			await this.state.save(tier.name, { ops: seq, opCursor: undefined });
 			this.noteRecent(op);
 		}
-		const reach = rewritableReach(views);
-		const cursors = views.slice(1, reach).map((view, offset) => offset + 1 === index ? applied : view.state.ops);
-		const done = cursors.length ? Math.min(...cursors) : ops.length ? ops[ops.length - 1].seq : 0;
+		const cursors = views.slice(1).map((view, offset) => offset + 1 === index ? applied : view.state.ops);
+		const done = Math.min(...cursors);
 		if (ops.length && ops[0].seq <= done) await this.head.dropOps(done);
+		return true;
+	}
+
+	/**
+	 * Messages of a purge's users that tier `index` holds and the op did not
+	 * name: their records can be anywhere. Reactions on them can be above, in
+	 * tiers that already applied the op, and also below: a message's latest
+	 * snapshot (an edit, a move) can be here while reactions made before it
+	 * went further down and its first snapshot is gone. The op takes them
+	 * with it for the tiers below (and pages read from them meanwhile); the
+	 * tiers above drop them now.
+	 */
+	private async carryFound(index: number, seq: number, op: HistoryOp, messageIds: readonly string[]): Promise<void> {
+		if (op.op !== "purge") return;
+		const fresh = messageIds.filter((id) => !op.messageIds.includes(id));
+		if (!fresh.length) return;
+		await this.head.amendPurge(seq, fresh);
+		await this.head.dropReactionsOn(fresh);
+		const drop: HistoryOp = { op: "purge", userIds: [], messageIds: fresh };
+		for (const above of this.lower.slice(0, index - 1)) {
+			let cursor: string | undefined;
+			do cursor = await above.applyOp(drop, { cursor, found: async () => undefined });
+			while (cursor !== undefined);
+		}
+	}
+
+	/** A pipeline with no tier below the head: the op log has no one to wait for. */
+	private async forgetOpsWithoutTiers(): Promise<void> {
+		if (this.lower.length) return;
+		const ops = await this.head.ops();
+		if (ops.length) await this.head.dropOps(ops[ops.length - 1].seq);
 	}
 
 	private noteRecent(op: HistoryOp): void {
@@ -260,9 +277,9 @@ export class HistoryPipeline {
 	}
 
 	/**
-	 * /purge through the pipeline: the head first, then each rewritable tier
-	 * below it in order, stopping at the first that is not. A
-	 * tier that fails now is caught up by the next cycle; pages read from it
+	 * /purge through the pipeline: the head first, then each tier below it
+	 * in order, as far as each gets in a step. A tier that fails, or needs
+	 * more steps, is caught up by the next cycles; pages read from it
 	 * meanwhile have the op applied in memory.
 	 */
 	async purge(userIds: readonly string[]): Promise<{ reached: string[] }> {
@@ -276,22 +293,18 @@ export class HistoryPipeline {
 		return this.carryOps();
 	}
 
-	/** Applies the op log down the rewritable tiers now; returns the tiers that hold every op. */
+	/** Applies the op log down the tiers now, a step each; returns the tiers that hold every op. */
 	async carryOps(): Promise<{ reached: string[] }> {
 		const reached = [this.head.name];
-		const reach = rewritableReach(await this.views());
-		for (let index = 1; index < reach; index += 1) {
+		for (let index = 1; index < this.tiers.length; index += 1) {
 			try {
-				await this.applyOps(index);
+				if (!await this.applyOps(index)) break;
 				reached.push(this.tiers[index].name);
 			} catch {
 				break;
 			}
 		}
-		if (reach <= 1) {
-			const ops = await this.head.ops();
-			if (ops.length) await this.head.dropOps(ops[ops.length - 1].seq);
-		}
+		await this.forgetOpsWithoutTiers();
 		return { reached };
 	}
 
@@ -310,23 +323,39 @@ export class HistoryPipeline {
 		if (!query.roomIds.length || query.lower > query.upper || query.limit <= 0) return [];
 		const [views, published] = await Promise.all([this.views(), this.head.publishedFloor()]);
 		const parts = planRead(query, views, published, options);
+		const pending = parts.some((part) => part.tier > 0) ? await this.head.ops() : [];
 		const pages: Array<{ tier: number; records: ChatRecord[] }> = [];
 		let found = new Set<number>();
 		for (const part of parts) {
 			if (found.size >= query.limit) break;
-			const records = await this.readPart(part, query.limit - found.size);
+			const ops = part.tier === 0 ? [] : this.opsFor(views[part.tier].state, pending);
+			const records = await this.readPart(part, query.limit - found.size, ops);
 			pages.push({ tier: part.tier, records });
 			found = new Set([...found, ...logIds(records)]);
 		}
-		const pending = pages.some((page) => page.tier > 0) ? await this.head.ops() : [];
-		const rewritten = pages.map((page) => page.tier === 0 || !views[page.tier].rewritable ? page : { ...page, records: applyOps(page.records, this.opsFor(views[page.tier].state, pending)) });
-		return mergePages(rewritten, query);
+		return mergePages(pages, query);
 	}
 
-	private async readPart(part: ReadPart, limit: number): Promise<ChatRecord[]> {
+	/**
+	 * A tier's part of a page, with `ops` applied: read on past what they
+	 * drop until the part has `limit` log IDs or the tier has no more in its
+	 * window, so a page whose records were all purged is not taken for the
+	 * end of history.
+	 */
+	private async readPart(part: ReadPart, limit: number, ops: readonly HistoryOp[]): Promise<ChatRecord[]> {
 		const tier = this.tiers[part.tier];
 		if (!tier.read) return [];
-		return tier.read({ ...part.query, limit });
+		const kept: ChatRecord[] = [];
+		let query = { ...part.query, limit };
+		for (;;) {
+			const records = await tier.read(query);
+			kept.push(...(ops.length ? applyOps(records, ops) : records));
+			const ids = logIds(records);
+			if (ids.length < query.limit || logIds(kept).length >= limit) return kept;
+			// The tier filled the page, but the ops dropped some: on from past what it read.
+			query = query.forward ? { ...query, lower: Math.max(...ids) + 1 } : { ...query, upper: Math.min(...ids) - 1 };
+			if (query.lower > query.upper) return kept;
+		}
 	}
 
 	/** The ops a tier has yet to apply, after those applied lately (applying one twice changes nothing). */
@@ -353,7 +382,7 @@ export class HistoryPipeline {
 			const upper = index === 0 ? undefined : views[index - 1].state.floor - 1;
 			return {
 				name: tier.name, label: this.labels[index], stats: await tier.stats({ lower, ...(upper === undefined ? {} : { upper }) }),
-				state: views[index].state, retention: this.retentions[index], readable: views[index].readable, rewritable: views[index].rewritable,
+				state: views[index].state, retention: this.retentions[index], readable: views[index].readable,
 			};
 		}));
 	}

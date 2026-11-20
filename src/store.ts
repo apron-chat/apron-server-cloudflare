@@ -30,7 +30,7 @@ import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/re
 import type { TierState } from "./history/tier";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
-import { SEGMENT_QUERY_ROWS, SqlSegmentIndex, type SqlPort } from "./history/blob/segments";
+import type { ChunkIndex, ChunkRef } from "./history/cold/chunks";
 import {
   BudgetLedger,
   MAINTENANCE_CONTROL_READS,
@@ -1098,8 +1098,6 @@ const META_HISTORY_TIER = "history:tier:";
 const META_HISTORY_EXPORT = "history:export:";
 /** The running import's journal: its archive, user mapping and rooms still to finish (importArchive). */
 const META_HISTORY_IMPORT = "history:import";
-/** Segment index rows a blob tier's query reads at most (segmentIndex): every query is bounded by SEGMENT_QUERY_ROWS, with room for index pages. */
-const SEGMENT_INDEX_READS = 2 * SEGMENT_QUERY_ROWS + 64;
 /** Log IDs one copy from this SQLite carries at most (historyScan). */
 export const HISTORY_SCAN_BATCH = 100;
 /** Index entries historyTarget reads past the cutoff at most, looking for the first record it keeps. */
@@ -2450,8 +2448,10 @@ export class Store {
   private serverCache: StoredServerMetadata | null = null;
   /** The rooms one roomMembers call read, when nothing is kept. */
   private readonly uncachedMembers = new Map<string, MemberCacheEntry>();
-  /** The blob tiers' segment indexes in this SQLite, by tier name (segmentIndex). */
-  private readonly segmentIndexes = new Map<string, SqlSegmentIndex>();
+  /** The cold tiers' chunk indexes, as loaded from this SQLite, by tier name (chunkIndex). */
+  private readonly chunkIndexes = new Map<string, Map<number, ChunkRef>>();
+  /** Whether the chunk table exists, this instance (chunkIndex). */
+  private chunkTableReady = false;
 
   constructor(
     storageOrState: unknown,
@@ -4106,7 +4106,7 @@ export class Store {
     });
   }
 
-  /** Forgets the ops through `seq`, once every rewritable tier below applied them. */
+  /** Forgets the ops through `seq`, once every tier below applied them. */
   dropHistoryOps(seq: number, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 4, writes: 4 }, true, now, () => {
@@ -4117,7 +4117,7 @@ export class Store {
 
   /**
    * Deletes the hot log's reaction sets on `messageIds`, messages of purged
-   * users that only a tier below held (HistoryPipeline: PurgeResult.messageIds): /purge found no current
+   * users that only a tier below held (HistoryPipeline: OpStep.found): /purge found no current
    * message for them, so their newer reaction records were left. Scans the
    * retained log for them, as /purge does.
    */
@@ -4527,46 +4527,44 @@ export class Store {
   }
 
   /**
-   * A blob tier's segment index, in this SQLite: one table a tier,
-   * `history_segments_<tier>` (characters other than [a-z0-9_] made `_`),
-   * created on first use, and one instance a tier name. Each statement is
-   * charged to maintenance: a read at most SEGMENT_INDEX_READS rows (every
-   * query SqlSegmentIndex makes is bounded by SEGMENT_QUERY_ROWS, however
-   * many segments the tier holds), and a write one segment's row and its
-   * index entries (clearing the table removes a bounded page at a time).
+   * A cold tier's chunk index (ChunkIndex), in this SQLite: one row a chunk
+   * in `history_chunks`, keyed by tier name and the chunk's first log ID,
+   * created on first use. The rows are read once a wake (a chunk holds
+   * about 10,000 log IDs, so they are few) and kept in memory (this object
+   * is the only writer); each read and write is charged to maintenance.
    */
-  segmentIndex(tier: string): SqlSegmentIndex {
-    const cached = this.segmentIndexes.get(tier);
-    if (cached) return cached;
-    // One table per tier name, and no two names alike: `_` doubles, `-` is `_d`, anything else `_x<hex>`.
-    const table = `history_segments_${[...tier].map((char) => /[a-z0-9]/.test(char) ? char : char === "_" ? "__" : char === "-" ? "_d" : `_x${char.codePointAt(0)!.toString(16)}_`).join("")}`;
-    let ready = false;
+  chunkIndex(tier: string): ChunkIndex {
     const prepare = () => {
       this.ensureReady();
-      if (ready) return;
-      ready = true;
-      try {
-        index.ensureSchema();
-      } catch (error) {
-        ready = false;
-        throw error;
-      }
+      if (this.chunkTableReady) return;
+      this.reserved({ reads: 8, writes: 8 }, true, this.clock.now(), () => {
+        this.rawExec("CREATE TABLE IF NOT EXISTS history_chunks (tier TEXT NOT NULL, first INTEGER NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (tier, first)) WITHOUT ROWID");
+      });
+      this.chunkTableReady = true;
     };
-    const port: SqlPort = {
-      rows: <T>(query: string, ...binds: unknown[]): T[] => {
-        prepare();
-        return this.reserved({ reads: 24 + SEGMENT_INDEX_READS }, true, this.clock.now(), () => this.rawRows<T>(query, ...binds));
-      },
-      run: (query: string, ...binds: unknown[]): void => {
-        prepare();
-        this.reserved({ reads: 64, writes: 64 }, true, this.clock.now(), () => {
-          this.rawExec(query, ...binds);
+    const loaded = (): Map<number, ChunkRef> => {
+      const cached = this.chunkIndexes.get(tier);
+      if (cached) return cached;
+      prepare();
+      // Charged for the rows there are: a count first, then the rows.
+      const count = this.reserved({ reads: 24 }, true, this.clock.now(), () => Number(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = ?", tier)[0]?.count ?? 0));
+      const rows = this.reserved({ reads: 24 + count }, true, this.clock.now(), () => this.rawRows<{ first: number; ref: string }>("SELECT first, ref FROM history_chunks WHERE tier = ?", tier));
+      const refs = new Map(rows.map((row) => [Number(row.first), JSON.parse(row.ref) as ChunkRef]));
+      this.chunkIndexes.set(tier, refs);
+      return refs;
+    };
+    return {
+      list: async () => [...loaded().values()].map((ref) => ({ ...ref })),
+      update: async ({ put = [], remove = [] }) => {
+        const refs = loaded();
+        this.reserved({ reads: 8 + put.length + remove.length, writes: 2 * (put.length + remove.length) }, true, this.clock.now(), () => {
+          for (const first of remove) this.rawExec("DELETE FROM history_chunks WHERE tier = ? AND first = ?", tier, first);
+          for (const ref of put) this.rawExec("INSERT OR REPLACE INTO history_chunks (tier, first, ref) VALUES (?, ?, ?)", tier, ref.first, JSON.stringify(ref));
         });
+        for (const first of remove) refs.delete(first);
+        for (const ref of put) refs.set(ref.first, { ...ref });
       },
     };
-    const index = new SqlSegmentIndex(port, { table });
-    this.segmentIndexes.set(tier, index);
-    return index;
   }
 
   /** A backup schedule's number in `_meta` (a key under `history:export:`), 0 when absent. */
@@ -9139,7 +9137,6 @@ export class Store {
         upper: Math.min(hot - 1, Math.max(...lowered.map(([, window]) => window.upper))),
         forward,
         limit: limit + 1,
-        ...(multiple ? { joined: true } : {}),
       };
       return { below, assemble: (rows) => {
         for (const row of rows) take(row);

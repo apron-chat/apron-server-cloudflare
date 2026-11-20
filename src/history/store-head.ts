@@ -13,7 +13,7 @@
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import { type ChatRecord, type HistoryQuery, type QueuedOp, type RecordRange, type TierStats, toRange } from "./records";
-import type { HistoryHead, PurgeResult, RestoreContext, RestoreResult, TierState, TierStateStore } from "./tier";
+import type { HistoryHead, RestoreContext, RestoreResult, TierState, TierStateStore } from "./tier";
 
 /** What the adapter needs of the Store (src/store.ts), so this module does not load it. */
 export interface StorePort {
@@ -46,8 +46,6 @@ export interface StorePort {
 }
 
 export class StoreHead implements HistoryHead {
-	readonly multiRoom = true;
-
 	constructor(readonly name: string, private readonly store: StorePort) {}
 
 	/** The Store makes its records by commit: nothing is copied into it. */
@@ -80,9 +78,8 @@ export class StoreHead implements HistoryHead {
 		return 0;
 	}
 
-	async purge(userIds: readonly string[]): Promise<PurgeResult> {
+	async purge(userIds: readonly string[]): Promise<void> {
 		this.store.purgeUsers({ userIds });
-		return { messageIds: [] };
 	}
 
 	async rename(from: string, to: string): Promise<void> {

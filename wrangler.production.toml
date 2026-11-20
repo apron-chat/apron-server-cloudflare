@@ -81,14 +81,14 @@ PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 # and imports): the paid plan's own limits, written out so this file says
 # what they are. SQLite keeps 5,000 records, none younger than three days
 # leaving by count, and no age limit; D1 (HISTORY_D1, below) 100,000 more;
-# the blob tier (HISTORY_BLOB) keeps everything past that (0). Each daily
+# the cold tier (HISTORY_BLOB) keeps everything past that (0). Each daily
 # cleanup keeps 80% of each count.
 LIMIT_RETENTION_RECORDS = "5000"
 LIMIT_MIN_RETENTION_SECONDS = "259200"
 LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
-LIMIT_HISTORY_BLOB_RECORDS = "0"
+LIMIT_HISTORY_COLD_RECORDS = "0"
 # Backups to HISTORY_BLOB under backups/: one a day (and an admin's
 # `/history export`), the newest 14 of each kind kept, private rooms
 # included, gzip-compressed. They are not encrypted: the bucket being
@@ -102,12 +102,12 @@ BACKUP_PRIVATE_ROOMS = "true"
 # object's own SQLite holds more than LIMIT_RETENTION_RECORDS, the oldest
 # move here, where history pages still read them, but their messages can no
 # longer be edited, reacted to or replied to. The tier keeps
-# LIMIT_HISTORY_D1_RECORDS of them, then they go on to the blob tier, or
+# LIMIT_HISTORY_D1_RECORDS of them, then they go on to the cold tier, or
 # expire without one. Both counts are ceilings: once a day, cleanup moves
 # what is past LIMIT_CLEANUP_THRESHOLD_PERCENT (80) of each.
 # `/purge` and `/rename` reach this tier too. Without this binding (or the
-# blob tier's), records past SQLite's limits expire at once. Once D1 holds
-# history, unbinding it while the blob tier is bound stops history moving
+# cold tier's), records past SQLite's limits expire at once. Once D1 holds
+# history, unbinding it while the cold tier is bound stops history moving
 # below SQLite until it is bound again. The object creates its table on
 # first use (the database keeps its first name, apron-archive). Previews
 # bind none (below), so theirs expire at once.
@@ -116,12 +116,12 @@ binding = "HISTORY_D1"
 database_name = "apron-archive"
 database_id = "67f4435a-f9d4-4c9a-89e0-c02f108d4fa2"
 
-# The blob history tier and backups (docs/configuration.md, History tiers,
+# The cold history tier and backups (docs/configuration.md, History tiers,
 # Backups and imports): a private R2 bucket, no custom domain, no r2.dev
 # access, no CORS, no lifecycle rules (apron-history: Standard class,
-# ENAM, default jurisdiction). Records past D1's count go there in segments
-# (kept by LIMIT_HISTORY_BLOB_RECORDS) instead of expiring, and the backups
-# above run.
+# ENAM, default jurisdiction). Records past D1's count go there in chunks
+# under history/ (kept by LIMIT_HISTORY_COLD_RECORDS) instead of expiring,
+# and the backups above run.
 [[r2_buckets]]
 binding = "HISTORY_BLOB"
 bucket_name = "apron-history"
