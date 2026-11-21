@@ -319,9 +319,13 @@ posts.
   joined to `rooms` (`8 + 2 × (151 + 100)` rows: the 101 public rooms and 50
   private memberships a user may hold, and removed rooms awaiting purge). A
   join or leave that changes nothing writes nothing.
-- A registration logs a membership in each starting room (at most the 101
-  rooms), so its write floor is `64 + 8 × 101`. Registrations are capped at
-  300 a day (Free 100); the credit-back returns the unused part.
+- A registration logs a membership in each starting room (a guest's, carried
+  over: at most `MAX_LISTED_USER_ROOMS`, 369, what a connection carries), so
+  it reserves `64 + 8 × n` writes and `128 + 6 × n` reads for `n` starting
+  rooms; measured, each costs 6 writes and 4 reads (2 to find the room by its
+  key, 2 to join it), 2,228 writes and 1,498 reads at 369 rooms. Registrations
+  are capped at 5,000 a day (Free 100); the credit-back returns the unused
+  part.
 - A guest's joins and leaves live in its connection and are not logged; a
   join reads the room record (24/8) and its members (below). Where guests
   may post, one that changes something is charged as a post: a 32/32

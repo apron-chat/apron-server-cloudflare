@@ -5726,11 +5726,15 @@ export class Store {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    // The starting rooms are checked against the capped rooms table, and each
-    // one takes a membership row and a logged membership record.
-    // The scan reads the public range, archived threads included; the joins it writes are as before.
-    const rooms = listedThreadScale(this.config.maxThreads) + 1;
-    const reservation = this.reserveCost({ reads: 128 + 2 * this.publicRoomRows, writes: 64 + 8 * rooms, registrations: 1 }, false, input.now);
+    // The starting rooms (a guest's, carried over), at most what a
+    // connection's attachment carries (MAX_LISTED_USER_ROOMS), and reserved
+    // for by how many there are. Each is looked up by its key in the rooms
+    // table (2 reads), and one that exists is joined: a membership row and a
+    // logged membership record (2 reads, 6 writes). Measured at exactly that
+    // (test/accounting.integration.test.ts); reserved at 6 reads and 8 writes
+    // a room, with the identity and credential rows besides.
+    const starting = [...new Set(input.rooms ?? DEFAULT_JOINED_ROOMS)].slice(0, MAX_LISTED_USER_ROOMS);
+    const reservation = this.reserveCost({ reads: 128 + 6 * starting.length, writes: 64 + 8 * starting.length, registrations: 1 }, false, input.now);
     try {
       if (!input.userId || !input.userHandle || !input.ipKey) throw new StoreError("invalid_params", "registration identity is incomplete");
       ensureText(input.name, "name", this.config.maxNameBytes);
@@ -5756,7 +5760,7 @@ export class Store {
         if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
         if (this.metaNumber("identity_count") >= this.config.registeredAccounts) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);
-        const joined = this.existingRooms(input.rooms ?? DEFAULT_JOINED_ROOMS);
+        const joined = this.existingRooms(starting);
         const publicKeyMetadata = JSON.stringify({
           publicKey: credential.publicKey,
           ...(credential.transports ? { transports: credential.transports } : {}),

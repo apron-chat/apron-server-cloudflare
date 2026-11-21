@@ -1,6 +1,6 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
+import { MAX_LISTED_USER_ROOMS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
 import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS, UPLOAD_POLICY } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
@@ -496,6 +496,43 @@ describe('measured storage accounting', () => {
 			return { rooms: rooms.length, listing, counting, registration, memberListing };
 		});
 		console.info('accounting-room-list-scaled', JSON.stringify(result));
+	});
+
+	it('reserves a registration by the rooms a guest carries over, up to what a connection carries', async () => {
+		const stub = env.DEMO.getByName('accounting-registration-guest-rooms');
+		const result = await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig(), clock);
+			store.initialize();
+			// A guest joins older threads too, so more rooms than the thread limit;
+			// past what a connection carries (MAX_LISTED_USER_ROOMS), the rest are not joined.
+			const count = MAX_LISTED_USER_ROOMS + 10;
+			state.storage.transactionSync(() => {
+				for (let index = 1; index <= count; index += 1) {
+					state.storage.sql.exec(
+						`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+						 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
+						`thread-${index}`, clock.now() + 1_000 + index, clock.now() + 1_000 + index, clock.now() + 1_000 + index,
+						JSON.stringify({ title: `Thread ${index}` }), clock.now(), clock.now(),
+					);
+				}
+			});
+			const rooms = ['general', ...Array.from({ length: count }, (_, index) => `thread-${index + 1}`)];
+			const before = snapshot(store);
+			const registered = store.registerIdentity({
+				userId: 'carrier', name: 'Carrier', userHandle: 'carrier-handle', now: clock.now(), ipKey: 'carrier-ip',
+				credential: { credentialId: 'carrier-credential', userId: 'carrier', publicKey: 'key', counter: 0 },
+				// Duplicates count once.
+				rooms: [...rooms, ...rooms.slice(0, 5)],
+			});
+			const registration = costSince(store, before);
+			expect(count + 1).toBeGreaterThan(MAX_LISTED_USER_ROOMS);
+			expect(registered.broadcasts).toHaveLength(MAX_LISTED_USER_ROOMS);
+			expect(registered.rooms).toEqual(rooms.slice(0, MAX_LISTED_USER_ROOMS));
+			expectWithinReserve(registration);
+			return { rooms: MAX_LISTED_USER_ROOMS, registration };
+		});
+		console.info('accounting-registration-guest-rooms', JSON.stringify(result));
 	});
 
 	it('measures member listings with status by population, and reuses a listing until a write', async () => {

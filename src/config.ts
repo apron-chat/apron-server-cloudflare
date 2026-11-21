@@ -369,7 +369,8 @@ const RENAMED_LIMITS: Readonly<Record<string, keyof Limits>> = {
  */
 function assertCurrentNames(env: EnvLike): void {
 	const values = env as EnvLike & Record<string, unknown>;
-	const set = (name: string) => values[name] !== undefined;
+	// Empty is unset, as parsePositiveInt reads a limit.
+	const set = (name: string) => values[name] !== undefined && values[name] !== "";
 	for (const [old, renamed] of Object.entries(RENAMED_LIMITS)) {
 		for (const name of [`LIMIT_${envName(old)}`, envName(old), old]) {
 			if (set(name)) throw new ConfigError(`${name} was renamed to LIMIT_${envName(renamed)} (docs/configuration.md)`);
