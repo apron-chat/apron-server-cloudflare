@@ -146,6 +146,8 @@ export interface RestorePort {
 	restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): Promise<{ joined: number; left: number; skipped: number }>;
 	/** The running import's journal, so a retry finishes it. */
 	readonly journal: Cell<string>;
+	/** How far its writes got (a line of the archive and its offset), so a retry goes on from there. */
+	readonly progress: Cell<string>;
 }
 
 /** What an export needs of the server beside its records (exportArchive). */

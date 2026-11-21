@@ -16,7 +16,8 @@
  * nothing behind.
  */
 
-import { ARCHIVE_CODECS, type ArchiveCodec, type ArchiveHeader, type ArchiveWriter, archiveName, archiveSink, jsonlWriter, type OpenedArchive, readEncodedArchive, utf8Length } from "@apron/archive";
+import { ARCHIVE_CODECS, type ArchiveCodec, type ArchiveHeader, type ArchiveLines, type ArchiveWriter, archiveName, archiveSink, encodedSource, jsonlWriter, type OpenedArchive, type Provenance, readEncodedArchive, utf8Length } from "@apron/archive";
+import { MAX_IMPORT_RECORDS } from "./archive/import";
 import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
 import type { HistoryChain } from "./chain";
 import type { Clock } from "./records";
@@ -62,24 +63,25 @@ export function backupFamily(kind: BackupKind, server: string, registry: Readonl
 	return { prefix, pattern: new RegExp(`^${escape(prefix)}\\d{8}-\\d{6}\\.jsonl${extensions ? `(?:${extensions})*` : ""}$`) };
 }
 
-/**
- * The largest archive `/history import` reads, decoded (and stored): it
- * holds the whole archive in memory while it plans, in the object's 128 MB
- * isolate. Collecting and planning take over 3 times the decoded size at
- * their peak (the records, parsed parts, then remapped and normalized
- * copies): measured in V8 under a 100 MB heap, 24 MiB fit and 32 MiB ran
- * out. 16 MiB peaks near 55 MB, leaving the rest for the object's own state
- * and the restore's writes. Streaming the import is future work; until
- * then, a backup larger than this (BackupResult.decodedBytes) is said so
- * when written.
- */
-export const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
+export { MAX_IMPORT_RECORDS };
 
-/** A backup past what an import takes: said with its size, so an operator knows before needing it. */
-export function importableWarning(decodedBytes: number): string {
-	if (decodedBytes <= MAX_IMPORT_BYTES) return "";
+/**
+ * The largest archive `/history import` reads, decoded (and stored). The
+ * import streams it, twice, holding neither file nor records
+ * (MAX_IMPORT_RECORDS bounds what it holds); this bounds the time it takes:
+ * its first pass parses and checks every record, about 17 MiB a second
+ * measured in workerd, so this much takes some 15 seconds of one
+ * invocation's 30, and a run after a failure takes it again.
+ */
+export const MAX_IMPORT_BYTES = 256 * 1024 * 1024;
+
+/** A backup past what an import takes, by records or decoded bytes: said with its size, so an operator knows before needing it. */
+export function importableWarning(records: number, decodedBytes: number): string {
 	const mib = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MiB`;
-	return `\nThis backup is ${mib(decodedBytes)} decoded, more than the ${mib(MAX_IMPORT_BYTES)} \`/history import\` reads: it cannot be imported here whole. Export rooms in parts (\`/history export <room_id>...\`) to have importable backups.`;
+	const over = records > MAX_IMPORT_RECORDS ? `${records} records, more than the ${MAX_IMPORT_RECORDS}`
+		: decodedBytes > MAX_IMPORT_BYTES ? `${mib(decodedBytes)} decoded, more than the ${mib(MAX_IMPORT_BYTES)}` : undefined;
+	if (!over) return "";
+	return `\nThis backup holds ${over} \`/history import\` takes: it cannot be imported here whole. Export rooms in parts (\`/history export <room_id>...\`) to have importable backups.`;
 }
 
 export interface BackupResult extends ExportReport {
@@ -161,6 +163,28 @@ export class BackupStore {
 		// Read whole before anything is written (an import plans first): bounded, so a file cannot exhaust the object's memory.
 		if (object.size > maxBytes) throw new Error(`${key} is ${object.size} bytes; an import reads at most ${maxBytes}`);
 		return readEncodedArchive(await object.stream(), { codecs: storedChain(key, object), maxBytes });
+	}
+
+	/**
+	 * The archive under `key` as lines an import reads twice (ArchiveLines),
+	 * each read fetching it again and decoding it through the codecs it
+	 * records (or its name says), bounded to `maxBytes` stored and decoded,
+	 * and what it is (`provenance`); undefined if there is none. A codec it
+	 * names that this server lacks, or an object that changes between reads,
+	 * fails it.
+	 */
+	async source(key: string, maxBytes: number): Promise<{ source: ArchiveLines; provenance: Provenance } | undefined> {
+		const object = await this.blobs.get(key);
+		if (!object) return undefined;
+		if (object.size > maxBytes) throw new Error(`${key} is ${object.size} bytes; an import reads at most ${maxBytes}`);
+		const codecs = storedChain(key, object);
+		const size = object.size;
+		const source = encodedSource(async () => {
+			const again = await this.blobs.get(key);
+			if (!again || again.size !== size) throw new Error(`${key} changed while it was being imported`);
+			return again.stream();
+		}, { codecs, maxBytes });
+		return { source, provenance: codecs.some((codec) => codec.authenticates) ? "verified" : "unverified" };
 	}
 }
 

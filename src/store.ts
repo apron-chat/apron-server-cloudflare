@@ -1053,6 +1053,8 @@ const META_HISTORY_KEPT = "history:kept:";
 const META_HISTORY_EXPORT = "history:export:";
 /** The running import's journal: its archive, user mapping and rooms still to finish (importArchive). */
 const META_HISTORY_IMPORT = "history:import";
+/** How far the running import's writes got: the line of the archive to go on from (importArchive). */
+const META_HISTORY_IMPORT_PROGRESS = "history:import_progress";
 /** Log IDs one copy from this SQLite carries at most (historyScan). */
 export const HISTORY_SCAN_BATCH = 100;
 /** Index entries historyTarget reads past the cutoff at most, looking for the first record it keeps. */
@@ -4561,6 +4563,18 @@ export class Store {
   setHistoryImportJournal(value: string | null, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 4, writes: 4 + Math.ceil((value?.length ?? 0) / 4_096) }, true, now, () => this.writeMeta(META_HISTORY_IMPORT, value));
+  }
+
+  /** How far the running import's writes got (`history:import_progress`, RestorePort.progress): a small JSON value. */
+  historyImportProgress(now = this.clock.now()): string | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT_PROGRESS) || undefined);
+  }
+
+  /** Writes or clears the running import's progress. */
+  setHistoryImportProgress(value: string | null, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => this.writeMeta(META_HISTORY_IMPORT_PROGRESS, value));
   }
 
   /**
@@ -9533,7 +9547,7 @@ export class Store {
         // again, they start at the hot floor, and what they held below is trimmed.
         // Backups' schedule (`history:export:`, setHistoryMeta) is no tier's state, and stays.
         const stale = this.rawRows<{ key: string }>(
-          `SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' AND NOT (key >= '${META_HISTORY_EXPORT}' AND key < '${META_HISTORY_EXPORT.slice(0, -1)};') AND key <> '${META_HISTORY_IMPORT}' LIMIT 64`,
+          `SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' AND NOT (key >= '${META_HISTORY_EXPORT}' AND key < '${META_HISTORY_EXPORT.slice(0, -1)};') AND key <> '${META_HISTORY_IMPORT}' AND key <> '${META_HISTORY_IMPORT_PROGRESS}' LIMIT 64`,
         );
         for (const row of stale) this.writeMeta(row.key, null);
         this.publishedCache = undefined;

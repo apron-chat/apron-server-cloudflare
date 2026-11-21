@@ -986,9 +986,8 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   them does, and also while an unfinished import's journal remains (after
   a restart mid-import): finish it, or abandon it with `restart`, first.
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
-  an object of the backup store (at most 16 MiB, stored and decoded: a
-  backup past that is warned of when written, and a streaming import is
-  future work), a
+  an object of the backup store (at most 250,000 records and 256 MiB,
+  stored and decoded: a backup past either is warned of when written), a
   backup or any ARCHIVE.md v1 file put there, gzip-compressed (`.jsonl.gz`,
   or its metadata says so) or plain (`.jsonl`), and adds what is new, after
   planning the whole file:
@@ -1024,6 +1023,35 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   writes (one too large to note is refused: `renumber` it): run again after
   a failure, the same file finishes; `restart` abandons an unfinished import
   of another file, and the notice names the rooms it left part-restored.
+
+**How an import reads a file.** It streams the file twice and never holds
+it: the first pass indexes it (25 bytes a record) and plans, before
+anything is written; the second reads it again and writes as it goes, 200
+records a call, saving where it got to every 2,000 records
+(`history:import_progress` in `_meta`). A run that fails partway (a write
+refused, the day's maintenance budget spent, the object restarted) is
+finished by running the same command again: it plans again, then decodes
+the file from its start and discards what comes before the saved position
+without parsing it, and writes on from there. Measured for a synthetic
+backup of 200,000 messages (100 MiB decoded, 25 MiB gzip-compressed):
+
+| What | Measured |
+| --- | --- |
+| Index and plan, memory | within a 16 MiB V8 heap and 12 MiB of typed arrays (index 31 bytes a record held, plan 24) |
+| First pass (parse, content policy, index) in workerd | about 17 MiB a second: 6 seconds |
+| Skipping to a saved position (gzip decode, bytes discarded) in workerd | 88 to 130 MiB a second: under 1.2 seconds for the whole file |
+| A whole import into memory tiers | 6.6 seconds in one run; 26 seconds in five (four forced failures), of which skipping 1.8 seconds and planning again most of the rest |
+
+The bounds follow: 250,000 records keeps the index and plan near 40 MB of
+the object's 128 MB, and the first pass, which each run repeats, near 8
+seconds of an invocation's 30 seconds of CPU; 256 MiB decoded keeps it
+under about 15 seconds however large the records. Known limitations:
+each run after a failure indexes and plans the whole file again; a file
+whose rooms' records are not each in log order (this server always writes
+them so) is sorted in memory, up to 16 MiB decoded, and refused past that;
+and the tiers below the hot log are appended a checkpoint's worth at a
+time, so a file not in log order across rooms (this server writes one room
+after another) makes the cold tier merge into chunks it wrote already.
 
 **Codecs.** Backups and the cold tier's chunks go through `@apron/archive`
 codecs on their way to the bucket (`packages/archive/src/codec.ts`): each is
