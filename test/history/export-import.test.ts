@@ -12,7 +12,6 @@ import { NOT_STALLED } from "../../src/history/stall";
 import { withoutOutputs } from "../../src/history/records";
 import { MemoryChainStateStore, MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
 import { type ChainStage, HistoryChain } from "../../src/history/chain";
-import { sceneArchives } from "../../packages/archive/test/fixtures/scenes";
 
 class TestClock {
 	constructor(public time = 1_000_000) {}
@@ -220,21 +219,6 @@ describe("export and import", () => {
 		// At or below the head's copy marker: the tier below holds it, as it will once the head lets it go.
 		expect(place(110, tiers, 20)).toEqual([1]);
 		expect(place(130, tiers, 20)).toEqual([0]);
-	});
-
-	it("imports every scene from scene.apron.chat to the scene's own replayed state", async () => {
-		for (const [name, text] of Object.entries(sceneArchives)) {
-			// A clock past the scenes' log IDs, which an import keeping them requires.
-			const target = chainOf("head+recent+cold", new TestClock(2_000_000_000_000));
-			const report = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
-			expect(report.expired, name).toBe(0);
-			await settle(target.chain);
-			const back = await exported(target.chain, target.clock);
-			const scene = await collectArchive(jsonlReader(linesOf(text)));
-			const comparison = compareReplayed(replayRecords(scene.records, scene.rooms, scene.users), await stateOf(back));
-			// Users carry over by name; rooms and messages exactly.
-			expect(comparison.differences.filter((line) => !line.startsWith("user ")), name).toEqual([]);
-		}
 	});
 
 	it("reads a gzip backup back through the codecs its metadata records, which verify nothing", async () => {

@@ -688,6 +688,18 @@ describe("fault injection", () => {
 });
 
 describe("model-based regressions", () => {
+	/** head → recent → cold, settled with 30 messages in general, one in three cy's (the rest ada's), and the model of them. */
+	async function settledWithCold() {
+		const built = build(compositions[2]);
+		const model = new Model();
+		for (let index = 0; index < 30; index += 1) {
+			built.clock.time += 1;
+			model.add(built.head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "cy" }, body: { text: `${index}` } }));
+		}
+		await settle(built.chain);
+		return { ...built, model };
+	}
+
 	// Found by the model runs: cy's message m1 is reacted to, then moved, and
 	// trimmed until its first snapshot is gone. Its move snapshot is in
 	// "recent", but the reactions made before the move are in "older". /purge of
@@ -738,13 +750,7 @@ describe("model-based regressions", () => {
 	// above lose the purged user's records, and every read of the cold tier
 	// applies the kept rewrites, so nothing served names the purged user.
 	it("keeps the rewrites a tier that takes none was delivered, and applies them on every read", async () => {
-		const { clock, head, stages, chain, state } = build(compositions[2]);
-		const model = new Model();
-		for (let index = 0; index < 30; index += 1) {
-			clock.time += 1;
-			model.add(head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "cy" }, body: { text: `${index}` } }));
-		}
-		await settle(chain);
+		const { head, stages, chain, state, model } = await settledWithCold();
 		const coldTier = stages[1].tier as ColdHistoryTier;
 		const recent = stages[0].tier as MemoryHistoryTier;
 		const namesCy = async (each: { scan(from: number, limit: number): Promise<{ records: ChatRecord[] }> }) => (await each.scan(0, 1_000)).records.some((record) => record.record_json.includes('"cy"'));
@@ -781,12 +787,7 @@ describe("model-based regressions", () => {
 	// rewrites stay few, delivery never stalls on their number, and reads
 	// stay correct.
 	it("keeps hundreds of purges and renames delivered to an unchanged cold tier as one group", async () => {
-		const { clock, head, chain, state } = build(compositions[2]);
-		for (let index = 0; index < 30; index += 1) {
-			clock.time += 1;
-			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "cy" }, body: { text: `${index}` } });
-		}
-		await settle(chain);
+		const { head, chain, state } = await settledWithCold();
 		const cold = (await chain.view()).tiers[2];
 		expect(cold.floor).toBeGreaterThan(0);
 		for (let index = 0; index < 600; index += 1) {
@@ -810,12 +811,7 @@ describe("model-based regressions", () => {
 	// new groups with the same `through` instead of growing one value past
 	// what SQLite keeps, and delivery never stalls on it.
 	it("splits kept rewrites into groups of bounded size on a quiet cold tier", async () => {
-		const { clock, head, chain, state } = build(compositions[2]);
-		for (let index = 0; index < 30; index += 1) {
-			clock.time += 1;
-			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "cy" }, body: { text: `${index}` } });
-		}
-		await settle(chain);
+		const { head, chain, state } = await settledWithCold();
 		// 300 purges, each with a list of 400 message IDs: about 6 MB as one group.
 		const messages = (index: number) => Array.from({ length: 400 }, (_, at) => `message-${index}-${at}-${"x".repeat(30)}`);
 		for (let index = 0; index < 300; index += 1) {
