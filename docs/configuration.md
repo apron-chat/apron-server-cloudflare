@@ -1547,7 +1547,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `anonymousPostsPerDay` | 200 | 100 |
 | `registeredPostsPerMinute` | 20 |  |
 | `registeredPostsPerDay` | 1000 | 500 |
-| `trustedPostsPerMinute` | 50 |  |
+| `trustedPostsPerMinute` | 100 | 50 |
 | `trustedPostsPerDay` | 4000 | 2000 |
 | `ipPostsPerMinute` | 30 |  |
 | `ipPostsPerDay` | 2000 | 1000 |

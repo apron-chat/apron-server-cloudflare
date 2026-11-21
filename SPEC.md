@@ -462,7 +462,7 @@ Every other `retry_after` carries no category; the daily SQL budget's has `data.
 | anonymous_posts_per_day | 200 (Free: 100) | Normalized IP |
 | registered_posts_per_minute | 20 | Verified user ID, all sockets |
 | registered_posts_per_day | 1,000 (Free: 500) | Verified user ID |
-| trusted_posts_per_minute | 50 | Verified user ID with any role (`friend`, `admin`, `mod`, `threader`, or another an admin gave), in place of `registered_posts_per_minute`; also their IP's minute limit when larger |
+| trusted_posts_per_minute | 100 (Free: 50) | Verified user ID with any role (`friend`, `admin`, `mod`, `threader`, or another an admin gave), in place of `registered_posts_per_minute`; also their IP's minute limit when larger |
 | trusted_posts_per_day | 4,000 (Free: 2,000) | Same, in place of `registered_posts_per_day`; also their IP's daily limit when larger |
 | ip_posts_per_minute | 30 | IP across guest/registered identities |
 | ip_posts_per_day | 2,000 (Free: 1,000) | IP across identities |

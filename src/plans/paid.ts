@@ -106,6 +106,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		historyRequestsPerDay: 400_000,
 		anonymousPostsPerDay: 200,
 		registeredPostsPerDay: 1_000,
+		// Role holders are people an admin trusts; this guards against a buggy
+		// client more than abuse. A re-thread is one post per message moved,
+		// so a long conversation moves at once. Kept under
+		// framesPerConnectionMinute (120), which closes the connection rather
+		// than answering `retry_after`, with room for pings and other frames.
+		trustedPostsPerMinute: 100,
 		trustedPostsPerDay: 4_000,
 		ipPostsPerDay: 2_000,
 		globalPostsPerMinute: 600,
