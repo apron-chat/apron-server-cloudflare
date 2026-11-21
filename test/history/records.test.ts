@@ -1,11 +1,15 @@
-// Kept rewrites (the cold tier's /purge and /rename): withKept finds the
-// rewrites a record names from its JSON's strings, and applies only those,
-// so its cost does not grow with how many are kept. It must give exactly
-// what applying every kept rewrite to every record in order gives.
+// /purge and /rename below SQLite (src/history/records.ts): the tiers that
+// take rewrites rewrite what they hold record by record (purgedRecord,
+// renamedRecord), and pages read from a tier have its pending rewrites
+// applied (rewritten). The cold tier takes none and keeps the rewrites it
+// is delivered: withKept finds the rewrites a record names from its JSON's
+// strings, and applies only those, so its cost does not grow with how many
+// are kept. It must give exactly what applying every kept rewrite to every
+// record in order gives.
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { authoredMessages, purgedRecord, renamedRecord } from "@apron/archive";
-import { type ChatRecord, type KeptRewrite, withKept } from "../../src/history/records";
+import { type ChatRecord, type KeptRewrite, rewritten, withKept } from "../../src/history/records";
 
 /** The definition: every rewrite, in order, to every record at or below its group's `through`; a purge's messages noted first. */
 function reference(records: readonly ChatRecord[], kept: readonly KeptRewrite[], purged?: Set<string>): ChatRecord[] {
@@ -48,6 +52,35 @@ const groups = fc.array(fc.record({ through: fc.integer({ min: 0, max: 45 }), re
 	.map((list) => list.map((group, index): KeptRewrite => ({ first: index * 10, seq: index * 10 + group.rewrites.length - 1, ...group })));
 
 const values = (records: readonly ChatRecord[]) => records.map((each) => ({ ...each, record_json: JSON.parse(each.record_json) as unknown }));
+
+describe("rewrites", () => {
+	it("rewrites a record as /purge and /rename rewrite SQLite's, and applies pending rewrites in order to a page", () => {
+		const reactions = { kind: "reactions", record_json: JSON.stringify({ message_id: "m1", reactions: [{ from: { user_id: "a" }, emojis: ["👍"] }, { from: { user_id: "b" }, emojis: ["🎉"] }] }) };
+		expect(JSON.parse(purgedRecord(reactions, ["a"], [])!).reactions).toEqual([{ from: { user_id: "b" }, emojis: ["🎉"] }]);
+		// Every set on a purged message goes, and a record left empty with them.
+		expect(purgedRecord(reactions, ["z"], ["m1"])).toBeNull();
+		const membership = { kind: "membership", record_json: JSON.stringify({ members: [{ user: { user_id: "a" }, joined: true }] }) };
+		expect(purgedRecord(membership, ["a"], [])).toBeNull();
+		const message = { kind: "message", record_json: JSON.stringify({ message_id: "m1", from: { user_id: "a", name: "A" } }) };
+		expect(JSON.parse(renamedRecord(message, "a", "b")).from).toEqual({ user_id: "b", name: "A" });
+		expect(JSON.parse(renamedRecord(reactions, "a", "c")).reactions.map((set: { from: { user_id: string } }) => set.from.user_id)).toEqual(["c", "b"]);
+		expect(JSON.parse(renamedRecord(membership, "a", "d")).members[0].user.user_id).toBe("d");
+		// Rewrites pending for a tier, applied in order to what a page read from it.
+		const at = (logId: number, kind: string, value: object) => ({ room_id: "general", log_id: logId, commit_ms: logId, kind, record_json: JSON.stringify(value) });
+		const records = [
+			at(1, "message", { message_id: "m1", from: { user_id: "gone" } }),
+			at(2, "message", { message_id: "m2", from: { user_id: "old" } }),
+			at(3, "reactions", { message_id: "m1", reactions: [{ from: { user_id: "x" }, emojis: ["👍"] }] }),
+			at(4, "reactions", { message_id: "m2", reactions: [{ from: { user_id: "gone" }, emojis: ["👍"] }, { from: { user_id: "old" }, emojis: ["🎉"] }] }),
+			at(5, "membership", { members: [{ user: { user_id: "gone" }, joined: true }] }),
+		];
+		const result = rewritten(records, [{ user: "gone", into: null }, { user: "old", into: "new" }]);
+		expect(result.map((entry) => [entry.log_id, JSON.parse(entry.record_json)])).toEqual([
+			[2, { message_id: "m2", from: { user_id: "new" } }],
+			[4, { message_id: "m2", reactions: [{ from: { user_id: "new" }, emojis: ["🎉"] }] }],
+		]);
+	});
+});
 
 describe("withKept", () => {
 	it("gives what applying every kept rewrite in order gives, and notes the same purged messages", () => {

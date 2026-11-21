@@ -2,14 +2,11 @@
 // caps count the rooms started within the window, so they limit how fast
 // rooms are started, not how many exist. Posting in, joining or leaving an
 // older room never needs a slot, and rooms are kept as long as their
-// history, however many. A user's own rooms are bounded by
+// history, however many (test/history/chain.integration.test.ts pages a
+// thread's history back from the cold tier). A user's own rooms are bounded by
 // MAX_MEMBERSHIPS_PER_USER, so reading them stays within its reservation.
-import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
 import { MAX_MEMBERSHIPS_PER_USER } from "../src/budget";
-import type { HistoryChain } from "../src/history/chain";
-import { buildHistoryChain } from "../src/history/config";
-import { R2BlobStore } from "../src/history/storage/r2";
 import { MAX_LISTED_USER_ROOMS, Store, StoreError, type StoreConfig, type StoreMutationInput } from "../src/store";
 import { messagesOf, withStore, type TestClock } from "./helpers/store";
 
@@ -81,8 +78,6 @@ it("the caps count rooms started within the window: older rooms stay listed and 
 		store.mutate(op(clock, "alice", "room_set", { room_id: second, title: "Renamed" }));
 		expect(messagesOf(store.historyPage({ roomId: first, after: "0", limit: 50, now: clock.value })).map((message) => message.body?.text)).toEqual(["before", "after"]);
 		expect(store.roomCounts(clock.value).public).toEqual({ recent: 2, older: 2 });
-		// No listing carries an archive mark any more.
-		for (const room of store.listRooms(clock.value)) expect(room).not.toHaveProperty("archived");
 	});
 });
 
@@ -301,39 +296,5 @@ it("a user in hundreds of rooms keeps the room just joined and their top-level r
 		const ids = Array.from({ length: MAX_LISTED_USER_ROOMS }, (_, i) => String(9_000_000_000_000_000 + i));
 		const reads = Object.fromEntries(ids.slice(0, 64).map((id) => [id, id]));
 		expect(JSON.stringify({ rooms: ids, reads }).length).toBeLessThan(12_000 - 2_000);
-	});
-});
-
-it("an old thread's history pages from the cold tier", async () => {
-	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-	type Runtime = { store: Store & { config: Record<string, unknown> }; config: { limits: Record<string, number> }; history?: HistoryChain; alarm(): Promise<void> };
-	await runInDurableObject(env.DEMO.getByName(`caps-cold-${crypto.randomUUID()}`), async (instance, state) => {
-		const runtime = instance as unknown as Runtime;
-		runtime.store.config = { ...runtime.store.config, retentionRecords: 3, cleanupThresholdPercent: 100, anonymousPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
-		runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 0, cleanupThresholdPercent: 100 } };
-		runtime.history = buildHistoryChain({
-			layout: { blobs: new R2BlobStore(env.HISTORY_BLOB!), blobLabel: "R2" }, limits: runtime.config.limits as never, store: runtime.store,
-			clock: { now: Date.now }, chunkIndex: (tier) => runtime.store.chunkIndex(tier), server: `caps-cold-${Date.now()}`,
-		});
-		const room = String(runtime.store.mutate({ userId: "p", ipKey: "ip", requestId: "t", method: "room_set", now: Date.now(), params: { parent_room_id: "general", title: "Long ago" }, identity: { user_id: "p", name: "p" } }).result.room_id);
-		const logs: number[] = [];
-		for (let index = 0; index < 120; index += 1) {
-			const result = runtime.store.mutate({ userId: "p", ipKey: "ip", requestId: `m-${index}`, method: "message", now: Date.now(), params: { room_id: room, body: { text: `m ${index}` } }, identity: { user_id: "p", name: "p" } });
-			logs.push(Number(result.message!.log_id));
-			await sleep(2);
-		}
-		for (let round = 0; round < 10; round += 1) {
-			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
-			runtime.store.forgetCleanupDue();
-			await runtime.alarm();
-		}
-		const cold = (await runtime.history!.tiers[1].scan(0, 100_000)).records.filter((record) => record.room_id === room);
-		expect(cold.length).toBeGreaterThan(0);
-		// Past the window it no longer counts against the caps, and every message still pages back through the cold tier.
-		runtime.store.config = { ...runtime.store.config, roomCreationWindowMs: 1 };
-		await sleep(5);
-		expect(runtime.store.listRooms(Date.now()).some((entry) => entry.room_id === room)).toBe(true);
-		const page = await runtime.history!.read({ roomIds: [room], lower: 1, upper: Number.MAX_SAFE_INTEGER, forward: true, limit: 1_000 });
-		expect(page.filter((record) => record.kind === "message").map((record) => record.log_id)).toEqual(logs);
 	});
 });

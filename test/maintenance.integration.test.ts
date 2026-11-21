@@ -467,30 +467,45 @@ describe("cleanup at the storage watermark", () => {
 		});
 	});
 
-	it("with tiers below, removes nothing that is not copied yet, even under pressure", async () => {
+	// The watermark brings only a job's start forward: a job in progress is
+	// due at its own next step (its next batch, or its wait on a copy below),
+	// however long it waits. An alarm sooner would find nothing to do and be
+	// set again at once (an alarm spinning while D1 is off).
+	it("with tiers below, removes nothing not yet copied, even under pressure, and never brings a waiting job forward", async () => {
 		await withStore("pressure-tiered", { ...pressed, tiered: true }, async (store, clock, state) => {
 			const logs = Array.from({ length: 8 }, (_, index) => {
 				clock.value += 1_000;
 				return oneLog(store.mutate(messageInput(clock, `tiered-flood-${index}`, `flood ${index}`)));
 			});
 			const records = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
+			const refused = (requestId: string) => {
+				let error: unknown;
+				try { store.mutate(messageInput(clock, requestId, "refused")); } catch (caught) { error = caught; }
+				expectRetryAfter(error);
+			};
 			scheduleTomorrow(store, state, clock);
 			overHighWater(store);
 			clock.value += 1_000;
-			let error: unknown;
-			try { store.mutate(messageInput(clock, "tiered-refused", "refused")); } catch (caught) { error = caught; }
-			expectRetryAfter(error);
+			refused("tiered-refused");
 			expect(store.cleanupDue(clock.value)).toBe(true);
 
-			// The job starts, but nothing is copied below: nothing leaves, and it looks again in a second.
-			const waiting = store.runCleanup(clock.value);
+			// The job starts, but nothing is copied below: nothing leaves, and it waits as long as the runtime says the copy takes.
+			const wait = 10 * 60_000;
+			const waiting = store.runCleanup(clock.value, { copyWaitMs: wait });
 			expect(waiting.deleted_records).toBe(0);
-			expect(waiting.next_due_ms).toBe(clock.value + 1_000);
+			expect(waiting.next_due_ms).toBe(clock.value + wait);
 			expect(records()).toBe(9);
+			// Past the pressure's five-minute backoff, and refused again meanwhile: still due only at its own next step.
+			clock.value += 6 * 60_000;
+			expect(store.cleanupDue(clock.value)).toBe(false);
+			refused("tiered-refused-again");
+			expect(store.cleanupDue(clock.value)).toBe(false);
+			clock.value = waiting.next_due_ms;
+			expect(store.cleanupDue(clock.value)).toBe(true);
+
 			// Its target is the first record the count keeps; once the chain copied up to it, those go.
 			expect(store.historyTarget(clock.value)).toBe(Number(logs[5]));
 			await chainStateStore(store.historyStatePort(), "hot").saveLink("hot", { through: Number(logs[4]) });
-			clock.value += 1_000;
 			const moved = store.runCleanup(clock.value);
 			expect(moved.deleted_records).toBe(6);
 			expect(records()).toBe(3);
