@@ -15,8 +15,8 @@ afterEach(() => { vi.restoreAllMocks(); });
  */
 class LeakyStore extends SqliteStore {
 	leakyListing(now: number): number {
-		const reserved = (this as unknown as { reserved: (cost: object, maintenance: boolean, now: number, fn: () => number) => number }).reserved;
-		return reserved.call(this, { reads: 0 }, false, now, () => this.listRooms(now).length);
+		const reserved = (this as unknown as { reserved: (operation: string, cost: object, maintenance: boolean, now: number, fn: () => number) => number }).reserved;
+		return reserved.call(this, 'leakyListing', { reads: 0 }, false, now, () => this.listRooms(now).length);
 	}
 }
 
@@ -160,12 +160,12 @@ it('charges rows found past an overrun already noted, and counts it once', async
 		// As runCleanup does: one reservation checked after each of two transactions.
 		const internals = sqliteOf(store) as unknown as {
 			observed: { reads: number; writes: number };
-			reserveCost(cost: object, maintenance: boolean, now: number): object;
+			reserveCost(operation: string, cost: object, maintenance: boolean, now: number): object;
 			assertReservation(reserved: object, reads: number, writes: number): void;
 		};
 		const before = foregroundReads(state);
 		const start = { reads: internals.observed.reads, writes: internals.observed.writes };
-		const reservation = internals.reserveCost({ reads: 0 }, false, now);
+		const reservation = internals.reserveCost('unknown', { reads: 0 }, false, now);
 		store.rooms.list(now);
 		internals.assertReservation(reservation, start.reads, start.writes);
 		const afterFirst = foregroundReads(state);

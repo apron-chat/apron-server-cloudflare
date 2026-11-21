@@ -39,8 +39,8 @@ export interface BudgetCost {
   maintenance?: boolean;
   /** The excess already noted and charged (Store.assertReservation), so a later check adds only rows past it. */
   overrun?: { reads: number; writes: number };
-  /** Where the reservation was made: the stack an overrun or breaker is named from (Store.operationName). */
-  site?: Error;
+  /** The operation the reservation is for, which an overrun or breaker is named after (SqliteStore.reserveCost). */
+  operation?: string;
 }
 
 export interface BudgetSnapshot extends BudgetCost {

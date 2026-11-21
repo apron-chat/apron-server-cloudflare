@@ -2,9 +2,8 @@
  * The parts (parts.ts) over a SqliteStore: each a small object whose
  * methods delegate to the SqliteStore method of the old name, looked up at
  * call time. They add nothing: the reservation, the SQL and the accounting
- * are SqliteStore's. Their functions are not methods of a class named
- * `…Store`, so an overrun is still named after the SqliteStore method
- * (SqliteStore.operationName reads the stack).
+ * are SqliteStore's, and so is each operation's name (named explicitly
+ * at its reservation, src/store/accounting.ts).
  */
 
 import { newTerminalOutputKey } from "./rows";

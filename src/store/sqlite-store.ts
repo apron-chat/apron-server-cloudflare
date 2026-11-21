@@ -44,7 +44,7 @@ import {
 } from "./meta";
 import {
   ACCOUNTING_UNCERTAIN, BREAKER_ALERT_ONLY, BREAKER_EXEMPT, BREAKER_MS, BREAKER_OVERRUNS, BREAKER_WINDOW_MS, DEGRADED, emptyGuard,
-  maintenanceDelta, OPERATION_PAUSED, OPERATION_WRAPPERS, parseGuard, STORAGE_UNAVAILABLE, TRIP_WINDOW_MS,
+  maintenanceDelta, OPERATION_PAUSED, parseGuard, STORAGE_UNAVAILABLE, TRIP_WINDOW_MS,
 } from "./accounting";
 import { SettledMeta } from "../settled-meta";
 import type { ChunkIndex, ChunkRef } from "../history/cold/chunks";
@@ -642,49 +642,20 @@ export class SqliteStore {
 
   /**
    * Refuses a foreground reservation whose operation's breaker is open, by
-   * the name its reservation site carries (operationName). Maintenance work,
+   * the name its reservation carries. Maintenance work,
    * operator alerts and admin (`unchecked`) work are never refused, nor the
    * operations every request passes through (BREAKER_EXEMPT).
    */
-  private assertBreaker(site: Error, now: number): void {
+  private assertBreaker(operation: string, now: number): void {
     let open = false;
     for (const end of Object.values(this.guard.breakers)) if (end > now) open = true;
     if (!open) return;
-    const operation = this.operationName(site);
     const until = this.guard.breakers[operation];
     if (until === undefined || until <= now || BREAKER_EXEMPT.has(operation)) return;
     throw new StoreError("retry_after", "This action is paused after it used more storage than expected; try again later", {
       retryAfterMs: Math.max(1_000, until - now),
       data: { reason: OPERATION_PAUSED },
     });
-  }
-
-  /**
-   * Where a reservation is made: a stack captured (not yet formatted) as it
-   * starts, so an overrun noted later and a breaker checked at the start
-   * name the same operation (operationName).
-   */
-  private captureSite(): Error {
-    const errors = Error as unknown as { stackTraceLimit: number };
-    const limit = errors.stackTraceLimit;
-    errors.stackTraceLimit = 12;
-    const site = new Error("reservation site");
-    errors.stackTraceLimit = limit;
-    return site;
-  }
-
-  /**
-   * The SqliteStore method a reservation belongs to: the innermost method on its
-   * site's stack that is not a wrapper (OPERATION_WRAPPERS). The stack is
-   * formatted only here, for an overrun or while a breaker is open. A part's
-   * function (sqlite-parts.ts) is no `…Store` method, so an operation keeps
-   * its SqliteStore name whichever part called it.
-   */
-  private operationName(site: Error | undefined): string {
-    for (const match of (site?.stack ?? "").matchAll(/at (?:async )?\w*Store\.(\w+)/g)) {
-      if (!OPERATION_WRAPPERS.has(match[1])) return match[1];
-    }
-    return "unknown";
   }
 
   /** What overruns have set off now, for the runtime's tier and `/status`. */
@@ -709,7 +680,7 @@ export class SqliteStore {
    * unbounded), open that operation's breaker for an hour.
    */
   private noteOverrun(reserved: BudgetCost, actualReads: number, actualWrites: number, excess: { reads: number; writes: number }): void {
-    const operation = this.operationName(reserved.site);
+    const operation = reserved.operation ?? "unknown";
     const now = Math.max(this.lastEffectiveMs, this.clock.now());
     const day = dayFor(now);
     const message = `${operation}: ${actualReads}/${reserved.reads} reads, ${actualWrites}/${reserved.writes} writes`;
@@ -1160,24 +1131,24 @@ export class SqliteStore {
    * Reserves an operation's bounded cost from today's budget before it runs
    * (budget-ledger.ts), refusing it with `retry_after` past a ceiling. An
    * admin command passes `unchecked`: it is charged but not refused.
+   * `operation` names it, for overruns and breakers (accounting.ts).
    */
-  private reserveCost(costInput: CostEstimate, maintenance = false, now = this.clock.now(), unchecked = false): BudgetCost {
+  private reserveCost(operation: string, costInput: CostEstimate, maintenance = false, now = this.clock.now(), unchecked = false): BudgetCost {
     this.ensureReady();
     this.assertAccounting();
-    const site = this.captureSite();
-    if (!maintenance && !unchecked && !this.alerting) this.assertBreaker(site, now);
+    if (!maintenance && !unchecked && !this.alerting) this.assertBreaker(operation, now);
     const cost = this.ledger.reserve(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), now, maintenance, unchecked || this.alerting);
-    cost.site = site;
+    cost.operation = operation;
     this.countReservation(cost);
     return cost;
   }
 
   /** Spend the maintenance control gap when ordinary work is exhausted. */
-  private reserveMaintenanceControl(costInput: CostEstimate, now: number): BudgetCost {
+  private reserveMaintenanceControl(operation: string, costInput: CostEstimate, now: number): BudgetCost {
     this.ensureReady();
     this.assertAccounting();
     const cost = this.ledger.reserveControl(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs));
-    cost.site = this.captureSite();
+    cost.operation = operation;
     this.countReservation(cost);
     return cost;
   }
@@ -1210,7 +1181,7 @@ export class SqliteStore {
    * identities too, so the reservation allows twice the registration cap.
    */
   usersWithRole(role: string, limit: number, now = this.clock.now()): string[] {
-    return this.reserved({ reads: 2 * this.config.registeredAccounts + 64 }, false, now, () =>
+    return this.reserved("usersWithRole", { reads: 2 * this.config.registeredAccounts + 64 }, false, now, () =>
       this.rawRows<{ user_id: string; roles_json: string }>("SELECT user_id, roles_json FROM identities WHERE roles_json LIKE ?", `%${JSON.stringify(role)}%`)
         .filter((row) => parseRoles(row.roles_json).includes(role))
         .map((row) => row.user_id)
@@ -1223,7 +1194,7 @@ export class SqliteStore {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    const reserved = this.reserveCost(cost, kind === "maintenance", now);
+    const reserved = this.reserveCost("unknown", cost, kind === "maintenance", now);
     try {
       return fn();
     } finally {
@@ -1246,7 +1217,7 @@ export class SqliteStore {
     // this reservation already charges the complete bounded external work.
     // Nothing settles it, so it is written now (its bookkeeping rows pay for
     // that), not left staged for a later operation an eviction may not reach.
-    this.reserveCost(cost, kind === "maintenance", now);
+    this.reserveCost("unknown", cost, kind === "maintenance", now);
     this.ledger.flush();
     return await fn();
   }
@@ -1280,11 +1251,11 @@ export class SqliteStore {
    * `unused.history` to give back history pages it reserved and did not
    * serve, whether it returns or throws.
    */
-  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: (unused: { history: number }) => T, unchecked = false): T {
+  private reserved<T>(operation: string, cost: CostEstimate, maintenance: boolean, now: number, fn: (unused: { history: number }) => T, unchecked = false): T {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    const reservation = this.reserveCost(cost, maintenance, now, unchecked);
+    const reservation = this.reserveCost(operation, cost, maintenance, now, unchecked);
     const unused = { history: 0 };
     try {
       return fn(unused);
@@ -1317,7 +1288,7 @@ export class SqliteStore {
 
   persistAccountUsageSnapshot(snapshot: AccountUsageSnapshot, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 8, writes: 8 }, true, now, () => {
+    this.reserved("persistAccountUsageSnapshot", { reads: 8, writes: 8 }, true, now, () => {
       this.writeMeta(META_ACCOUNT_USAGE, JSON.stringify(snapshot));
     });
   }
@@ -1336,7 +1307,7 @@ export class SqliteStore {
    */
   status(now = this.clock.now()): { budget: BudgetSnapshot; identities: number; databaseBytes: number | null; counts: { frames: number; admissions: number; posts: number } } {
     this.ensureReady();
-    return this.alert(() => this.reserved({ reads: 16 }, false, now, () => {
+    return this.alert(() => this.reserved("status", { reads: 16 }, false, now, () => {
       const day = dayFor(this.effectiveNow(now));
       const rows = this.rawRows<{ scope: string; day: string; posts_day: number }>(
         "SELECT scope, day, posts_day FROM principal_limits WHERE principal_key = 'global' AND scope IN ('frames', 'admission', 'post')",
@@ -1395,7 +1366,7 @@ export class SqliteStore {
    */
   noteThrottleTrip(trigger: string, now = this.clock.now()): void {
     this.ensureReady();
-    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.alert(() => this.reserved("noteThrottleTrip", { reads: 4, writes: 4 }, false, now, () => {
       const buckets = this.tripBuckets(now);
       const hour = String(Math.floor(now / 3_600_000) * 3_600_000);
       const bucket = buckets[hour] ??= {};
@@ -1408,7 +1379,7 @@ export class SqliteStore {
   /** Throttle trips by trigger over the last TRIP_WINDOW_MS (noteThrottleTrip), most first. */
   throttleTrips(now = this.clock.now()): Array<[trigger: string, count: number]> {
     this.ensureReady();
-    return this.alert(() => this.reserved({ reads: 4 }, false, now, () => {
+    return this.alert(() => this.reserved("throttleTrips", { reads: 4 }, false, now, () => {
       const totals = new Map<string, number>();
       for (const bucket of Object.values(this.tripBuckets(now))) {
         for (const [trigger, count] of Object.entries(bucket)) totals.set(trigger, (totals.get(trigger) ?? 0) + count);
@@ -1435,13 +1406,13 @@ export class SqliteStore {
   /** The server tier last announced to the admins (the runtime's record), or "" before any. */
   announcedTier(now = this.clock.now()): string {
     this.ensureReady();
-    return this.alert(() => this.reserved({ reads: 4 }, false, now, () => this.metaValue(META_ANNOUNCED_TIER), true));
+    return this.alert(() => this.reserved("announcedTier", { reads: 4 }, false, now, () => this.metaValue(META_ANNOUNCED_TIER), true));
   }
 
   /** Records the server tier just announced (announcedTier): charged, never refused. */
   setAnnouncedTier(value: string, now = this.clock.now()): void {
     this.ensureReady();
-    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.alert(() => this.reserved("setAnnouncedTier", { reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_ANNOUNCED_TIER, value);
     }, true));
   }
@@ -1469,7 +1440,7 @@ export class SqliteStore {
   /** Records whether that alert stands (storageAlerted): charged, never refused, written only when it flips. */
   setStorageAlerted(alerted: boolean, now = this.clock.now()): void {
     this.ensureReady();
-    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.alert(() => this.reserved("setStorageAlerted", { reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_STORAGE_ALERTED, alerted ? "1" : "0");
     }, true));
   }
@@ -1487,7 +1458,7 @@ export class SqliteStore {
   /** Records whether that alert stands (roomNotesAlerted): charged, never refused, written only when it flips. */
   setRoomNotesAlerted(alerted: boolean, now = this.clock.now()): void {
     this.ensureReady();
-    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.alert(() => this.reserved("setRoomNotesAlerted", { reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_ROOM_NOTES_ALERTED, alerted ? "1" : "0");
     }, true));
   }
@@ -1509,7 +1480,7 @@ export class SqliteStore {
   /** Records an attack pause (attackPause): charged, never refused. */
   setAttackPause(value: string, now = this.clock.now()): void {
     this.ensureReady();
-    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.alert(() => this.reserved("setAttackPause", { reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_ATTACK_PAUSE, value);
     }, true));
   }
@@ -1642,7 +1613,7 @@ export class SqliteStore {
   listRooms(now = this.clock.now(), options: { maintenance?: boolean; changedSinceFloor?: number; withPrivate?: boolean } = {}): RoomRecord[] {
     this.ensureReady();
     const withPrivate = options.withPrivate === true;
-    return this.reserved({ reads: this.roomListingReads() + (withPrivate ? 4 * PRIVATE_ROOM_ROWS : 0) }, options.maintenance === true, now, () => {
+    return this.reserved("listRooms", { reads: this.roomListingReads() + (withPrivate ? 4 * PRIVATE_ROOM_ROWS : 0) }, options.maintenance === true, now, () => {
       const floor = this.publishedFloor();
       const rows = this.listedRoomRows(withPrivate);
       const since = options.changedSinceFloor;
@@ -1679,7 +1650,7 @@ export class SqliteStore {
   allRooms(now = this.clock.now()): RoomRecord[] {
     this.ensureReady();
     const rows = 1 + this.metaNumber("thread_count") + this.metaNumber("private_count");
-    return this.reserved({ reads: 32 + 2 * rows }, true, now, () => {
+    return this.reserved("allRooms", { reads: 32 + 2 * rows }, true, now, () => {
       const floor = this.publishedFloor();
       const found: RawRoomRow[] = [];
       let after = "";
@@ -1698,7 +1669,7 @@ export class SqliteStore {
   /** One room's record, or null when the room does not exist. */
   getRoom(roomId: string, now = this.clock.now()): RoomRecord | null {
     this.ensureReady();
-    return this.reserved({ reads: 16 }, false, now, () => {
+    return this.reserved("getRoom", { reads: 16 }, false, now, () => {
       const row = this.roomRow(roomId);
       if (!row) return null;
       return this.roomRecord(row, this.publishedFloor());
@@ -1713,7 +1684,7 @@ export class SqliteStore {
    */
   privateRoomsOf(userId: string, now = this.clock.now()): RoomRecord[] {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) }, false, now, () => {
+    return this.reserved("privateRoomsOf", { reads: 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) }, false, now, () => {
       const floor = this.publishedFloor();
       return this.rawRows<RawRoomRow>(
         `SELECT ${ROOM_COLUMNS.split(", ").map((column) => `r.${column}`).join(", ")}
@@ -1734,7 +1705,7 @@ export class SqliteStore {
    */
   roomCreator(roomId: string, now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 16 }, false, now, () => {
+    return this.reserved("roomCreator", { reads: 16 }, false, now, () => {
       const row = this.roomRow(roomId);
       if (!row || (row.parent_room_id === null && !isPrivateRoomId(row.room_id))) return undefined;
       return storedCreator(row.fields_json);
@@ -1751,7 +1722,7 @@ export class SqliteStore {
   /** The server-wide log head and retention floor. */
   logBounds(): { latest_log_id: string; history_floor: string } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, this.clock.now(), () => {
+    return this.reserved("logBounds", { reads: 8 }, false, this.clock.now(), () => {
       const state = this.logState();
       return { latest_log_id: idString(state.last_log_id), history_floor: idString(this.publishedFloor()) };
     });
@@ -1779,7 +1750,7 @@ export class SqliteStore {
    */
   hotRecords(now = this.clock.now()): number {
     this.ensureReady();
-    return this.reserved({ reads: 16 + RETAINED_SCAN_CAP + 1 }, false, now, () => integerColumn(this.rawRows<{ count: number }>(
+    return this.reserved("hotRecords", { reads: 16 + RETAINED_SCAN_CAP + 1 }, false, now, () => integerColumn(this.rawRows<{ count: number }>(
       "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx WHERE log_id >= ? LIMIT ?)",
       this.logState().history_floor, RETAINED_SCAN_CAP + 1,
     )[0]?.count));
@@ -1792,7 +1763,7 @@ export class SqliteStore {
    */
   historyFloors(now = this.clock.now()): { hot: number; published: number; latest: number } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, true, now, () => {
+    return this.reserved("historyFloors", { reads: 8 }, true, now, () => {
       const state = this.logState();
       return { hot: state.history_floor, published: this.publishedFloor(), latest: state.last_log_id };
     });
@@ -1809,7 +1780,7 @@ export class SqliteStore {
   historyTarget(now = this.clock.now()): number | undefined {
     this.ensureReady();
     if (!this.config.tiered) return undefined;
-    return this.reserved({ reads: 24 + HISTORY_TARGET_SCAN }, true, now, () => {
+    return this.reserved("historyTarget", { reads: 24 + HISTORY_TARGET_SCAN }, true, now, () => {
       const maintenance = this.maintenanceRow();
       if (maintenance.cleanup_cursor === null || maintenance.cleanup_cutoff_ms === null) return undefined;
       const cutoff = maintenance.cleanup_cutoff_ms;
@@ -1835,7 +1806,7 @@ export class SqliteStore {
   historyScan(from: number, limit = HISTORY_SCAN_BATCH, now = this.clock.now()): ChatRecord[] {
     this.ensureReady();
     const capped = Math.max(0, Math.min(limit, HISTORY_SCAN_BATCH));
-    return this.reserved({ reads: 24 + 6 * capped }, true, now, () => this.rawRows<ChatRecord>(
+    return this.reserved("historyScan", { reads: 24 + 6 * capped }, true, now, () => this.rawRows<ChatRecord>(
       `SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE log_id IN (
          SELECT DISTINCT log_id FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT ?)
        ORDER BY log_id, room_id`, from, capped,
@@ -1853,13 +1824,13 @@ export class SqliteStore {
     if (!query.roomIds.length || query.lower > query.upper || !limit) return [];
     if (query.roomIds.length === 1) {
       // One room (exports page room by room): its own key range, a page at most.
-      return this.reserved({ reads: 24 + limit + 1 }, true, now, () => this.rawRows<ChatRecord>(
+      return this.reserved("historyRecords", { reads: 24 + limit + 1 }, true, now, () => this.rawRows<ChatRecord>(
         `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
          WHERE room_id = ? AND log_id >= ? AND log_id <= ? ORDER BY log_id ${query.forward ? "ASC" : "DESC"} LIMIT ?`,
         query.roomIds[0], Math.max(query.lower, this.logState().history_floor), query.upper, limit,
       ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
     }
-    return this.reserved({ reads: 24 + 4 * limit * Math.min(query.roomIds.length, 8) }, true, now, () => this.rawRows<ChatRecord>(
+    return this.reserved("historyRecords", { reads: 24 + 4 * limit * Math.min(query.roomIds.length, 8) }, true, now, () => this.rawRows<ChatRecord>(
       `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
        WHERE room_id IN (SELECT value FROM json_each(?)) AND log_id IN (
          SELECT DISTINCT log_id FROM records
@@ -1875,7 +1846,7 @@ export class SqliteStore {
     this.ensureReady();
     const ids = [...new Set(logIds)].slice(0, 1_000);
     if (!ids.length) return [];
-    return this.reserved({ reads: 24 + 4 * ids.length }, true, now, () => this.rawRows<ChatRecord>(
+    return this.reserved("historyLookup", { reads: 24 + 4 * ids.length }, true, now, () => this.rawRows<ChatRecord>(
       "SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE log_id IN (SELECT value FROM json_each(?)) ORDER BY log_id, room_id",
       JSON.stringify(ids),
     ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
@@ -1889,6 +1860,8 @@ export class SqliteStore {
    * (runCleanup).
    */
   historyStatePort(): ChainStatePort {
+    // Its functions run when the history chain calls them, outside any store
+    // operation: their reservations are named `unknown` (accounting.ts).
     const owned = (key: string) => {
       if (!key.startsWith(META_HISTORY_TIER) && !key.startsWith(META_HISTORY_LINK) && !key.startsWith(META_HISTORY_KEPT)) throw new Error(`not a history chain state key: ${key}`);
       return key;
@@ -1896,30 +1869,30 @@ export class SqliteStore {
     return {
       value: (key) => {
         this.ensureReady();
-        return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaValue(owned(key)) || undefined);
+        return this.reserved("unknown", { reads: 4 }, true, this.clock.now(), () => this.metaValue(owned(key)) || undefined);
       },
       setValue: (key, value) => {
         this.ensureReady();
         if (!this.config.tiered) return;
-        this.reserved({ reads: 4, writes: 4 }, true, this.clock.now(), () => this.writeMeta(owned(key), value));
+        this.reserved("unknown", { reads: 4, writes: 4 }, true, this.clock.now(), () => this.writeMeta(owned(key), value));
       },
       hotFloor: () => this.historyFloors().hot,
       publishedFloor: () => this.historyFloors().published,
       copyMarker: () => {
         this.ensureReady();
-        return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_THROUGH));
+        return this.reserved("unknown", { reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_THROUGH));
       },
       raiseCopyMarker: (through) => {
         this.ensureReady();
         if (!this.config.tiered) return;
-        this.reserved({ reads: 4, writes: 4 }, true, this.clock.now(), () => {
+        this.reserved("unknown", { reads: 4, writes: 4 }, true, this.clock.now(), () => {
           if (through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(through));
         });
       },
       entries: (prefix) => {
         this.ensureReady();
         const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
-        return this.reserved({ reads: 16 + MAX_KEPT_GROUPS }, true, this.clock.now(), () => this.rawRows<{ key: string; value: string }>(
+        return this.reserved("unknown", { reads: 16 + MAX_KEPT_GROUPS }, true, this.clock.now(), () => this.rawRows<{ key: string; value: string }>(
           "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", owned(prefix), end, MAX_KEPT_GROUPS,
         ).map((row) => [row.key, row.value] as [string, string]));
       },
@@ -1934,7 +1907,7 @@ export class SqliteStore {
   publishHistoryFloor(floor: number, now = this.clock.now()): void {
     this.ensureReady();
     if (!this.config.tiered) return;
-    this.reserved({ reads: 16, writes: 8 }, true, now, () => {
+    this.reserved("publishHistoryFloor", { reads: 16, writes: 8 }, true, now, () => {
       const published = Math.min(floor, this.logState().history_floor);
       if (published <= this.publishedFloor()) return;
       this.writeMeta(META_HISTORY_PUBLISHED, String(published));
@@ -1949,13 +1922,13 @@ export class SqliteStore {
   historyRewrites(now = this.clock.now()): QueuedRewrite[] {
     this.ensureReady();
     if (!this.config.tiered) return [];
-    return this.reserved({ reads: 4 }, true, now, () => this.queuedRewrites());
+    return this.reserved("historyRewrites", { reads: 4 }, true, now, () => this.queuedRewrites());
   }
 
   /** The newest rewrite's number ever given (0: none), delivered or not. */
   historyRewritesLogged(now = this.clock.now()): number {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, true, now, () => this.metaNumber(META_HISTORY_OPS_SEQ));
+    return this.reserved("historyRewritesLogged", { reads: 4 }, true, now, () => this.metaNumber(META_HISTORY_OPS_SEQ));
   }
 
   private queuedRewrites(): QueuedRewrite[] {
@@ -1966,7 +1939,7 @@ export class SqliteStore {
   amendHistoryPurge(seq: number, messageIds: readonly string[], now = this.clock.now()): void {
     this.ensureReady();
     if (!messageIds.length) return;
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+    this.reserved("amendHistoryPurge", { reads: 4, writes: 4 }, true, now, () => {
       const next = this.queuedRewrites().map((entry) => entry.seq === seq && entry.rewrite.into === null ? { seq, rewrite: { ...entry.rewrite, messages: [...new Set([...(entry.rewrite.messages ?? []), ...messageIds])] } } : entry);
       this.writeMeta(META_HISTORY_OPS, JSON.stringify(next));
     });
@@ -1975,7 +1948,7 @@ export class SqliteStore {
   /** Forgets the rewrites through `seq`, once every link delivered them. */
   dropHistoryRewrites(seq: number, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+    this.reserved("dropHistoryRewrites", { reads: 4, writes: 4 }, true, now, () => {
       const kept = this.queuedRewrites().filter((entry) => entry.seq > seq);
       this.writeMeta(META_HISTORY_OPS, kept.length ? JSON.stringify(kept) : null);
     });
@@ -1992,7 +1965,7 @@ export class SqliteStore {
     if (!messageIds.length) return;
     const list = JSON.stringify([...new Set(messageIds)]);
     const records = this.retainedRecords(now, true);
-    this.reserved({ reads: 64 + 2 * records, writes: 64 + 4 * records }, true, now, () => this.transaction(() => {
+    this.reserved("dropReactionsOn", { reads: 64 + 2 * records, writes: 64 + 4 * records }, true, now, () => this.transaction(() => {
       const rows = this.rawRows<{ room_id: string; log_id: number }>(
         "SELECT room_id, log_id FROM records WHERE kind = 'reactions' AND json_extract(record_json, '$.message_id') IN (SELECT value FROM json_each(?))", list,
       );
@@ -2009,7 +1982,7 @@ export class SqliteStore {
    */
   isRetiredUserId(userId: string, now = this.clock.now()): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, true, now, () => this.retiredUserId(userId));
+    return this.reserved("isRetiredUserId", { reads: 8 }, true, now, () => this.retiredUserId(userId));
   }
 
   private retiredUserId(userId: string): boolean {
@@ -2024,7 +1997,7 @@ export class SqliteStore {
   exportMembers(roomId: string, limit: number, now = this.clock.now()): { members: string[]; count: number } {
     this.ensureReady();
     const max = Math.max(0, Math.floor(limit));
-    return this.reserved({ reads: 8 + max }, true, now, () => {
+    return this.reserved("exportMembers", { reads: 8 + max }, true, now, () => {
       const members = max ? this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? ORDER BY user_id LIMIT ?", roomId, max).map((row) => row.user_id) : [];
       // A full page may be truncated: the room row's count (one read) says how many there are.
       const count = members.length < max ? members.length : Math.max(members.length, integerColumn(this.rawRows<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0]?.member_count));
@@ -2050,7 +2023,7 @@ export class SqliteStore {
     const isPrivate = isPrivateRoomId(roomId);
     // Per join, the user's memberships counted against MAX_MEMBERSHIPS_PER_USER (and for a private room, their private rooms).
     const cost = { reads: 16 + 4 * size + changes.join.length * (MEMBERSHIP_COUNT_READS + (isPrivate ? this.userRoomsReads() : 0)), writes: 8 + 3 * size };
-    return this.reserved(cost, true, now, () => this.transaction(() => {
+    return this.reserved("restoreMembers", cost, true, now, () => this.transaction(() => {
       if (!this.roomRow(roomId)) throw new StoreError("invalid_params", `No room ${roomId} to restore members into`.slice(0, 200));
       const member = (userId: string) => this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
       let joined = 0;
@@ -2102,7 +2075,7 @@ export class SqliteStore {
     if (!unique.size) return [];
     this.ensureGrowthCapacity(unique.size * 2_048);
     // Per user, its identity row and two retired markers, then the row and its index pages written.
-    return this.reserved({ reads: 32 + 8 * unique.size, writes: 16 + 8 * unique.size }, true, now, () => this.transaction(() => {
+    return this.reserved("restoreUsers", { reads: 32 + 8 * unique.size, writes: 16 + 8 * unique.size }, true, now, () => this.transaction(() => {
       const fresh = [...unique.values()].filter((user) => !this.identityRow(user.user_id) && !this.retiredUserId(user.user_id));
       if (!fresh.length) return [];
       const count = this.metaNumber("identity_count");
@@ -2228,7 +2201,7 @@ export class SqliteStore {
     // First the reads: the floors, which records are stored already, and,
     // when new ones are older than the room's newest, the stored ones after
     // them, from which their state is replayed.
-    const probe = this.reserved({ reads: 48 + 4 * batch.length + 2 * (RESTORE_REPLAY_CAP + 1) }, true, now, () => {
+    const probe = this.reserved("restoreRoom", { reads: 48 + 4 * batch.length + 2 * (RESTORE_REPLAY_CAP + 1) }, true, now, () => {
       const state = this.logState();
       const through = this.config.tiered ? this.metaNumber(META_HISTORY_THROUGH) : 0;
       const below = batch.find((record) => record.log_id < state.history_floor || record.log_id <= through);
@@ -2280,7 +2253,7 @@ export class SqliteStore {
       writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
     };
     if (fresh.length) this.ensureGrowthCapacity(2 * fresh.reduce((sum, record) => sum + utf8Bytes(record.record_json), 0) + 1_024);
-    return this.reserved(cost, true, now, () => this.transaction(() => {
+    return this.reserved("restoreRoom", cost, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       let row = this.roomRow(roomId);
       const created = row === null;
@@ -2453,10 +2426,11 @@ export class SqliteStore {
    * is the only writer); each read and write is charged to maintenance.
    */
   chunkIndex(tier: string): ChunkIndex {
+    // As historyStatePort's: run by the cold tier, so named `unknown`.
     const prepare = () => {
       this.ensureReady();
       if (this.chunkTableReady) return;
-      this.reserved({ reads: 8, writes: 8 }, true, this.clock.now(), () => {
+      this.reserved("unknown", { reads: 8, writes: 8 }, true, this.clock.now(), () => {
         this.rawExec("CREATE TABLE IF NOT EXISTS history_chunks (tier TEXT NOT NULL, first INTEGER NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (tier, first)) WITHOUT ROWID");
       });
       this.chunkTableReady = true;
@@ -2466,8 +2440,8 @@ export class SqliteStore {
       if (cached) return cached;
       prepare();
       // Charged for the rows there are: a count first, then the rows.
-      const count = this.reserved({ reads: 24 }, true, this.clock.now(), () => Number(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = ?", tier)[0]?.count ?? 0));
-      const rows = this.reserved({ reads: 24 + count }, true, this.clock.now(), () => this.rawRows<{ first: number; ref: string }>("SELECT first, ref FROM history_chunks WHERE tier = ?", tier));
+      const count = this.reserved("unknown", { reads: 24 }, true, this.clock.now(), () => Number(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = ?", tier)[0]?.count ?? 0));
+      const rows = this.reserved("unknown", { reads: 24 + count }, true, this.clock.now(), () => this.rawRows<{ first: number; ref: string }>("SELECT first, ref FROM history_chunks WHERE tier = ?", tier));
       const refs = new Map(rows.map((row) => [Number(row.first), JSON.parse(row.ref) as ChunkRef]));
       this.chunkIndexes.set(tier, refs);
       return refs;
@@ -2476,7 +2450,7 @@ export class SqliteStore {
       list: async () => [...loaded().values()].map((ref) => ({ ...ref })),
       update: async ({ put = [], remove = [] }) => {
         const refs = loaded();
-        this.reserved({ reads: 8 + put.length + remove.length, writes: 2 * (put.length + remove.length) }, true, this.clock.now(), () => {
+        this.reserved("unknown", { reads: 8 + put.length + remove.length, writes: 2 * (put.length + remove.length) }, true, this.clock.now(), () => {
           for (const first of remove) this.rawExec("DELETE FROM history_chunks WHERE tier = ? AND first = ?", tier, first);
           for (const ref of put) this.rawExec("INSERT OR REPLACE INTO history_chunks (tier, first, ref) VALUES (?, ?, ?)", tier, ref.first, JSON.stringify(ref));
         });
@@ -2490,31 +2464,31 @@ export class SqliteStore {
   historyMetaNumber(key: string, now = this.clock.now()): number {
     this.ensureReady();
     if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
-    return this.reserved({ reads: 4 }, true, now, () => this.metaNumber(key));
+    return this.reserved("historyMetaNumber", { reads: 4 }, true, now, () => this.metaNumber(key));
   }
 
   /** The running import's journal (`history:import`, RestorePort.journal): what a retry needs to finish it. */
   historyImportJournal(now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT) || undefined);
+    return this.reserved("historyImportJournal", { reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT) || undefined);
   }
 
   /** Writes or clears the running import's journal (its size is the importer's to bound: MAX_JOURNAL_BYTES). */
   setHistoryImportJournal(value: string | null, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 + Math.ceil((value?.length ?? 0) / 4_096) }, true, now, () => this.writeMeta(META_HISTORY_IMPORT, value));
+    this.reserved("setHistoryImportJournal", { reads: 4, writes: 4 + Math.ceil((value?.length ?? 0) / 4_096) }, true, now, () => this.writeMeta(META_HISTORY_IMPORT, value));
   }
 
   /** How far the running import's writes got (`history:import_progress`, RestorePort.progress): a small JSON value. */
   historyImportProgress(now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT_PROGRESS) || undefined);
+    return this.reserved("historyImportProgress", { reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT_PROGRESS) || undefined);
   }
 
   /** Writes or clears the running import's progress. */
   setHistoryImportProgress(value: string | null, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => this.writeMeta(META_HISTORY_IMPORT_PROGRESS, value));
+    this.reserved("setHistoryImportProgress", { reads: 4, writes: 4 }, true, now, () => this.writeMeta(META_HISTORY_IMPORT_PROGRESS, value));
   }
 
   /**
@@ -2523,7 +2497,7 @@ export class SqliteStore {
    */
   roomIsEmpty(roomId: string, now = this.clock.now()): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 8 + EMPTY_ROOM_SCAN }, true, now, () => {
+    return this.reserved("roomIsEmpty", { reads: 8 + EMPTY_ROOM_SCAN }, true, now, () => {
       const room = this.rawRows<{ created_log_id: number; latest_log_id: number }>("SELECT created_log_id, latest_log_id FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
       if (room === undefined) return false;
       if (integerColumn(room.latest_log_id) <= integerColumn(room.created_log_id)) return true;
@@ -2556,7 +2530,7 @@ export class SqliteStore {
   setHistoryMeta(key: string, value: string | null, now = this.clock.now()): void {
     this.ensureReady();
     if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => this.writeMeta(key, value));
+    this.reserved("setHistoryMeta", { reads: 4, writes: 4 }, true, now, () => this.writeMeta(key, value));
   }
 
   /**
@@ -2635,7 +2609,7 @@ export class SqliteStore {
   /** Whether an identity has this `user_id` now, one indexed read. */
   identityExists(userId: string): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, this.clock.now(), () => this.identityRow(userId) !== null);
+    return this.reserved("identityExists", { reads: 4 }, false, this.clock.now(), () => this.identityRow(userId) !== null);
   }
 
   /**
@@ -2645,7 +2619,7 @@ export class SqliteStore {
    */
   userIdTaken(userId: string): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.idTaken(userId));
+    return this.reserved("userIdTaken", { reads: 8 }, false, this.clock.now(), () => this.idTaken(userId));
   }
 
   private idTaken(userId: string): boolean {
@@ -2674,7 +2648,7 @@ export class SqliteStore {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (this.roomRowCount() + MAX_PURGE_ROOMS) }, false, now, () => {
+    const found = this.reserved("renameIdentity", { reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (this.roomRowCount() + MAX_PURGE_ROOMS) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
@@ -2709,7 +2683,7 @@ export class SqliteStore {
     const moved = 2 * membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
     const rewritten = found.records.length + found.messages.length + found.created.length;
     const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
-    return this.reserved(cost, false, now, () => this.transaction(() => {
+    return this.reserved("renameIdentity", cost, false, now, () => this.transaction(() => {
       const renamed = (user: Identity): Identity => user.user_id === from ? { ...user, user_id: to } : user;
       this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", to, this.effectiveNow(now), from);
       this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", to, from);
@@ -2770,7 +2744,7 @@ export class SqliteStore {
   private retainedRecords(now: number, unchecked = false): number {
     // Each record is a row and an index entry, well over 64 bytes.
     const cap = unchecked ? Math.ceil(this.config.storageHardTargetBytes / 64) : RETAINED_SCAN_CAP;
-    return this.reserved({ reads: 16 + cap + 1 }, false, now, () => {
+    return this.reserved("retainedRecords", { reads: 16 + cap + 1 }, false, now, () => {
       const count = integerColumn(this.rawRows<{ count: number }>(
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx LIMIT ?)",
         cap + 1,
@@ -2836,7 +2810,7 @@ export class SqliteStore {
     // Every room row is read for its creator, and each one theirs rewritten.
     const roomRows = this.roomRowCount() + MAX_PURGE_ROOMS;
     const cost = { reads: 64 + 5 * records + 2 * roomRows + ids.length * perUser, writes: 64 + 4 * records + 2 * roomRows + ids.length * perUser };
-    return this.reserved(cost, false, now, () => this.transaction(() => {
+    return this.reserved("purgeUsers", cost, false, now, () => this.transaction(() => {
       // Their records may be the newest.
       this.writeLogHead();
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -2914,7 +2888,7 @@ export class SqliteStore {
   noteActive(userId: string, now = this.clock.now()): void {
     try {
       this.ensureReady();
-      this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.reserved("noteActive", { reads: 4, writes: 4 }, false, now, () => {
         const effective = this.effectiveNow(now);
         this.rawExec("UPDATE identities SET updated_ms = ? WHERE user_id = ? AND updated_ms < ? AND updated_ms > 0", effective, userId, effective - ACTIVITY_GRANULARITY_MS);
       });
@@ -2951,7 +2925,7 @@ export class SqliteStore {
       const value = stored as { day?: unknown; runs?: unknown; done?: unknown };
       return value.day === today ? { day: today, runs: integerColumn(value.runs), done: value.done === true } : undefined;
     }, { day: today, runs: 0, done: false });
-    const state = this.reserved({ reads: 8, writes: 4 }, true, now, () => {
+    const state = this.reserved("pruneIdleIdentities", { reads: 8, writes: 4 }, true, now, () => {
       const since = Number(this.metaValue(META_IDLE_ACTIVITY_SINCE));
       if (!Number.isFinite(since) || since <= 0) {
         this.writeMeta(META_IDLE_ACTIVITY_SINCE, String(now));
@@ -2960,7 +2934,7 @@ export class SqliteStore {
       return { ...progress(), waiting: now - since < this.config.idleAccountMs };
     }, false);
     if (state.waiting || state.done || state.runs >= IDLE_PRUNE_RUNS_PER_DAY) return { pruned: [], more: false };
-    const record = (done: boolean) => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+    const record = (done: boolean) => this.reserved("pruneIdleIdentities", { reads: 4, writes: 4 }, true, now, () => {
       const current = progress();
       this.writeMeta(META_IDLE_PRUNE_DAY,
         JSON.stringify({ day: today, runs: current.runs + 1, done: done || current.runs + 1 >= IDLE_PRUNE_RUNS_PER_DAY }));
@@ -2969,7 +2943,7 @@ export class SqliteStore {
     // Ranking reads every identity twice, each with its passkeys and a bot
     // lookup; bots and the admin are identities beyond the cap.
     const perIdentity = 2 * (3 + MAX_PASSKEYS_PER_USER);
-    const found = this.reserved({ reads: 64 + perIdentity * (2 * this.config.registeredAccounts + 1) + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
+    const found = this.reserved("pruneIdleIdentities", { reads: 64 + perIdentity * (2 * this.config.registeredAccounts + 1) + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
       const candidates = this.rawRows<{ user_id: string }>(
         `SELECT i.user_id FROM identities i
          WHERE i.roles_json = '[]' AND i.user_id != ? AND ${lastActiveSql("i")} < ?
@@ -3011,7 +2985,7 @@ export class SqliteStore {
       writes: 64 + 4 * found.rows + 2 * roomRows + 2 * limiterRows + 8 * ids.length,
     };
     try {
-      this.reserved(cost, true, now, () => this.transaction(() => {
+      this.reserved("pruneIdleIdentities", cost, true, now, () => this.transaction(() => {
         this.rawExec(
           `UPDATE rooms SET member_count = MAX(0, member_count - (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id AND m.user_id IN (SELECT value FROM json_each(?))))
            WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (SELECT value FROM json_each(?)))`,
@@ -3061,7 +3035,7 @@ export class SqliteStore {
   /** Idle accounts pruned today and in all (pruneIdleIdentities), for `/status`: charged, never refused. */
   idlePruned(now = this.clock.now()): { today: number; total: number } {
     this.ensureReady();
-    return this.alert(() => this.reserved({ reads: 4 }, false, now, () => {
+    return this.alert(() => this.reserved("idlePruned", { reads: 4 }, false, now, () => {
       const record = this.idlePrunedRaw();
       return { today: record.day === dayFor(now) ? record.today : 0, total: record.total };
     }, true));
@@ -3081,7 +3055,7 @@ export class SqliteStore {
   dueRetiredUserIds(now = this.clock.now()): string[] {
     this.ensureReady();
     const end = META_PURGED_PREFIX.slice(0, -1) + ";";
-    return this.reserved({ reads: 16 + 4 * this.config.registeredAccounts, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+    return this.reserved("dueRetiredUserIds", { reads: 16 + 4 * this.config.registeredAccounts, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
       const state = this.logState();
       const legacy = this.rawRows<{ key: string }>(
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) <= 1 LIMIT ?", META_PURGED_PREFIX, end, RETIRED_SWEEP_BATCH,
@@ -3115,7 +3089,7 @@ export class SqliteStore {
   freeRetiredUserIds(userIds: readonly string[], now = this.clock.now()): void {
     if (!userIds.length) return;
     this.ensureReady();
-    this.reserved({ reads: 8 + 2 * userIds.length, writes: 8 + 4 * userIds.length }, true, now, () => {
+    this.reserved("freeRetiredUserIds", { reads: 8 + 2 * userIds.length, writes: 8 + 4 * userIds.length }, true, now, () => {
       this.rawExec("DELETE FROM _meta WHERE key IN (SELECT ? || value FROM json_each(?))", META_PURGED_PREFIX, JSON.stringify(userIds));
     }, false);
   }
@@ -3128,7 +3102,7 @@ export class SqliteStore {
   clearExpiredMutes(now = this.clock.now()): number {
     this.ensureReady();
     const cap = this.config.registeredAccounts;
-    return this.reserved({ reads: 16 + 2 * cap + 2 * MAX_ROOM_MUTES_PER_USER * 64, writes: 16 + 4 * 1_000 }, true, now, () => this.transaction(() => {
+    return this.reserved("clearExpiredMutes", { reads: 16 + 2 * cap + 2 * MAX_ROOM_MUTES_PER_USER * 64, writes: 16 + 4 * 1_000 }, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       let changed = 0;
       changed += this.rawExec("UPDATE user_status SET mute_until_ms = NULL WHERE user_id IN (SELECT user_id FROM user_status WHERE mute_until_ms IS NOT NULL AND mute_until_ms <= ? LIMIT 1000)", effective).rowsWritten ?? 0;
@@ -3159,7 +3133,7 @@ export class SqliteStore {
 
   getIdentity(userId: string): StoredIdentity | null {
     this.ensureReady();
-    return this.reserved({ reads: 16 + this.userRoomsReads() }, false, this.clock.now(), () => {
+    return this.reserved("getIdentity", { reads: 16 + this.userRoomsReads() }, false, this.clock.now(), () => {
       const row = this.identityRow(userId);
       if (!row) return null;
       const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM credentials WHERE user_id = ? LIMIT 1", userId)[0];
@@ -3220,7 +3194,7 @@ export class SqliteStore {
     if (missing.length) {
       // Each member's status adds its `user_status` row, when it has one:
       // measured at one more read a member at worst.
-      this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
+      this.reserved("roomMembers", { reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
         const generation = this.memberGeneration;
         if (this.memberCache.size > 2 * this.listedRoomBound) this.memberCache.clear();
         for (const roomId of missing) {
@@ -3268,7 +3242,7 @@ export class SqliteStore {
   /** One registered member of a room, for `room_list` with `user_id` (§4.2.1), or null when they aren't one. */
   roomMember(roomId: string, userId: string, now = this.clock.now(), withStatus = false): RoomMember | null {
     this.ensureReady();
-    return this.reserved({ reads: 8 + (withStatus ? 3 : 2) }, false, now, () => {
+    return this.reserved("roomMember", { reads: 8 + (withStatus ? 3 : 2) }, false, now, () => {
       const row = this.rawRows<RawMemberRow>(
         withStatus
           ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
@@ -3291,7 +3265,7 @@ export class SqliteStore {
 
   getCredential(credentialId: string): StoredCredential | null {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.credentialValue(credentialId));
+    return this.reserved("getCredential", { reads: 8 }, false, this.clock.now(), () => this.credentialValue(credentialId));
   }
 
   private credentialValue(credentialId: string): StoredCredential | null {
@@ -3315,7 +3289,7 @@ export class SqliteStore {
 
   countIdentities(): number {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.metaNumber("identity_count"));
+    return this.reserved("countIdentities", { reads: 8 }, false, this.clock.now(), () => this.metaNumber("identity_count"));
   }
 
   /** The accounts in use and the most there may be (registeredAccounts): an import's placeholders must fit (restoreUsers). */
@@ -3329,7 +3303,7 @@ export class SqliteStore {
    */
   restoreRoomCapacity(listings: readonly RoomListing[], now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 24 + MAX_CREATED_ROOMS + listings.length + 2 * this.roomCountReads }, true, now, () => {
+    return this.reserved("restoreRoomCapacity", { reads: 24 + MAX_CREATED_ROOMS + listings.length + 2 * this.roomCountReads }, true, now, () => {
       const privates = listings.filter((listing) => isPrivateRoomId(listing.room_id));
       const publics = listings.filter((listing) => !isPrivateRoomId(listing.room_id));
       const topLevel = publics.filter((listing) => typeof listing.parent_room_id !== "string");
@@ -3371,7 +3345,7 @@ export class SqliteStore {
 
   accountCapacity(now = this.clock.now()): { used: number; limit: number } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, true, now, () => ({ used: this.metaNumber("identity_count"), limit: this.config.registeredAccounts }));
+    return this.reserved("accountCapacity", { reads: 8 }, true, now, () => ({ used: this.metaNumber("identity_count"), limit: this.config.registeredAccounts }));
   }
 
   private dedupRow(userId: string, requestId: string, now: number): RawDedupRow | null {
@@ -3556,7 +3530,7 @@ export class SqliteStore {
     // Frames are reserved by reserveFrames at the websocket boundary.  Keep
     // the auth operation's SQL reservation separate so one frame is not
     // charged twice.
-    this.reserved({ ...this.config.authCost, frames: 0, reads: Math.max(32, this.config.authCost.reads ?? 0), writes: Math.max(16, this.config.authCost.writes ?? 0) }, false, input.now, () => {
+    this.reserved("reserveAuthAttempt", { ...this.config.authCost, frames: 0, reads: Math.max(32, this.config.authCost.reads ?? 0), writes: Math.max(16, this.config.authCost.writes ?? 0) }, false, input.now, () => {
       const effective = this.effectiveNow(input.now);
       this.transaction(() => {
         this.chargeEvent("auth", `ip:${input.ipKey}`, effective, { perMinute: this.config.authAttemptsPerIpMinute }, "Authentication attempts limited");
@@ -3576,7 +3550,7 @@ export class SqliteStore {
   reserveGuestNumbers(count: number, now = this.clock.now()): { first: number; limit: number } {
     this.ensureReady();
     if (!Number.isSafeInteger(count) || count <= 0) throw new StoreError("invalid_params", "guest number block must be a positive safe integer");
-    return this.reserved(GUEST_NUMBER_BLOCK_COST, false, now, () => this.transaction(() => {
+    return this.reserved("reserveGuestNumbers", GUEST_NUMBER_BLOCK_COST, false, now, () => this.transaction(() => {
       const mark = this.metaNumber(META_GUEST_NUMBER_MARK);
       if (mark > MAX_SAFE_ID - count - 1) throw new StoreError("internal_error", "guest numbers are exhausted");
       this.writeMeta(META_GUEST_NUMBER_MARK, String(mark + count));
@@ -3590,7 +3564,7 @@ export class SqliteStore {
     if (count > this.config.framesPerIpMinute || count > this.config.processedFramesPerDay) {
       throw new StoreError("invalid_params", "frame reservation is too large");
     }
-    this.reserved({ reads: 16 + count * 4, writes: 16, frames: count }, false, input.now, () => {
+    this.reserved("reserveFrames", { reads: 16 + count * 4, writes: 16, frames: count }, false, input.now, () => {
       const effective = this.effectiveNow(input.now);
       this.transaction(() => {
         const row = this.limitRow("frames", `ip:${input.ipKey}`, effective);
@@ -3657,7 +3631,7 @@ export class SqliteStore {
     // (test/accounting.integration.test.ts); reserved at 6 reads and 8 writes
     // a room, with the identity and credential rows besides.
     const starting = [...new Set(input.rooms ?? DEFAULT_JOINED_ROOMS)].slice(0, MAX_LISTED_USER_ROOMS);
-    const reservation = this.reserveCost({ reads: 128 + 6 * starting.length, writes: 64 + 8 * starting.length, registrations: 1 }, false, input.now);
+    const reservation = this.reserveCost("registerIdentity", { reads: 128 + 6 * starting.length, writes: 64 + 8 * starting.length, registrations: 1 }, false, input.now);
     try {
       if (!input.userId || !input.userHandle || !input.ipKey) throw new StoreError("invalid_params", "registration identity is incomplete");
       ensureText(input.name, "name", this.config.maxNameBytes);
@@ -3754,7 +3728,7 @@ export class SqliteStore {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    const reservation = this.reserveCost({ reads: 96, writes: 48, registrations: 1 }, false, input.now);
+    const reservation = this.reserveCost("addCredential", { reads: 96, writes: 48, registrations: 1 }, false, input.now);
     try {
       ensureText(credential.credentialId, "credential_id", 16 * 1024);
       ensureText(credential.publicKey, "public_key", 16 * 1024);
@@ -3805,7 +3779,7 @@ export class SqliteStore {
    */
   ensureUserHandle(userId: string, candidate: string, now = this.clock.now()): string | null {
     this.ensureReady();
-    return this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
+    return this.reserved("ensureUserHandle", { reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
       const identity = this.identityRow(userId);
       if (!identity) return null;
       if (identity.user_handle) return identity.user_handle;
@@ -3817,7 +3791,7 @@ export class SqliteStore {
   /** An identity's passkeys, oldest first: at most MAX_PASSKEYS_PER_USER, for `/passkeys`. */
   passkeys(userId: string, now = this.clock.now()): Array<{ credentialId: string; createdMs: number; usedMs: number }> {
     this.ensureReady();
-    return this.reserved({ reads: 8 + 2 * MAX_PASSKEYS_PER_USER }, false, now, () => this.rawRows<{ credential_id: string; created_ms: number; updated_ms: number }>(
+    return this.reserved("passkeys", { reads: 8 + 2 * MAX_PASSKEYS_PER_USER }, false, now, () => this.rawRows<{ credential_id: string; created_ms: number; updated_ms: number }>(
       "SELECT credential_id, created_ms, updated_ms FROM credentials INDEXED BY credentials_user_idx WHERE user_id = ? ORDER BY created_ms, credential_id LIMIT ?",
       userId, MAX_PASSKEYS_PER_USER,
     ).map((row) => ({ credentialId: row.credential_id, createdMs: row.created_ms, usedMs: row.updated_ms })));
@@ -3830,7 +3804,7 @@ export class SqliteStore {
    */
   removePasskey(input: { userId: string; credentialId: string; now?: number }): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 8 + 2 * MAX_PASSKEYS_PER_USER, writes: 16 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+    return this.reserved("removePasskey", { reads: 8 + 2 * MAX_PASSKEYS_PER_USER, writes: 16 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
       const count = integerColumn(this.rawRows<{ count: number }>(
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER + 1,
       )[0]?.count);
@@ -3850,7 +3824,7 @@ export class SqliteStore {
   resetAuth(input: { userId: string; now?: number }): number {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 16 + 2 * MAX_PASSKEYS_PER_USER, writes: 16 + 4 * MAX_PASSKEYS_PER_USER }, false, now, () => this.transaction(() => {
+    return this.reserved("resetAuth", { reads: 16 + 2 * MAX_PASSKEYS_PER_USER, writes: 16 + 4 * MAX_PASSKEYS_PER_USER }, false, now, () => this.transaction(() => {
       const count = integerColumn(this.rawRows<{ count: number }>(
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER,
       )[0]?.count);
@@ -3862,7 +3836,7 @@ export class SqliteStore {
 
   credentialIdsForUser(userId: string): string[] {
     this.ensureReady();
-    return this.reserved({ reads: 32 }, false, this.clock.now(), () => {
+    return this.reserved("credentialIdsForUser", { reads: 32 }, false, this.clock.now(), () => {
       const rows = this.rawRows<{ credential_id: string }>("SELECT credential_id FROM credentials WHERE user_id = ? ORDER BY credential_id LIMIT 16", userId);
       return rows.map((row) => row.credential_id);
     });
@@ -3871,7 +3845,7 @@ export class SqliteStore {
   updateCredentialCounter(credentialId: string, counter: number): void {
     if (!Number.isSafeInteger(counter) || counter < 0) throw new StoreError("invalid_params", "invalid credential counter");
     this.ensureReady();
-    this.reserved({ reads: 8, writes: 8 }, false, this.clock.now(), () => {
+    this.reserved("updateCredentialCounter", { reads: 8, writes: 8 }, false, this.clock.now(), () => {
       const now = this.effectiveNow(this.clock.now());
       this.rawExec(
         "UPDATE credentials SET sign_count = CASE WHEN sign_count < ? THEN ? ELSE sign_count END, updated_ms = ? WHERE credential_id = ?",
@@ -3886,7 +3860,7 @@ export class SqliteStore {
   reserveConnection(input: { ipKey: string; now: number }): void {
     this.ensureReady();
     if (!this.config.admissionEnabled) throw new StoreError("denied", "Demo admission is closed");
-    this.reserved({ reads: 64, writes: 32, admissions: 1 }, false, input.now, () => {
+    this.reserved("reserveConnection", { reads: 64, writes: 32, admissions: 1 }, false, input.now, () => {
       const now = this.effectiveNow(input.now);
       this.transaction(() => {
         this.chargeEvent("admission", `ip:${input.ipKey}`, now, { perMinute: this.config.connectionAdmissionsPerIpMinute }, "Connection admission limit reached");
@@ -4048,7 +4022,7 @@ export class SqliteStore {
    */
   topLevelRoomIds(now = this.clock.now()): string[] {
     this.ensureReady();
-    return this.reserved({ reads: this.roomListingReads() }, false, now, () => this.rawRows<{ room_id: string }>(
+    return this.reserved("topLevelRoomIds", { reads: this.roomListingReads() }, false, now, () => this.rawRows<{ room_id: string }>(
       `SELECT room_id FROM rooms WHERE ${roomKind(0)} ORDER BY created_log_id ASC LIMIT ?`, MAX_CREATED_ROOMS + 1,
     ).map((row) => row.room_id));
   }
@@ -4077,7 +4051,7 @@ export class SqliteStore {
     this.ensureReady();
     ensureText(input.name, "name", this.config.maxNameBytes);
     if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
-    const existing = this.reserved({ reads: 16 }, false, input.now, () => {
+    const existing = this.reserved("registerBot", { reads: 16 }, false, input.now, () => {
       const owner = this.identityRow(input.ownerId);
       // A bot, an owner's or one made by `/role … bot`, owns no bot of its own.
       if (!owner || owner.tier !== "registered" || parseRoles(owner.roles_json).includes("bot")) throw new StoreError("denied", "Only registered users may invite a bot");
@@ -4087,7 +4061,7 @@ export class SqliteStore {
       if (existing.tier !== "bot") throw new StoreError("internal_error", "bot identity is taken");
       const renamed = existing.name !== input.name;
       if (renamed) {
-        this.reserved({ reads: 8, writes: 8 }, false, input.now, () => {
+        this.reserved("registerBot", { reads: 8, writes: 8 }, false, input.now, () => {
           this.rawExec("UPDATE identities SET name = ?, updated_ms = ? WHERE user_id = ?", input.name, this.effectiveNow(input.now), input.botId);
         });
       }
@@ -4110,7 +4084,7 @@ export class SqliteStore {
   setRole(input: { userId: string; role: string; on?: boolean; now?: number }): { changed: boolean; on: boolean; name: string; roles: string[] } {
     this.ensureReady();
     if (!ROLE_PATTERN.test(input.role)) throw new StoreError("invalid_params", "A role is 1 to 24 lowercase letters, digits, _ or -, starting with a letter");
-    return this.reserved({ reads: 12, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+    return this.reserved("setRole", { reads: 12, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
       if (!identity || (identity.tier !== "registered" && identity.tier !== "bot")) throw new StoreError("invalid_params", "No registered user has that user_id");
       const held = parseRoles(identity.roles_json);
@@ -4148,7 +4122,7 @@ export class SqliteStore {
    */
   markBotActive(userId: string, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.reserved("markBotActive", { reads: 4, writes: 4 }, false, now, () => {
       this.rawExec(`UPDATE identities SET updated_ms = ? WHERE user_id = ? AND roles_json = '["bot"]'`, this.effectiveNow(now), userId);
     });
   }
@@ -4160,7 +4134,7 @@ export class SqliteStore {
    */
   markBotSignedOut(userId: string, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+    this.reserved("markBotSignedOut", { reads: 4, writes: 4 }, true, now, () => {
       this.rawExec(`UPDATE identities SET updated_ms = 0 WHERE user_id = ? AND roles_json = '["bot"]'`, userId);
     });
   }
@@ -4176,13 +4150,13 @@ export class SqliteStore {
    */
   idleBots(input: { now: number; before: number; limit: number; intervalMs: number; graceMs: number }): string[] | null {
     this.ensureReady();
-    const { due, identities } = this.reserved({ reads: 4 }, true, input.now, () => ({
+    const { due, identities } = this.reserved("idleBots", { reads: 4 }, true, input.now, () => ({
       due: this.metaValue(META_BOT_SWEEP), identities: this.metaNumber("identity_count"),
     }));
     if (due !== "" && this.effectiveNow(input.now) < Number(due)) return null;
     // A scan of every identity row, the sort reading each idle bot's again,
     // and the next due time.
-    return this.reserved({ reads: 16 + 2 * identities, writes: 4 }, true, input.now, () => {
+    return this.reserved("idleBots", { reads: 16 + 2 * identities, writes: 4 }, true, input.now, () => {
       const effective = this.effectiveNow(input.now);
       const idle = due === "" ? [] : this.rawRows<{ user_id: string }>(
         `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ? ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
@@ -4200,7 +4174,7 @@ export class SqliteStore {
    */
   ensureAdminUser(input: { userId: string; name: string; now: number; ipKey: string }): { created: boolean; broadcasts: Broadcast[] } {
     this.ensureReady();
-    const existing = this.reserved({ reads: 8 }, false, input.now, () => this.identityRow(input.userId));
+    const existing = this.reserved("ensureAdminUser", { reads: 8 }, false, input.now, () => this.identityRow(input.userId));
     if (existing) {
       if (existing.tier !== "registered") throw new StoreError("internal_error", "admin user identity is taken");
       return { created: false, broadcasts: [] };
@@ -4216,7 +4190,7 @@ export class SqliteStore {
    */
   createInvitedIdentity(input: { userId: string; name: string; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
     this.ensureReady();
-    if (this.reserved({ reads: 8 }, false, input.now, () => this.idTaken(input.userId))) {
+    if (this.reserved("createInvitedIdentity", { reads: 8 }, false, input.now, () => this.idTaken(input.userId))) {
       throw new StoreError("invalid_params", `The user_id ${input.userId} is taken`.slice(0, 200));
     }
     return this.createKeylessIdentity({ ...input, tier: "registered" });
@@ -4235,7 +4209,7 @@ export class SqliteStore {
     const beforeWrites = this.observed.writes;
     // The limiter and meta rows, the identity row, and one membership row and
     // logged record in `general`.
-    const reservation = this.reserveCost({ reads: 128, writes: 72, registrations: 1 }, false, input.now);
+    const reservation = this.reserveCost("createKeylessIdentity", { reads: 128, writes: 72, registrations: 1 }, false, input.now);
     // An operator alert creating the admin user it posts as (alert) is not
     // held to the registration cap, limits, or storage high-water.
     const alerting = this.alerting;
@@ -4328,7 +4302,7 @@ export class SqliteStore {
     // the private rooms the user is in, through the same membership rows.
     const privateJoin = input.join && isPrivateRoomId(input.roomId);
     // A join also counts the user's memberships against MAX_MEMBERSHIPS_PER_USER.
-    const reserved = this.reserveCost({ reads: 64 + (privateJoin ? 2 : 1) * this.userRoomsReads() + (input.join ? MEMBERSHIP_COUNT_READS : 0), writes: 64, posts: 1 }, false, operationNow);
+    const reserved = this.reserveCost("changeMembership", { reads: 64 + (privateJoin ? 2 : 1) * this.userRoomsReads() + (input.join ? MEMBERSHIP_COUNT_READS : 0), writes: 64, posts: 1 }, false, operationNow);
     try {
       const effective = this.effectiveNow(operationNow);
       if (input.join) this.ensureGrowthCapacity(1024);
@@ -4381,7 +4355,7 @@ export class SqliteStore {
   chargeGuestMembership(input: { ipKey: string; now?: number }): void {
     this.ensureReady();
     const operationNow = input.now ?? this.clock.now();
-    this.reserved({ reads: 32, writes: 32, posts: 1 }, false, operationNow, () => {
+    this.reserved("chargeGuestMembership", { reads: 32, writes: 32, posts: 1 }, false, operationNow, () => {
       const effective = this.effectiveNow(operationNow);
       this.transaction(() => this.chargePosting({ userId: "", tier: "anonymous", ipKey: input.ipKey, now: effective }));
     });
@@ -4398,7 +4372,7 @@ export class SqliteStore {
    */
   removeEmptyThread(roomId: string, now = this.clock.now()): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 16, writes: 8 }, false, now, () => this.transaction(() => {
+    return this.reserved("removeEmptyThread", { reads: 16, writes: 8 }, false, now, () => this.transaction(() => {
       const room = this.roomRow(roomId);
       // A private room goes the same way, freeing its slot among the private ones.
       const isPrivate = room !== null && isPrivateRoomId(room.room_id);
@@ -4930,7 +4904,7 @@ export class SqliteStore {
     this.ensureReady();
     if (!this.config.liveText) return [];
     if (this.liveCache) return this.liveTexts();
-    return this.reserved({ reads: 4 }, false, now, () => this.liveTexts());
+    return this.reserved("openLiveTexts", { reads: 4 }, false, now, () => this.liveTexts());
   }
 
   /**
@@ -4943,7 +4917,7 @@ export class SqliteStore {
   startLiveCommand(input: { userId: string; ipKey: string; identity: Identity; kind: LiveKind; roomId: string; title?: string; text?: string; replyTo?: string; now?: number }): LiveEntry {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 64, writes: 48 + LIVE_WRITES }, false, now, () => this.transaction(() => {
+    return this.reserved("startLiveCommand", { reads: 64, writes: 48 + LIVE_WRITES }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       if (!this.visibleRoomRow(input.roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
       const text = ensureText(input.text ?? "", "body.text", this.config.maxTextBytes);
@@ -4972,7 +4946,7 @@ export class SqliteStore {
     this.ensureReady();
     if (!this.config.liveText) return null;
     try {
-      return this.reserved({ reads: 256, writes: 96 + LIVE_WRITES }, false, now, () => this.transaction(() => {
+      return this.reserved("claimLiveText", { reads: 256, writes: 96 + LIVE_WRITES }, false, now, () => this.transaction(() => {
         const effective = this.effectiveNow(now);
         const entries = this.liveTexts();
         const entry = entries.find((candidate) => candidate.key === key);
@@ -5015,7 +4989,7 @@ export class SqliteStore {
     } catch (error) {
       // A message that cannot be posted any more will not be later either.
       if (error instanceof StoreError && ["invalid_params", "denied", "too_large"].includes(error.code)) {
-        this.reserved({ reads: 4, writes: 4 }, true, now, () => this.transaction(() => this.dropLiveTexts((entry) => entry.key === key)));
+        this.reserved("claimLiveText", { reads: 4, writes: 4 }, true, now, () => this.transaction(() => this.dropLiveTexts((entry) => entry.key === key)));
       }
       throw error;
     }
@@ -5034,7 +5008,7 @@ export class SqliteStore {
     this.ensureReady();
     if (!this.config.liveText) return { broadcasts: [] };
     // A stored output adds its upload row and the stored-bytes count.
-    return this.reserved({ reads: 96 + (stored ? 16 : 0), writes: 64 + LIVE_WRITES + (stored ? 16 : 0) }, true, now, () => this.transaction(() => {
+    return this.reserved("finishLiveText", { reads: 96 + (stored ? 16 : 0), writes: 64 + LIVE_WRITES + (stored ? 16 : 0) }, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const entries = this.liveTexts();
       const entry = entries.find((candidate) => candidate.key === key);
@@ -5059,7 +5033,7 @@ export class SqliteStore {
     if (!this.config.liveText) return { broadcasts: [], ended: [] };
     // Known to be none: nothing to read or reserve, so the alarm pays nothing for the feature.
     if (this.liveCache?.length === 0) return { broadcasts: [], ended: [] };
-    return this.reserved({ reads: 32 + 64 * this.config.liveText.concurrent, writes: 8 + 32 * this.config.liveText.concurrent }, true, now, () => this.transaction(() => {
+    return this.reserved("expireLiveTexts", { reads: 32 + 64 * this.config.liveText.concurrent, writes: 8 + 32 * this.config.liveText.concurrent }, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const entries = this.liveTexts();
       const due = entries.filter((entry) => entry.state === "pending" ? effective > entry.writeExpiresMs : !streaming.has(entry.key));
@@ -5106,7 +5080,7 @@ export class SqliteStore {
   /** An admin's `/toggle` of a feature, or undefined while it follows the deployment's default. */
   toggle(feature: string, now = this.clock.now()): boolean | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => {
+    return this.reserved("toggle", { reads: 4 }, false, now, () => {
       const value = this.metaValue(META_TOGGLE_PREFIX + feature);
       return value === "on" ? true : value === "off" ? false : undefined;
     });
@@ -5119,7 +5093,7 @@ export class SqliteStore {
    */
   presenceToggle(now = this.clock.now()): { on: boolean | undefined; since?: number } {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => {
+    return this.reserved("presenceToggle", { reads: 4 }, false, now, () => {
       const rows = this.rawRows<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key IN (?, ?)", META_TOGGLE_PREFIX + "presence", META_PRESENCE_ON);
       const value = rows.find((row) => row.key === META_TOGGLE_PREFIX + "presence")?.value;
       const since = Number(rows.find((row) => row.key === META_PRESENCE_ON)?.value);
@@ -5135,7 +5109,7 @@ export class SqliteStore {
    */
   setToggle(feature: string, on: boolean | undefined, now = this.clock.now(), since?: number): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 8 }, false, now, () => this.transaction(() => {
+    this.reserved("setToggle", { reads: 4, writes: 8 }, false, now, () => this.transaction(() => {
       this.writeMeta(META_TOGGLE_PREFIX + feature, on === undefined ? null : on ? "on" : "off");
       if (since !== undefined) this.writeMeta(META_PRESENCE_ON, String(since));
     }));
@@ -5148,7 +5122,7 @@ export class SqliteStore {
   startAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
+    return this.reserved("startAvatarUpload", { reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       return this.startUpload("avatar", input.userId, effective, { embedId: `embed_${randomKey()}` });
     }));
@@ -5166,7 +5140,7 @@ export class SqliteStore {
   startEmojiUpload(input: { userId: string; key: string; now?: number }): PendingUpload {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
+    return this.reserved("startEmojiUpload", { reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const catalog = this.loadEmojiCatalog();
       const most = this.config.uploads?.maxEmoji ?? 0;
@@ -5185,7 +5159,7 @@ export class SqliteStore {
   startServerAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
+    return this.reserved("startServerAvatarUpload", { reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       return this.startUpload("server", input.userId, effective, { embedId: `embed_${randomKey()}` }, SERVER_OWNER);
     }));
@@ -5198,7 +5172,7 @@ export class SqliteStore {
    */
   serverMetadata(now = this.clock.now()): StoredServerMetadata {
     this.ensureReady();
-    return { ...(this.serverCache ?? this.reserved({ reads: 4 }, false, now, () => this.loadServerMetadata())) };
+    return { ...(this.serverCache ?? this.reserved("serverMetadata", { reads: 4 }, false, now, () => this.loadServerMetadata())) };
   }
 
   /** The cached server metadata, read from its `_meta` rows on first need; the caller holds a reservation. */
@@ -5237,7 +5211,7 @@ export class SqliteStore {
    */
   setServerText(field: "title" | "description", value: string | undefined, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => this.writeServerField(field, value)));
+    this.reserved("setServerText", { reads: 8, writes: 8 }, false, now, () => this.transaction(() => this.writeServerField(field, value)));
   }
 
   /**
@@ -5248,7 +5222,7 @@ export class SqliteStore {
   clearServerAvatar(now = this.clock.now()): { changed: boolean; deletedUploads: string[] } {
     this.ensureReady();
     // Its upload is found by a scan of every upload the server owns (uploadsPerOwner).
-    return this.reserved({ reads: 32 + this.uploadsPerOwner(SERVER_OWNER), writes: 32 }, false, now, () => this.transaction(() => {
+    return this.reserved("clearServerAvatar", { reads: 32 + this.uploadsPerOwner(SERVER_OWNER), writes: 32 }, false, now, () => this.transaction(() => {
       const changed = this.loadServerMetadata().avatar !== undefined;
       if (changed) this.writeServerField("avatar", undefined);
       const rows = this.rawRows<RawUploadRow>(
@@ -5269,7 +5243,7 @@ export class SqliteStore {
     this.ensureReady();
     const origin = this.config.uploads?.mediaOrigin;
     if (!origin) return null;
-    const catalog = this.emojiCache ?? this.reserved({ reads: 4 }, false, now, () => this.loadEmojiCatalog());
+    const catalog = this.emojiCache ?? this.reserved("emojiCatalog", { reads: 4 }, false, now, () => this.loadEmojiCatalog());
     return catalog.key ? { url: `${origin}/${catalog.key}`, keys: catalog.keys } : null;
   }
 
@@ -5300,7 +5274,7 @@ export class SqliteStore {
     this.ensureReady();
     const origin = this.config.uploads?.mediaOrigin;
     if (!origin) return null;
-    return this.reserved({ reads: 16 }, false, now, () => {
+    return this.reserved("emojiDraft", { reads: 16 }, false, now, () => {
       const catalog = this.loadEmojiCatalog();
       let entries: Record<string, EmojiEntry>;
       if ("add" in edit) {
@@ -5338,7 +5312,7 @@ export class SqliteStore {
   commitEmoji(draft: EmojiDraft, now = this.clock.now()): { applied: boolean; deletedUploads: string[] } {
     this.ensureReady();
     const most = this.config.uploads?.maxEmoji ?? 0;
-    const result = this.reserved({ reads: 96, writes: 96 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+    const result = this.reserved("commitEmoji", { reads: 96, writes: 96 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const before = this.loadEmojiCatalog();
       // Everything is checked before anything is written.
@@ -5397,7 +5371,7 @@ export class SqliteStore {
   /** Who owns an upload (`owner_id`: a user, or SERVER_OWNER or EMOJI_OWNER), or undefined for an unknown key: one row by primary key. */
   uploadOwner(key: string, now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.uploadRow(key)?.owner_id);
+    return this.reserved("uploadOwner", { reads: 4 }, false, now, () => this.uploadRow(key)?.owner_id);
   }
 
   finishUpload(write: UploadWrite, now = this.clock.now()): UploadFinish {
@@ -5405,7 +5379,7 @@ export class SqliteStore {
     // A user's or the server's avatar write scans its owner's uploads for the
     // one it replaces, so the reservation is sized by the owner, read first.
     const owner = this.uploadOwner(write.key, now) ?? "";
-    return this.reserved({ reads: 96 + this.uploadsPerOwner(owner), writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+    return this.reserved("finishUpload", { reads: 96 + this.uploadsPerOwner(owner), writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const row = this.uploadRow(write.key);
       if (!row || row.state !== "writing" || effective > row.write_expires_ms + UPLOAD_WRITE_GRACE_MS) {
@@ -5425,7 +5399,7 @@ export class SqliteStore {
    */
   claimUpload(key: string, now = this.clock.now()): boolean | "closed" {
     this.ensureReady();
-    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+    return this.reserved("claimUpload", { reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const row = this.uploadRow(key);
       if (!row || row.state !== "pending" || effective > row.write_expires_ms) return false;
@@ -5526,14 +5500,14 @@ export class SqliteStore {
     this.ensureReady();
     const done = { broadcasts: [] as Broadcast[], deletedUploads: [] as string[] };
     if (!this.config.uploads) return done;
-    const due = this.reserved({ reads: 16 + UPLOAD_SWEEP_BATCH }, true, now, () => this.rawRows<RawUploadRow>(
+    const due = this.reserved("expirePendingUploads", { reads: 16 + UPLOAD_SWEEP_BATCH }, true, now, () => this.rawRows<RawUploadRow>(
       `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
        FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing') AND write_expires_ms < ?
        ORDER BY write_expires_ms LIMIT ?`,
       this.effectiveNow(now) - UPLOAD_WRITE_GRACE_MS, UPLOAD_SWEEP_BATCH,
     ));
     for (const row of due) {
-      const finished = this.reserved({ reads: 96, writes: 64 + UPLOAD_WRITES }, true, now, () => this.transaction(() => {
+      const finished = this.reserved("expirePendingUploads", { reads: 96, writes: 64 + UPLOAD_WRITES }, true, now, () => this.transaction(() => {
         const current = this.uploadRow(row.upload_key);
         return current && current.state !== "done" ? this.completeUpload(current, { key: row.upload_key, ok: false }, this.effectiveNow(now)) : null;
       }));
@@ -5541,7 +5515,7 @@ export class SqliteStore {
       done.broadcasts.push(...finished.broadcasts);
       done.deletedUploads.push(...finished.deletedUploads);
     }
-    const next = this.reserved({ reads: 8 }, true, now, () => this.rawRows<{ due: number | null }>(
+    const next = this.reserved("expirePendingUploads", { reads: 8 }, true, now, () => this.rawRows<{ due: number | null }>(
       "SELECT MIN(write_expires_ms) AS due FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing')",
     )[0]?.due);
     return typeof next === "number" ? { ...done, next: next + UPLOAD_WRITE_GRACE_MS } : done;
@@ -5555,7 +5529,7 @@ export class SqliteStore {
   nextUploadDeadline(now = this.clock.now()): number | undefined {
     this.ensureReady();
     if (!this.config.uploads) return undefined;
-    const next = this.reserved({ reads: 8 }, true, now, () => this.rawRows<{ due: number | null }>(
+    const next = this.reserved("nextUploadDeadline", { reads: 8 }, true, now, () => this.rawRows<{ due: number | null }>(
       "SELECT MIN(write_expires_ms) AS due FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing')",
     )[0]?.due);
     return typeof next === "number" ? next + UPLOAD_WRITE_GRACE_MS : undefined;
@@ -5579,7 +5553,7 @@ export class SqliteStore {
     const policy = this.config.uploads;
     if (!policy) return { count: 0, deleted: [] };
     // Five reads a row: the four of its release, or the message lookup of an extension.
-    return this.reserved({ reads: 16 + 5 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+    return this.reserved("cleanupUploads", { reads: 16 + 5 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
       const rows = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms
          FROM uploads INDEXED BY uploads_expiry_idx WHERE expires_ms < ? ORDER BY expires_ms LIMIT ?`,
@@ -5615,7 +5589,7 @@ export class SqliteStore {
     this.ensureReady();
     const policy = this.config.uploads;
     if (!policy) return null;
-    return this.reserved({ reads: 8 }, false, now, () => {
+    return this.reserved("avatarRefreshDue", { reads: 8 }, false, now, () => {
       const row = this.identityRow(userId);
       const prefix = `${policy.mediaOrigin}/`;
       if (!row?.avatar_url.startsWith(prefix) || row.avatar_expires_ms <= now) return null;
@@ -5629,7 +5603,7 @@ export class SqliteStore {
     const policy = this.config.uploads;
     if (!policy) return;
     const now = input.now ?? this.clock.now();
-    this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+    this.reserved("renewAvatar", { reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
       const expires = this.effectiveNow(now) + policy.avatarRetentionSeconds * 1_000;
       this.rawExec("UPDATE uploads SET expires_ms = ? WHERE upload_key = ? AND owner_id = ?", expires, input.key, input.userId);
       this.rawExec(
@@ -5644,7 +5618,7 @@ export class SqliteStore {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     // The avatar's upload is found by a scan of every upload the user owns (uploadsPerOwner).
-    return this.reserved({ reads: 32 + this.uploadsPerOwner(input.userId), writes: 32 }, false, now, () => this.transaction(() => {
+    return this.reserved("clearAvatar", { reads: 32 + this.uploadsPerOwner(input.userId), writes: 32 }, false, now, () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
       const rows = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
@@ -5684,7 +5658,7 @@ export class SqliteStore {
     // The row and the user's index range; each eviction rewrites a row and
     // its index entries, four for one that keeps `joined`.
     const rows = MAX_PUSH_SUBSCRIPTIONS_PER_USER + 2;
-    return this.reserved({ reads: 32 + 2 * rows, writes: 32 + 6 * rows }, false, now, () => this.transaction(() => {
+    return this.reserved("registerPushSubscription", { reads: 32 + 2 * rows, writes: 32 + 6 * rows }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const identity = this.identityRow(input.userId);
       if (!identity) throw new StoreError("denied", "Sign in to receive push notifications");
@@ -5717,7 +5691,7 @@ export class SqliteStore {
   removePushSubscription(input: { userId: string; url: string; now?: number }): void {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    this.reserved({ reads: 16, writes: 16 }, false, now, () => {
+    this.reserved("removePushSubscription", { reads: 16, writes: 16 }, false, now, () => {
       this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ? AND url = ?", input.userId, input.url);
     });
   }
@@ -5735,7 +5709,7 @@ export class SqliteStore {
     const policy = this.config.push;
     if (!policy) return [];
     const rows = MAX_PUSH_CANDIDATES * policy.subscriptionsPerUser;
-    return this.reserved({ reads: 8 + rows }, false, now, () => {
+    return this.reserved("joinedWakers", { reads: 8 + rows }, false, now, () => {
       const live = this.effectiveNow(now) - policy.pushExpiryDays * 86_400_000;
       const found = this.rawRows<{ user_id: string }>(
         `SELECT user_id FROM push_subscriptions INDEXED BY push_subscriptions_joined_idx
@@ -5799,7 +5773,7 @@ export class SqliteStore {
     // server's and sender's counters; and for each woken user a wake row and
     // the recipient counter, created on a user's first push of the day.
     const cost = { reads: 56 + candidates.length * (32 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
-    return this.reserved(cost, false, now, () => this.transaction(() => {
+    return this.reserved("claimPushes", cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
       const live = effective - policy.pushExpiryDays * 86_400_000;
@@ -5905,7 +5879,7 @@ export class SqliteStore {
   clearPushUnread(userId: string, now = this.clock.now()): void {
     this.ensureReady();
     if (!this.config.push) return;
-    this.reserved({ reads: 8, writes: 8 }, false, now, () => this.zeroPushUnread(userId));
+    this.reserved("clearPushUnread", { reads: 8, writes: 8 }, false, now, () => this.zeroPushUnread(userId));
   }
 
   /** Read first: an update is charged a write even when it changes nothing (rawExec), and most find none. */
@@ -5926,7 +5900,7 @@ export class SqliteStore {
    */
   clearPushSubscriptions(userId: string, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER, writes: 8 + 6 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => {
+    this.reserved("clearPushSubscriptions", { reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER, writes: 8 + 6 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => {
       this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ?", userId);
     });
   }
@@ -5945,7 +5919,7 @@ export class SqliteStore {
     // One primary-key row each, whatever other users hold the same endpoint:
     // a delete by endpoint alone would touch every user's row for it, which
     // anyone can multiply by registering one endpoint from many accounts.
-    this.reserved({ reads: 8 + 4 * rows.length, writes: 8 + 6 * rows.length }, false, now, () => this.transaction(() => {
+    this.reserved("forgetPushSubscriptions", { reads: 8 + 4 * rows.length, writes: 8 + 6 * rows.length }, false, now, () => this.transaction(() => {
       for (const row of rows) {
         this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ? AND url = ? AND p256dh = ?", row.userId, row.url, row.p256dh);
       }
@@ -5959,7 +5933,7 @@ export class SqliteStore {
    */
   messageAuthor(messageId: string, now = this.clock.now()): string | null {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.author_id ?? null);
+    return this.reserved("messageAuthor", { reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.author_id ?? null);
   }
 
   /**
@@ -5968,7 +5942,7 @@ export class SqliteStore {
    */
   pushedMessage(messageId: string, now = this.clock.now()): MessageSnapshot | null {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => {
+    return this.reserved("pushedMessage", { reads: 8 }, false, now, () => {
       const row = this.currentMessage(messageId, this.logState().history_floor);
       return row ? parseJson<MessageSnapshot>(row.snapshot_json) : null;
     });
@@ -5985,7 +5959,7 @@ export class SqliteStore {
   setMute(input: { userId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+    return this.reserved("setMute", { reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       if (!this.identityRow(input.userId)) return { changed: false };
       const existing = this.userStatusRow(input.userId);
@@ -6016,7 +5990,7 @@ export class SqliteStore {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     let written: number | undefined;
-    const result = this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction((): { changed: boolean; seen?: number } => {
+    const result = this.reserved("setStatus", { reads: 16, writes: 16 }, false, now, () => this.transaction((): { changed: boolean; seen?: number } => {
       this.effectiveNow(now);
       const row = this.identityRow(input.userId);
       if (!row) return { changed: false };
@@ -6076,7 +6050,7 @@ export class SqliteStore {
     // delete of those that ran out (a row and its key each), each at most
     // the cap.
     const cost = { reads: 24 + 4 * MAX_ROOM_MUTES_PER_USER, writes: 16 + 4 * MAX_ROOM_MUTES_PER_USER };
-    return this.reserved(cost, false, now, () => this.transaction(() => {
+    return this.reserved("setRoomMute", cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const row = this.rawRows<{ mute_until_ms: number }>("SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id = ? LIMIT 1", input.userId, input.roomId)[0];
       const stored = row ? integerColumn(row.mute_until_ms) : null;
@@ -6111,7 +6085,7 @@ export class SqliteStore {
    */
   expireRoomMutes(userId: string, now = this.clock.now()): { expired: string[]; next?: number } {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 + 4 * MAX_ROOM_MUTES_PER_USER }, false, now, () => this.transaction(() => {
+    return this.reserved("expireRoomMutes", { reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 + 4 * MAX_ROOM_MUTES_PER_USER }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const rows = this.roomMuteRows(userId);
       const expired = rows.filter((row) => row.untilMs <= effective).map((row) => row.roomId);
@@ -6140,7 +6114,7 @@ export class SqliteStore {
    */
   statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 }, false, now, () => {
+    return this.reserved("statusInputs", { reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 }, false, now, () => {
       if (this.config.push) this.zeroPushUnread(userId);
       const effective = this.effectiveNow(now);
       const row = this.userStatusRow(userId);
@@ -6161,7 +6135,7 @@ export class SqliteStore {
   readCursors(userId: string, now = this.clock.now()): Map<string, string> {
     this.ensureReady();
     const rows = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
-    return this.reserved({ reads: 8 + 2 * rows }, false, now, () => new Map(this.rawRows<{ room_id: string; message_id: number }>(
+    return this.reserved("readCursors", { reads: 8 + 2 * rows }, false, now, () => new Map(this.rawRows<{ room_id: string; message_id: number }>(
       "SELECT room_id, message_id FROM read_cursors WHERE user_id = ? LIMIT ?", userId, rows,
     ).map((row) => [row.room_id, idString(integerColumn(row.message_id))])));
   }
@@ -6182,7 +6156,7 @@ export class SqliteStore {
     if (!rooms.length) return found;
     this.ensureReady();
     const limit = MAX_READ_RECEIPT_MEMBERS;
-    return this.reserved({ reads: 8 + rooms.length * (4 + (limit + 1) + 3 * limit) }, false, now, () => {
+    return this.reserved("roomReadCursors", { reads: 8 + rooms.length * (4 + (limit + 1) + 3 * limit) }, false, now, () => {
       for (const roomId of rooms) {
         const members = this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? LIMIT ?", roomId, limit + 1);
         if (members.length > limit) continue;
@@ -6207,7 +6181,7 @@ export class SqliteStore {
    */
   roomMemberCount(roomId: string, now = this.clock.now()): number | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 8 + 2 }, false, now, () => {
+    return this.reserved("roomMemberCount", { reads: 8 + 2 }, false, now, () => {
       const row = this.rawRows<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
       return row ? integerColumn(row.member_count) : undefined;
     });
@@ -6230,7 +6204,7 @@ export class SqliteStore {
     if (!cursors.length) return;
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    this.reserved({ reads: 8 + 4 * cursors.length, writes: 8 + 4 * cursors.length }, false, now, () => this.transaction(() => {
+    this.reserved("saveReadCursors", { reads: 8 + 4 * cursors.length, writes: 8 + 4 * cursors.length }, false, now, () => this.transaction(() => {
       this.effectiveNow(now);
       for (const [roomId, messageId] of cursors) {
         if (!this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, input.userId).length) continue;
@@ -6264,7 +6238,7 @@ export class SqliteStore {
     assertSeen(input.at);
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 8, writes: 8 }, false, now, () => {
+    return this.reserved("settleSeen", { reads: 8, writes: 8 }, false, now, () => {
       this.effectiveNow(now);
       const at = input.at;
       // Written only where the stored one does not stand (seenStands, in SQL).
@@ -6315,7 +6289,7 @@ export class SqliteStore {
    */
   limiterDay(scope: string, principalKey: string, now = this.clock.now()): { day: string; posts_day: number } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => {
+    return this.reserved("limiterDay", { reads: 8 }, false, now, () => {
       const row = this.limiters.peek(scope, principalKey) ?? this.rawRows<{ day: string; posts_day: number }>(
         "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", scope, principalKey,
       )[0];
@@ -6326,7 +6300,7 @@ export class SqliteStore {
   /** Pushes sent today, for `/status`. */
   pushesToday(now = this.clock.now()): number {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => {
+    return this.reserved("pushesToday", { reads: 8 }, false, now, () => {
       const rows = this.rawRows<{ day: string; posts_day: number }>(
         "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1",
         "push",
@@ -6598,7 +6572,7 @@ export class SqliteStore {
    */
   roomCounts(now = this.clock.now()): { public: { recent: number; older: number }; private: { recent: number; older: number } } {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * this.roomCountReads }, false, now, () => {
+    return this.reserved("roomCounts", { reads: 16 + 2 * this.roomCountReads }, false, now, () => {
       const publicRecent = this.recentRoomCount("public", now);
       const privateRecent = this.recentRoomCount("private", now);
       return {
@@ -6834,7 +6808,7 @@ export class SqliteStore {
     const operationNow = input.now ?? this.clock.now();
     if (method === "message" && this.emptyNewMessage(input.params)) {
       // Nothing is logged, charged, or recorded; only the room is checked.
-      return this.reserved({ reads: 8 }, false, operationNow, () => {
+      return this.reserved("commitMutation", { reads: 8 }, false, operationNow, () => {
         const roomId = input.params.room_id === undefined ? ROOM_ID : input.params.room_id;
         if (typeof roomId !== "string" || !this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
         return { result: {}, broadcasts: [] };
@@ -6846,7 +6820,7 @@ export class SqliteStore {
     // capacity is exhausted, while still paying their bounded SQL lookup.
     let effective = operationNow;
     if (input.requestId !== undefined) {
-      const lookup = this.reserved({ reads: 8 + 4 * this.config.maxEmbeds, writes: 8 }, false, operationNow, () => {
+      const lookup = this.reserved("commitMutation", { reads: 8 + 4 * this.config.maxEmbeds, writes: 8 }, false, operationNow, () => {
         const lookupNow = this.effectiveNow(operationNow);
         const row = this.dedupRow(input.userId, input.requestId!, lookupNow);
         return { now: lookupNow, row, replay: row ? this.deduplicatedCommit(row, digest, lookupNow) : null };
@@ -6884,7 +6858,7 @@ export class SqliteStore {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    const reserved = this.reserveCost(mutationCost, false, operationNow);
+    const reserved = this.reserveCost("commitMutation", mutationCost, false, operationNow);
     try {
       effective = this.effectiveNow(operationNow);
       // An operator alert is one small message: storage high-water does not hold it back.
@@ -6967,7 +6941,7 @@ export class SqliteStore {
     const newestReach = 2 * limit;
     const guestReach = Math.max(this.config.guestHistoryDepth, limit);
     const depthCap = Math.max(newestReach, query.guest ? guestReach : 0);
-    return this.reserved({
+    return this.reserved("historyImpl", {
       ...this.config.historyCost,
       // Measuring a backward page reads the rooms again (a private one's
       // membership too) and at most `depthCap` records and one more a room.
@@ -7030,7 +7004,7 @@ export class SqliteStore {
   historyPage(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
-    return this.reserved({
+    return this.reserved("historyPage", {
       ...this.config.historyCost,
       reads: this.historyReads(query),
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
@@ -7264,7 +7238,7 @@ export class SqliteStore {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    const reserved = this.reserveMaintenanceControl({ reads: 8, writes: 8 }, effective);
+    const reserved = this.reserveMaintenanceControl("deferCleanup", { reads: 8, writes: 8 }, effective);
     this.rawExec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", nextDue);
     this.cleanupDueCache = undefined;
     this.deferredCleanupUntil = nextDue;
@@ -7324,7 +7298,7 @@ export class SqliteStore {
   cleanupDue(now = this.clock.now()): boolean {
     if (this.cleanupDueCache !== undefined) return this.cleanupDueAt(this.cleanupDueCache) <= Math.max(Math.trunc(now), this.lastEffectiveMs);
     try {
-      return this.reserved({ reads: 4 }, true, now, () =>
+      return this.reserved("cleanupDue", { reads: 4 }, true, now, () =>
         this.cleanupDueAt(cleanupSchedule(this.maintenanceRow())) <= this.effectiveNow(now));
     } catch {
       return true;
@@ -7400,7 +7374,7 @@ export class SqliteStore {
     // not consume the reservation for a complete deletion batch.
     let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number; published: number; cutoff?: number; pressed?: boolean };
     try {
-      gate = this.reserved({ reads: 24 + this.retentionCountReads(), writes: 2 }, true, now, () => {
+      gate = this.reserved("runCleanup", { reads: 24 + this.retentionCountReads(), writes: 2 }, true, now, () => {
         const maintenance = this.maintenanceRow();
         const state = this.logState();
         const effective = this.effectiveNow(now);
@@ -7446,7 +7420,7 @@ export class SqliteStore {
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     let reserved: BudgetCost;
-    try { reserved = this.reserveCost(this.config.cleanupCost, true, effective); }
+    try { reserved = this.reserveCost("runCleanup", this.config.cleanupCost, true, effective); }
     catch (error) {
       if (error instanceof StoreError && error.code === "retry_after") {
         this.deferCleanup(effective);
@@ -7667,12 +7641,12 @@ export class SqliteStore {
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     let reserved: BudgetCost;
-    try { reserved = this.reserveCost({ reads: 16, writes: 4 }, true, now); }
+    try { reserved = this.reserveCost("scheduleAlarm", { reads: 16, writes: 4 }, true, now); }
     catch (error) {
       if (!(error instanceof StoreError) || error.code !== "retry_after") throw error;
       // Eight of the withheld control rows defer cleanup; 24 remain to install
       // its reset alarm even after ordinary maintenance is exhausted.
-      reserved = this.reserveMaintenanceControl({ reads: 24, writes: 24 }, now);
+      reserved = this.reserveMaintenanceControl("scheduleAlarm", { reads: 24, writes: 24 }, now);
     }
     const effective = Math.max(Math.trunc(now), this.lastEffectiveMs);
     const maintenance = this.maintenanceRow();

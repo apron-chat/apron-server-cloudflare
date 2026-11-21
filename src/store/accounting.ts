@@ -38,13 +38,15 @@ export function parseGuard(raw: string): AccountingGuard {
 }
 
 /**
- * Store methods between an operation and its reservation (reserveCost), so
- * not what an overrun or breaker is named after (operationName).
+ * Operation names. Each reservation names its operation explicitly
+ * (SqliteStore.reserveCost's `operation`): the SqliteStore method that made
+ * it, as the names were first found from the stack, which overrun logs,
+ * breaker keys and the sets below are keyed by. The metering entry points
+ * the runtime calls (withMeter, withMeterAsync, the meter part), and the
+ * history chain's state and cold chunk index closures, reserve as
+ * `unknown`, the name the stack gave them. test/store/operation-names.test.ts
+ * pins a representative set.
  */
-export const OPERATION_WRAPPERS = new Set([
-  "captureSite", "reserveCost", "reserveMaintenanceControl", "reserved", "withMeter", "withMeterAsync",
-  "transaction", "transactionInner", "alert",
-]);
 /**
  * Operations every request or connection passes through, which a breaker
  * never refuses: refusing them would refuse everything (an overrun in one is
