@@ -1345,6 +1345,8 @@ export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
  * being permanent, this keeps them from taking all of its slots.
  */
 export const MAX_CREATED_ROOMS = 16;
+/** Most rooms userRooms lists: MAX_USER_ROOMS, the top-level rooms, and a room just joined. What a connection's attachment carries. */
+export const MAX_LISTED_USER_ROOMS = MAX_USER_ROOMS + MAX_CREATED_ROOMS + 2;
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */
@@ -4624,28 +4626,47 @@ export class Store {
    * rooms the user is in (rooms are kept for good) the read stops there.
    * Room IDs order the private rooms (a user is in at most
    * maxPrivateMembershipsPerUser) and `general` before the others, which are
-   * log IDs: the newest rooms by creation. An older one is still theirs,
-   * read by its room_id. The join with `rooms` hides memberships of removed
-   * rooms awaiting purge.
+   * log IDs: the newest rooms by creation. The user's top-level rooms (at
+   * most MAX_CREATED_ROOMS + 1, the oldest IDs) are always among them, read
+   * apart from the kind index, and so is `include`, a room just joined
+   * however old: a connection is delivered to the rooms listed here. An
+   * older thread is still theirs, read by its room_id. The join with `rooms`
+   * hides memberships of removed rooms awaiting purge. At most
+   * MAX_LISTED_USER_ROOMS.
    */
-  private userRooms(userId: string): string[] {
-    return this.rawRows<{ room_id: string }>(
-      `SELECT room_id FROM (
-         SELECT m.room_id AS room_id, r.created_log_id AS created_log_id FROM memberships m INDEXED BY memberships_user_idx
-         JOIN rooms r ON r.room_id = m.room_id
-         WHERE m.user_id = ? ORDER BY m.room_id DESC LIMIT ?
-       ) ORDER BY created_log_id`,
+  private userRooms(userId: string, include?: string): string[] {
+    const rows = this.rawRows<{ room_id: string; created_log_id: number }>(
+      `SELECT m.room_id AS room_id, r.created_log_id AS created_log_id FROM memberships m INDEXED BY memberships_user_idx
+       JOIN rooms r ON r.room_id = m.room_id
+       WHERE m.user_id = ? ORDER BY m.room_id DESC LIMIT ?`,
       userId, MAX_USER_ROOMS,
-    ).map((row) => row.room_id);
+    );
+    // The top-level rooms by the kind index, each looked up in memberships by its key.
+    rows.push(...this.rawRows<{ room_id: string; created_log_id: number }>(
+      `SELECT t.room_id AS room_id, t.created_log_id AS created_log_id FROM (
+         SELECT room_id, created_log_id FROM rooms WHERE ${roomKind(0)} LIMIT ?
+       ) t JOIN memberships m ON m.room_id = t.room_id AND m.user_id = ?`,
+      MAX_CREATED_ROOMS + 1, userId,
+    ));
+    if (include !== undefined) {
+      rows.push(...this.rawRows<{ room_id: string; created_log_id: number }>(
+        `SELECT r.room_id AS room_id, r.created_log_id AS created_log_id FROM memberships m
+         JOIN rooms r ON r.room_id = m.room_id WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`,
+        include, userId,
+      ));
+    }
+    const rooms = new Map(rows.map((row) => [row.room_id, integerColumn(row.created_log_id)]));
+    return [...rooms].sort((a, b) => a[1] - b[1]).map(([roomId]) => roomId);
   }
 
   /**
    * Reads for userRooms(): at most MAX_USER_ROOMS of the user's membership
    * rows, and those awaiting purge it passes on the way, each an index entry
-   * and a room lookup (measured: three reads a row).
+   * and a room lookup (measured: three reads a row); the top-level rooms,
+   * each an index entry and a membership lookup; and a room just joined.
    */
   private userRoomsReads(): number {
-    return 8 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS);
+    return 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 3 * (MAX_CREATED_ROOMS + 1);
   }
 
   /** Whether an identity has this `user_id` now, one indexed read. */
@@ -6352,7 +6373,7 @@ export class Store {
         const room = privateJoin ? this.visibleRoomRow(input.roomId, input.actorId ?? input.userId) : this.roomRow(input.roomId);
         if (!room) throw new StoreError("invalid_params", "Unknown room");
         const member = this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", input.roomId, input.userId).length > 0;
-        if (member === input.join) return { rooms: this.userRooms(input.userId), changed: false };
+        if (member === input.join) return { rooms: this.userRooms(input.userId, input.join ? input.roomId : undefined), changed: false };
         if (privateJoin && this.privateMembershipCount(input.userId) >= this.config.maxPrivateMembershipsPerUser) {
           throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
         }
@@ -6370,7 +6391,7 @@ export class Store {
         this.finishCommit(context, startLogId);
         const updated = { ...room, latest_log_id: Math.max(room.latest_log_id, context.state.last_log_id) };
         const record = this.roomRecord(updated, this.publishedFloor());
-        const rooms = this.userRooms(input.userId);
+        const rooms = this.userRooms(input.userId, input.join ? input.roomId : undefined);
         this.assertStorageTarget();
         this.assertReservation(reserved, beforeReads, beforeWrites);
         return { rooms, changed: true, membership, room: record };

@@ -10,7 +10,7 @@ import { MAX_MEMBERSHIPS_PER_USER } from "../src/budget";
 import type { HistoryChain } from "../src/history/chain";
 import { buildHistoryChain } from "../src/history/config";
 import { R2BlobStore } from "../src/history/storage/r2";
-import { Store, StoreError, type StoreConfig, type StoreMutationInput } from "../src/store";
+import { MAX_LISTED_USER_ROOMS, Store, StoreError, type StoreConfig, type StoreMutationInput } from "../src/store";
 import { messagesOf, withStore, type TestClock } from "./helpers/store";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -264,6 +264,43 @@ it("a user in hundreds of rooms joins and leaves within their reservations, and 
 		expect(store.changeMembership({ userId: "bob_1", ipKey: "ip", roomId: room, join: false, now: clock.value }).changed).toBe(true);
 		expect(store.changeMembership({ userId: "bob_1", ipKey: "ip", roomId: other, join: true, now: clock.value }).changed).toBe(true);
 		expect(overruns(error)).toEqual([]);
+	});
+});
+
+it("a user in hundreds of rooms keeps the room just joined and their top-level rooms in their listing", async () => {
+	await withStore("room-caps-listed-rooms", { ...CONFIG, maxThreads: 10 }, (store, clock, state) => {
+		register(store, clock, "bob_1");
+		const sql = state.storage.sql;
+		const base = clock.value - 400 * DAY;
+		const insert = (roomId: string, parent: string | null, logId: number) => {
+			sql.exec("INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms, member_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)", roomId, parent, logId, logId, logId, JSON.stringify({ title: "t" }), base, base);
+		};
+		// A top-level room made long ago, and an old thread bob has not joined: the oldest IDs.
+		const top = String(base - 2_000);
+		insert(top, null, base - 2_000);
+		sql.exec("INSERT INTO memberships (room_id, user_id) VALUES (?, 'bob_1')", top);
+		const old = String(base - 1_000);
+		insert(old, "general", base - 1_000);
+		// 360 newer threads bob is in: more than a listing names by room_id.
+		for (let i = 0; i < 360; i += 1) {
+			insert(String(base + i), "general", base + i);
+			sql.exec("INSERT INTO memberships (room_id, user_id) VALUES (?, 'bob_1')", String(base + i));
+		}
+		const listed = store.getIdentity("bob_1")!.rooms;
+		expect(listed).toContain(top);
+		expect(listed).toContain("general");
+		expect(listed.length).toBeLessThanOrEqual(MAX_LISTED_USER_ROOMS);
+		// Joining the old thread lists it, however many newer rooms bob is in: a connection is delivered to what is listed.
+		const change = store.changeMembership({ userId: "bob_1", ipKey: "ip", roomId: old, join: true, now: clock.value });
+		expect(change.rooms).toContain(old);
+		expect(change.rooms).toContain(top);
+		expect(change.rooms.length).toBeLessThanOrEqual(MAX_LISTED_USER_ROOMS);
+		// Joining it again (already a member) lists it too.
+		expect(store.changeMembership({ userId: "bob_1", ipKey: "ip", roomId: old, join: true, now: clock.value }).rooms).toContain(old);
+		// The longest listing, as a connection's attachment stores it, fits the attachment's budget beside 64 read cursors.
+		const ids = Array.from({ length: MAX_LISTED_USER_ROOMS }, (_, i) => String(9_000_000_000_000_000 + i));
+		const reads = Object.fromEntries(ids.slice(0, 64).map((id) => [id, id]));
+		expect(JSON.stringify({ rooms: ids, reads }).length).toBeLessThan(12_000 - 2_000);
 	});
 });
 

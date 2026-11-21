@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
 import { MAX_LISTING_MEMBERS } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
@@ -107,6 +107,7 @@ import {
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
+	MAX_LISTED_USER_ROOMS,
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import { isProtocolId, type StoredCredential } from "./domain";
@@ -567,8 +568,21 @@ const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } 
  */
 const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
-/** Joined room IDs a connection attachment may carry: every public room and the user's private ones, with slack for removals in flight. */
-const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER);
+/**
+ * Joined room IDs a connection attachment may carry: every room the user's
+ * listing names (MAX_LISTED_USER_ROOMS), so each is delivered to. Room IDs
+ * are log IDs (16 digits at most) or private ones, so that list stays near
+ * 8 KB, within ATTACHMENT_SAFETY_BYTES beside the read cursors below.
+ */
+const MAX_ATTACHED_ROOMS = MAX_LISTED_USER_ROOMS;
+/**
+ * Unwritten read cursors a connection holds before writing them: past this
+ * many rooms read within READ_CURSOR_FLUSH_MS they are written at once, so
+ * cursors and rooms together stay within ATTACHMENT_SAFETY_BYTES. A stored
+ * attachment is still read with up to MAX_ATTACHED_ROOMS of them, so none
+ * held by a connection from before is dropped.
+ */
+const MAX_ATTACHED_READS = 64;
 /** How often one connection writes the read cursors it was sent (flushReads): a reader writes about once a minute, however often their client sends. */
 const READ_CURSOR_FLUSH_MS = 60_000;
 /** The close reason of a connection that did not sign in within `unauthenticatedTimeoutSeconds`. */
@@ -5764,7 +5778,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!latest.rooms?.includes(roomId)) return;
 		const holding = !latest.reads;
 		latest.reads = { ...latest.reads, [roomId]: read };
-		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
+		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_READS) this.flushReads(latest, now, socket);
 		else {
 			writeAttachment(socket, latest);
 			// A connection that starts holding cursors has a new deadline (connectionDeadlines): schedule it.

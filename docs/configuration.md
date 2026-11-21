@@ -831,8 +831,11 @@ What grows with the rooms kept, and its bounds:
   someone a member of more of its rooms is refused at planning. So the reads
   of a user's own rooms stay bounded: their joined rooms are listed newest
   first, at most `MAX_USER_ROOMS` (351), read in the membership index's order
-  so the read stops there, and a `/purge` or `/rename` of them reserves for
-  at most that many memberships.
+  so the read stops there, plus their top-level rooms (at most 17) and a room
+  just joined, however old (`MAX_LISTED_USER_ROOMS`, 370): a connection is
+  delivered to the rooms its user's listing names, and carries them all in
+  its attachment. A `/purge` or `/rename` of them reserves for at most that
+  many memberships.
 - `/purge`, `/rename` and idle-account pruning read every room row for its
   creator; their reservations count the rows the table holds.
 
