@@ -70,6 +70,19 @@ means; the server says what is true there (`ImportTarget`,
   (`ImportTarget.roomCapacity`, given their listings).
   Returns a report and a `state` from which a retry makes the same plan
   (`resume`), kept as compact JSON (`importStateJson`, `parseImportState`).
+  It plans from an index: `indexArchive(source)` reads an archive's lines
+  once and keeps 25 bytes a record (log ID, room, kind, the user it
+  names, a hash of its content), and `planFromIndex(index, source, target,
+  options)` makes a `StreamPlan`, whose `select` gives each line's records
+  to write as the archive is read again (`recordLines`, which numbers them
+  and goes on from a saved `RecordPosition`). `planImport` does both for an
+  archive held whole. A renumbered plan's report lists no log IDs (all are
+  new, in order: its `IdMap` maps them, `IdMap.renumbered`).
+- `stream.ts`: archives as lines that can be read again (`ArchiveLines`):
+  `scanLines` (lines of a decoded byte stream with their ordinals and
+  offsets, from a saved line by discarding the bytes before it unparsed),
+  `encodedSource` (an archive stored encoded, opened afresh each read and
+  decoded through its codecs), `textSource`, `collectedSource`.
 - `export.ts`: `exportArchive(source, writer, options)`, a history as one
   archive from any `ArchiveSource` (rooms, users, paged records, a floor):
   listings with their members (bounded by `MAX_LISTING_MEMBERS` and

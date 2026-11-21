@@ -23,19 +23,43 @@ const PRIVATE_ROOM_PREFIX = "private_";
 /** A decimal log ID as the wire writes it: digits, no sign, no leading zeros. */
 const DECIMAL_ID = /^(0|[1-9][0-9]*)$/;
 
-/** The old-to-new mapping of log IDs and user IDs that an import applies. IDs absent from a map stay as they are. */
+/**
+ * The old-to-new mapping of log IDs and user IDs that an import applies.
+ * IDs absent from a map stay as they are. A renumbered import's log IDs
+ * (`renumbered`) are each archive ID's place among them after a base, kept
+ * as the sorted IDs alone rather than as a pair each.
+ */
 export class IdMap {
 	readonly logIds: Map<number, number>;
 	readonly users: Map<string, string>;
+	/** Every log ID in `ids` (ascending, without repeats) becomes `base` plus its index there; others follow `logIds`. */
+	readonly renumbered: { ids: ArrayLike<number>; base: number } | undefined;
 
-	constructor(logIds: Map<number, number> = new Map(), users: Map<string, string> = new Map()) {
+	constructor(logIds: Map<number, number> = new Map(), users: Map<string, string> = new Map(), renumbered?: { ids: ArrayLike<number>; base: number }) {
 		this.logIds = logIds;
 		this.users = users;
+		this.renumbered = renumbered;
 	}
 
 	/** The new log ID of `id`. */
 	logId(id: number): number {
+		if (this.renumbered) {
+			const { ids, base } = this.renumbered;
+			let low = 0;
+			let high = ids.length - 1;
+			while (low <= high) {
+				const middle = (low + high) >> 1;
+				if (ids[middle] === id) return base + middle;
+				if (ids[middle]! < id) low = middle + 1;
+				else high = middle - 1;
+			}
+		}
 		return this.logIds.get(id) ?? id;
+	}
+
+	/** Whether it changes nothing. */
+	get empty(): boolean {
+		return this.logIds.size === 0 && this.users.size === 0 && !this.renumbered?.ids.length;
 	}
 
 	/** The new log ID of a decimal log ID string; anything else is returned as it is. */
@@ -43,8 +67,8 @@ export class IdMap {
 		if (!DECIMAL_ID.test(id)) return id;
 		const value = Number(id);
 		if (!Number.isSafeInteger(value)) return id;
-		const mapped = this.logIds.get(value);
-		return mapped === undefined ? id : String(mapped);
+		const mapped = this.logId(value);
+		return mapped === value ? id : String(mapped);
 	}
 
 	/** The new user ID of `id`. */
@@ -163,7 +187,7 @@ function mapFields<T>(value: T, fields: readonly Field[], map: IdMap): T {
  * the same `record_json` text when the wire shape did not.
  */
 export function remapRecord(record: ChatRecord, map: IdMap): ChatRecord {
-	if (map.logIds.size === 0 && map.users.size === 0) return record;
+	if (map.empty) return record;
 	const logId = map.logId(record.log_id);
 	const roomId = map.roomId(record.room_id);
 	const commitMs = record.commit_ms === record.log_id ? logId : record.commit_ms;

@@ -12,3 +12,4 @@ export * from "./validate.ts";
 export * from "./plan.ts";
 export * from "./export.ts";
 export * from "./codec.ts";
+export * from "./stream.ts";

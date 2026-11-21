@@ -24,7 +24,8 @@
 		"./validate": "./src/validate.ts",
 		"./plan": "./src/plan.ts",
 		"./export": "./src/export.ts",
-		"./codec": "./src/codec.ts"
+		"./codec": "./src/codec.ts",
+		"./stream": "./src/stream.ts"
 	},
 	"files": [
 		"src"
