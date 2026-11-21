@@ -8256,12 +8256,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const live = this.config.liveText!;
+		// Offered only where live text is configured (liveTextOn), which is where the store has it.
+		const liveText = this.store.liveText;
+		if (!liveText) throw { name: "unsupported", message: "Live text is not available here" } satisfies ProtocolError;
 		const replyTo = objectParam(request.params, "reply_to", false);
 		const replyId = replyTo === undefined ? undefined : requiredString(replyTo, "message_id");
 		await this.recoverLiveTexts();
 		let entry: LiveEntry | undefined;
 		await this.runMutation(async () => {
-			entry = this.store.liveText!.start({
+			entry = liveText.start({
 				userId: identity.user_id, ipKey: attachment.ipKey, identity: { user_id: identity.user_id, ...(attachment.name ? { name: attachment.name } : {}) },
 				kind, roomId, now: nowMs(),
 				// A non-empty opening ends in a paragraph break, so the streamed text starts a new paragraph.
@@ -8312,11 +8315,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Ends the live texts that fell due or were lost (Store.expireLiveTexts), and closes their waiting readers. */
 	private async expireLive(now: number): Promise<void> {
+		const liveText = this.store.liveText;
+		if (!liveText) return;
 		await this.runMutation(async () => {
 			// Read inside the mutation: a write claimed before it is streaming by now (liveWrite).
 			const streaming = new Set<string>();
 			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
-			const expired = this.store.liveText!.expire(streaming, now);
+			const expired = liveText.expire(streaming, now);
 			await this.broadcastRecords(expired.broadcasts);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
@@ -8337,9 +8342,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Forgets the waiting sessions of a live text the store no longer holds open. */
 	private forgetEndedLive(key: string): void {
+		const liveText = this.store.liveText;
+		if (!liveText) return;
 		let open: ReadonlySet<string>;
 		try {
-			open = new Set(this.store.liveText!.open(nowMs()).map((entry) => entry.key));
+			open = new Set(liveText.open(nowMs()).map((entry) => entry.key));
 		} catch {
 			return; // Unknown: the alarm's expiry ends them if their text went.
 		}
@@ -8421,9 +8428,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private liveRead(id: string, head: boolean, navigate = false, ipKey?: string): Response {
 		const { policy, viewerUrl, publicOrigin } = this.config.liveText!;
+		// Reached only where live text is configured (liveFetch), which is where the store has it.
+		const liveText = this.store.liveText;
+		if (!liveText) return liveAnswer(404, "Not found");
 		let session = this.liveSessions.get(id);
 		if (!session) {
-			const entry = this.store.liveText!.open(nowMs()).find((candidate) => candidate.id === id);
+			const entry = liveText.open(nowMs()).find((candidate) => candidate.id === id);
 			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveRefused(liveAnswer(404, "This live text has ended, or never existed"), "ended");
 			session = { phase: "waiting", entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
@@ -8459,11 +8469,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * kept once (endLiveText) and answers the writer.
 	 */
 	private async liveWrite(key: string, body: ReadableStream<Uint8Array>): Promise<Response> {
+		// Reached only where live text is configured (liveFetch), which is where the store has it.
+		const liveText = this.store.liveText;
+		if (!liveText) return liveAnswer(404, "Not found");
 		let claimed: ReturnType<LiveText["claim"]> = null;
 		let streaming: Extract<LiveSession, { phase: "streaming" }> | undefined;
 		await this.runMutation(async () => {
 			try {
-				claimed = this.store.liveText!.claim(key, nowMs());
+				claimed = liveText.claim(key, nowMs());
 			} catch (error) {
 				// A refused claim may end the text (Store.claimLiveText): its waiting readers go with it.
 				this.forgetEndedLive(key);
@@ -8545,7 +8558,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let used = false;
 		try {
 			await this.runMutation(async () => {
-				const finished = this.store.liveText!.finish(entry.key, kept, nowMs(), stored);
+				const liveText = this.store.liveText;
+				if (!liveText) throw new Error("live text is not configured");
+				const finished = liveText.finish(entry.key, kept, nowMs(), stored);
 				used = !!finished.stored;
 				await this.broadcastRecords(finished.broadcasts);
 				published = !!finished.entry;
@@ -8603,9 +8618,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		// Offered only where uploads are configured (uploadsOn), which is where the store has them.
+		const uploads = this.store.uploads;
+		if (!uploads) throw { name: "unsupported", message: "Uploads are not available here" } satisfies ProtocolError;
 		let started = false;
 		await this.runMutation(async () => {
-			const upload = this.store.uploads!.startAvatar({ userId: attachment.userId!, now: nowMs() });
+			const upload = uploads.startAvatar({ userId: attachment.userId!, now: nowMs() });
 			this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 			started = this.afterUploads({ uploads: [upload] });
 		});
@@ -8624,9 +8642,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async emojiCommand(grant: RoleCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, { action, key }: EmojiArgs): Promise<void> {
 		assertRoles(grant, EMOJI_ROLES);
 		if (action === "add") {
+			// Offered only where uploads are configured, which is where the store has them.
+			const uploads = this.store.uploads;
+			if (!uploads) throw { name: "unsupported", message: "Uploads are not available here" } satisfies ProtocolError;
 			let started = false;
 			await this.runMutation(async () => {
-				const upload = this.store.uploads!.startEmoji({ userId: attachment.userId!, key, now: nowMs() });
+				const upload = uploads.startEmoji({ userId: attachment.userId!, key, now: nowMs() });
 				this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 				started = this.afterUploads({ uploads: [upload] });
 			});
