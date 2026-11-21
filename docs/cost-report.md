@@ -37,6 +37,32 @@ to check persisted limiter state. Figures not re-measured on the current
 schema are marked as such and listed under
 [Measurement limits](#measurement-limits).
 
+## Cost profile
+
+`test/cost-profile.integration.test.ts` drives one typical session through
+the protocol into the real Durable Object (about 40 named steps: guest and
+passkey sign-in, room listing and joins, posts, edits, reactions, history,
+read cursors, private rooms and alarms) and measures each step's SQLite rows
+read and written, and what its reservations charged. The numbers are
+deterministic, and the test fails when any of them differs from the
+committed baseline, [`cost-profile.json`](cost-profile.json), whether up or
+down, so a change in cost is never accidental. It runs in `npm test`, so in
+CI, in about ten seconds (plus up to 90 near UTC midnight, which it waits
+out so no step crosses a day).
+
+When a change is meant to cost more or less, regenerate the baseline and
+commit it with the change; its diff is the record of the decision:
+
+```sh
+npm run cost:profile          # rewrites docs/cost-profile.json
+npm run cost:check            # compares a run with it, as a table
+node scripts/cost-profile.mjs --compare a.json b.json
+```
+
+It does not cover live text, uploads, push, cleanup of expired data, or
+history paging into D1 or R2, nor Durable Object key-value, D1 or R2
+operations.
+
 ## Schema and write cost
 
 Each row SQLite writes is billed, and so is each index entry, so the indexes

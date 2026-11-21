@@ -3037,11 +3037,6 @@ export class SqliteStore {
     return rows[0] ?? null;
   }
 
-  private parseEventList(value: string | null | undefined): number[] {
-    const parsed = parseJson<unknown[]>(value ?? "[]", []);
-    return parsed.filter((item): item is number => typeof item === "number" && Number.isSafeInteger(item));
-  }
-
   private limitRow(scope: string, principalKey: string, now: number): RawLimitRow {
     const hit = this.limiters.get(scope, principalKey);
     if (hit) return hit;

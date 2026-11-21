@@ -11,6 +11,7 @@
 
 import { expect, it } from "vitest";
 import { LIVE_TEXT_POLICY, PUSH_POLICY, UPLOAD_POLICY } from "../../src/budget";
+import { BREAKER_ALERT_ONLY, BREAKER_EXEMPT } from "../../src/store/accounting";
 import { WAKE_SCOPES } from "../../src/domain";
 import type { Store } from "../../src/store";
 import { sqliteOf } from "../../src/store/open";
@@ -97,8 +98,8 @@ it("names each operation's reservations as before", async () => {
 			// The message is committed (commitMessage) inside the mutation's reservations.
 			"messages.mutate": ["commitMutation", "commitMutation"],
 			// Named after the method that reserves for every history read; BREAKER_ALERT_ONLY's "history" never matches it.
-			"messages.historyAcrossTiers": ["historyImpl"],
-			"sqlite.history": ["historyImpl"],
+			"messages.historyAcrossTiers": ["history"],
+			"sqlite.history": ["history"],
 			"reads.setRoomMute": ["setRoomMute"],
 			"reads.statusInputs": ["statusInputs"],
 			"reads.cursors": ["readCursors"],
@@ -127,4 +128,22 @@ it("names each operation's reservations as before", async () => {
 			"accounts.pruneIdle": ["pruneIdleIdentities"],
 		});
 	});
+});
+
+/** Every operation name a reservation in src/store passes, from the sources. */
+function reservedNames(): Set<string> {
+	const sources = import.meta.glob("../../src/store/*.ts", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+	const names = new Set<string>();
+	for (const source of Object.values(sources)) {
+		for (const match of source.matchAll(/\b(?:reserved|reserveCost|reserveMaintenanceControl)\(\s*"(\w+)"/g)) names.add(match[1]);
+	}
+	return names;
+}
+
+it("names only operations that exist in BREAKER_EXEMPT and BREAKER_ALERT_ONLY", () => {
+	const names = reservedNames();
+	expect(names.size).toBeGreaterThan(50);
+	// A name no reservation uses never matches: its policy would silently do nothing.
+	expect([...BREAKER_EXEMPT].filter((name) => !names.has(name))).toEqual([]);
+	expect([...BREAKER_ALERT_ONLY].filter((name) => !names.has(name))).toEqual([]);
 });

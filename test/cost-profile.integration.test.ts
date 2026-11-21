@@ -13,6 +13,11 @@ import { softPasskey } from './helpers/webauthn';
 // (`npm run cost:check`). Step names are stable: a step is compared with the
 // step of the same name in the baseline.
 //
+// The test itself fails when any step's rows read or written, or reserved,
+// differ from docs/cost-profile.json, up or down: a change in cost is an
+// explicit decision, made by regenerating the baseline and committing it,
+// so it shows in review (docs/cost-report.md, Cost profile).
+//
 // The scenario uses only the protocol, so it runs unchanged on older and
 // newer stores. Everything that reaches inside the object is in `adapter`
 // below: port the profile to another version by changing only that.
@@ -291,8 +296,31 @@ it('profiles the storage cost of a typical session', async () => {
 		expect.soft(row.reads, `${row.step}: reads within reserved`).toBeLessThanOrEqual(row.reservedReads);
 		expect.soft(row.writes, `${row.step}: writes within reserved`).toBeLessThanOrEqual(row.reservedWrites);
 	}
+	// And every step costs exactly what the committed baseline says: a cost
+	// that changes, up or down, is a decision, made by regenerating the
+	// baseline (`npm run cost:profile`) so the change shows in review.
+	expect(costChanges(steps), 'storage costs differ from docs/cost-profile.json; if intended, run `npm run cost:profile` and commit it').toEqual([]);
 }, 120_000);
 
 function pick(accounting: Accounting): Omit<Step, 'step'> {
 	return { reads: accounting.reads, writes: accounting.writes, reservedReads: accounting.reservedReads, reservedWrites: accounting.reservedWrites };
+}
+
+const BASELINE = Object.values(import.meta.glob('../docs/cost-profile.json', { query: '?raw', import: 'default', eager: true }) as Record<string, string>)[0];
+
+/** Each step whose cost differs from the baseline's, or that only one of them has: `step: field baseline → now`. */
+function costChanges(steps: Step[]): string[] {
+	if (!BASELINE) return ['docs/cost-profile.json is missing'];
+	const baseline = new Map((JSON.parse(BASELINE) as { steps: Step[] }).steps.map((row) => [row.step, row]));
+	const changes: string[] = [];
+	for (const row of steps) {
+		const was = baseline.get(row.step);
+		baseline.delete(row.step);
+		if (!was) { changes.push(`${row.step}: new step`); continue; }
+		for (const field of ['reads', 'writes', 'reservedReads', 'reservedWrites'] as const) {
+			if (row[field] !== was[field]) changes.push(`${row.step}: ${field} ${was[field]} → ${row[field]}`);
+		}
+	}
+	for (const step of baseline.keys()) changes.push(`${step}: no longer measured`);
+	return changes;
 }

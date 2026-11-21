@@ -434,7 +434,7 @@ export class HistoryModule {
     const newestReach = 2 * limit;
     const guestReach = Math.max(this.core.config.guestHistoryDepth, limit);
     const depthCap = Math.max(newestReach, query.guest ? guestReach : 0);
-    return this.core.reserved("historyImpl", {
+    return this.core.reserved("history", {
       ...this.core.config.historyCost,
       // Measuring a backward page reads the rooms again (a private one's
       // membership too) and at most `depthCap` records and one more a room.
