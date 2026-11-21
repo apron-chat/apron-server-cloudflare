@@ -1203,14 +1203,14 @@ The calibrated hard ceilings are `maxFrameBytes` 32 KiB, `maxTextBytes` 16 KiB,
 `maxSnapshotBytes` 24 KiB, JSON depth 8, JSON nodes 2,048, request IDs 128
 bytes, names 80 Unicode code points/320 UTF-8 bytes, embeds 4, history limit
 50, history response 256 KiB, one concurrent history request per connection,
-pending work 8 frames/128 KiB, open sockets 100,
-registered identities and limiter records 10,000 each, processed frames
-150,000/day, global posts 120/minute and 10,000/day, registrations 300/day,
-connection frame rate 120/minute, server-wide frames 1,000/minute (at least one
+pending work 8 frames/128 KiB, open sockets 500,
+registered identities 50,000 and limiter records 500,000, processed frames
+6,000,000/day, global posts 600/minute and 60,000/day, registrations 5,000/day,
+connection frame rate 120/minute, server-wide frames 5,000/minute (at least one
 IP's minute), per-type throttles 60/minute, frame blocks
 20 frames (and one block per anonymous connection must fit the IP's frame
 minute), `room_list` registered members 200 per room, guest-number blocks
-10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
+10,000 numbers, SQL writes 10,500,000/day, SQL reads 120,000,000/day,
 database high-water 768 MiB and hard target 1 GiB, cleanup 100 records,
 the thread limit by the room listing it sizes (1 MiB at worst,
 `roomListingWorstBytes`), a room's client fields 16 KiB and every room's past the
@@ -1218,7 +1218,8 @@ minimum together 256 KiB, private rooms 200 and 50
 memberships per user, reactions 64 users per message
 and 16 emoji per user, and credentials/challenges 16 KiB. The ceilings for
 open sockets, identities, limiter records, processed frames, global posts,
-registrations, SQL and database watermarks are the selected plan's defaults.
+registrations, server-wide frames, SQL and database watermarks are the selected
+plan's defaults (the figures here are Workers Paid's, `src/plans/paid.ts`).
 Operators may lower these values but cannot raise them without changing the
 implementation and recalibrating its resource model.
 

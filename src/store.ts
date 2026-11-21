@@ -5726,15 +5726,15 @@ export class Store {
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    // The starting rooms (a guest's, carried over) are checked against the
-    // capped rooms table, and each one takes a membership row and a logged
-    // membership record. At most what a connection's attachment carries
-    // (MAX_LISTED_USER_ROOMS), and reserved for by how many there are: the
-    // scan reads the public range, archived threads included, and each join
-    // reads its room and membership rows (measured at under 4 a room,
-    // test/accounting.integration.test.ts).
+    // The starting rooms (a guest's, carried over), at most what a
+    // connection's attachment carries (MAX_LISTED_USER_ROOMS), and reserved
+    // for by how many there are. Each is looked up by its key in the rooms
+    // table (2 reads), and one that exists is joined: a membership row and a
+    // logged membership record (2 reads, 6 writes). Measured at exactly that
+    // (test/accounting.integration.test.ts); reserved at 6 reads and 8 writes
+    // a room, with the identity and credential rows besides.
     const starting = [...new Set(input.rooms ?? DEFAULT_JOINED_ROOMS)].slice(0, MAX_LISTED_USER_ROOMS);
-    const reservation = this.reserveCost({ reads: 128 + 2 * this.publicRoomRows + 4 * starting.length, writes: 64 + 8 * starting.length, registrations: 1 }, false, input.now);
+    const reservation = this.reserveCost({ reads: 128 + 6 * starting.length, writes: 64 + 8 * starting.length, registrations: 1 }, false, input.now);
     try {
       if (!input.userId || !input.userHandle || !input.ipKey) throw new StoreError("invalid_params", "registration identity is incomplete");
       ensureText(input.name, "name", this.config.maxNameBytes);
