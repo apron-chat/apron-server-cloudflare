@@ -119,3 +119,64 @@ it("with the D1 tier off, looks at the pressure again in minutes, not every alar
 		}
 	});
 });
+
+/** Takes D1 away after it has held history, so cleanup jobs wait on the copy into it. */
+async function holdThenDropD1(runtime: Runtime, state: DurableObjectState, helpers: Awaited<ReturnType<typeof setUp>>) {
+	await helpers.post(10);
+	for (let round = 0; round < 6; round += 1) {
+		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
+		runtime.store.forgetCleanupDue();
+		await runtime.alarm();
+		helpers.continueJob();
+	}
+	runtime.runtimeEnv = { ...runtime.runtimeEnv, HISTORY_D1: undefined };
+	runtime.d1Held = undefined;
+	runtime.history = helpers.build({ ...env, HISTORY_D1: undefined });
+	await helpers.post(10);
+}
+
+/** Runs alarms and checks none of them finds cleanup due or sets the next alarm to now. */
+async function expectNoSpin(runtime: Runtime, state: DurableObjectState, hotRecords: () => number) {
+	const before = hotRecords();
+	const seen: Array<number | null> = [];
+	for (let round = 0; round < 5; round += 1) {
+		expect(runtime.store.cleanupDue(Date.now())).toBe(false);
+		await runtime.alarm();
+		const alarm = await state.storage.getAlarm();
+		seen.push(alarm === null ? null : alarm - Date.now());
+	}
+	// Another deadline may stand a moment away, but no alarm is set to now to find cleanup due again.
+	for (const delay of seen) expect(delay === null || delay > 100).toBe(true);
+	expect(hotRecords()).toBe(before);
+}
+
+it("a refusal at the watermark does not re-trigger a scheduled cleanup job that waits on D1", async () => {
+	await runInDurableObject(env.DEMO.getByName("pressure-cleanup-running-job-v1"), async (instance, state) => {
+		const runtime = instance as unknown as Runtime;
+		const helpers = await setUp(runtime, state, "pressure-running");
+		await holdThenDropD1(runtime, state, helpers);
+		// The daily cleanup starts unpressed, and waits on the copy into D1.
+		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
+		runtime.store.forgetCleanupDue();
+		await runtime.alarm();
+		expect(helpers.jobRunning()).toBe(true);
+		// The watermark is met while that job waits: it is not due before its own next step.
+		helpers.flood();
+		await expectNoSpin(runtime, state, helpers.hotRecords);
+	});
+});
+
+it("a cleanup job the watermark started is not re-triggered once it outlasts the pressure backoff", async () => {
+	await runInDurableObject(env.DEMO.getByName("pressure-cleanup-long-job-v1"), async (instance, state) => {
+		const runtime = instance as unknown as Runtime;
+		const helpers = await setUp(runtime, state, "pressure-long");
+		await holdThenDropD1(runtime, state, helpers);
+		helpers.scheduleTomorrow();
+		helpers.flood();
+		await runtime.alarm();
+		expect(helpers.jobRunning()).toBe(true);
+		// The backoff since that start runs out while the job still waits on D1.
+		(runtime.store as unknown as { pressureCleanupAfter: number }).pressureCleanupAfter = 0;
+		await expectNoSpin(runtime, state, helpers.hotRecords);
+	});
+});

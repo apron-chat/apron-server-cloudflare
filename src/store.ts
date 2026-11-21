@@ -1064,6 +1064,16 @@ const HISTORY_TARGET_SCAN = 200;
  * a failing copy below) is looked at again then, not at every alarm.
  */
 const PRESSURE_CLEANUP_RETRY_MS = 5 * 60_000;
+
+/** When cleanup is scheduled, and whether a job is in progress (a cursor and cutoff are set): what cleanupDueAt reads. */
+interface CleanupSchedule {
+  next: number;
+  jobInProgress: boolean;
+}
+
+function cleanupSchedule(row: Pick<RawMaintenanceRow, "next_cleanup_ms" | "cleanup_cursor" | "cleanup_cutoff_ms">): CleanupSchedule {
+  return { next: row.next_cleanup_ms, jobInProgress: row.cleanup_cursor !== null && row.cleanup_cutoff_ms !== null };
+}
 /** Rewrites the log holds at most: a /purge or /rename past it waits for the links to catch up (retry_after). */
 const MAX_HISTORY_REWRITES = 200;
 /**
@@ -2271,11 +2281,12 @@ export class Store {
   /** Set when a refusal at the watermark needs an earlier alarm than the one scheduled (takeAlarmChange). */
   private alarmChanged = false;
   /**
-   * `next_cleanup_ms` as last read (maintenanceRow), so an alarm can tell
-   * whether cleanup is due without a reservation (cleanupDue); forgotten at
-   * every write of it, which reads it again.
+   * `next_cleanup_ms` as last read (maintenanceRow), and whether a cleanup
+   * job was in progress then, so an alarm can tell whether cleanup is due
+   * without a reservation (cleanupDue); forgotten at every write of the row,
+   * which reads it again.
    */
-  private cleanupDueCache?: number;
+  private cleanupDueCache?: CleanupSchedule;
   private scheduledAlarmAt?: number;
   /** Bumped by every write to a table member listings read (MEMBER_TABLES). */
   private memberGeneration = 0;
@@ -5964,7 +5975,7 @@ export class Store {
       "SELECT id, next_cleanup_ms, cleanup_cutoff_ms, cleanup_cursor, schema_version FROM maintenance WHERE id = 1 LIMIT 1",
     );
     if (!rows.length) throw new StoreError("internal_error", "maintenance state is missing");
-    this.cleanupDueCache = rows[0].next_cleanup_ms;
+    this.cleanupDueCache = cleanupSchedule(rows[0]);
     return rows[0];
   }
 
@@ -9324,7 +9335,7 @@ export class Store {
     if (this.cleanupDueCache !== undefined) return this.cleanupDueAt(this.cleanupDueCache) <= Math.max(Math.trunc(now), this.lastEffectiveMs);
     try {
       return this.reserved({ reads: 4 }, true, now, () =>
-        this.cleanupDueAt(this.maintenanceRow().next_cleanup_ms) <= this.effectiveNow(now));
+        this.cleanupDueAt(cleanupSchedule(this.maintenanceRow())) <= this.effectiveNow(now));
     } catch {
       return true;
     }
@@ -9335,11 +9346,15 @@ export class Store {
    * or sooner while the database is at its storage watermark (a refusal set
    * the storagePressure latch), no sooner than PRESSURE_CLEANUP_RETRY_MS
    * after the last cleanup the pressure started; never before a deferral for
-   * an exhausted budget ends (deferredCleanupUntil). The latch is read only
-   * as already loaded (a refusal loads it), so this reads nothing.
+   * an exhausted budget ends (deferredCleanupUntil). The watermark only
+   * brings a job's start forward: while one is in progress its own
+   * `next_cleanup_ms` (its next batch, or its wait on a copy below) is when
+   * it is due, since runCleanup continues a job only then, and an earlier
+   * alarm would find nothing to do and be set again at once. The latch is
+   * read only as already loaded (a refusal loads it), so this reads nothing.
    */
-  private cleanupDueAt(scheduled: number): number {
-    const pressed = this.storagePressure.known === "1" ? Math.min(scheduled, this.pressureCleanupAfter) : scheduled;
+  private cleanupDueAt(schedule: CleanupSchedule): number {
+    const pressed = this.storagePressure.known === "1" && !schedule.jobInProgress ? Math.min(schedule.next, this.pressureCleanupAfter) : schedule.next;
     return Math.max(pressed, this.deferredCleanupUntil);
   }
 
@@ -9404,7 +9419,7 @@ export class Store {
         // (including expired thread rooms, which the cheap probes below do not
         // cover). Continue it rather than letting the idle check end it.
         const jobInProgress = maintenance.cleanup_cursor !== null && maintenance.cleanup_cutoff_ms !== null;
-        if (!jobInProgress && effective >= this.cleanupDueAt(maintenance.next_cleanup_ms)) {
+        if (!jobInProgress && effective >= this.cleanupDueAt(cleanupSchedule(maintenance))) {
           // Started by the storage watermark before the scheduled time: the
           // next such start waits a while (a start that finds no work leaves
           // the schedule as it was; a job sets the next from its own end).
@@ -9671,7 +9686,7 @@ export class Store {
     }
     const effective = Math.max(Math.trunc(now), this.lastEffectiveMs);
     const maintenance = this.maintenanceRow();
-    const cleanupDue = this.cleanupDueAt(maintenance.next_cleanup_ms);
+    const cleanupDue = this.cleanupDueAt(cleanupSchedule(maintenance));
     const dueAt = Math.max(effective, socketDeadline === undefined ? cleanupDue : Math.min(cleanupDue, socketDeadline));
     const getAlarm = this.durableStorage?.getAlarm;
     const setAlarm = this.durableStorage?.setAlarm;
