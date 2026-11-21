@@ -490,8 +490,12 @@ function validateLimits(limits: Limits): void {
 	if (!Number.isSafeInteger(limits.sessionTtlSeconds) || limits.sessionTtlSeconds <= 0 || limits.sessionTtlSeconds > 30 * 24 * 60 * 60) {
 		fail("session lifetime must be between one second and thirty days");
 	}
-	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.roomMetadataLimit > budget.MAX_ROOM_METADATA_LIMIT) {
+	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.roomMetadataLimit > budget.MAX_ROOM_METADATA_LIMIT) {
 		fail("metadata or cleanup exceeds calibrated bounds");
+	}
+	// threadLimit has no fixed ceiling: the listing it sizes must fit (budget.ts).
+	if (budget.roomListingWorstBytes(limits) > budget.MAX_ROOM_LISTING_BYTES) {
+		fail("threadLimit is too large for a room listing with these room metadata limits; lower threadLimit, roomMetadataMinLimit or roomMetadataTotalLimit");
 	}
 	// A room_set carries the fields in one frame, with its envelope.
 	if (limits.roomMetadataLimit + 1024 > limits.maxFrameBytes) fail("roomMetadataLimit must fit one frame");

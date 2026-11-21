@@ -32,18 +32,27 @@ it('uses durable registered identities for twenty posts while preserving the agg
 	await runInDurableObject(env.DEMO.getByName('quota-registered-ip'), (_instance, state) => {
 		const now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
 		const store = new Store(state, {}, { now: () => now });
+		const { registeredPostsPerMinute: perUser, ipPostsPerMinute: perIp } = DEFAULT_LIMITS;
+		// Enough users behind one address to fill its allowance, and one more it refuses outright.
+		const users = Array.from({ length: Math.ceil(perIp / perUser) + 1 }, (_, index) => `registered-${index}`);
 		// Identity fixtures exercise policy only; signed ceremonies are tested in
 		// auth.integration.test.ts and the browser against the real verifier.
-		for (const userId of ['registered-a', 'registered-b']) store.registerIdentity({
+		for (const userId of users) store.registerIdentity({
 			userId, name: userId, userHandle: userId, ipKey: 'shared-nat', now,
 			credential: { credentialId: userId, userId, publicKey: 'fixture-policy-only', counter: 0 },
 		});
 		const post = (userId: string) => store.mutate({ userId, ipKey: 'shared-nat', method: 'message', now,
 			identity: { user_id: userId }, params: { room_id: 'general', body: { text: 'bounded' } } });
-		for (let index = 0; index < 20; index++) post('registered-a');
-		expect(() => post('registered-a')).toThrow('Posting limit reached');
-		for (let index = 0; index < 10; index++) post('registered-b');
-		expect(() => post('registered-b')).toThrow('Posting limit reached');
+		for (let index = 0; index < perUser; index++) post(users[0]);
+		expect(() => post(users[0])).toThrow('Posting limit reached');
+		let left = perIp - perUser;
+		for (const userId of users.slice(1)) {
+			const share = Math.min(perUser, left);
+			for (let index = 0; index < share; index++) post(userId);
+			left -= share;
+			expect(() => post(userId)).toThrow('Posting limit reached');
+		}
+		expect(left).toBe(0);
 	});
 });
 

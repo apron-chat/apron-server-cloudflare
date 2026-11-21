@@ -819,8 +819,9 @@ queries scan the table instead.
 
 What grows with the rooms kept, and its bounds:
 
-- A `room_list` names every top-level room and the 200 threads most recently
-  active (`LISTED_THREADS`); a maintenance listing the 400 most recently
+- A `room_list` names every top-level room and the threads most recently
+  active, twice `threadLimit` and at least 200 (`listedThreads` in
+  `src/budget.ts`); a maintenance listing the 400 most recently
   active private rooms. An older thread is still listed by its `room_id`
   (`room_list` with `room_id`) and read by `history`, and an export names
   every room (`Store.allRooms`, read in pages).
@@ -1406,7 +1407,18 @@ operation budgets.
 `threadLimit` counts active thread rooms (rooms with a `parent_room_id`)
 and the top-level rooms admins and mods create (at most 16 of them);
 `threadsPerUser` (at most `threadLimit`) caps the active threads one
-registered user has created, so one account cannot take every slot.
+registered user has created, so one account cannot take every slot; a user
+holding any role (one an admin gave, as for `trustedPostsPerMinute`) is held
+only to `threadLimit`, since a moderator re-threading conversations starts
+many. `threadLimit` has no fixed ceiling: a room listing names twice as many
+threads (at least 200) and is sent whole, so its worst case, every listed
+public room at `roomMetadataMinLimit` plus 256 bytes and
+`roomMetadataTotalLimit` besides, must stay within 1 MiB
+(`roomListingWorstBytes`, `MAX_ROOM_LISTING_BYTES`); at the default room
+metadata limits that allows up to 298. Listing and room-count reservations
+scale with it; what a user's own listing and a connection's attachment carry
+(`MAX_USER_ROOMS`, `MAX_LISTED_USER_ROOMS`) stays fixed, calibrated at 100
+(`CALIBRATED_THREAD_LIMIT`).
 `privateRoomLimit` (at most 200) counts active private rooms apart from the
 threads; `privateRoomsPerUser` caps the active private rooms one registered
 user has started, and `privateMembershipsPerUser` (at most 50, and at least
@@ -1549,8 +1561,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `registeredPostsPerDay` | 1000 | 500 |
 | `trustedPostsPerMinute` | 100 | 50 |
 | `trustedPostsPerDay` | 4000 | 2000 |
-| `ipPostsPerMinute` | 30 |  |
-| `ipPostsPerDay` | 2000 | 1000 |
+| `ipPostsPerMinute` | 120 | 30 |
+| `ipPostsPerDay` | 5000 | 1000 |
 | `globalPostsPerMinute` | 600 | 60 |
 | `globalPostsPerDay` | 60000 | 5000 |
 | `registrationsPerIpDay` | 20 | 3 |
@@ -1559,7 +1571,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `authAttemptsPerIpMinute` | 64 | 10 |
 | `openConnections` | 500 | 100 |
 | `anonymousConnectionsPerIp` | 24 | 2 |
-| `registeredConnectionsPerUser` | 5 | 3 |
+| `registeredConnectionsPerUser` | 8 | 3 |
 | `connectionsPerIp` | 32 | 10 |
 | `connectionAdmissionsPerIpMinute` | 30 | 5 |
 | `connectionAdmissionsPerDay` | 300000 | 2000 |

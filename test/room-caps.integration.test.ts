@@ -111,6 +111,35 @@ it("per-user caps count the user's own rooms started within the window", async (
 	});
 });
 
+it("a user holding any role is held only to the server's thread cap, not the per-user one", async () => {
+	const config = { ...CONFIG, maxThreads: 5, maxThreadsPerUser: 2 };
+	await withStore("caps-per-user-roles", config, (store, clock) => {
+		for (const [userId, role] of [["mod_1", "threader"], ["pal_1", "friend"], ["plain_1", ""]] as const) {
+			register(store, clock, userId);
+			if (role) store.setRole({ userId, role, on: true, now: clock.value });
+		}
+		thread(store, clock, "One", "mod_1");
+		thread(store, clock, "Two", "mod_1");
+		thread(store, clock, "Three", "mod_1");
+		thread(store, clock, "Four", "pal_1");
+		// Without a role, the per-user cap still holds.
+		thread(store, clock, "Plain", "plain_1");
+		// The server's cap holds for everyone: five threads started in the window.
+		expect(refusal(() => thread(store, clock, "Six", "mod_1"))).toMatch(/^denied: thread_limit/);
+	});
+	await withStore("caps-per-user-roles-plain", config, (store, clock) => {
+		register(store, clock, "plain_1");
+		thread(store, clock, "One", "plain_1");
+		thread(store, clock, "Two", "plain_1");
+		expect(refusal(() => thread(store, clock, "Three", "plain_1"))).toMatch(/^denied: You can start at most 2 threads/);
+		// Losing the role restores the per-user cap.
+		store.setRole({ userId: "plain_1", role: "threader", on: true, now: clock.value });
+		thread(store, clock, "Three", "plain_1");
+		store.setRole({ userId: "plain_1", role: "threader", on: false, now: clock.value });
+		expect(refusal(() => thread(store, clock, "Four", "plain_1"))).toMatch(/^denied: You can start at most 2 threads/);
+	});
+});
+
 it("private rooms follow the same rule, with their own caps", async () => {
 	await withStore("caps-private", CONFIG, (store, clock) => {
 		register(store, clock, "carol_1");

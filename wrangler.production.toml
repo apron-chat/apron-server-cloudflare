@@ -94,6 +94,24 @@ LIMIT_HISTORY_COLD_RECORDS = "0"
 # are kept as long as their history (docs/configuration.md, Rooms). 0 counts
 # every room that exists.
 LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
+# Threads (docs/configuration.md, Rooms): public rooms and threads started in
+# that window, server-wide, and per registered user. A user holding any role
+# (one an admin gave) is held only to the server-wide limit. THREAD_LIMIT has
+# no fixed ceiling: the deploy check refuses one whose worst-case room listing
+# would pass 1 MiB with the ROOM_METADATA_* limits above (298 with them).
+LIMIT_THREAD_LIMIT = "100"
+LIMIT_THREADS_PER_USER = "25"
+# Posting (docs/configuration.md, Posting): role holders' allowance, kept
+# under the 120 frames a connection may send a minute (past which it is
+# closed, not slowed); and one address's, shared by the registered users
+# behind it (guests stay at 5 a minute an address).
+LIMIT_TRUSTED_POSTS_PER_MINUTE = "100"
+LIMIT_TRUSTED_POSTS_PER_DAY = "4000"
+LIMIT_IP_POSTS_PER_MINUTE = "120"
+LIMIT_IP_POSTS_PER_DAY = "5000"
+# Open connections one registered user may hold: a phone, a laptop and a few
+# tabs, with room for a stale socket or two.
+LIMIT_REGISTERED_CONNECTIONS_PER_USER = "8"
 # Backups to HISTORY_BLOB under backups/: one a day (and an admin's
 # `/history export`), the newest 14 of each kind kept, private rooms
 # included, gzip-compressed. They are not encrypted: the bucket being

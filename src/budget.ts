@@ -619,12 +619,52 @@ export const MAX_HISTORY_D1_RECORDS = 100_000;
 export function thresholdRecords(limit: number, percent: number): number {
 	return limit > 0 ? Math.max(1, Math.floor((limit * percent) / 100)) : 0;
 }
-export const MAX_THREAD_LIMIT = 100;
+/**
+ * The thread limit the fixed per-user sizes were calibrated at (store.ts:
+ * MAX_USER_ROOMS, what a connection's attachment carries, and
+ * MAX_PURGE_ROOMS). A `threadLimit` above it scales what scales with the
+ * threads (listedThreadScale); one below it lists as this does, so lowering
+ * the limit never shortens a listing.
+ */
+export const CALIBRATED_THREAD_LIMIT = 100;
+/**
+ * Most top-level rooms created besides `general`. They also count against
+ * `threadLimit`, which bounds the rooms table, and, being permanent, this
+ * keeps them from taking all of its slots.
+ */
+export const MAX_CREATED_ROOMS = 16;
+/** The thread count listings and the public room scans are sized for: `threadLimit`, at least CALIBRATED_THREAD_LIMIT. */
+export function listedThreadScale(threadLimit: number): number {
+	return Math.max(threadLimit, CALIBRATED_THREAD_LIMIT);
+}
+/** Threads a listing names, the most recently active (store.ts, listRooms): twice the thread scale. */
+export function listedThreads(threadLimit: number): number {
+	return 2 * listedThreadScale(threadLimit);
+}
+/**
+ * The largest a room listing (`room_list`) may be at its worst: it goes out
+ * as one frame and is never cut to fit (ApronDemoServer.boundedListing), so
+ * this bounds `threadLimit` against the room metadata limits
+ * (roomListingWorstBytes, checked by validateLimits). The runtime allows
+ * far larger messages; this keeps a listing a modest frame for clients and
+ * for the object's memory.
+ */
+export const MAX_ROOM_LISTING_BYTES = 1024 * 1024;
+/** A listed room's bytes besides its client fields (room_id, parent, counts, JSON), once boundedListing has dropped members. */
+export const ROOM_LISTING_ENTRY_BYTES = 256;
+/**
+ * A room listing's worst size: every public room it names (`general`, the
+ * created rooms, listedThreads) at roomMetadataMinLimit each, and what they
+ * hold past that together (roomMetadataTotalLimit). At the defaults, about
+ * 530 KiB; with them, `threadLimit` may go up to 298.
+ */
+export function roomListingWorstBytes(limits: Pick<Limits, "threadLimit" | "roomMetadataMinLimit" | "roomMetadataTotalLimit">): number {
+	return (1 + MAX_CREATED_ROOMS + listedThreads(limits.threadLimit)) * (limits.roomMetadataMinLimit + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalLimit;
+}
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinLimit is bounded together by at most one history
 // response, so a listing of every room is at most the minimum per room plus
-// that (about 121 KiB + 256 KiB for one connection at the defaults); a
-// listing is never cut to fit (ApronDemoServer.boundedListing).
+// that (roomListingWorstBytes).
 export const MAX_ROOM_METADATA_LIMIT = 16 * 1024;
 export const MAX_ROOM_METADATA_TOTAL_LIMIT = MAX_HISTORY_RESPONSE_BYTES;
 // Private rooms share the rooms table with the threads, outside the ranges the

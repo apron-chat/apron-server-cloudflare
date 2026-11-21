@@ -439,6 +439,54 @@ describe('measured storage accounting', () => {
 		console.info('accounting-room-list', JSON.stringify(result));
 	});
 
+	it('scales room listing and counting reservations with a threadLimit above the calibrated 100', async () => {
+		const stub = env.DEMO.getByName('accounting-room-list-scaled');
+		const result = await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const maxThreads = 250;
+			const store = new Store(state, defaultStoreConfig({ maxThreads }), clock);
+			store.initialize();
+			// More recent threads than the cap allows, as after a window lengthened since.
+			const count = maxThreads + 50;
+			state.storage.transactionSync(() => {
+				for (let index = 1; index <= count; index += 1) {
+					state.storage.sql.exec(
+						`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+						 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
+						`thread-${index}`, clock.now() + 1_000 + index, clock.now() + 1_000 + index, clock.now() + 1_000 + index,
+						JSON.stringify({ title: `Thread ${index}`, description: `description ${index}` }), clock.now(), clock.now(),
+					);
+				}
+			});
+
+			const beforeListing = snapshot(store);
+			const rooms = store.listRooms(clock.now());
+			const listing = costSince(store, beforeListing);
+			// Every one is named: a listing names twice the thread limit.
+			expect(rooms).toHaveLength(count + 1);
+			expectWithinReserve(listing);
+
+			const beforeCounts = snapshot(store);
+			expect(store.roomCounts(clock.now()).public.recent).toBe(count);
+			const counting = costSince(store, beforeCounts);
+			expectWithinReserve(counting);
+
+			// A registration that starts in as many rooms as the thread limit.
+			const beforeRegistration = snapshot(store);
+			const registered = store.registerIdentity({
+				userId: 'lister', name: 'Lister', userHandle: 'lister-handle', now: clock.now(), ipKey: 'lister-ip',
+				credential: { credentialId: 'lister-credential', userId: 'lister', publicKey: 'key', counter: 0 },
+				rooms: ['general', ...Array.from({ length: maxThreads }, (_, index) => `thread-${index + 1}`)],
+			});
+			const registration = costSince(store, beforeRegistration);
+			expect(registered.broadcasts).toHaveLength(maxThreads + 1);
+			expectWithinReserve(registration);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { rooms: rooms.length, listing, counting, registration };
+		});
+		console.info('accounting-room-list-scaled', JSON.stringify(result));
+	});
+
 	it('measures member listings with status by population, and reuses a listing until a write', async () => {
 		const stub = env.DEMO.getByName('accounting-member-status-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {

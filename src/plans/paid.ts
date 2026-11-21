@@ -113,7 +113,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// than answering `retry_after`, with room for pings and other frames.
 		trustedPostsPerMinute: 100,
 		trustedPostsPerDay: 4_000,
-		ipPostsPerDay: 2_000,
+		// An office or conference behind one address posts together: several
+		// registered users at their own 20 a minute each. Guests stay at
+		// anonymousPostsPerMinute per address, and sign-ups per address
+		// (registrationsPerIpDay) bound how many accounts share it.
+		ipPostsPerMinute: 120,
+		ipPostsPerDay: 5_000,
 		globalPostsPerMinute: 600,
 		globalPostsPerDay: 60_000,
 		// A conference or office behind one address can sign up together.
@@ -153,7 +158,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// 3, and about one connection in fifteen ended as such a socket, so a
 		// phone waking up could lock its own account out for a minute. Cost
 		// is bounded by connectionsPerIp, openConnections and the admissions.
-		registeredConnectionsPerUser: 5,
+		// 8 since then: a phone, a laptop and several open tabs, with room
+		// for a stale socket or two.
+		registeredConnectionsPerUser: 8,
 		// Every connection's `auth` is an attempt, guest and token sign-ins
 		// too: twice every connection an address may hold, so a reconnect wave
 		// signs them all in before the 30-second auth deadline.
