@@ -846,6 +846,8 @@ export class SqliteStore {
     this.memberCache.clear();
     this.uploads.emojiCache = null;
     this.historyLog.forgetState();
+    this.historyLog.forgetChunkIndexes();
+    this.live.liveCache = undefined;
     this.uploads.serverCache = null;
     this.initialized = false;
     this.logCache = null;

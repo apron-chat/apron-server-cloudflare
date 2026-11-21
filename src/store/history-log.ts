@@ -88,6 +88,12 @@ export class HistoryModule {
   /** Whether the chunk table exists, this instance (chunkIndex). */
   private chunkTableReady = false;
 
+  /** Forgets the chunk indexes loaded and that their table exists: after a reset wiped them (SqliteStore.resetStorage). */
+  forgetChunkIndexes(): void {
+    this.chunkIndexes.clear();
+    this.chunkTableReady = false;
+  }
+
   /**
    * The records the hot log holds from the hot floor on, for `/status`:
    * counted up to RETAINED_SCAN_CAP (one index entry each, refunded past
