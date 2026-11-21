@@ -169,6 +169,8 @@ export interface RestoreResult {
 	collided?: number;
 	/** Records dropped: not something a client could have sent (RestorePort.normalize). */
 	rejected?: number;
+	/** Joins the records would make that a cap refused: MAX_MEMBERSHIPS_PER_USER, or the private-room cap. */
+	membersSkipped?: number;
 }
 
 /** A tier's own state: nothing below `floor` is in it; `target` is the floor its retention allows, applied next. */

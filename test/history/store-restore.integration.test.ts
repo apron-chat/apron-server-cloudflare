@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import type { ChatRecord } from "../../src/history/records";
 import { RESTORE_RECORDS_BATCH, Store, UNCLAIMED_ROLE, type RoomRecord, type StoreConfig, type StoreMutationInput } from "../../src/store";
+import { MAX_MEMBERSHIPS_PER_USER } from "../../src/budget";
 import { exportArchive } from "../../src/history/archive/export";
 import { type ArchivedRoom, type ArchivedUser, collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "@apron/archive";
 import { importArchive } from "../../src/history/archive/import";
@@ -587,6 +588,33 @@ it("joins a new room's listed members with no membership record, within its acco
 		expect(store.restoreMembers(`private_${base}`, { join: ["ana"], leave: [] })).toEqual({ joined: 1, left: 0, skipped: 0 });
 		expect(store.restoreMembers(`private_${base + 1}`, { join: ["ana"], leave: [] })).toEqual({ joined: 0, left: 0, skipped: 1 });
 		expect(() => store.restoreMembers("no-such-room", { join: ["ana"], leave: [] })).toThrow(/No room/);
+		expect(overruns).toEqual([]);
+	});
+});
+
+it("never makes anyone a member of more than MAX_MEMBERSHIPS_PER_USER rooms on restore: past it, joins are skipped and counted", async () => {
+	await withStore("restore-membership-cap", CONFIG, (store, clock, state) => {
+		const overruns = watched(store);
+		store.restoreUsers(["ana", "ben"].map((user_id) => ({ user_id, name: user_id.toUpperCase() })));
+		const base = clock.value - 60_000;
+		const sql = state.storage.sql;
+		// Ana is in as many rooms as anyone may be.
+		for (let at = 0; at < MAX_MEMBERSHIPS_PER_USER; at += 1) sql.exec("INSERT INTO memberships (room_id, user_id) VALUES (?, 'ana')", `held-${at}`);
+		const memberships = (userId: string) => Number(sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM memberships WHERE user_id = ?", userId).one().n);
+		const room = (room_id: string) => ({ listing: { room_id, log_id: String(base) }, joined: false });
+		const joinRecord = (roomId: string, logId: number, userIds: string[]): ChatRecord => ({
+			room_id: roomId, log_id: logId, commit_ms: logId, kind: "membership",
+			record_json: JSON.stringify({ log_id: String(logId), room_id: roomId, members: userIds.map((user_id) => ({ user: { user_id }, joined: true })) }),
+		});
+		// A listing's member: skipped for ana, joined for ben; repeated (as a resumed or second import), still skipped.
+		store.restoreRoom(room("lounge"), []);
+		expect(store.restoreMembers("lounge", { join: ["ana", "ben"], leave: [] })).toEqual({ joined: 1, left: 0, skipped: 1 });
+		expect(store.restoreMembers("lounge", { join: ["ana"], leave: [] })).toEqual({ joined: 0, left: 0, skipped: 1 });
+		// A membership record: the same, counted in the room's result.
+		const result = store.restoreRoom(room("den"), [joinRecord("den", base + 1, ["ana", "ben"])], clock.value, { rooms: ["den"] });
+		expect(result).toMatchObject({ created: true, membersSkipped: 1 });
+		expect(memberships("ana")).toBe(MAX_MEMBERSHIPS_PER_USER);
+		expect(memberships("ben")).toBe(2);
 		expect(overruns).toEqual([]);
 	});
 });

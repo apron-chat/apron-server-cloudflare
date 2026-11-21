@@ -250,6 +250,7 @@ export async function importArchive(chain: HistoryChain, restore: RestorePort, i
 		for (const result of results) {
 			report.collisions += result.collided ?? 0;
 			report.rejected += result.rejected ?? 0;
+			report.membersSkipped += result.membersSkipped ?? 0;
 		}
 		// Then the members its listing names (records the room has in every tier count).
 		const changes = membersOf(listing, plan.records);

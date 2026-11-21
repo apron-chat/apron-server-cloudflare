@@ -182,7 +182,7 @@ export interface ImportReport {
 	collisions: number;
 	/** Members a new room's listing names that were joined there with no membership record (the writer's count). */
 	membersJoined: number;
-	/** Listed members not joined there: no account, or a cap of the target's (the writer's count). */
+	/** Members not joined there: a listed one with no account, or a join (listed or recorded) a cap of the target's refused (the writer's count). */
 	membersSkipped: number;
 	/** Records the file holds only as references (ARCHIVE.md §3.1). */
 	references: number;

@@ -828,7 +828,9 @@ What grows with the rooms kept, and its bounds:
   (`MAX_MEMBERSHIPS_PER_USER`, in `src/budget.ts`): a join past it, or
   creating a room, which joins its creator, is `denied` ("A user may be in at
   most 1000 rooms; leave one to join another"). An import that would make
-  someone a member of more of its rooms is refused at planning. So the reads
+  someone a member of more of its rooms is refused at planning, and restoring
+  never joins anyone past it: a join past it (a second or resumed import's,
+  from records or listings) is skipped and counted as `membersSkipped`. So the reads
   of a user's own rooms stay bounded: their joined rooms are listed newest
   first, at most `MAX_USER_ROOMS` (351), read in the membership index's order
   so the read stops there, plus their top-level rooms (at most 17) and a room

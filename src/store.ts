@@ -4096,9 +4096,9 @@ export class Store {
    * are history): `join` are joined where they are not, with no membership
    * record made (as a membership is kept after its record leaves the log),
    * and `leave` (members the import's own records joined that a complete
-   * listing leaves out) are removed. Joins only for identities here, and in
-   * a private room only within maxPrivateMembershipsPerUser; the others are
-   * counted as `skipped`. At most RESTORE_ENTRIES_BATCH users a call;
+   * listing leaves out) are removed. Joins only for identities here, within
+   * MAX_MEMBERSHIPS_PER_USER, and in a private room within
+   * maxPrivateMembershipsPerUser; the others are counted as `skipped`. At most RESTORE_ENTRIES_BATCH users a call;
    * charged to maintenance. Repeating a call changes nothing.
    */
   restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }, now = this.clock.now()): { joined: number; left: number; skipped: number } {
@@ -4106,7 +4106,8 @@ export class Store {
     const size = changes.join.length + changes.leave.length;
     if (size > RESTORE_ENTRIES_BATCH) throw new StoreError("invalid_params", `At most ${RESTORE_ENTRIES_BATCH} members are restored a call`);
     const isPrivate = isPrivateRoomId(roomId);
-    const cost = { reads: 16 + 4 * size + (isPrivate ? changes.join.length * this.userRoomsReads() : 0), writes: 8 + 3 * size };
+    // Per join, the user's memberships counted against MAX_MEMBERSHIPS_PER_USER (and for a private room, their private rooms).
+    const cost = { reads: 16 + 4 * size + changes.join.length * (MEMBERSHIP_COUNT_READS + (isPrivate ? this.userRoomsReads() : 0)), writes: 8 + 3 * size };
     return this.reserved(cost, true, now, () => this.transaction(() => {
       if (!this.roomRow(roomId)) throw new StoreError("invalid_params", `No room ${roomId} to restore members into`.slice(0, 200));
       const member = (userId: string) => this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
@@ -4115,7 +4116,8 @@ export class Store {
       let skipped = 0;
       for (const userId of new Set(changes.join)) {
         if (member(userId)) continue;
-        if (!this.identityRow(userId) || (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser)) {
+        if (!this.identityRow(userId) || this.membershipCount(userId) >= MAX_MEMBERSHIPS_PER_USER ||
+          (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser)) {
           skipped += 1;
           continue;
         }
@@ -4244,7 +4246,7 @@ export class Store {
    * Charged to maintenance, so a day's exhausted budget refuses a call with
    * `retry_after`, to be repeated later.
    */
-  restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now = this.clock.now(), options: { rooms?: readonly string[] } = {}): { created: boolean; stored: number; collided?: number; rejected?: number } {
+  restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now = this.clock.now(), options: { rooms?: readonly string[] } = {}): { created: boolean; stored: number; collided?: number; rejected?: number; membersSkipped?: number } {
     this.ensureReady();
     const listing = room?.listing;
     const roomId = listing?.room_id;
@@ -4332,7 +4334,7 @@ export class Store {
     // private room their private rooms); and the log head.
     const cost = {
       reads: 128 + EMPTY_ROOM_SCAN + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + ROOM_COUNT_READS + 4 * fresh.length + 8 * keys + 4 * named.size +
-        (isPrivate ? memberships.size * this.userRoomsReads() : 0),
+        memberships.size * (MEMBERSHIP_COUNT_READS + (isPrivate ? this.userRoomsReads() : 0)),
       writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
     };
     if (fresh.length) this.ensureGrowthCapacity(2 * fresh.reduce((sum, record) => sum + utf8Bytes(record.record_json), 0) + 1_024);
@@ -4457,13 +4459,20 @@ export class Store {
           this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ?", set.messageId, set.userId);
         }
       }
-      // Memberships: each user's latest change, joins only for identities here.
+      // Memberships: each user's latest change, joins only for identities
+      // here, within MAX_MEMBERSHIPS_PER_USER and the private-room cap (those
+      // two counted as `membersSkipped`).
       let members = 0;
+      let membersSkipped = 0;
       for (const [userId, { joined }] of memberships) {
         const member = this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
         if (joined && !member) {
           if (!this.identityRow(userId)) continue;
-          if (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser) continue;
+          if (this.membershipCount(userId) >= MAX_MEMBERSHIPS_PER_USER ||
+            (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser)) {
+            membersSkipped += 1;
+            continue;
+          }
           this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", roomId, userId);
           members += 1;
         } else if (!joined && member) {
@@ -4490,7 +4499,7 @@ export class Store {
         this.rawExec("UPDATE log_state SET last_log_id = MAX(last_log_id, ?), last_commit_ms = MAX(last_commit_ms, ?) WHERE id = 1", newest, commitMs);
         this.logCache = { ...state, last_log_id: Math.max(state.last_log_id, newest), last_commit_ms: Math.max(state.last_commit_ms, commitMs) };
       }
-      return { created, stored: fresh.length, ...(collided.size ? { collided: collided.size } : {}), ...(rejected ? { rejected } : {}) };
+      return { created, stored: fresh.length, ...(collided.size ? { collided: collided.size } : {}), ...(rejected ? { rejected } : {}), ...(membersSkipped ? { membersSkipped } : {}) };
     }));
   }
 
