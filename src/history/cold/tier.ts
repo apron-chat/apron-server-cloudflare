@@ -264,7 +264,7 @@ export class ColdHistoryTier implements HistoryTier {
 	 * The floor a retention allows over whole chunks wholly below `below`
 	 * (records at or past it are copies held above): the newest chunks that
 	 * hold the count's and bytes' threshold share stay, chunks older than
-	 * `ageMs` go, and none younger than `minAgeMs` does. The floor is a
+	 * `ageMs` go. The floor is a
 	 * chunk's first; undefined while nothing need leave.
 	 */
 	async floorFor(retention: Retention, context: FloorContext): Promise<number | undefined> {
@@ -287,10 +287,6 @@ export class ColdHistoryTier implements HistoryTier {
 			const fresh = own.find((ref) => ref.last >= cutoff);
 			const ageFloor = fresh ? fresh.first : own[own.length - 1].last + 1;
 			floor = Math.max(floor ?? 0, ageFloor);
-		}
-		if (floor !== undefined && retention.minAgeMs && retention.minAgeMs > 0) {
-			const young = own.find((ref) => ref.last >= context.now - retention.minAgeMs!);
-			if (young) floor = Math.min(floor, young.first);
 		}
 		return floor === undefined || floor <= own[0].first ? undefined : floor;
 	}

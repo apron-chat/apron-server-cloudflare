@@ -228,8 +228,6 @@ export interface StoreConfig {
   retentionMs: number;
   /** History keeps at least the latest this many records; 0 keeps no count (retentionCutoff). */
   retentionRecords: number;
-  /** Records younger than this never expire by count. */
-  minRetentionMs: number;
   /**
    * Whether history tiers lie below this SQLite (the history chain,
    * src/history/: the D1 tier where it is bound): records leaving it are
@@ -570,7 +568,6 @@ export interface UploadWrite {
 const DEFAULT_CONFIG: StoreConfig = {
   retentionMs: DEFAULT_LIMITS.retentionSeconds * 1000,
   retentionRecords: DEFAULT_LIMITS.retentionRecords,
-  minRetentionMs: DEFAULT_LIMITS.minRetentionSeconds * 1000,
   tiered: false,
   cleanupThresholdPercent: DEFAULT_LIMITS.cleanupThresholdPercent,
   idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
@@ -651,7 +648,7 @@ const DEFAULT_CONFIG: StoreConfig = {
 
 export function defaultStoreConfig(overrides: Partial<StoreConfig> = {}): StoreConfig {
   const merged = { ...DEFAULT_CONFIG, ...overrides };
-  if (merged.retentionMs < 0 || merged.retentionRecords < 0 || merged.minRetentionMs < 0 || (merged.retentionMs === 0 && merged.retentionRecords === 0) || merged.dedupTtlMs <= 0) {
+  if (merged.retentionMs < 0 || merged.retentionRecords < 0 || (merged.retentionMs === 0 && merged.retentionRecords === 0) || merged.dedupTtlMs <= 0) {
     throw new Error("retention needs an age or a count, and dedup TTL must be positive");
   }
   if (merged.maxSnapshotBytes <= 0 || merged.maxTextBytes <= 0) {
@@ -1060,6 +1057,13 @@ const META_HISTORY_IMPORT = "history:import";
 export const HISTORY_SCAN_BATCH = 100;
 /** Index entries historyTarget reads past the cutoff at most, looking for the first record it keeps. */
 const HISTORY_TARGET_SCAN = 200;
+/**
+ * How soon after a cleanup started at the storage watermark another may
+ * start while the database stays over it (cleanupDueAt): a pressure that
+ * cleanup cannot relieve (what is past the count already gone, or waiting on
+ * a failing copy below) is looked at again then, not at every alarm.
+ */
+const PRESSURE_CLEANUP_RETRY_MS = 5 * 60_000;
 /** Rewrites the log holds at most: a /purge or /rename past it waits for the links to catch up (retry_after). */
 const MAX_HISTORY_REWRITES = 200;
 /**
@@ -2257,6 +2261,15 @@ export class Store {
   /** Overruns' excess rows, charged once the operation's transaction has ended (persistSettled). */
   private overrunCharges: Array<{ day: string; delta: BudgetDelta }> = [];
   private deferredCleanupUntil = 0;
+  /**
+   * The earliest effective time a cleanup may start because the database is
+   * at its storage watermark (cleanupDueAt), however far off the scheduled
+   * one is: 0 until one has, then PRESSURE_CLEANUP_RETRY_MS after the last.
+   * In memory: a new instance looks once at once.
+   */
+  private pressureCleanupAfter = 0;
+  /** Set when a refusal at the watermark needs an earlier alarm than the one scheduled (takeAlarmChange). */
+  private alarmChanged = false;
   /**
    * `next_cleanup_ms` as last read (maintenanceRow), so an alarm can tell
    * whether cleanup is due without a reservation (cleanupDue); forgotten at
@@ -3580,12 +3593,34 @@ export class Store {
     const growthAllowance = Math.max(1024 * 1024, Math.max(0, additionalBytes) * 16);
     if (size >= this.config.storageHighWaterBytes || size + growthAllowance > this.config.storageHardTargetBytes) {
       if (!paused) this.settle(this.storagePressure, "1");
-      throw new StoreError("retry_after", "Demo capacity reached", { retryAfterMs: this.config.cleanupIntervalMs });
+      throw this.pressureRefusal();
     }
     if (paused) {
-      if (size > this.config.storageLowWaterBytes) throw new StoreError("retry_after", "Demo capacity reached", { retryAfterMs: this.config.cleanupIntervalMs });
+      if (size > this.config.storageLowWaterBytes) throw this.pressureRefusal();
       this.settle(this.storagePressure, "0");
     }
+  }
+
+  /**
+   * A refusal at the storage watermark. Cleanup starts at once for it
+   * (cleanupDueAt), moving what is past the count down: so the runtime is
+   * told to bring its alarm forward (takeAlarmChange) when the one scheduled
+   * is later, and the client to retry once that cleanup has had time to run.
+   */
+  private pressureRefusal(): StoreError {
+    const startAt = Math.max(this.lastEffectiveMs, this.pressureCleanupAfter);
+    if (this.scheduledAlarmAt === undefined || this.scheduledAlarmAt > startAt) {
+      this.scheduledAlarmAt = undefined;
+      this.alarmChanged = true;
+    }
+    return new StoreError("retry_after", "Demo capacity reached", { retryAfterMs: PRESSURE_CLEANUP_RETRY_MS });
+  }
+
+  /** Whether a refusal at the storage watermark needs the alarm brought forward; clears the flag. */
+  takeAlarmChange(): boolean {
+    const changed = this.alarmChanged;
+    this.alarmChanged = false;
+    return changed;
   }
 
   private assertStorageTarget(): void {
@@ -9286,19 +9321,31 @@ export class Store {
   }
 
   cleanupDue(now = this.clock.now()): boolean {
-    if (this.cleanupDueCache !== undefined) return Math.max(this.cleanupDueCache, this.deferredCleanupUntil) <= Math.max(Math.trunc(now), this.lastEffectiveMs);
+    if (this.cleanupDueCache !== undefined) return this.cleanupDueAt(this.cleanupDueCache) <= Math.max(Math.trunc(now), this.lastEffectiveMs);
     try {
       return this.reserved({ reads: 4 }, true, now, () =>
-        Math.max(this.maintenanceRow().next_cleanup_ms, this.deferredCleanupUntil) <= this.effectiveNow(now));
+        this.cleanupDueAt(this.maintenanceRow().next_cleanup_ms) <= this.effectiveNow(now));
     } catch {
       return true;
     }
   }
 
   /**
+   * When cleanup is next due, given the scheduled `next_cleanup_ms`: that,
+   * or sooner while the database is at its storage watermark (a refusal set
+   * the storagePressure latch), no sooner than PRESSURE_CLEANUP_RETRY_MS
+   * after the last cleanup the pressure started; never before a deferral for
+   * an exhausted budget ends (deferredCleanupUntil). The latch is read only
+   * as already loaded (a refusal loads it), so this reads nothing.
+   */
+  private cleanupDueAt(scheduled: number): number {
+    const pressed = this.storagePressure.known === "1" ? Math.min(scheduled, this.pressureCleanupAfter) : scheduled;
+    return Math.max(pressed, this.deferredCleanupUntil);
+  }
+
+  /**
    * The commit time before which records have expired (section 9): those
-   * past the latest `retentionRecords` once `minRetentionMs` old, and any
-   * `retentionMs` old. Commit times are nondecreasing in log order, so the
+   * past the latest `retentionRecords`, and any `retentionMs` old. Commit times are nondecreasing in log order, so the
    * count ends at a time too, the commit time of the Nth newest record. A
    * move's record is stored in both of its rooms and counts twice. 0 when
    * nothing has expired. Reads up to `retentionRecords` index entries
@@ -9315,7 +9362,7 @@ export class Store {
     const commit = nth.length ? this.rawRows<{ commit_ms: number }>(
       "SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id = ? LIMIT 1", nth[0].log_id,
     ) : [];
-    const byCount = commit.length ? Math.min(integerColumn(commit[0].commit_ms), effective - this.config.minRetentionMs) : 0;
+    const byCount = commit.length ? integerColumn(commit[0].commit_ms) : 0;
     return Math.max(0, byAge, byCount);
   }
 
@@ -9346,7 +9393,7 @@ export class Store {
     this.scheduledAlarmAt = undefined;
     // A challenge deadline is not an hourly cleanup. Its cheap due check must
     // not consume the reservation for a complete deletion batch.
-    let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number; published: number; cutoff?: number };
+    let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number; published: number; cutoff?: number; pressed?: boolean };
     try {
       gate = this.reserved({ reads: 24 + this.retentionCountReads(), writes: 2 }, true, now, () => {
         const maintenance = this.maintenanceRow();
@@ -9357,15 +9404,21 @@ export class Store {
         // (including expired thread rooms, which the cheap probes below do not
         // cover). Continue it rather than letting the idle check end it.
         const jobInProgress = maintenance.cleanup_cursor !== null && maintenance.cleanup_cutoff_ms !== null;
-        if (!jobInProgress && effective >= Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil)) {
+        if (!jobInProgress && effective >= this.cleanupDueAt(maintenance.next_cleanup_ms)) {
+          // Started by the storage watermark before the scheduled time: the
+          // next such start waits a while (a start that finds no work leaves
+          // the schedule as it was; a job sets the next from its own end).
+          const pressed = effective < Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil);
+          if (pressed) this.pressureCleanupAfter = effective + PRESSURE_CLEANUP_RETRY_MS;
           const cutoff = this.retentionCutoff(effective);
           // Idle hours must not burn a full deletion reservation.
           if (!this.cleanupHasWork(state.history_floor, cutoff, effective, this.limiterCutoff(effective))) {
+            if (pressed) return { maintenance, state, effective, published };
             maintenance.next_cleanup_ms = effective + this.config.cleanupIntervalMs;
             this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", maintenance.next_cleanup_ms);
             this.cleanupDueCache = undefined;
           }
-          return { maintenance, state, effective, published, cutoff };
+          return { maintenance, state, effective, published, cutoff, pressed };
         }
         return { maintenance, state, effective, published };
       });
@@ -9376,7 +9429,8 @@ export class Store {
     const { maintenance, state, effective } = gate;
     const previousFloor = state.history_floor;
     const previousPublished = gate.published;
-    const due = Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil);
+    // A start the watermark made is due now, whatever the schedule says.
+    const due = gate.pressed ? effective : Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil);
     const empty = (nextDue: number): StoreCleanupResult => ({
       history_floor: idString(previousPublished), previous_floor: idString(previousPublished), latest_id: idString(state.last_log_id),
       deleted_records: 0, deleted_messages: 0, deleted_reactions: 0, deleted_memberships: 0, deleted_requests: 0, deleted_limiters: 0,
@@ -9617,7 +9671,7 @@ export class Store {
     }
     const effective = Math.max(Math.trunc(now), this.lastEffectiveMs);
     const maintenance = this.maintenanceRow();
-    const cleanupDue = Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil);
+    const cleanupDue = this.cleanupDueAt(maintenance.next_cleanup_ms);
     const dueAt = Math.max(effective, socketDeadline === undefined ? cleanupDue : Math.min(cleanupDue, socketDeadline));
     const getAlarm = this.durableStorage?.getAlarm;
     const setAlarm = this.durableStorage?.setAlarm;

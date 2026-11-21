@@ -28,6 +28,11 @@ export class SettledMeta {
 		return this.desired!;
 	}
 
+	/** The value as it should be, if read or set already; undefined otherwise (reads nothing). */
+	get known(): string | undefined {
+		return this.desired;
+	}
+
 	/** What storage was last read or written to hold, if known. */
 	get persisted(): string | undefined {
 		return this.stored;

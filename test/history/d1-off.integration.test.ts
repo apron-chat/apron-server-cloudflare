@@ -20,7 +20,7 @@ it("stops the chain when D1 goes off after its first copy, before its first trim
 	await runInDurableObject(stub(), async (instance, state) => {
 		const runtime = instance as unknown as Runtime;
 		const server = `d1-off-${Date.now()}`;
-		runtime.store.config = { ...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, cleanupThresholdPercent: 100, anonymousPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
+		runtime.store.config = { ...runtime.store.config, retentionRecords: 3, cleanupThresholdPercent: 100, anonymousPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
 		runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 100, cleanupThresholdPercent: 100 } };
 		const build = (bindings: Record<string, unknown>) => buildHistoryChain({
 			layout: historyLayout(bindings as never, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store,

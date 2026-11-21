@@ -5,7 +5,7 @@ import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { type BlobStoreChoice, type HistoryEnv, type ChainStore, type HistoryLimits, WORKER_BLOB_STORES, blobStoreOf, buildHistoryChain, d1Off, historyLayout, layoutTiered } from "../../src/history/config";
 import { MemoryBlobStore, memoryBlobStores } from "./support/memory-blob-store";
 
-const LIMITS: HistoryLimits = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0, cleanupThresholdPercent: 80 };
+const LIMITS: HistoryLimits = { retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 const clock = { now: () => 0 };
 const store = { historyStatePort: () => ({}) } as unknown as ChainStore;
 /** The chain for these bindings and limits, as the Worker builds it: the layout first. */

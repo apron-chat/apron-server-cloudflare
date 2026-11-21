@@ -479,9 +479,13 @@ function validateLimits(limits: Limits): void {
 	if (limits.historyD1Records > budget.MAX_HISTORY_D1_RECORDS) fail("historyD1Records exceeds the calibrated bound");
 	if (limits.cleanupThresholdPercent > 100) fail("cleanupThresholdPercent is a share of the limits, at most 100");
 	if (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.cleanupSeconds) fail("retentionSeconds must be at least one cleanup interval");
-	// The minimum age applies only to retention by count.
-	if (limits.retentionRecords > 0 && (limits.minRetentionSeconds < limits.cleanupSeconds || (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.minRetentionSeconds))) {
-		fail("minRetentionSeconds must be at least one cleanup interval, and retentionSeconds at least minRetentionSeconds");
+	// Cleanup at the storage watermark moves what is past the count down: the
+	// records it keeps, even every one a largest snapshot (twice that, for
+	// their indexes and state rows), must fit under the watermark that
+	// resumes posting, or a flood could hold posting off with records the
+	// count keeps.
+	if (limits.retentionRecords > 0 && limits.retentionRecords * limits.maxSnapshotBytes * 2 > limits.databaseResumeLowWaterBytes) {
+		fail("retentionRecords of the largest snapshots must fit under databaseResumeLowWaterBytes");
 	}
 	if (!Number.isSafeInteger(limits.sessionTtlSeconds) || limits.sessionTtlSeconds <= 0 || limits.sessionTtlSeconds > 30 * 24 * 60 * 60) {
 		fail("session lifetime must be between one second and thirty days");

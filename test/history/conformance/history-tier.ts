@@ -168,12 +168,11 @@ export function describeHistoryTier(name: string, makeTier: () => HistoryTier | 
 			expect(await tier.floorFor({ thresholdPercent: 100 }, { now: 0, below: Infinity })).toBeUndefined();
 		});
 
-		it("finds its floor by age, held back by the minimum age", async () => {
+		it("finds its floor by age", async () => {
 			const tier = await makeTier();
 			await appendEach(tier, messages(TEN));
 			expect(await tier.floorFor({ ageMs: 5_500, thresholdPercent: 100 }, { now: 10_000, below: Infinity })).toBe(5000);
 			expect(await tier.floorFor({ ageMs: 1_000, thresholdPercent: 100 }, { now: 100_000, below: Infinity })).toBe(10_001);
-			expect(await tier.floorFor({ records: 2, minAgeMs: 6_500, thresholdPercent: 100 }, { now: 10_000, below: Infinity })).toBe(4000);
 		});
 
 		it("trims below a floor in bounded batches, idempotently", async () => {

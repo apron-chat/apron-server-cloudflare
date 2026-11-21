@@ -64,7 +64,6 @@ ROOM_METADATA_TOTAL_LIMIT = "262144"
 # History (docs/configuration.md, History retention, History tiers, Backups
 # and imports): the plan's own limits written out, as in production.
 LIMIT_RETENTION_RECORDS = "5000"
-LIMIT_MIN_RETENTION_SECONDS = "259200"
 LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"

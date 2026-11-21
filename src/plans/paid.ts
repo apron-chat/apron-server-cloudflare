@@ -26,11 +26,11 @@
 //   768 MB (1 GB hard), a fifth of the 5 GB-month included. A week of the
 //   demo's traffic in November 2026 was about 800 message records and a
 //   1.5 MB database, so 5,000 records are a few MB;
-//   only a flood reaches the watermark, and then posting waits until its
-//   records are three days old and past the count (minRetentionSeconds) or
-//   an admin purges the flooder. Cleanup runs daily; it removes the same
-//   rows a day as hourly would, in batches that continue until it is caught
-//   up.
+//   only a flood reaches the watermark, and then cleanup starts at once
+//   (not at the daily slot), moving what is past the count down to D1, and
+//   posting resumes once the database is under the low-water mark. Cleanup
+//   otherwise runs daily; it removes the same rows a day as hourly would, in
+//   batches that continue until it is caught up.
 //
 // That is about $11 a day in all, and the daily cap stops the server at $5
 // first; early in a month the inclusions cover it (50 million rows written).
@@ -55,13 +55,13 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// D1's share stays within its included 5 GB even were every record
 		// there a maximum-size snapshot (80,000 × 24 KiB, about 1.9 GB). The
 		// cold tier (R2), where it is bound, keeps everything past that.
-		// Records younger than three days stay whatever the count, so a flood
-		// cannot push out the last few days before an admin purges it; the
-		// database watermarks still bound what the flood itself stores. No age
-		// limit: a removed account's user_id is retired until the log has
-		// moved past it, not for a time (Store.dueRetiredUserIds).
+		// A flood that reaches the database watermark starts cleanup at once,
+		// moving what is past the count down to D1 (Store.runCleanup), so
+		// posting waits minutes, not a day; the cost is that recent records it
+		// pushes out become read-only. No age limit: a removed account's
+		// user_id is retired until the log has moved past it, not for a time
+		// (Store.dueRetiredUserIds).
 		retentionRecords: 5_000,
-		minRetentionSeconds: 3 * 24 * 60 * 60,
 		retentionSeconds: 0,
 		historyD1Records: 100_000,
 		historyColdRecords: 0,

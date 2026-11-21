@@ -272,7 +272,7 @@ it("an old thread's history pages from the cold tier", async () => {
 	type Runtime = { store: Store & { config: Record<string, unknown> }; config: { limits: Record<string, number> }; history?: HistoryChain; alarm(): Promise<void> };
 	await runInDurableObject(env.DEMO.getByName(`caps-cold-${crypto.randomUUID()}`), async (instance, state) => {
 		const runtime = instance as unknown as Runtime;
-		runtime.store.config = { ...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, cleanupThresholdPercent: 100, anonymousPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
+		runtime.store.config = { ...runtime.store.config, retentionRecords: 3, cleanupThresholdPercent: 100, anonymousPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
 		runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 0, cleanupThresholdPercent: 100 } };
 		runtime.history = buildHistoryChain({
 			layout: { blobs: new R2BlobStore(env.HISTORY_BLOB!), blobLabel: "R2" }, limits: runtime.config.limits as never, store: runtime.store,

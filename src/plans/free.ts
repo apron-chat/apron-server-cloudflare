@@ -9,7 +9,6 @@ export const FREE_PLAN: Plan = Object.freeze({
 	limits: Object.freeze({
 		// A day of history, by age alone (no count).
 		retentionRecords: 0,
-		minRetentionSeconds: 86_400,
 		retentionSeconds: 86_400,
 		historyD1Records: 0,
 		historyColdRecords: 0,

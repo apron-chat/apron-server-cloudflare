@@ -31,7 +31,6 @@ import { type HeadStore, storeHead } from "./store-head";
 export interface HistoryLimits {
 	retentionRecords: number;
 	retentionSeconds: number;
-	minRetentionSeconds: number;
 	historyD1Records: number;
 	historyColdRecords: number;
 	cleanupThresholdPercent: number;
@@ -146,12 +145,11 @@ export function d1Enabled(env: HistoryEnv, limits: Pick<HistoryLimits, "historyD
 	return Boolean(env.HISTORY_D1) && limits.historyD1Records > 0;
 }
 
-/** The head's retention, from the limits: its own count, age ceiling and minimum age. */
+/** The head's retention, from the limits: its own count and age ceiling. */
 export function headRetention(limits: HistoryLimits): Retention {
 	return {
 		...(limits.retentionRecords > 0 ? { records: limits.retentionRecords } : {}),
 		...(limits.retentionSeconds > 0 ? { ageMs: limits.retentionSeconds * 1_000 } : {}),
-		minAgeMs: limits.minRetentionSeconds * 1_000,
 		thresholdPercent: limits.cleanupThresholdPercent,
 	};
 }

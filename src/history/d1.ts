@@ -162,12 +162,6 @@ export class D1HistoryTier implements HistoryTier {
 				if (floor === undefined || ageFloor > floor) floor = ageFloor;
 			}
 		}
-		if (floor !== undefined && retention.minAgeMs && retention.minAgeMs > 0) {
-			const young = await this.db.prepare(
-				`SELECT log_id FROM ${this.table} WHERE commit_ms >= ?1 ORDER BY log_id LIMIT 1`,
-			).bind(context.now - retention.minAgeMs).first<{ log_id: number }>();
-			if (young && Number(young.log_id) < floor) floor = Number(young.log_id);
-		}
 		return floor;
 	}
 

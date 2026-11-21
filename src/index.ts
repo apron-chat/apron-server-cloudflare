@@ -1152,7 +1152,6 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,
 		retentionRecords: limits.retentionRecords,
-		minRetentionMs: limits.minRetentionSeconds * 1_000,
 		cleanupThresholdPercent: limits.cleanupThresholdPercent,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
@@ -3740,7 +3739,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// A sign-in that failed after holding deliveries sends them after its error.
 		this.releaseDeliveries(socket);
-		if (!this.alarmKnown) await this.rescheduleAlarm();
+		// A refusal at the storage watermark starts cleanup at once: its alarm may be sooner than the one set.
+		if (!this.alarmKnown || this.store.takeAlarmChange()) await this.rescheduleAlarm();
 	}
 
 	/** Counts one frame against the server-wide minute; the seconds to wait when it is full. */

@@ -350,7 +350,7 @@ function messageRecord(roomId: string, logId: number, value: Record<string, unkn
 	return { room_id: roomId, log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: roomId, from: { user_id: "ada", name: "Ada" }, body: { text: `m${logId}` }, ...value }) };
 }
 
-const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
+const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 
 it("refuses records past the clock, and raises the log head only by records it stores, never by a listing", async () => {
 	await withStore("restore-future", CONFIG, (store, clock) => {

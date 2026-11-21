@@ -414,7 +414,7 @@ test("production writes out the plan's own history limits, and daily backups", (
 	const { production } = splitPreviews(readFileSync(new URL('../wrangler.production.toml', import.meta.url), 'utf8'));
 	const vars = wranglerVars(production);
 	const config = loadConfig(vars);
-	for (const key of ['retentionRecords', 'retentionSeconds', 'minRetentionSeconds', 'historyD1Records', 'historyColdRecords', 'cleanupThresholdPercent', 'roomCreationWindowSeconds']) {
+	for (const key of ['retentionRecords', 'retentionSeconds', 'historyD1Records', 'historyColdRecords', 'cleanupThresholdPercent', 'roomCreationWindowSeconds']) {
 		const name = `LIMIT_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`;
 		assert.ok(Object.hasOwn(vars, name), `wrangler.production.toml sets ${name}`);
 		assert.equal(config.limits[key], DEFAULT_LIMITS[key], key);

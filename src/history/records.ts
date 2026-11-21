@@ -58,14 +58,12 @@ export interface HistoryQuery {
 
 /**
  * A tier's ceiling: retention keeps `thresholdPercent` of whichever limits
- * are set (the strictest wins). `minAgeMs` holds records younger than it
- * whatever the count says.
+ * are set (the strictest wins).
  */
 export interface Retention {
 	records?: number;
 	bytes?: number;
 	ageMs?: number;
-	minAgeMs?: number;
 	thresholdPercent: number;
 }
 

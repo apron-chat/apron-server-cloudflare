@@ -126,7 +126,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps history by count, by age or both, but not by neither, and only the retention bounds take 0', () => {
-		expect(config().limits).toMatchObject({ retentionRecords: 5_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0 });
+		expect(config().limits).toMatchObject({ retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0 });
 		expect(config({ LIMIT_HISTORY_D1_RECORDS: '0' }).limits.historyD1Records).toBe(0);
 		expect(() => config({ LIMIT_HISTORY_D1_RECORDS: '100001' })).toThrow('historyD1Records exceeds the calibrated bound');
 		expect(config({ LIMIT_HISTORY_COLD_RECORDS: '1000000' }).limits.historyColdRecords).toBe(1_000_000);
@@ -140,11 +140,14 @@ describe('configuration policy boundaries', () => {
 		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '604800' }).limits).toMatchObject({ retentionRecords: 0, retentionSeconds: 604_800 });
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '0' })).toThrow('retentionRecords or retentionSeconds must be set');
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '50001' })).toThrow(ConfigError);
-		// An age limit under the minimum age contradicts it.
-		expect(() => config({ LIMIT_RETENTION_SECONDS: '86400' })).toThrow(ConfigError);
-		expect(() => config({ LIMIT_MIN_RETENTION_SECONDS: '0' })).toThrow('minRetentionSeconds must be a positive safe integer');
+		// A count and an age ceiling together: whichever expires a record first.
+		expect(config({ LIMIT_RETENTION_SECONDS: '86400' }).limits).toMatchObject({ retentionRecords: 5_000, retentionSeconds: 86_400 });
+		// The minimum age is gone: a leftover var is refused like any misspelt limit.
+		expect(() => config({ LIMIT_MIN_RETENTION_SECONDS: '259200' })).toThrow('LIMIT_MIN_RETENTION_SECONDS is not a limit');
 		expect(() => config({ LIMIT_RETENTION_SECONDS: '-1' })).toThrow('retentionSeconds must be a non-negative safe integer');
-		// By age alone, the minimum age (for the count) does not apply.
+		// The count's largest snapshots must fit under the watermark that resumes posting, so cleanup there relieves it.
+		expect(() => config({ LIMIT_RETENTION_RECORDS: '20000' })).toThrow('retentionRecords of the largest snapshots must fit under databaseResumeLowWaterBytes');
+		expect(config({ LIMIT_RETENTION_RECORDS: '13000' }).limits.retentionRecords).toBe(13_000);
 		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600', LIMIT_CLEANUP_SECONDS: '3600' }).limits.retentionSeconds).toBe(3_600);
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600' })).toThrow('retentionSeconds must be at least one cleanup interval');
 	});

@@ -6,13 +6,13 @@ import { PAID_PLAN } from "./plans/paid.ts";
 export interface Limits {
 	/**
 	 * Message history (the server-wide log) keeps at least the latest this
-	 * many records: messages, edits, reactions and room changes alike. Older
-	 * records expire once they are `minRetentionSeconds` old. 0 keeps no
-	 * count, leaving `retentionSeconds` alone to expire records.
+	 * many records in the object's SQLite: messages, edits, reactions and
+	 * room changes alike. Older ones leave it at the next cleanup (to the
+	 * tiers below where bound, else they expire), and at once when the
+	 * database reaches its storage watermark. 0 keeps no count, leaving
+	 * `retentionSeconds` alone to expire records.
 	 */
 	retentionRecords: number;
-	/** Records younger than this never expire by count (`retentionRecords`): a flood cannot push out the last few days. */
-	minRetentionSeconds: number;
 	/**
 	 * Records past the limits above that the D1 history tier (binding
 	 * HISTORY_D1) keeps, newest first, before they go on to the cold tier or

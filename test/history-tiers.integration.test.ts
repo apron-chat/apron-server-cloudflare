@@ -31,7 +31,7 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 			const runtime = instance as unknown as Runtime;
 			// Three records in the hot log, four more in the archive, with no minimum age.
 			runtime.store.config = {
-				...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, historyD1Records: 4, cleanupThresholdPercent: 100,
+				...runtime.store.config, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100,
 				anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 			};
 			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };

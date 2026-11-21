@@ -14,8 +14,7 @@ import type { Cell, ChainState, ChainStateStore, ExportPort, FloorContext, Histo
  * The floor a retention allows over a tier's log entries, oldest first
  * (one per log ID), counting only those below `below` (records past it are
  * copies held above). The count keeps its threshold's share newest first;
- * the age drops what is older than `ageMs`; `minAgeMs` holds back whatever
- * is younger. Undefined while nothing need leave. The tiers the Worker
+ * the age drops what is older than `ageMs`. Undefined while nothing need leave. The tiers the Worker
  * runs find theirs in their own storage (SQL, the chunk index).
  */
 function retentionFloor(entries: ReadonlyArray<{ log_id: number; commit_ms: number }>, retention: Retention, context: { now: number; below: number }): number | undefined {
@@ -28,10 +27,6 @@ function retentionFloor(entries: ReadonlyArray<{ log_id: number; commit_ms: numb
 		const fresh = own.find((entry) => entry.commit_ms >= cutoff);
 		const ageFloor = fresh ? fresh.log_id : own.length ? own[own.length - 1].log_id + 1 : undefined;
 		if (ageFloor !== undefined && (floor === undefined || ageFloor > floor)) floor = ageFloor;
-	}
-	if (floor !== undefined && retention.minAgeMs && retention.minAgeMs > 0) {
-		const young = own.find((entry) => entry.commit_ms >= context.now - retention.minAgeMs!);
-		if (young && young.log_id < floor) floor = young.log_id;
 	}
 	if (floor === undefined || !own.length || floor <= own[0].log_id) return undefined;
 	return floor;

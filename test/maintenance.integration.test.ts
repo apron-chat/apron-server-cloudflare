@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { Store, type StoreConfig, type StoreMutationInput } from "../src/store";
 import { chainStateStore } from "../src/history/state";
 import { NOT_STALLED } from "../src/history/stall";
@@ -231,8 +231,8 @@ it("publishes a floor before a failed physical delete and resumes after restart"
 	});
 });
 
-it("keeps the latest retentionRecords records however old, expiring older ones only once minRetentionMs old", async () => {
-	const byCount: Partial<StoreConfig> = { retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, cleanupThresholdPercent: 100 };
+it("keeps the latest retentionRecords records however old, expiring older ones at the next cleanup however young", async () => {
+	const byCount: Partial<StoreConfig> = { retentionRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100 };
 	await withStore("retention-count", byCount, (store, clock, state) => {
 		// The seeded general room record and five messages: six records, a
 		// second apart (the count ends at a commit time, and keeps any record
@@ -243,14 +243,10 @@ it("keeps the latest retentionRecords records however old, expiring older ones o
 		});
 		const visible = () => messagesOf(store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id));
 
-		// Past the count, but younger than minRetentionMs: nothing expires.
+		// Past the count, an hour old: all but the latest three go at the next
+		// cleanup, whatever their age: the general room record and two messages.
 		clock.value += 60 * 60 * 1000;
 		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", clock.value);
-		expect(store.runCleanup(clock.value).deleted_records).toBe(0);
-		expect(visible()).toEqual(logs);
-
-		// A day on, all but the latest three go: the general room record and two messages.
-		clock.value += 2 * DAY_MS;
 		const expired = store.runCleanup(clock.value);
 		expect(expired.history_floor).toBe(String(logs[1] + 1n));
 		expect(expired.deleted_records).toBe(3);
@@ -265,7 +261,7 @@ it("keeps the latest retentionRecords records however old, expiring older ones o
 });
 
 it("expires records past retentionSeconds whatever the count", async () => {
-	await withStore("retention-ceiling", { retentionRecords: 100, minRetentionMs: DAY_MS, retentionMs: 7 * DAY_MS }, (store, clock) => {
+	await withStore("retention-ceiling", { retentionRecords: 100, retentionMs: 7 * DAY_MS }, (store, clock) => {
 		const last = ["old", "older"].map((text) => oneLog(store.mutate(messageInput(clock, `ceiling-${text}`, text)))).at(-1)!;
 		clock.value += 8 * DAY_MS;
 		const expired = store.runCleanup(clock.value);
@@ -276,7 +272,7 @@ it("expires records past retentionSeconds whatever the count", async () => {
 
 it("with tiers below, removes records from SQLite only once copied, and keeps the published floor until the chain raises it", async () => {
 	const tiered: Partial<StoreConfig> = {
-		tiered: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, cleanupThresholdPercent: 100,
+		tiered: true, retentionRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	await withStore("history-floors", tiered, async (store, clock, state) => {
@@ -387,7 +383,7 @@ it("drops SQLite's reaction sets on messages that only a tier below held, for /p
 
 it("keeps cleanupThresholdPercent of retentionRecords: each daily cleanup trims back to it", async () => {
 	const config: Partial<StoreConfig> = {
-		retentionRecords: 10, cleanupThresholdPercent: 50, minRetentionMs: DAY_MS, retentionMs: 0,
+		retentionRecords: 10, cleanupThresholdPercent: 50, retentionMs: 0,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	await withStore("threshold", config, (store, clock, state) => {
@@ -406,5 +402,98 @@ it("keeps cleanupThresholdPercent of retentionRecords: each daily cleanup trims 
 		expect(count()).toBe(5);
 		// And comes back a day later, not sooner.
 		expect(cleaned.next_due_ms).toBe(clock.value + DAY_MS);
+	});
+});
+
+describe("cleanup at the storage watermark", () => {
+	const MIB = 1024 * 1024;
+	const pressed: Partial<StoreConfig> = {
+		retentionRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100,
+		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
+	};
+	/** Puts the database past its high-water mark, as a flood would: every write is refused until it is under the low one. */
+	const overHighWater = (store: Store) => {
+		const size = store.databaseSize()!;
+		Object.assign(store.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
+		return size;
+	};
+	const scheduleTomorrow = (store: Store, state: DurableObjectState, clock: TestClock) => {
+		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", clock.value + DAY_MS);
+		store.forgetCleanupDue();
+	};
+
+	it("starts at once, not at the scheduled time, moves what is past the count, and is not started again for five minutes while the pressure stays", async () => {
+		await withStore("pressure-cleanup", pressed, (store, clock, state) => {
+			const logs = Array.from({ length: 6 }, (_, index) => {
+				clock.value += 1_000;
+				return oneLog(store.mutate(messageInput(clock, `flood-${index}`, `flood ${index}`)));
+			});
+			const records = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
+			scheduleTomorrow(store, state, clock);
+			expect(store.cleanupDue(clock.value)).toBe(false);
+
+			// The next post meets the watermark: refused, and the runtime is told its alarm must come sooner.
+			const size = overHighWater(store);
+			clock.value += 1_000;
+			let error: unknown;
+			try { store.mutate(messageInput(clock, "flood-refused", "refused")); } catch (caught) { error = caught; }
+			expectRetryAfter(error);
+			expect(store.takeAlarmChange()).toBe(true);
+			expect(store.takeAlarmChange()).toBe(false);
+
+			// Cleanup is due now, a day before its scheduled time, and moves everything past the latest three.
+			expect(store.cleanupDue(clock.value)).toBe(true);
+			const relieved = store.runCleanup(clock.value);
+			expect(relieved.deleted_records).toBe(4);
+			expect(records()).toBe(3);
+			expect(messagesOf(store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3));
+
+			// Still over the watermark (here, by construction): not due again at the next alarm, only five minutes on, and then it finds nothing to do and leaves the schedule alone.
+			expect(store.cleanupDue(clock.value + 1_000)).toBe(false);
+			clock.value += 5 * 60_000;
+			expect(store.cleanupDue(clock.value)).toBe(true);
+			const scheduled = Number(state.storage.sql.exec<{ next: number }>("SELECT next_cleanup_ms AS next FROM maintenance WHERE id = 1").one().next);
+			const idle = store.runCleanup(clock.value);
+			expect(idle.deleted_records).toBe(0);
+			expect(idle.did_work).toBe(false);
+			expect(Number(state.storage.sql.exec<{ next: number }>("SELECT next_cleanup_ms AS next FROM maintenance WHERE id = 1").one().next)).toBe(scheduled);
+			expect(store.cleanupDue(clock.value + 1_000)).toBe(false);
+
+			// Under the low-water mark, posting resumes and the latch clears: cleanup waits for its schedule again.
+			Object.assign(store.config, { storageLowWaterBytes: size * 2, storageHighWaterBytes: size * 3, storageHardTargetBytes: size * 3 + 64 * MIB });
+			clock.value += 1_000;
+			oneLog(store.mutate(messageInput(clock, "flood-after", "after")));
+			expect(store.cleanupDue(clock.value + 10 * 60_000)).toBe(false);
+		});
+	});
+
+	it("with tiers below, removes nothing that is not copied yet, even under pressure", async () => {
+		await withStore("pressure-tiered", { ...pressed, tiered: true }, async (store, clock, state) => {
+			const logs = Array.from({ length: 8 }, (_, index) => {
+				clock.value += 1_000;
+				return oneLog(store.mutate(messageInput(clock, `tiered-flood-${index}`, `flood ${index}`)));
+			});
+			const records = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
+			scheduleTomorrow(store, state, clock);
+			overHighWater(store);
+			clock.value += 1_000;
+			let error: unknown;
+			try { store.mutate(messageInput(clock, "tiered-refused", "refused")); } catch (caught) { error = caught; }
+			expectRetryAfter(error);
+			expect(store.cleanupDue(clock.value)).toBe(true);
+
+			// The job starts, but nothing is copied below: nothing leaves, and it looks again in a second.
+			const waiting = store.runCleanup(clock.value);
+			expect(waiting.deleted_records).toBe(0);
+			expect(waiting.next_due_ms).toBe(clock.value + 1_000);
+			expect(records()).toBe(9);
+			// Its target is the first record the count keeps; once the chain copied up to it, those go.
+			expect(store.historyTarget(clock.value)).toBe(Number(logs[5]));
+			await chainStateStore(store.historyStatePort(), "hot").saveLink("hot", { through: Number(logs[4]) });
+			clock.value += 1_000;
+			const moved = store.runCleanup(clock.value);
+			expect(moved.deleted_records).toBe(6);
+			expect(records()).toBe(3);
+		});
 	});
 });
