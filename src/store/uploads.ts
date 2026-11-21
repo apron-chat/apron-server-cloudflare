@@ -11,8 +11,9 @@
 import { StoreError, limitData } from "../store-error";
 import { UPLOAD_SWEEP_BATCH, UPLOAD_WRITES, UPLOAD_WRITE_GRACE_MS } from "./limits";
 import { EMOJI_OWNER, META_EMOJI_CATALOG, META_EMOJI_PREVIOUS, META_PRESENCE_ON, META_SERVER_PREFIX, META_TOGGLE_PREFIX, META_UPLOAD_BYTES, SERVER_FIELDS, SERVER_OWNER } from "./meta";
-import { type RawUploadRow, dayCount, dayFor, emojiObjectKey, integerColumn, isPlainObject, parseJson, randomKey } from "./rows";
-import type { Broadcast, EmojiDraft, EmojiEdit, EmojiEntry, PendingUpload, StoredServerMetadata, UploadFinish, UploadPurpose, UploadWrite } from "./types";
+import { type RawUploadRow, dayCount, dayFor, emojiObjectKey, integerColumn, isPlainObject, parseJson, randomKey, utf8Bytes } from "./rows";
+import type { Broadcast, EmojiDraft, EmojiEdit, EmojiEntry, LiveEntry, PendingUpload, StoredServerMetadata, TerminalStored, UploadFinish, UploadPurpose, UploadWrite } from "./types";
+import type { TerminalOutputRef } from "../content/output-ref";
 import type { Sql, StoreCore } from "./core";
 
 /** Uploads and the server's settings over the store's core: the Uploads part's implementation, and the Server part's. */
@@ -640,5 +641,29 @@ export class UploadsModule {
       if (changed) sql.exec("UPDATE identities SET avatar_url = '', avatar_expires_ms = 0, updated_ms = ? WHERE user_id = ?", this.core.effectiveNow(now), input.userId);
       return { changed, deletedUploads: this.releaseUploadRows(sql, rows) };
     }));
+  }
+
+  /**
+   * Records a terminal's output stored in R2 (publishLiveText) as an attached
+   * file of its message and embed: written, kept `fileRetentionSeconds`,
+   * and released with them, so removing the embed, deleting the message or
+   * purging its owner deletes it, and the bucket's lifecycle rule for `f/`
+   * catches what is left. Counts toward `storedBytesCap`, not the upload
+   * counts; undefined, keeping the output in the snapshot, when uploads are
+   * off or the cap is reached.
+   */
+  storeTerminalOutput(sql: Sql, stored: TerminalStored, entry: LiveEntry, now: number): TerminalOutputRef | undefined {
+    const policy = this.core.config.uploads;
+    if (!policy || !entry.messageId || !/^f\/[A-Za-z0-9_-]{22}$/.test(stored.key)) return undefined;
+    const bytes = utf8Bytes(stored.output);
+    const total = sql.metaNumber(META_UPLOAD_BYTES);
+    if (total + bytes > policy.storedBytesCap) return undefined;
+    this.setUploadBytes(sql, total + bytes);
+    sql.exec(
+      `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
+       VALUES (?, ?, 'file', ?, ?, 'done', ?, ?, ?, ?)`,
+      stored.key, entry.owner, entry.messageId, entry.embedId, bytes, now, now + policy.fileRetentionSeconds * 1_000, now,
+    );
+    return { key: stored.key, bytes: utf8Bytes(JSON.stringify(stored.output)) };
   }
 }

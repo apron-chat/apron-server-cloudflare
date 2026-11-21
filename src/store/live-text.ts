@@ -8,12 +8,11 @@
  */
 
 import { uploadTitle } from "../content/embeds";
-import type { TerminalOutputRef } from "../content/output-ref";
 import { LIVE_TEXT_LONG_ROLES } from "../domain";
 import { type LiveKind, keepAppend, keepLast, liveDeadline, liveHolds, liveTextString, terminalOutput } from "../live-text";
 import { StoreError } from "../store-error";
 import { LIVE_WRITES } from "./limits";
-import { META_LIVE_TEXTS, META_TOGGLE_PREFIX, META_UPLOAD_BYTES } from "./meta";
+import { META_LIVE_TEXTS, META_TOGGLE_PREFIX } from "./meta";
 import { clone, ensureText, isLiveEntry, liveUrl, randomKey, utf8Bytes } from "./rows";
 import type { Broadcast, Identity, LiveEntry, LiveFinish, MessageSnapshot, StoreMutationInput, TerminalStored, Tier } from "./types";
 import type { Sql, StoreCore } from "./core";
@@ -34,30 +33,6 @@ export class LiveTextModule {
    * transaction restores it.
    */
   liveCache: LiveEntry[] | undefined;
-
-  /**
-   * Records a terminal's output stored in R2 (publishLiveText) as an attached
-   * file of its message and embed: written, kept `fileRetentionSeconds`,
-   * and released with them, so removing the embed, deleting the message or
-   * purging its owner deletes it, and the bucket's lifecycle rule for `f/`
-   * catches what is left. Counts toward `storedBytesCap`, not the upload
-   * counts; undefined, keeping the output in the snapshot, when uploads are
-   * off or the cap is reached.
-   */
-  private storeTerminalOutput(sql: Sql, stored: TerminalStored, entry: LiveEntry, now: number): TerminalOutputRef | undefined {
-    const policy = this.core.config.uploads;
-    if (!policy || !entry.messageId || !/^f\/[A-Za-z0-9_-]{22}$/.test(stored.key)) return undefined;
-    const bytes = utf8Bytes(stored.output);
-    const total = sql.metaNumber(META_UPLOAD_BYTES);
-    if (total + bytes > policy.storedBytesCap) return undefined;
-    this.uploads.setUploadBytes(sql, total + bytes);
-    sql.exec(
-      `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
-       VALUES (?, ?, 'file', ?, ?, 'done', ?, ?, ?, ?)`,
-      stored.key, entry.owner, entry.messageId, entry.embedId, bytes, now, now + policy.fileRetentionSeconds * 1_000, now,
-    );
-    return { key: stored.key, bytes: utf8Bytes(JSON.stringify(stored.output)) };
-  }
 
   /** The open live texts (META_LIVE_TEXTS): one `_meta` row, absent while there are none. */
   liveTexts(sql: Sql): LiveEntry[] {
@@ -313,7 +288,7 @@ export class LiveTextModule {
       const { url: _url, ...rest } = embed;
       void _url;
       if (!output) return sql.rewriteEmbed(message, snapshot, entry.embedId, null, now);
-      const ref = stored && stored.output === output ? this.storeTerminalOutput(sql, stored, entry, now) : undefined;
+      const ref = stored && stored.output === output ? this.uploads.storeTerminalOutput(sql, stored, entry, now) : undefined;
       if (ref && published) published.stored = true;
       return sql.rewriteEmbed(message, snapshot, entry.embedId, ref ? { ...rest, output_ref: ref } : { ...rest, output }, now);
     }

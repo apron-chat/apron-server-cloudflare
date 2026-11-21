@@ -325,3 +325,33 @@ export const SCHEMA_DDL = `
     schema_version INTEGER NOT NULL
   );
 `;
+
+/**
+ * The module that owns each table: the one file in src/store whose SQL may
+ * name it (besides this one's DDL), checked by
+ * test/store/table-ownership.test.ts, which lists the few exceptions.
+ * sqlite-store.ts owns the log and the core's tables: it is the commit
+ * path, accounting, schema and cleanup.
+ */
+export const TABLE_OWNERS: Readonly<Record<string, string>> = {
+  _meta: "sqlite-store.ts",
+  accepted_requests: "sqlite-store.ts",
+  credentials: "sqlite-store.ts",
+  identities: "sqlite-store.ts",
+  log_state: "sqlite-store.ts",
+  maintenance: "sqlite-store.ts",
+  memberships: "sqlite-store.ts",
+  message_state: "sqlite-store.ts",
+  principal_limits: "sqlite-store.ts",
+  reaction_state: "sqlite-store.ts",
+  records: "sqlite-store.ts",
+  resource_budgets: "sqlite-store.ts",
+  rooms: "sqlite-store.ts",
+  push_subscriptions: "push.ts",
+  push_wakes: "push.ts",
+  read_cursors: "reads.ts",
+  room_mutes: "reads.ts",
+  user_status: "reads.ts",
+  uploads: "uploads.ts",
+  history_chunks: "history-log.ts",
+};

@@ -300,7 +300,7 @@ export class ReadsModule {
     this.core.reserved("saveReadCursors", { reads: 8 + 4 * cursors.length, writes: 8 + 4 * cursors.length }, false, now, (sql) => sql.transaction(() => {
       this.core.effectiveNow(now);
       for (const [roomId, messageId] of cursors) {
-        if (!sql.rows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, input.userId).length) continue;
+        if (!sql.isMember(roomId, input.userId)) continue;
         sql.exec(
           `INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)
            ON CONFLICT (user_id, room_id) DO UPDATE SET message_id = excluded.message_id WHERE excluded.message_id > read_cursors.message_id`,
