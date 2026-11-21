@@ -34,6 +34,10 @@ export class HistoryModule {
    * reservation, then from memory, and every write here updates it once
    * written; a rollback forgets them all. So a history cycle's snapshots,
    * one a step, read no SQL and reserve nothing once the state is known.
+   * Each answer from memory is still refused where its reservation would
+   * have been (StoreCore.checkMaintenance, with the cost it reserved): with
+   * accounting closed or the maintenance budget spent, a cycle stops at its
+   * first snapshot, before it asks any tier below for anything.
    * `_meta` values by key (undefined: absent), groups of kept rewrites by
    * prefix, the copy marker, the queue (META_HISTORY_OPS) and the newest
    * rewrite's number (META_HISTORY_OPS_SEQ).
@@ -106,7 +110,11 @@ export class HistoryModule {
     this.core.ensureReady();
     // The log head and the published floor are kept in memory once read (SqliteStore's logState and publishedFloor).
     const known = this.core.knownFloors();
-    if (known) return known;
+    if (known) {
+      // Refused where the reservation below would be.
+      this.core.checkMaintenance({ reads: 8 }, now);
+      return known;
+    }
     return this.core.reserved("historyFloors", { reads: 8 }, true, now, (sql) => {
       const state = sql.logState();
       return { hot: state.history_floor, published: sql.publishedFloor(), latest: state.last_log_id };
@@ -210,10 +218,14 @@ export class HistoryModule {
       if (!key.startsWith(META_HISTORY_TIER) && !key.startsWith(META_HISTORY_LINK) && !key.startsWith(META_HISTORY_KEPT)) throw new Error(`not a history chain state key: ${key}`);
       return key;
     };
+    // Each function's answer from memory is refused where the reservation it
+    // made before the state was kept would be (StoreCore.checkMaintenance).
+    const check = (cost: { reads: number; writes?: number }) => this.core.checkMaintenance(cost, this.core.clock.now());
     return {
       value: (key) => {
         this.core.ensureReady();
         owned(key);
+        check({ reads: 4 });
         if (!key.startsWith(META_HISTORY_KEPT)) this.loadChainState();
         if (this.stateValues.has(key)) return this.stateValues.get(key);
         if (this.stateLoaded && !key.startsWith(META_HISTORY_KEPT)) return undefined;
@@ -232,6 +244,7 @@ export class HistoryModule {
       publishedFloor: () => this.historyFloors().published,
       copyMarker: () => {
         this.core.ensureReady();
+        check({ reads: 4 });
         this.loadChainState();
         this.copyMarkerCache ??= this.core.reserved("unknown", { reads: 4 }, true, this.core.clock.now(), (sql) => sql.metaNumber(META_HISTORY_THROUGH));
         return this.copyMarkerCache;
@@ -240,7 +253,10 @@ export class HistoryModule {
         this.core.ensureReady();
         if (!this.core.config.tiered) return;
         // Never lowered: a marker known to be there already needs no write.
-        if (this.copyMarkerCache !== undefined && through <= this.copyMarkerCache) return;
+        if (this.copyMarkerCache !== undefined && through <= this.copyMarkerCache) {
+          check({ reads: 4, writes: 4 });
+          return;
+        }
         this.copyMarkerCache = this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => {
           const stored = sql.metaNumber(META_HISTORY_THROUGH);
           if (through > stored) sql.writeMeta(META_HISTORY_THROUGH, String(through));
@@ -250,6 +266,7 @@ export class HistoryModule {
       entries: (prefix) => {
         this.core.ensureReady();
         owned(prefix);
+        check({ reads: 16 + MAX_KEPT_GROUPS });
         const known = this.stateEntries.get(prefix);
         if (known) return known.map(([key, value]) => [key, value] as [string, string]);
         const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
@@ -264,6 +281,8 @@ export class HistoryModule {
   historyRewrites(now = this.core.clock.now()): QueuedRewrite[] {
     this.core.ensureReady();
     if (!this.core.config.tiered) return [];
+    // Refused from memory where the reservation would be (historyStatePort).
+    this.core.checkMaintenance({ reads: 4 }, now);
     this.queueCache ??= this.core.reserved("historyRewrites", { reads: 4 }, true, now, (sql) => this.queuedRewrites(sql));
     return clone(this.queueCache);
   }
@@ -271,6 +290,7 @@ export class HistoryModule {
   /** The newest rewrite's number ever given (0: none), delivered or not. */
   historyRewritesLogged(now = this.core.clock.now()): number {
     this.core.ensureReady();
+    this.core.checkMaintenance({ reads: 4 }, now);
     this.loadChainState();
     this.loggedCache ??= this.core.reserved("historyRewritesLogged", { reads: 4 }, true, now, (sql) => sql.metaNumber(META_HISTORY_OPS_SEQ));
     return this.loggedCache;

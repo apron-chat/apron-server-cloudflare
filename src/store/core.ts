@@ -108,6 +108,15 @@ export interface StoreCore {
    */
   reserved<T>(operation: string, cost: CostEstimate, maintenance: boolean, now: number, fn: (sql: Sql, unused: { history: number }) => T, unchecked?: boolean): T;
   /**
+   * Refuses as `reserved` would refuse a maintenance reservation of `cost`
+   * now (accounting closed on a storage failure, the maintenance budget
+   * spent), reserving nothing: for work that answers from memory what it
+   * once read under such a reservation, so it is still refused where that
+   * reservation would have been. No SQL, except that accounting closed on a
+   * storage failure is tried for reopening, as every reservation tries it.
+   */
+  checkMaintenance(cost: CostEstimate, now: number): void;
+  /**
    * Runs `fn` with the Sql handle and no reservation: for the few reads that
    * were never metered (each says why at its call), and nothing else.
    * Every use is listed in src/store/index.ts.

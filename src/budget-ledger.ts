@@ -256,6 +256,28 @@ export class BudgetLedger {
   }
 
   /**
+   * Refuses as reserve would refuse `input` at `at`, with no SQL and nothing
+   * reserved: against the cached row, or, on a day after the cached one
+   * (past a UTC midnight), against the new day's row as reserve would make
+   * it, empty, with the handover reserve would add. Before anything is
+   * cached (no reservation since the wake) nothing is refused.
+   */
+  checkReservation(input: CostEstimate, at: number, maintenance: boolean): void {
+    const day = dayFor(at);
+    if (!this.cached || !this.cachedDay || day < this.cachedDay) return;
+    if (day === this.cachedDay) {
+      this.check(this.reservationCost(input, day), maintenance, at);
+      return;
+    }
+    const cost = this.reservationCost(input, day);
+    if (!this.handoverPending) {
+      cost.reads += 8;
+      cost.writes += 8;
+    }
+    this.check(cost, maintenance, at, { day, ...Object.fromEntries(BUDGET_COLUMNS.map((column) => [column, 0])) } as RawBudgetRow);
+  }
+
+  /**
    * Reserves `input` plus the reservation's own bookkeeping from the day of
    * `at`, foreground or maintenance, after checking it fits (unless
    * `unchecked`: an admin command is charged but not refused). Then it
@@ -475,8 +497,7 @@ export class BudgetLedger {
     return cost;
   }
 
-  private check(cost: BudgetCost, maintenance: boolean, at: number): void {
-    const row = this.cached!;
+  private check(cost: BudgetCost, maintenance: boolean, at: number, row: RawBudgetRow = this.cached!): void {
     const limits = this.limits;
     if (cost.history > 0 && row.history_reserved + cost.history > limits.historyRequestsPerDay) {
       // A refusal like any other: no SQL, and the SQL budget stays for everything else.

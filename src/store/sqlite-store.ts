@@ -297,6 +297,7 @@ export class SqliteStore {
       knownFloors: () => this.knownFloors(),
       ensureReady: () => this.ensureReady(),
       effectiveNow: (candidate) => this.effectiveNow(candidate),
+      checkMaintenance: (cost, now) => this.checkMaintenance(cost, now),
       reserved: (operation, cost, maintenance, now, fn, unchecked) => this.reserved(operation, cost, maintenance, now, (unused) => fn(this.sqlHandle, unused), unchecked),
       assertNotDegraded: (feature, now) => this.assertNotDegraded(feature, now),
       journal: (journal) => { this.journals.push(journal); },
@@ -1202,6 +1203,19 @@ export class SqliteStore {
     cost.operation = operation;
     this.countReservation(cost);
     return cost;
+  }
+
+  /**
+   * Refuses as reserved and reserveCost would refuse a maintenance
+   * reservation of `costInput` (closed accounting, a spent maintenance
+   * budget: a maintenance reservation has no breaker), reserving nothing
+   * (StoreCore.checkMaintenance).
+   */
+  private checkMaintenance(costInput: CostEstimate, now: number): void {
+    this.ensureReady();
+    this.assertAccounting();
+    if (this.alerting) return;
+    this.ledger.checkReservation(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), true);
   }
 
   /** Spend the maintenance control gap when ordinary work is exhausted. */
