@@ -114,7 +114,7 @@ LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
 # registered user; a user holding any role (one an admin gave) is held only
 # to the server-wide limit. LIMIT_THREADS has no fixed ceiling: the deploy
 # check refuses one whose worst-case room listing would pass 1 MiB with the
-# room metadata limits below (298 with these).
+# room metadata limits below (288 with these).
 LIMIT_THREADS = "100"
 LIMIT_THREADS_PER_USER = "25"
 # Room titles and descriptions, in serialized bytes: a room's limit; what

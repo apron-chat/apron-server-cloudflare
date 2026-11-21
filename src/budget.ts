@@ -653,13 +653,15 @@ export const MAX_ROOM_LISTING_BYTES = 1024 * 1024;
 /** A listed room's bytes besides its client fields (room_id, parent, counts, JSON), once boundedListing has dropped members. */
 export const ROOM_LISTING_ENTRY_BYTES = 256;
 /**
- * A room listing's worst size: every public room it names (`general`, the
- * created rooms, listedThreads) at roomMetadataMinBytes each, and what they
- * hold past that together (roomMetadataTotalBytes). At the defaults, about
- * 530 KiB; with them, `threads` may go up to 298.
+ * A room listing's worst size: every room it names (`general`, the created
+ * rooms, listedThreads, and the caller's private rooms, at most
+ * privateMembershipsPerUser) at roomMetadataMinBytes each, and what they hold
+ * past that together (roomMetadataTotalBytes). At the defaults, about
+ * 550 KiB; with them, `threads` may go up to 288.
  */
-export function roomListingWorstBytes(limits: Pick<Limits, "threads" | "roomMetadataMinBytes" | "roomMetadataTotalBytes">): number {
-	return (1 + MAX_CREATED_ROOMS + listedThreads(limits.threads)) * (limits.roomMetadataMinBytes + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalBytes;
+export function roomListingWorstBytes(limits: Pick<Limits, "threads" | "privateMembershipsPerUser" | "roomMetadataMinBytes" | "roomMetadataTotalBytes">): number {
+	const rooms = 1 + MAX_CREATED_ROOMS + listedThreads(limits.threads) + limits.privateMembershipsPerUser;
+	return rooms * (limits.roomMetadataMinBytes + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalBytes;
 }
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinBytes is bounded together by at most one history

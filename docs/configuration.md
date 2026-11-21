@@ -1212,7 +1212,8 @@ IP's minute), per-type throttles 60/minute, frame blocks
 minute), `room_list` registered members 200 per room, guest-number blocks
 10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
 database high-water 768 MiB and hard target 1 GiB, cleanup 100 records,
-thread rooms 100, a room's client fields 16 KiB and every room's past the
+the thread limit by the room listing it sizes (1 MiB at worst,
+`roomListingWorstBytes`), a room's client fields 16 KiB and every room's past the
 minimum together 256 KiB, private rooms 200 and 50
 memberships per user, reactions 64 users per message
 and 16 emoji per user, and credentials/challenges 16 KiB. The ceilings for
@@ -1446,7 +1447,8 @@ threads (at least 200) and is sent whole, so its worst case, every listed
 public room at `roomMetadataMinBytes` plus 256 bytes and
 `roomMetadataTotalBytes` besides, must stay within 1 MiB
 (`roomListingWorstBytes`, `MAX_ROOM_LISTING_BYTES`); at the default room
-metadata limits that allows up to 298. Listing and room-count reservations
+metadata limits that allows up to 288 (the caller's private rooms, at most
+`privateMembershipsPerUser`, count too). Listing and room-count reservations
 scale with it; what a user's own listing and a connection's attachment carry
 (`MAX_USER_ROOMS`, `MAX_LISTED_USER_ROOMS`) stays fixed, calibrated at 100
 (`CALIBRATED_THREAD_LIMIT`).

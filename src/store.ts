@@ -2191,6 +2191,14 @@ export class Store {
     return listedThreadScale(this.config.maxThreads) + this.listedThreadCount + 1;
   }
   /**
+   * Most rooms one `room_list` names, whose members roomMembers fills in:
+   * `general`, the created rooms, the listed threads and the caller's private
+   * rooms, or a user's own listing (MAX_USER_ROOMS), whichever is more.
+   */
+  private get listedRoomBound(): number {
+    return Math.max(MAX_USER_ROOMS, 1 + MAX_CREATED_ROOMS + this.listedThreadCount + this.config.maxPrivateMembershipsPerUser);
+  }
+  /**
    * Reads for counting a kind's rooms created within the window
    * (recentRoomCount), or a user's among them: its range of
    * ROOM_CREATED_INDEX, which the caps keep within the ceilings (a room is
@@ -5275,7 +5283,7 @@ export class Store {
   ): Map<string, RoomMember[]> {
     this.ensureReady();
     // A listing holds the public rooms and the caller's private ones.
-    const ids = [...new Set(roomIds)].slice(0, MAX_USER_ROOMS);
+    const ids = [...new Set(roomIds)].slice(0, this.listedRoomBound);
     const perRoom = Math.max(0, Math.floor(limit));
     const members = new Map<string, RoomMember[]>();
     if (!ids.length || perRoom === 0) return members;
@@ -5291,7 +5299,7 @@ export class Store {
       // measured at one more read a member at worst.
       this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
         const generation = this.memberGeneration;
-        if (this.memberCache.size > 2 * MAX_USER_ROOMS) this.memberCache.clear();
+        if (this.memberCache.size > 2 * this.listedRoomBound) this.memberCache.clear();
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus

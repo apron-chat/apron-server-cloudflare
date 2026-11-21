@@ -439,15 +439,16 @@ describe('measured storage accounting', () => {
 		console.info('accounting-room-list', JSON.stringify(result));
 	});
 
-	it('scales room listing and counting reservations with a threads above the calibrated 100', async () => {
+	it('scales room listing and counting reservations with a thread limit above the calibrated 100', async () => {
 		const stub = env.DEMO.getByName('accounting-room-list-scaled');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const maxThreads = 250;
 			const store = new Store(state, defaultStoreConfig({ maxThreads }), clock);
 			store.initialize();
-			// More recent threads than the cap allows, as after a window lengthened since.
-			const count = maxThreads + 50;
+			// More recent threads than the cap allows, as after a window lengthened
+			// since, and more rooms than a user's own listing (MAX_USER_ROOMS, 351).
+			const count = maxThreads + 150;
 			state.storage.transactionSync(() => {
 				for (let index = 1; index <= count; index += 1) {
 					state.storage.sql.exec(
@@ -481,8 +482,18 @@ describe('measured storage accounting', () => {
 			const registration = costSince(store, beforeRegistration);
 			expect(registered.broadcasts).toHaveLength(maxThreads + 1);
 			expectWithinReserve(registration);
+
+			// Members are filled in for every room the listing names, past MAX_USER_ROOMS too.
+			state.storage.transactionSync(() => {
+				for (const room of rooms) state.storage.sql.exec('INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)', room.room_id, 'lister');
+			});
+			const beforeMembers = snapshot(store);
+			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
+			const memberListing = costSince(store, beforeMembers);
+			expect(rooms.every((room) => members.get(room.room_id)?.some((member) => member.user_id === 'lister'))).toBe(true);
+			expectWithinReserve(memberListing);
 			expect(store.accountingStatus().unsafe).toBe(false);
-			return { rooms: rooms.length, listing, counting, registration };
+			return { rooms: rooms.length, listing, counting, registration, memberListing };
 		});
 		console.info('accounting-room-list-scaled', JSON.stringify(result));
 	});

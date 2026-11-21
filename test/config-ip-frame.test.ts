@@ -230,9 +230,10 @@ describe('configuration policy boundaries', () => {
 	it('takes the thread limit (LIMIT_THREADS) from the wrangler vars, bounded by the room listing it sizes rather than a fixed ceiling', () => {
 		expect(config().limits.threads).toBe(DEFAULT_LIMITS.threads);
 		expect(config({ LIMIT_THREADS: '250', LIMIT_THREADS_PER_USER: '50' }).limits).toMatchObject({ threads: 250, threadsPerUser: 50 });
-		// At the default room metadata limits a worst-case listing fits up to 298 threads.
-		expect(config({ LIMIT_THREADS: '298' }).limits.threads).toBe(298);
-		expect(() => config({ LIMIT_THREADS: '299' })).toThrow(/threads \(the thread limit\) is too large for a room listing/);
+		// At the default room metadata limits a worst-case listing, the caller's
+		// private rooms included, fits up to 288 threads.
+		expect(config({ LIMIT_THREADS: '288' }).limits.threads).toBe(288);
+		expect(() => config({ LIMIT_THREADS: '289' })).toThrow(/threads \(the thread limit\) is too large for a room listing/);
 		// Smaller room fields leave a listing room for more threads.
 		expect(config({ LIMIT_THREADS: '1000', LIMIT_ROOM_METADATA_BYTES: '512', LIMIT_ROOM_METADATA_MIN_BYTES: '128', LIMIT_ROOM_METADATA_TOTAL_BYTES: '65536' }).limits.threads).toBe(1000);
 		expect(() => config({ LIMIT_THREADS_PER_USER: String(DEFAULT_LIMITS.threads + 1) })).toThrow(/threadsPerUser must be between 1 and the thread limit/);
