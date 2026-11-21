@@ -115,15 +115,15 @@ export function sqliteServer(sqlite: SqliteStore): Server {
 /** Admission over SqliteStore. */
 export function sqliteAdmission(sqlite: SqliteStore): Admission {
   return {
-    reserveAuthAttempt: (input) => sqlite.reserveAuthAttempt(input),
-    reserveGuestNumbers: (count, now) => sqlite.reserveGuestNumbers(count, now),
-    reserveFrames: (input) => sqlite.reserveFrames(input),
-    reserveConnection: (input) => sqlite.reserveConnection(input),
+    reserveAuthAttempt: (input) => sqlite.admission.reserveAuthAttempt(input),
+    reserveGuestNumbers: (count, now) => sqlite.admission.reserveGuestNumbers(count, now),
+    reserveFrames: (input) => sqlite.admission.reserveFrames(input),
+    reserveConnection: (input) => sqlite.admission.reserveConnection(input),
     checkConnectionBudget: (now) => sqlite.checkConnectionBudget(now),
-    noteThrottleTrip: (trigger, now) => sqlite.noteThrottleTrip(trigger, now),
-    throttleTrips: (now) => sqlite.throttleTrips(now),
-    attackPause: () => sqlite.attackPause(),
-    setAttackPause: (value, now) => sqlite.setAttackPause(value, now),
+    noteThrottleTrip: (trigger, now) => sqlite.admission.noteThrottleTrip(trigger, now),
+    throttleTrips: (now) => sqlite.admission.throttleTrips(now),
+    attackPause: () => sqlite.admission.attackPause(),
+    setAttackPause: (value, now) => sqlite.admission.setAttackPause(value, now),
   };
 }
 

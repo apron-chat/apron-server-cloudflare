@@ -34,12 +34,16 @@ export interface Sql {
   metaValue(key: string): string;
   /** A `_meta` value as a whole number, 0 when absent or not one. */
   metaNumber(key: string): number;
+  /** A JSON `_meta` record as `decode` makes it, `fallback` when absent, unreadable or refused. */
+  metaJson<T>(key: string, decode: (value: unknown) => T | undefined, fallback: T): T;
   /** Sets a `_meta` value; null deletes it. */
   writeMeta(key: string, value: string | null): void;
   /** An identity's row, or null. */
   identityRow(userId: string): RawIdentityRow | null;
   /** Whether a registered user holds one of `roles`. */
   holdsRole(userId: string, roles: readonly string[]): boolean;
+  /** Whether a registered user holds any role but `unclaimed`. */
+  holdsAnyRole(userId: string): boolean;
   /** Whether `userId` is a member of `roomId` (a `memberships` row). */
   isMember(roomId: string, userId: string): boolean;
   /** The log's head and floor, read once and then kept. */
@@ -50,6 +54,8 @@ export interface Sql {
   ensureGrowthCapacity(additionalBytes: number): void;
   /** A limiter row (`principal_limits`), from the cache or read. */
   limitRow(scope: string, principalKey: string, now: number): RawLimitRow;
+  /** A limiter row held in the cache, without reading it. */
+  peekLimitRow(scope: string, principalKey: string): RawLimitRow | undefined;
   /** Writes a limiter row's changes, through the cache. */
   updateLimitRow(row: RawLimitRow, updates: Partial<RawLimitRow>, now: number, weight?: number): void;
 }
@@ -75,6 +81,16 @@ export interface StoreCore {
    * did not serve.
    */
   reserved<T>(operation: string, cost: CostEstimate, maintenance: boolean, now: number, fn: (sql: Sql, unused: { history: number }) => T, unchecked?: boolean): T;
+  /**
+   * Runs `fn` with the Sql handle and no reservation: for the few reads that
+   * were never metered (each says why at its call), and nothing else.
+   * Every use is listed in src/store/index.ts.
+   */
+  unmetered<T>(fn: (sql: Sql) => T): T;
+  /** Runs `fn` as an operator alert's storage work: charged, never refused (SqliteStore.alert). */
+  alert<T>(fn: () => T): T;
+  /** Whether an operator alert's work is running now. */
+  readonly alerting: boolean;
   /** Refuses `feature` with `retry_after` while the server is degraded (DEGRADE_SHARE). */
   assertNotDegraded(feature: string, now: number): void;
   /** Adds a cache SqliteStore.transaction saves and puts back. */

@@ -789,7 +789,7 @@ describe('measured storage accounting', () => {
 				accepted.push(...messagesOf(page));
 			}
 			// As the store holds it: a principal's row is written at most once a minute.
-			const limiter = sqliteOf(store).limiterDay('post', 'anonymous:audit-ip', clock.now());
+			const limiter = sqliteOf(store).admission.limiterDay('post', 'anonymous:audit-ip', clock.now());
 			expect(new Set(accepted.map((entry) => entry.log_id)).size).toBe(18);
 			expect(limiter.posts_day).toBe(13);
 			expect(limiter.day).toBe(new Date(clock.now()).toISOString().slice(0, 10));

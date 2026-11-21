@@ -13,6 +13,7 @@
 
 import { defaultStoreConfig, type StoreConfig } from "./config";
 import type { Sql, StoreCore, TransactionJournal } from "./core";
+import { AdmissionModule } from "./admission";
 import { PushModule } from "./push";
 import type {
   AccountingGuard, Broadcast, PendingUpload, PushClaim, RoomMember, StoreCleanupResult, StoreHistoryQuery, UploadPurpose,
@@ -262,6 +263,9 @@ export class SqliteStore {
     metaValue: (key) => this.metaValue(key),
     metaNumber: (key) => this.metaNumber(key),
     writeMeta: (key, value) => this.writeMeta(key, value),
+    metaJson: (key, decode, fallback) => this.metaJson(key, decode, fallback),
+    holdsAnyRole: (userId) => this.holdsAnyRole(userId),
+    peekLimitRow: (scope, key) => this.limiters.peek(scope, key),
     identityRow: (userId) => this.identityRow(userId),
     holdsRole: (userId, roles) => this.holdsRole(userId, roles),
     isMember: (roomId, userId) => this.isMember(roomId, userId),
@@ -273,6 +277,8 @@ export class SqliteStore {
   };
   /** The core the implementation modules run over (core.ts). */
   readonly core: StoreCore = this.makeCore();
+  /** Rate limits and admission: the posting, event and registration charges, frames, connections, throttle trips, the attack pause (admission.ts). */
+  readonly admission: AdmissionModule;
   /** Web Push registrations, wakes and claims (push.ts). */
   readonly pushes: PushModule;
 
@@ -282,6 +288,9 @@ export class SqliteStore {
     return {
       get config() { return store.config; },
       get clock() { return store.clock; },
+      get alerting() { return store.alerting; },
+      alert: (fn) => this.alert(fn),
+      unmetered: (fn) => fn(this.sqlHandle),
       ensureReady: () => this.ensureReady(),
       effectiveNow: (candidate) => this.effectiveNow(candidate),
       reserved: (operation, cost, maintenance, now, fn, unchecked) => this.reserved(operation, cost, maintenance, now, (unused) => fn(this.sqlHandle, unused), unchecked),
@@ -321,6 +330,7 @@ export class SqliteStore {
       markUnsafe: (error) => this.markAccountingUnsafe("uncertain", error),
     }, this.config);
     this.pushes = new PushModule(this.core);
+    this.admission = new AdmissionModule(this.core);
   }
 
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
@@ -1401,51 +1411,6 @@ export class SqliteStore {
     return Boolean(shares && Math.max(shares.reads, shares.writes, shares.frames) >= DEGRADE_SHARE);
   }
 
-  /**
-   * Counts one throttle trip (a long refusal a user ran into, told to them
-   * once: ApronDemoServer.noteTrip) under `trigger`, in hourly buckets kept
-   * for TRIP_WINDOW_MS. Charged but never refused: counting a refusal must
-   * not itself be refused.
-   */
-  noteThrottleTrip(trigger: string, now = this.clock.now()): void {
-    this.ensureReady();
-    this.alert(() => this.reserved("noteThrottleTrip", { reads: 4, writes: 4 }, false, now, () => {
-      const buckets = this.tripBuckets(now);
-      const hour = String(Math.floor(now / 3_600_000) * 3_600_000);
-      const bucket = buckets[hour] ??= {};
-      // Bounded: a trigger is a reason or a short slug, and the window is a day of hours.
-      if (bucket[trigger] !== undefined || Object.keys(bucket).length < 64) bucket[trigger] = (bucket[trigger] ?? 0) + 1;
-      this.writeMeta(META_THROTTLE_TRIPS, JSON.stringify(buckets));
-    }, true));
-  }
-
-  /** Throttle trips by trigger over the last TRIP_WINDOW_MS (noteThrottleTrip), most first. */
-  throttleTrips(now = this.clock.now()): Array<[trigger: string, count: number]> {
-    this.ensureReady();
-    return this.alert(() => this.reserved("throttleTrips", { reads: 4 }, false, now, () => {
-      const totals = new Map<string, number>();
-      for (const bucket of Object.values(this.tripBuckets(now))) {
-        for (const [trigger, count] of Object.entries(bucket)) totals.set(trigger, (totals.get(trigger) ?? 0) + count);
-      }
-      return [...totals].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-    }, true));
-  }
-
-  /** The stored trip buckets still inside the window. */
-  private tripBuckets(now: number): Record<string, Record<string, number>> {
-    // An unreadable record starts the window afresh.
-    return this.metaJson(META_THROTTLE_TRIPS, (stored) => {
-      const kept: Record<string, Record<string, number>> = {};
-      for (const [hour, bucket] of Object.entries(stored as Record<string, unknown>)) {
-        if (Number(hour) <= now - TRIP_WINDOW_MS || !bucket || typeof bucket !== "object") continue;
-        const counts: Record<string, number> = {};
-        for (const [trigger, count] of Object.entries(bucket)) if (Number.isSafeInteger(count) && (count as number) > 0) counts[trigger] = count as number;
-        kept[hour] = counts;
-      }
-      return kept;
-    }, {});
-  }
-
   /** The server tier last announced to the admins (the runtime's record), or "" before any. */
   announcedTier(now = this.clock.now()): string {
     this.ensureReady();
@@ -1458,16 +1423,6 @@ export class SqliteStore {
     this.alert(() => this.reserved("setAnnouncedTier", { reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_ANNOUNCED_TIER, value);
     }, true));
-  }
-
-  /**
-   * The runtime's attack pause record (ApronDemoServer.pauseForAttack), or ""
-   * before any. Read once as an instance starts, uncharged like the usage
-   * snapshot, so a paused server's refusals cost no SQL.
-   */
-  attackPause(): string {
-    this.ensureReady();
-    return this.metaValue(META_ATTACK_PAUSE) ?? "";
   }
 
   /**
@@ -1518,14 +1473,6 @@ export class SqliteStore {
     const check = this.roomNotesCheck;
     this.roomNotesCheck = undefined;
     return check;
-  }
-
-  /** Records an attack pause (attackPause): charged, never refused. */
-  setAttackPause(value: string, now = this.clock.now()): void {
-    this.ensureReady();
-    this.alert(() => this.reserved("setAttackPause", { reads: 4, writes: 4 }, false, now, () => {
-      this.writeMeta(META_ATTACK_PAUSE, value);
-    }, true));
   }
 
   private budgetValue(now: number): BudgetSnapshot {
@@ -3483,169 +3430,6 @@ export class SqliteStore {
   }
 
   /**
-   * Charges `weight` posts (one by default) to the poster's, the IP's and
-   * the global windows, or none when any of them lacks room for all of
-   * them. A trusted user, registered and holding any role (`friend`,
-   * MODERATOR_ROLES, or any label: only an admin gives roles; one identity
-   * read), is held to the trusted limits instead of the registered ones,
-   * and their IP to the larger of its own and those, so the IP's limits
-   * don't undercut them (moving a long conversation into a thread is one
-   * post per message, and more for one with many reactors:
-   * MOVE_REACTION_SETS_PER_POST). An owner's bot (tier `bot`) is never
-   * trusted. The global limits hold for everyone. A refusal names the
-   * `write` category (extension `ext:limits`), unless `uncategorized`: a
-   * `me` request, which the `write` row does not list.
-   */
-  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number; uncategorized?: boolean }): void {
-    const { userId, tier, ipKey, now } = input;
-    const weight = Math.max(1, input.weight ?? 1);
-    const trusted = tier === "registered" && this.holdsAnyRole(userId);
-    const perUser = trusted
-      ? { minute: this.config.trustedPostsPerMinute, day: this.config.trustedPostsPerDay }
-      : tier === "registered"
-        ? { minute: this.config.registeredPostsPerMinute, day: this.config.registeredPostsPerDay }
-        : { minute: this.config.guestPostsPerMinute, day: this.config.guestPostsPerDay };
-    const perIp = trusted
-      ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.trustedPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.trustedPostsPerDay) }
-      : { minute: this.config.ipPostsPerMinute, day: this.config.ipPostsPerDay };
-    const principal = tier === "registered" ? `user:${userId}` : `anonymous:${ipKey}`;
-    const rows = [
-      this.limitRow("post", principal, now),
-      this.limitRow("post", `ip:${ipKey}`, now),
-      this.limitRow("post", "global", now),
-    ];
-    const daily = dayFor(now);
-    let retryAfterMs = 0;
-    let reason = "Posting limit reached";
-    const charged: Bucket[] = [];
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index];
-      const allowance = index === 0 ? perUser.minute : index === 1 ? perIp.minute : this.config.globalPostsPerMinute;
-      const dailyAllowance = index === 0 ? perUser.day : index === 1 ? perIp.day : this.config.globalPostsPerDay;
-      const minute = chargeBucket(bucketOf(row), now, { perMinute: allowance }, weight);
-      if ("retryAfterMs" in minute) {
-        const retry = Math.max(1, minute.retryAfterMs);
-        if (retry > retryAfterMs) {
-          retryAfterMs = retry;
-          reason = index === 0 && tier === "anonymous" ? "Guest posting limit reached" : "Posting limit reached";
-        }
-      } else {
-        charged.push(minute.bucket);
-      }
-      const count = dayCount(row, "posts_day", daily);
-      if (count + weight > dailyAllowance) {
-        const retry = Math.max(1, 86_400_000 - now % 86_400_000);
-        if (retry > retryAfterMs) {
-          retryAfterMs = retry;
-          reason = index === 2 ? "Daily posting limit reached for the server" : "Daily posting limit reached";
-        }
-      }
-    }
-    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, ...(input.uncategorized ? {} : { data: limitData("write") }) });
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index];
-      const dailyCount = dayCount(row, "posts_day", daily) + weight;
-      this.updateLimitRow(row, { ...bucketRow(charged[index]), day: daily, posts_day: dailyCount }, now, weight);
-    }
-  }
-
-  /**
-   * Charges one event to a principal's `scope` limiter at `rate`, and, with
-   * `perDay`, to its count for the UTC day (kept in `posts_day`; the scope
-   * separates it from posts), or neither when either is full. A refusal
-   * names `category`, if any, as `ext.limits` (limitData).
-   */
-  private chargeEvent(scope: string, principalKey: string, now: number, rate: Rate, message: string, perDay?: { limit: number; message: string }, category?: LimitCategory): void {
-    const data = category ? limitData(category) : undefined;
-    const row = this.limitRow(scope, principalKey, now);
-    const day = dayFor(now);
-    const count = dayCount(row, "posts_day", day);
-    if (perDay && count >= perDay.limit) {
-      throw new StoreError("retry_after", perDay.message, { retryAfterMs: Math.max(1000, 86_400_000 - now % 86_400_000), data });
-    }
-    const charged = chargeBucket(bucketOf(row), now, rate);
-    if ("retryAfterMs" in charged) throw new StoreError("retry_after", message, { retryAfterMs: Math.max(1000, charged.retryAfterMs), data });
-    this.updateLimitRow(row, perDay ? { ...bucketRow(charged.bucket), day, posts_day: count + 1 } : bucketRow(charged.bucket), now);
-  }
-
-  reserveAuthAttempt(input: { ipKey: string; now: number }): void {
-    this.ensureReady();
-    // Frames are reserved by reserveFrames at the websocket boundary.  Keep
-    // the auth operation's SQL reservation separate so one frame is not
-    // charged twice.
-    this.reserved("reserveAuthAttempt", { ...this.config.authCost, frames: 0, reads: Math.max(32, this.config.authCost.reads ?? 0), writes: Math.max(16, this.config.authCost.writes ?? 0) }, false, input.now, () => {
-      const effective = this.effectiveNow(input.now);
-      this.transaction(() => {
-        this.chargeEvent("auth", `ip:${input.ipKey}`, effective, { perMinute: this.config.authAttemptsPerIpMinute }, "Authentication attempts limited");
-      });
-    });
-  }
-
-  /**
-   * Durably reserve the next `count` guest numbers and return them as the
-   * half-open range [first, limit). The stored high-water mark advances by
-   * `count` in one write, so numbers handed out from the range are never
-   * reissued, even after a restart, eviction, or hibernation wake loses the
-   * caller's in-memory range: the next call reserves past it, leaving a gap.
-   * Synchronous, like every Store call, so callers in one object cannot
-   * interleave two reservations.
-   */
-  reserveGuestNumbers(count: number, now = this.clock.now()): { first: number; limit: number } {
-    this.ensureReady();
-    if (!Number.isSafeInteger(count) || count <= 0) throw new StoreError("invalid_params", "guest number block must be a positive safe integer");
-    return this.reserved("reserveGuestNumbers", GUEST_NUMBER_BLOCK_COST, false, now, () => this.transaction(() => {
-      const mark = this.metaNumber(META_GUEST_NUMBER_MARK);
-      if (mark > MAX_SAFE_ID - count - 1) throw new StoreError("internal_error", "guest numbers are exhausted");
-      this.writeMeta(META_GUEST_NUMBER_MARK, String(mark + count));
-      return { first: mark + 1, limit: mark + count + 1 };
-    }));
-  }
-
-  reserveFrames(input: { ipKey: string; now: number; count?: number }): void {
-    this.ensureReady();
-    const count = Math.max(1, Math.floor(input.count ?? 1));
-    if (count > this.config.framesPerIpMinute || count > this.config.processedFramesPerDay) {
-      throw new StoreError("invalid_params", "frame reservation is too large");
-    }
-    this.reserved("reserveFrames", { reads: 16 + count * 4, writes: 16, frames: count }, false, input.now, () => {
-      const effective = this.effectiveNow(input.now);
-      this.transaction(() => {
-        const row = this.limitRow("frames", `ip:${input.ipKey}`, effective);
-        const charged = chargeBucket(bucketOf(row), effective, { perMinute: this.config.framesPerIpMinute }, count);
-        if ("retryAfterMs" in charged) {
-          throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: Math.max(1000, charged.retryAfterMs) });
-        }
-        this.updateLimitRow(row, bucketRow(charged.bucket), effective, count);
-        const global = this.limitRow("frames", "global", effective);
-        const day = dayFor(effective);
-        const globalCount = dayCount(global, "posts_day", day);
-        // An admin's frames (alert) are counted but never refused, so `/status` answers on a spent day.
-        if (!this.alerting && globalCount + count > this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: Math.max(1_000, 86_400_000 - effective % 86_400_000), data: { reason: "frame_budget" } });
-        }
-        this.updateLimitRow(global, { day, posts_day: globalCount + count }, effective);
-      });
-    });
-  }
-
-  private chargeRegistration(ipKey: string, now: number): void {
-    const day = dayFor(now);
-    const ip = this.limitRow("registration", `ip:${ipKey}`, now);
-    const global = this.limitRow("registration", "global", now);
-    const ipCount = dayCount(ip, "registrations_day", day);
-    const globalCount = dayCount(global, "registrations_day", day);
-    const retryAfterMs = Math.max(1, 86_400_000 - now % 86_400_000);
-    if (ipCount >= this.config.registrationsPerIpDay) {
-      throw new StoreError("retry_after", "Registration limit reached for this network", { retryAfterMs });
-    }
-    if (globalCount >= this.config.registrationsPerDay) {
-      throw new StoreError("retry_after", "Registration limit reached", { retryAfterMs });
-    }
-    this.updateLimitRow(ip, { day, registrations_day: ipCount + 1 }, now);
-    this.updateLimitRow(global, { day, registrations_day: globalCount + 1 }, now);
-  }
-
-  /**
    * Registers an identity and its credential. The identity starts in the
    * given rooms that still exist (the guest's it replaces, or `general`), and
    * each start is a logged membership (§4.2.2), returned in `broadcasts` for
@@ -3699,7 +3483,7 @@ export class SqliteStore {
         if (this.idTaken(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
         if (this.metaNumber("identity_count") >= this.config.registeredAccounts) throw new StoreError("denied", "registration_closed");
-        this.chargeRegistration(input.ipKey, effective);
+        this.admission.chargeRegistration(this.sqlHandle, input.ipKey, effective);
         const joined = this.existingRooms(starting);
         const publicKeyMetadata = JSON.stringify({
           publicKey: credential.publicKey,
@@ -3786,7 +3570,7 @@ export class SqliteStore {
           "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER,
         )[0]?.count);
         if (count >= MAX_PASSKEYS_PER_USER) throw new StoreError("denied", `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys`);
-        this.chargeRegistration(input.ipKey, effective);
+        this.admission.chargeRegistration(this.sqlHandle, input.ipKey, effective);
         this.rawExec(
           `INSERT INTO credentials
            (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
@@ -3897,37 +3681,6 @@ export class SqliteStore {
         now,
         credentialId,
       );
-    });
-  }
-
-  reserveConnection(input: { ipKey: string; now: number }): void {
-    this.ensureReady();
-    if (!this.config.admissionEnabled) throw new StoreError("denied", "Demo admission is closed");
-    this.reserved("reserveConnection", { reads: 64, writes: 32, admissions: 1 }, false, input.now, () => {
-      const now = this.effectiveNow(input.now);
-      this.transaction(() => {
-        this.chargeEvent("admission", `ip:${input.ipKey}`, now, { perMinute: this.config.connectionAdmissionsPerIpMinute }, "Connection admission limit reached");
-        const day = dayFor(now);
-        // The daily admission ceiling is global. The per-IP control above is a
-        // rolling minute gate; using it as a daily counter would make a quiet
-        // IP permanently consume global capacity independently.
-        const global = this.limitRow("admission", "global", now);
-        const admissions = dayCount(global, "posts_day", day);
-        // Until the UTC day ends, when the counts reset.
-        const untilReset = Math.max(1_000, 86_400_000 - now % 86_400_000);
-        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: untilReset });
-        this.updateLimitRow(global, { day, posts_day: admissions + 1 }, now);
-        // Live connection caps are authoritative in ctx.getWebSockets(), which
-        // includes closing sockets and survives object hibernation.  Durable
-        // open counters become stale after a lost close and can permanently
-        // deny admission, so only the durable admission/day and frame budget
-        // controls are maintained here.
-        const frames = this.limitRow("frames", "global", now);
-        const frameCount = dayCount(frames, "posts_day", day);
-        if (frameCount >= this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: untilReset, data: { reason: "frame_budget" } });
-        }
-      });
     });
   }
 
@@ -4263,7 +4016,7 @@ export class SqliteStore {
       return this.transaction(() => {
         if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (!alerting && this.metaNumber("identity_count") >= this.config.registeredAccounts) throw new StoreError("denied", "registration_closed");
-        if (!alerting) this.chargeRegistration(input.ipKey, effective);
+        if (!alerting) this.admission.chargeRegistration(this.sqlHandle, input.ipKey, effective);
         this.rawExec(
           "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)",
           input.userId, input.name, input.tier, effective, effective, JSON.stringify(input.roles ?? []),
@@ -4362,7 +4115,7 @@ export class SqliteStore {
           throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
         }
         if (input.join && this.membershipCount(input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
-        this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
+        this.admission.chargePosting(this.sqlHandle, { userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else {
           this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
@@ -4400,7 +4153,7 @@ export class SqliteStore {
     const operationNow = input.now ?? this.clock.now();
     this.reserved("chargeGuestMembership", { reads: 32, writes: 32, posts: 1 }, false, operationNow, () => {
       const effective = this.effectiveNow(operationNow);
-      this.transaction(() => this.chargePosting({ userId: "", tier: "anonymous", ipKey: input.ipKey, now: effective }));
+      this.transaction(() => this.admission.chargePosting(this.sqlHandle, { userId: "", tier: "anonymous", ipKey: input.ipKey, now: effective }));
     });
   }
 
@@ -4914,10 +4667,10 @@ export class SqliteStore {
     const registered = this.identityRow(input.userId) !== null;
     const principal = registered ? `user:${input.userId}` : `anonymous:${input.ipKey}`;
     const window = policy.startWindowMinutes;
-    this.chargeEvent("live", principal, now, { perMinute: policy.startsPerUser / window, burst: policy.startsPerUser }, "Live text limit reached",
+    this.admission.chargeEvent(this.sqlHandle, "live", principal, now, { perMinute: policy.startsPerUser / window, burst: policy.startsPerUser }, "Live text limit reached",
       { limit: policy.startsPerUserDay, message: "Daily live text limit reached" });
-    this.chargeEvent("live", `ip:${input.ipKey}`, now, { perMinute: policy.startsPerIp / window, burst: policy.startsPerIp }, "Live text limit reached");
-    this.chargeEvent("live", "global", now, { perMinute: policy.startsPerDay }, "Daily live text limit reached for the server",
+    this.admission.chargeEvent(this.sqlHandle, "live", `ip:${input.ipKey}`, now, { perMinute: policy.startsPerIp / window, burst: policy.startsPerIp }, "Live text limit reached");
+    this.admission.chargeEvent(this.sqlHandle, "live", "global", now, { perMinute: policy.startsPerDay }, "Daily live text limit reached for the server",
       { limit: policy.startsPerDay, message: "Daily live text limit reached for the server" });
     const long = registered && this.holdsRole(input.userId, LIVE_TEXT_LONG_ROLES);
     const entry: LiveEntry = {
@@ -4968,7 +4721,7 @@ export class SqliteStore {
         : this.messageReference({ message_id: input.replyTo }, "reply_to", this.logState().history_floor, { viewer: input.userId, roomId: input.roomId });
       const title = input.kind === "terminal" ? uploadTitle(input.title) : undefined;
       const tier: Tier = this.identityRow(input.userId) ? "registered" : "anonymous";
-      this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective });
+      this.admission.chargePosting(this.sqlHandle, { userId: input.userId, tier, ipKey: input.ipKey, now: effective });
       return this.startLiveText(input.kind, input, effective, {
         embedId: `embed_${randomKey()}`,
         text,
@@ -6018,21 +5771,6 @@ export class SqliteStore {
     }
   }
 
-  /**
-   * A principal's count for its UTC day in a limiter scope (`posts_day`, which
-   * scopes other than posts reuse), as the store holds it: a cached row
-   * (limiter-cache.ts) may not be written yet. Zero for none.
-   */
-  limiterDay(scope: string, principalKey: string, now = this.clock.now()): { day: string; posts_day: number } {
-    this.ensureReady();
-    return this.reserved("limiterDay", { reads: 8 }, false, now, () => {
-      const row = this.limiters.peek(scope, principalKey) ?? this.rawRows<{ day: string; posts_day: number }>(
-        "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", scope, principalKey,
-      )[0];
-      return { day: row?.day ?? dayFor(this.effectiveNow(now)), posts_day: integerColumn(row?.posts_day) };
-    });
-  }
-
   /** Replace the caller's reaction set on one message (§4.7). */
   private commitReactions(input: StoreMutationInput, context: CommitContext, floor: number): StoreMutationResult {
     const params = input.params;
@@ -6596,7 +6334,7 @@ export class SqliteStore {
           return value;
         };
         const tier: Tier = this.identityRow(input.userId) ? "registered" : "anonymous";
-        if (!input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me" });
+        if (!input.system) this.admission.chargePosting(this.sqlHandle, { userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me" });
         let committed: StoreMutationResult;
         if (method === "me") {
           committed = this.commitMeMutation(input, effective);
@@ -6610,7 +6348,7 @@ export class SqliteStore {
             : method === "room_set" ? this.commitRoom(input, context, this.publishedFloor(), tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
-          if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
+          if (context.extraPosts && !input.system) this.admission.chargePosting(this.sqlHandle, { userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
           this.finishCommit(context, startLogId);
         }
         this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);
@@ -6689,13 +6427,13 @@ export class SqliteStore {
         if (degraded && !backward) this.assertNotDegraded("Loading older history", operationNow);
         const page = this.transaction(() => {
           if (charged && !query.guest) {
-            this.chargeEvent("history", `user:${query.userId}`, now,
+            this.admission.chargeEvent(this.sqlHandle, "history", `user:${query.userId}`, now,
               { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
               "History request limit reached",
               { limit: this.config.historyRequestsPerUserDay, message: "Daily history limit reached" }, "read");
           }
           if (charged) {
-            this.chargeEvent("history", `ip:${query.ipKey}`, now,
+            this.admission.chargeEvent(this.sqlHandle, "history", `ip:${query.ipKey}`, now,
               { perMinute: this.config.historyRequestsPerIpMinute, burst: this.config.historyBurstPerIp },
               "History request limit reached",
               { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" }, "read");

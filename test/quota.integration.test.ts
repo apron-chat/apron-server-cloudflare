@@ -360,11 +360,11 @@ describe('history quota', () => {
 			// now 3, then 2, then 1 (within the cap plus 6, limiter-cache.ts).
 			const user = cycles({ historyRequestsPerUserDay: 3 }, (store) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'reader-ip' }));
 			expect(user).toBe(6);
-			expect(sqliteOf(openStore(state, {}, { now: () => now })).limiterDay('history', 'user:reader', now).posts_day).toBe(3);
+			expect(sqliteOf(openStore(state, {}, { now: () => now })).admission.limiterDay('history', 'user:reader', now).posts_day).toBe(3);
 			// The IP's cap, which keeps one network from using up the server's count, the same way.
 			const network = cycles({ historyRequestsPerIpDay: 3 }, (store, index) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: `neighbour-${now}-${index}`, ipKey: 'shared-ip' }));
 			expect(network).toBe(6);
-			expect(sqliteOf(openStore(state, {}, { now: () => now })).limiterDay('history', 'ip:shared-ip', now).posts_day).toBe(3);
+			expect(sqliteOf(openStore(state, {}, { now: () => now })).admission.limiterDay('history', 'ip:shared-ip', now).posts_day).toBe(3);
 		});
 	});
 
@@ -403,12 +403,12 @@ describe('history quota', () => {
 			now += 1_000;
 			// Held in memory: lost to the eviction below.
 			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
-			expect(sqliteOf(store).limiterDay('history', 'user:reader', now).posts_day).toBe(3);
+			expect(sqliteOf(store).admission.limiterDay('history', 'user:reader', now).posts_day).toBe(3);
 		});
 		await evictDurableObject(stub);
 		await runInDurableObject(stub, (_instance, state) => {
 			const store = openStore(state, config, { now: () => now });
-			expect(sqliteOf(store).limiterDay('history', 'user:reader', now).posts_day).toBe(2);
+			expect(sqliteOf(store).admission.limiterDay('history', 'user:reader', now).posts_day).toBe(2);
 			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			expect(refusal(() => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' })).message).toBe('Daily history limit reached');
 		});
