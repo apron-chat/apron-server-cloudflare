@@ -295,8 +295,9 @@ History (messages, edits, reactions, room changes, and registered users'
 memberships) is kept in tiers, all of it readable: the latest 4,000 records
 in the server's own storage, 80,000 more in its D1 history tier (80% of
 limits of 5,000 and 100,000, the rest headroom), and everything older in its
-cold tier in R2, kept indefinitely by default. None younger than three days
-leaves the server's own storage. Without the tiers below it, only those
+cold tier in R2, kept indefinitely by default. A flood that fills the
+server's own storage is moved down at once, so posting pauses for minutes,
+not a day. Without the tiers below it, only those
 4,000 are kept and older records expire; 24 hours on Workers Free. Messages
 below the server's own storage can be read in history but not edited,
 reacted to or replied to. An admin's `/purge` or `/rename` reaches the

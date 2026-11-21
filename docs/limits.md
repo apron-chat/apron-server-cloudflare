@@ -165,8 +165,8 @@ A history page holds at most 50 records (20 by default) and 256 KiB. History
 keeps the latest 4,000 records (messages, edits, reactions and room changes) in
 the server's own storage, 80,000 more in a D1 history tier, and everything
 older in a cold tier in R2 (kept indefinitely by default), all read by history;
-each is trimmed back to its share once past it, and none younger than three
-days leaves the server's own storage. Where the server has no tiers below it,
+each is trimmed back to its share once past it, and a flood that fills the
+server's own storage is moved down at once. Where the server has no tiers below it,
 4,000 are kept and older records expire. Messages below the server's own
 storage cannot be edited, reacted to or replied to.
 

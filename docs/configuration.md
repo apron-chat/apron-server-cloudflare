@@ -742,19 +742,21 @@ and so on), which both Wrangler configs write out:
 | Limit | Workers Paid | Workers Free |
 | --- | ---: | ---: |
 | `retentionRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
-| `minRetentionSeconds`: never move a younger record out by count | 3 days | 1 day |
 | `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
 | `historyD1Records`: the D1 tier keeps the newest this many records that left | 100000 | 0 (off) |
 | `historyColdRecords`: the cold tier keeps the newest this many records past D1's | 0 (everything) | 0 (everything) |
 | `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
 
-A record leaves the hot log once it is past the latest `retentionRecords` and
-at least `minRetentionSeconds` old, or once it is older than
-`retentionSeconds`. Without a tier below the hot log it expires then. Set
+A record leaves the hot log once it is past the latest `retentionRecords`, or
+once it is older than `retentionSeconds`. Without a tier below the hot log it
+expires then. Set
 `retentionRecords` to 0 for history by age alone, as on Free, or
 `retentionSeconds` to 0 for no age limit, as on Paid; at least one must be
 set. Each cleanup run reads up to `retentionRecords` index entries to find
-where the count ends, so it is at most 50,000.
+where the count ends, so it is at most 50,000; and the count, every record a
+largest snapshot (`maxSnapshotBytes`, twice over for its indexes and state
+rows), must fit under `databaseResumeLowWaterBytes`, so that cleanup at the
+watermark (below) always relieves it: about 13,600 records on Paid.
 
 **The limits are ceilings.** Each daily cleanup keeps `cleanupThresholdPercent`
 of each count limit (80%: 4,000 of the hot log's 5,000 and 80,000 of the
@@ -762,17 +764,27 @@ D1 tier's 100,000, 84,000 in all): it moves what is past the hot log's share
 to the D1 tier, and what is past the D1 tier's to the cold tier, or expires
 it without one. The rest of each
 limit is headroom for a day's records, so the hot log reaches its limit only
-on a day that brings more than 1,000 records, or when records are younger
-than the minimum age. 100 keeps each limit whole, as a floor rather than a
-ceiling.
+on a day that brings more than 1,000 records. 100 keeps each limit whole, as
+a floor rather than a ceiling.
 
 The count is of log records, not messages: edits, reactions, memberships and
 room changes count too, so 84,000 records are fewer messages. At the demo's
 traffic in November 2026 (about 115 records a day) they span about two
 years, the hot log's 4,000 about five weeks; a busier stretch keeps less time, a quieter one
-more. The minimum age
-keeps a flood from pushing out the last three days before an admin purges
-it; the database watermarks still bound what the flood stores.
+more.
+
+**A flood starts cleanup at once.** When a write meets the database's
+high-water mark (`databaseHighWaterBytes`, 768 MiB on Paid), it is refused
+and cleanup starts at the next alarm, whatever the daily schedule says: it
+moves what is past the count down to D1 (or, without tiers, expires it), and
+posting resumes once the database is under `databaseResumeLowWaterBytes`
+(640 MiB) again, minutes rather than a day later. While the database stays
+over the mark and cleanup has nothing more to move (or the copy into D1 is
+failing, which stalls and alerts as any failing copy does), it looks again
+every five minutes, not at every alarm. The cost is that a flood can push
+the last hours of real conversation into D1, where it is kept and readable
+but read-only (no edits, reactions or replies); `/purge` still reaches the
+flood there.
 
 Uploaded files expire by age (`fileRetentionSeconds`, 120 days on Paid), since
 the bucket's lifecycle rules can only expire by age: a message kept longer
@@ -1095,9 +1107,9 @@ defaults:
   Low, high, and hard storage watermarks must be strictly ordered.
 - At least one of `retentionRecords` and `retentionSeconds` is set;
   `retentionRecords` is at most 50,000 and `historyD1Records` at most 100,000;
-  `retentionSeconds`, when set, is at least `cleanupSeconds`; with
-  `retentionRecords` set, `minRetentionSeconds` is at least `cleanupSeconds`
-  and `retentionSeconds`, when set, at least `minRetentionSeconds`. `sessionTtlSeconds` is at most 30 days;
+  `retentionSeconds`, when set, is at least `cleanupSeconds`;
+  `retentionRecords` largest snapshots, twice over, fit under
+  `databaseResumeLowWaterBytes`. `sessionTtlSeconds` is at most 30 days;
   `idleAccountSeconds` is at least a day; `keptActiveAccounts` is at most
   `registeredIdentityCount`.
 - `roomMetadataLimit` plus 1 KiB of envelope must fit `maxFrameBytes`;
@@ -1396,7 +1408,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 - History: `retentionRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
   `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
-- Durations: `minRetentionSeconds` and `retentionSeconds` ([History
+- Durations: `retentionSeconds` ([History
   retention](#history-retention)), `roomCreationWindowSeconds` ([Rooms and
   the caps](#rooms-and-the-caps)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
@@ -1459,7 +1471,6 @@ The numeric rows are grouped by their unit and enforcement scope:
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
 | `retentionRecords` | 5000 | 0 |
-| `minRetentionSeconds` | 259200 | 86400 |
 | `retentionSeconds` | 0 | 86400 |
 | `historyD1Records` | 100000 | 0 |
 | `historyColdRecords` | 0 |  |
