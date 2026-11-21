@@ -63,7 +63,7 @@ export function sqliteRooms(sqlite: SqliteStore): Rooms {
     members: (roomIds, limit, now, counts, withStatus) => sqlite.roomMembers(roomIds, limit, now, counts, withStatus),
     member: (roomId, userId, now, withStatus) => sqlite.roomMember(roomId, userId, now, withStatus),
     creator: (roomId, now) => sqlite.roomCreator(roomId, now),
-    counts: (now) => sqlite.roomCounts(now),
+    counts: (now) => sqlite.caps.roomCounts(now),
     privateOf: (userId, now) => sqlite.privateRoomsOf(userId, now),
     topLevelIds: (now) => sqlite.topLevelRoomIds(now),
     changeMembership: (input) => sqlite.changeMembership(input),

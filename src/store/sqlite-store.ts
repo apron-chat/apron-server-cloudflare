@@ -13,6 +13,7 @@
 
 import { defaultStoreConfig, type StoreConfig } from "./config";
 import type { Sql, StoreCore, TransactionJournal } from "./core";
+import { RoomCapsModule } from "./room-caps";
 import { HistoryModule } from "./history-log";
 import { LiveTextModule } from "./live-text";
 import { UploadsModule } from "./uploads";
@@ -62,7 +63,7 @@ import {
   UPGRADABLE_SCHEMA_VERSION,
 } from "./schema";
 import {
-  BOOTSTRAP_ROW_RESERVATION, DEGRADE_SHARE, listedThreads, listedThreadScale, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES,
+  BOOTSTRAP_ROW_RESERVATION, DEGRADE_SHARE, listedThreads, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES,
   MAX_PUSHES_PER_MESSAGE, SEEN_WRITE_GRANULARITY_MS, thresholdRecords,
 } from "../budget";
 import { type LimitCategory, limitData, StoreError } from "../store-error";
@@ -78,9 +79,9 @@ import {
   GUEST_NUMBER_BLOCK_COST, HISTORY_SCAN_BATCH, HISTORY_SCAN_PAGES, HISTORY_TARGET_SCAN, IDLE_PRUNE_BATCH, IDLE_PRUNE_RUNS_PER_DAY,
   LIMITER_IDLE_MS, LISTED_PRIVATE_ROOMS, LIVE_KINDS, LIVE_WRITES, MAX_CARRIED_PASSKEYS, MAX_HISTORY_REWRITES,
   MAX_MEMBERSHIP_ROWS, MAX_PURGE_ROOMS, MAX_PUSH_SUBSCRIPTIONS_PER_USER, MAX_PUSH_WAKES_PER_USER, MAX_SAFE_ID, MEMBERSHIP_COUNT_READS,
-  MEMBERSHIP_LIMIT_MESSAGE, MINUTE_MS, MOVE_REACTION_SETS_PER_POST, PRESSURE_CLEANUP_RETRY_MS, PRIVATE_ROOM_COUNT_READS, PRIVATE_ROOM_ROWS,
+  MEMBERSHIP_LIMIT_MESSAGE, MINUTE_MS, MOVE_REACTION_SETS_PER_POST, PRESSURE_CLEANUP_RETRY_MS, PRIVATE_ROOM_COUNT_READS, PRIVATE_ROOM_ROWS, publicRoomRows,
   PUSH_REFRESH_MS, RESTORE_ENTRIES_BATCH, RESTORE_ENTRIES_SINGLE, RESTORE_FUTURE_MS, RESTORE_RECORDS_BATCH,
-  RESTORE_REPLAY_CAP, RESTORE_USERS_BATCH, RETAINED_SCAN_CAP, RETIRED_MARKER_MARGIN, RETIRED_SWEEP_BATCH,
+  RESTORE_REPLAY_CAP, RESTORE_USERS_BATCH, RETAINED_SCAN_CAP, RETIRED_MARKER_MARGIN, RETIRED_SWEEP_BATCH, roomCountReads,
   ROOM_NOTES_NAMED, ROOM_TITLE, UPLOAD_SWEEP_BATCH, UPLOAD_WRITE_GRACE_MS, UPLOAD_WRITES,
 } from "./limits";
 import type { AccountUsageSnapshot } from "../account-usage";
@@ -110,13 +111,9 @@ export class SqliteStore {
   private get listedThreadCount(): number {
     return listedThreads(this.config.maxThreads);
   }
-  /**
-   * Most public rows a listing reads (listRooms): `general` and the top-level
-   * rooms (MAX_CREATED_ROOMS, well within one thread scale), and the
-   * listedThreadCount threads it names.
-   */
+  /** Most public rows a listing reads (limits.ts publicRoomRows). */
   private get publicRoomRows(): number {
-    return listedThreadScale(this.config.maxThreads) + this.listedThreadCount + 1;
+    return publicRoomRows(this.config.maxThreads);
   }
   /**
    * Most rooms one `room_list` names, whose members roomMembers fills in:
@@ -126,15 +123,9 @@ export class SqliteStore {
   private get listedRoomBound(): number {
     return Math.max(MAX_USER_ROOMS, 1 + MAX_CREATED_ROOMS + this.listedThreadCount + this.config.maxPrivateMembershipsPerUser);
   }
-  /**
-   * Reads for counting a kind's rooms created within the window
-   * (recentRoomCount), or a user's among them: its range of
-   * ROOM_CREATED_INDEX, which the caps keep within the ceilings (a room is
-   * created, or restored inside the window, only while there is a slot), with
-   * room for a window lengthened since, and index pages.
-   */
+  /** Reads for counting a kind's rooms created within the window (limits.ts roomCountReads). */
   private get roomCountReads(): number {
-    return 2 * Math.max(this.publicRoomRows, PRIVATE_ROOM_ROWS) + 16;
+    return roomCountReads(this.config.maxThreads);
   }
   /**
    * Reads for checkRoomFieldsTotal(): the rooms a listing names (listedRoomRows),
@@ -277,6 +268,8 @@ export class SqliteStore {
   };
   /** The core the implementation modules run over (core.ts). */
   readonly core: StoreCore = this.makeCore();
+  /** Room caps: the counts of rooms and memberships a creation, join or restore is checked against (room-caps.ts). */
+  readonly caps: RoomCapsModule;
   /** History: pages of the log, the head's records and floors, the chain's state, rewrite log, chunk index and import journal (history-log.ts). */
   readonly historyLog: HistoryModule;
   /** Open live texts: their start, claim, finish and expiry (live-text.ts). */
@@ -345,6 +338,7 @@ export class SqliteStore {
     this.uploads = new UploadsModule(this.core);
     this.live = new LiveTextModule(this.core, this.admission, this.uploads);
     this.historyLog = new HistoryModule(this.core, this.admission);
+    this.caps = new RoomCapsModule(this.core);
   }
 
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
@@ -1841,8 +1835,8 @@ export class SqliteStore {
       let skipped = 0;
       for (const userId of new Set(changes.join)) {
         if (member(userId)) continue;
-        if (!this.identityRow(userId) || this.membershipCount(userId) >= MAX_MEMBERSHIPS_PER_USER ||
-          (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser)) {
+        if (!this.identityRow(userId) || this.caps.membershipCount(this.sqlHandle, userId) >= MAX_MEMBERSHIPS_PER_USER ||
+          (isPrivate && this.caps.privateMembershipCount(this.sqlHandle, userId) >= this.config.maxPrivateMembershipsPerUser)) {
           skipped += 1;
           continue;
         }
@@ -2076,12 +2070,12 @@ export class SqliteStore {
         const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? roomClientFields(latestRoom.fields) : roomClientFields(listing);
         // A room created before roomCreationWindowMs takes no slot: the caps
         // count the rooms started within it (roomSlotFree).
-        const old = createdLogId < this.creationCutoff(effective);
-        const slot = (kind: "public" | "private"): boolean => old || this.roomSlotFree(kind, effective);
+        const old = createdLogId < this.caps.creationCutoff(effective);
+        const slot = (kind: "public" | "private"): boolean => old || this.caps.roomSlotFree(this.sqlHandle, kind, effective);
         if (isPrivate) {
           if (parentRoomId !== null) throw new StoreError("invalid_params", "A private room cannot be a thread on this server");
           if (this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
-          if (!slot("private")) throw new StoreError("denied", this.privateRoomLimitMessage());
+          if (!slot("private")) throw new StoreError("denied", this.caps.privateRoomLimitMessage());
         } else {
           if (parentRoomId !== null) {
             const parent = this.roomRow(parentRoomId);
@@ -2193,8 +2187,8 @@ export class SqliteStore {
         const member = this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
         if (joined && !member) {
           if (!this.identityRow(userId)) continue;
-          if (this.membershipCount(userId) >= MAX_MEMBERSHIPS_PER_USER ||
-            (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser)) {
+          if (this.caps.membershipCount(this.sqlHandle, userId) >= MAX_MEMBERSHIPS_PER_USER ||
+            (isPrivate && this.caps.privateMembershipCount(this.sqlHandle, userId) >= this.config.maxPrivateMembershipsPerUser)) {
             membersSkipped += 1;
             continue;
           }
@@ -2362,7 +2356,7 @@ export class SqliteStore {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved("renameIdentity", { reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (this.roomRowCount() + MAX_PURGE_ROOMS) }, false, now, () => {
+    const found = this.reserved("renameIdentity", { reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (this.caps.roomRowCount(this.sqlHandle) + MAX_PURGE_ROOMS) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
@@ -2503,7 +2497,7 @@ export class SqliteStore {
     const perUser = 64 + 8 * MAX_MEMBERSHIP_ROWS + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
-    const roomRows = this.roomRowCount() + MAX_PURGE_ROOMS;
+    const roomRows = this.caps.roomRowCount(this.sqlHandle) + MAX_PURGE_ROOMS;
     const cost = { reads: 64 + 5 * records + 2 * roomRows + ids.length * perUser, writes: 64 + 4 * records + 2 * roomRows + ids.length * perUser };
     return this.reserved("purgeUsers", cost, false, now, () => this.transaction(() => {
       // Their records may be the newest.
@@ -2674,7 +2668,7 @@ export class SqliteStore {
     // Each row deleted (and its index entries), the rooms rescanned for counts
     // and creators, limiter rows, and the identity rows and their markers.
     const limiterRows = ids.length * USER_LIMIT_SCOPES.length;
-    const roomRows = this.roomRowCount() + MAX_PURGE_ROOMS;
+    const roomRows = this.caps.roomRowCount(this.sqlHandle) + MAX_PURGE_ROOMS;
     const cost = {
       reads: 64 + 2 * found.rows + 2 * roomRows + 2 * limiterRows + 4 * ids.length,
       writes: 64 + 4 * found.rows + 2 * roomRows + 2 * limiterRows + 8 * ids.length,
@@ -2988,14 +2982,14 @@ export class SqliteStore {
       // its creation is the lowest of its listing's log_id and history_log_id,
       // and of its records, which planning has not read, so without the
       // listing's it counts: the import never finds a cap mid-write.
-      const cutoff = this.creationCutoff(now);
+      const cutoff = this.caps.creationCutoff(now);
       const recent = (listing: RoomListing): boolean => {
         const known = [parseLogId(listing.log_id), parseLogId(listing.history_log_id)].filter((logId): logId is number => logId !== undefined);
         return !known.length || Math.min(...known) >= cutoff;
       };
       if (privates.length) {
         if (this.config.maxPrivateRooms === 0) return "this archive has private rooms, and private rooms are not supported on this server";
-        const used = this.recentRoomCount("private", now);
+        const used = this.caps.recentRoomCount(this.sqlHandle, "private", now);
         const adding = privates.filter(recent).length;
         if (used + adding > this.config.maxPrivateRooms) return `this archive would add ${adding} recently created private rooms, but there is room for ${Math.max(0, this.config.maxPrivateRooms - used)} more (${used} of ${this.config.maxPrivateRooms})`;
       }
@@ -3005,7 +2999,7 @@ export class SqliteStore {
         if (used + topLevel.length - 1 > MAX_CREATED_ROOMS) return `this archive would add ${topLevel.length} top-level rooms, but there is room for ${Math.max(0, MAX_CREATED_ROOMS + 1 - used)} more (room_limit)`;
       }
       if (publics.length) {
-        const used = this.recentRoomCount("public", now);
+        const used = this.caps.recentRoomCount(this.sqlHandle, "public", now);
         const adding = publics.filter(recent).length;
         if (used + adding > this.config.maxThreads) return `this archive would add ${adding} recently created public rooms and threads, but there is room for ${Math.max(0, this.config.maxThreads - used)} more (thread_limit, ${used} of ${this.config.maxThreads})`;
       }
@@ -3805,10 +3799,10 @@ export class SqliteStore {
         if (!room) throw new StoreError("invalid_params", "Unknown room");
         const member = this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", input.roomId, input.userId).length > 0;
         if (member === input.join) return { rooms: this.userRooms(input.userId, input.join ? input.roomId : undefined), changed: false };
-        if (privateJoin && this.privateMembershipCount(input.userId) >= this.config.maxPrivateMembershipsPerUser) {
+        if (privateJoin && this.caps.privateMembershipCount(this.sqlHandle, input.userId) >= this.config.maxPrivateMembershipsPerUser) {
           throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
         }
-        if (input.join && this.membershipCount(input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
+        if (input.join && this.caps.membershipCount(this.sqlHandle, input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
         this.admission.chargePosting(this.sqlHandle, { userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else {
@@ -4410,9 +4404,9 @@ export class SqliteStore {
       const parentId = params.parent_room_id;
       let parentRoomId: string | null = null;
       // Creating a room joins its registered creator.
-      if (registered && this.membershipCount(input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
+      if (registered && this.caps.membershipCount(this.sqlHandle, input.userId) >= MAX_MEMBERSHIPS_PER_USER) throw new StoreError("denied", MEMBERSHIP_LIMIT_MESSAGE);
       if (makePrivate) {
-        const counts = this.privateRoomCounts(input.userId, this.creationCutoff(context.commitMs));
+        const counts = this.caps.privateRoomCounts(this.sqlHandle, input.userId, this.caps.creationCutoff(context.commitMs));
         if (counts.memberships >= this.config.maxPrivateMembershipsPerUser) {
           throw new StoreError("denied", `You are in ${counts.memberships} private rooms, the most at once; leave one to start another`);
         }
@@ -4422,7 +4416,7 @@ export class SqliteStore {
             ? `You can start at most ${this.config.maxPrivateRoomsPerUser} private rooms in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
             : `You can have started at most ${this.config.maxPrivateRoomsPerUser} private rooms at once; one stops counting when everyone has left it`);
         }
-        if (!this.roomSlotFree("private", context.commitMs)) throw new StoreError("denied", this.privateRoomLimitMessage());
+        if (!this.caps.roomSlotFree(this.sqlHandle, "private", context.commitMs)) throw new StoreError("denied", this.caps.privateRoomLimitMessage());
       } else if (parentId === undefined) {
         if (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES)) throw new StoreError("denied", "Only an admin or mod may create a room; others may create threads");
         const rooms = this.rawRows(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_CREATED_ROOMS + 1).length;
@@ -4438,14 +4432,14 @@ export class SqliteStore {
         // started within roomCreationWindowMs. A user holding any role (one an
         // admin gave, as for the trusted posting limits) is held only to the
         // server's maxThreads: a moderator re-threading starts many.
-        if (registered && !this.holdsAnyRole(input.userId) && this.recentThreadsCreatedBy(input.userId, this.creationCutoff(context.commitMs)) >= this.config.maxThreadsPerUser) {
+        if (registered && !this.holdsAnyRole(input.userId) && this.caps.recentThreadsCreatedBy(this.sqlHandle, input.userId, this.caps.creationCutoff(context.commitMs)) >= this.config.maxThreadsPerUser) {
           throw new StoreError("denied", this.config.roomCreationWindowMs > 0
             ? `You can start at most ${this.config.maxThreadsPerUser} threads in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
             : `You can have at most ${this.config.maxThreadsPerUser} threads at once; one stops counting when everyone has left it`);
         }
       }
       const counter = makePrivate ? "private_count" : "thread_count";
-      if (!makePrivate && !this.roomSlotFree("public", context.commitMs)) throw new StoreError("denied", "thread_limit");
+      if (!makePrivate && !this.caps.roomSlotFree(this.sqlHandle, "public", context.commitMs)) throw new StoreError("denied", "thread_limit");
       const fields = roomFields(undefined);
       this.checkRoomFields(fields);
       this.checkRoomFieldsTotal(fields);
@@ -4506,112 +4500,6 @@ export class SqliteStore {
     const record = this.roomRecord(row, floor);
     // Room records are not broadcast: the caller sends room_update (§4.2.3).
     return { result: { room_id: row.room_id }, broadcasts: [], room: record, created, ...(membership ? { membership } : {}) };
-  }
-
-  /**
-   * The creation log ID (a commit time) from which a room counts against
-   * the thread and private-room caps (roomCreationWindowMs): 0, which every
-   * room is at or past, when every room that exists counts.
-   */
-  private creationCutoff(now: number): number {
-    return this.config.roomCreationWindowMs > 0 ? Math.max(0, now - this.config.roomCreationWindowMs) : 0;
-  }
-
-  /** Rows the rooms table holds (`general`, the public rooms counted by thread_count, the private ones): what a scan of every room reads. */
-  private roomRowCount(): number {
-    return 1 + this.metaNumber("thread_count") + this.metaNumber("private_count");
-  }
-
-  /**
-   * The rooms counted against a cap (roomCountReads): those created within
-   * roomCreationWindowMs. `public`, the top-level rooms and threads besides
-   * `general`, against maxThreads; `private`, the private rooms, against
-   * maxPrivateRooms. Each a range of ROOM_CREATED_INDEX.
-   */
-  private recentRoomCount(kind: "public" | "private", now: number): number {
-    const cutoff = this.creationCutoff(now);
-    const count = (sql: string, ...bindings: unknown[]) => integerColumn(this.rawRows<{ count: number }>(sql, ...bindings)[0]?.count);
-    if (kind === "private") return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND created_log_id >= ?`, cutoff);
-    return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(0)} AND created_log_id >= ? AND room_id != ?`, cutoff, ROOM_ID) +
-      count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND created_log_id >= ?`, cutoff);
-  }
-
-  /** Whether a room of `kind` may be created (or restored as created within the window): fewer were created within it than the cap. */
-  private roomSlotFree(kind: "public" | "private", now: number): boolean {
-    const cap = kind === "public" ? this.config.maxThreads : this.config.maxPrivateRooms;
-    return this.recentRoomCount(kind, now) < cap;
-  }
-
-  /** The refusal when the private-room cap is full. */
-  private privateRoomLimitMessage(): string {
-    return this.config.roomCreationWindowMs > 0
-      ? `This server starts at most ${this.config.maxPrivateRooms} private rooms in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
-      : "The demo holds as many private rooms as it can; one frees up when everyone has left it";
-  }
-
-  /**
-   * `/status`: the public rooms (besides `general`) and private rooms
-   * created within roomCreationWindowMs, which the caps count, and those
-   * kept besides.
-   */
-  roomCounts(now = this.clock.now()): { public: { recent: number; older: number }; private: { recent: number; older: number } } {
-    this.ensureReady();
-    return this.reserved("roomCounts", { reads: 16 + 2 * this.roomCountReads }, false, now, () => {
-      const publicRecent = this.recentRoomCount("public", now);
-      const privateRecent = this.recentRoomCount("private", now);
-      return {
-        public: { recent: publicRecent, older: Math.max(0, this.metaNumber("thread_count") - publicRecent) },
-        private: { recent: privateRecent, older: Math.max(0, this.metaNumber("private_count") - privateRecent) },
-      };
-    });
-  }
-
-  /**
-   * The rooms a registered user is a member of, through the user index,
-   * those awaiting purge included: at most MAX_MEMBERSHIP_ROWS rows read
-   * (MEMBERSHIP_COUNT_READS), the count stopping there.
-   */
-  private membershipCount(userId: string): number {
-    return integerColumn(this.rawRows<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM (SELECT 1 FROM memberships INDEXED BY memberships_user_idx WHERE user_id = ? LIMIT ?)", userId, MAX_MEMBERSHIP_ROWS,
-    )[0]?.count);
-  }
-
-  /** Thread rooms `userId` created within roomCreationWindowMs (`cutoff`): ROOM_CREATED_INDEX's range of them, the creator read from each row. */
-  private recentThreadsCreatedBy(userId: string, cutoff: number): number {
-    return integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND created_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
-      cutoff, userId,
-    )[0]?.count);
-  }
-
-  /**
-   * For a private room's creation (PRIVATE_ROOM_COUNT_READS): the private
-   * rooms `userId` created within roomCreationWindowMs (`cutoff`), as
-   * recentThreadsCreatedBy counts threads; and the private rooms they are
-   * in, from their memberships.
-   */
-  private privateRoomCounts(userId: string, cutoff: number): { created: number; memberships: number } {
-    const created = integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND created_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
-      cutoff, userId,
-    )[0]?.count);
-    return { created, memberships: this.privateMembershipCount(userId) };
-  }
-
-  /**
-   * The private rooms a registered user is in. Their membership rows,
-   * through the user index, joined with `rooms` so the rows of a removed
-   * room awaiting purge do not count: at most MAX_MEMBERSHIP_ROWS rows, and
-   * a room lookup each.
-   */
-  private privateMembershipCount(userId: string): number {
-    return integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM memberships m INDEXED BY memberships_user_idx
-       JOIN rooms r ON r.room_id = m.room_id
-       WHERE m.user_id = ? AND ${privateRange("m.room_id")}`,
-      userId,
-    )[0]?.count);
   }
 
   /** Whether a registered user has a membership row in `roomId`. */

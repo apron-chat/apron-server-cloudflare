@@ -1,6 +1,6 @@
 /** Storage caps, batch sizes and read reservations: how much one operation may touch. */
 
-import { CALIBRATED_THREAD_LIMIT, DEFAULT_LIMITS, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_ROOM_LIMIT, MAX_PUSHES_PER_MESSAGE } from "../budget";
+import { CALIBRATED_THREAD_LIMIT, DEFAULT_LIMITS, listedThreads, listedThreadScale, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_ROOM_LIMIT, MAX_PUSHES_PER_MESSAGE } from "../budget";
 import { MAX_USER_ROOMS, WAKE_SCOPES } from "../domain";
 
 export const ROOM_TITLE = "General";
@@ -18,6 +18,24 @@ export const LISTED_PRIVATE_ROOMS = 2 * MAX_PRIVATE_ROOM_LIMIT;
 export const MEMBERSHIP_LIMIT_MESSAGE = `A user may be in at most ${MAX_MEMBERSHIPS_PER_USER} rooms; leave one to join another`;
 /** Most private rows a maintenance listing reads: the ones it names. */
 export const PRIVATE_ROOM_ROWS = LISTED_PRIVATE_ROOMS;
+/**
+ * Most public rows a listing reads (listRooms) under a thread limit of
+ * `maxThreads`: `general` and the top-level rooms (MAX_CREATED_ROOMS, well
+ * within one thread scale), and the listedThreads threads it names.
+ */
+export function publicRoomRows(maxThreads: number): number {
+  return listedThreadScale(maxThreads) + listedThreads(maxThreads) + 1;
+}
+/**
+ * Reads for counting a kind's rooms created within the window
+ * (recentRoomCount), or a user's among them: its range of
+ * ROOM_CREATED_INDEX, which the caps keep within the ceilings (a room is
+ * created, or restored inside the window, only while there is a slot), with
+ * room for a window lengthened since, and index pages.
+ */
+export function roomCountReads(maxThreads: number): number {
+  return 2 * Math.max(publicRoomRows(maxThreads), PRIVATE_ROOM_ROWS) + 16;
+}
 export const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
 export const MINUTE_MS = 60 * 1000;
