@@ -1091,8 +1091,18 @@ the first daily cleanup that finds more than `retentionRecords`' share):
 Records already in D1 and R2 survive a rollback, and come back into history
 when this version is deployed again. If a rollback cannot wait, make it in the
 first days after the deploy, before anything has moved, or deploy this
-version with a much higher `LIMIT_RETENTION_RECORDS` instead, which stops
-records moving without losing any.
+version with a higher `LIMIT_RETENTION_RECORDS` instead (up to what the
+config check allows: about 13,600 on Workers Paid), which slows records
+moving without losing any.
+
+Roll back the code and its configuration together: revert the merge commit
+(so `wrangler.production.toml` goes back with the code) or use a Cloudflare
+version rollback. The older code refuses this version's configuration (it
+reads `LIMIT_RETENTION_SECONDS` of 0 as invalid and refuses `LIMIT_*` names
+it does not know), so deploying older code with this file would fail every
+request. Likewise, before deploying this version, make sure no production
+secret is named `LIMIT_*`: a deploy replaces vars but keeps secrets, and this
+version refuses unknown `LIMIT_*` names too.
 
 ## Runtime overrides
 
