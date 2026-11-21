@@ -2,7 +2,7 @@
 
 This report records what the current storage schema costs in SQLite rows
 read and written, and in bytes, measured on native SQLite in the Workers test
-runtime. The schema is 11 (`SCHEMA_VERSION` in `src/store.ts`), last
+runtime. The schema is 11 (`SCHEMA_VERSION` in `src/store/schema.ts`), last
 measured on 2026-10-27; a section that names another date or test says so.
 It does not claim a deployed account's billing rate, a per-message capacity,
 or a free-plan capacity. How reservations, the daily ceilings and the plan
@@ -30,7 +30,7 @@ devenv shell -- npm test -- \
 ```
 
 The test uses twelve separate Durable Objects through `runInDurableObject`
-and constructs a `Store` over each object's native SQLite state with a fake
+and opens a store (`openStore`) over each object's native SQLite state with a fake
 clock. The traffic tests start at a future UTC noon, cross three UTC posting
 days, run cleanup a day and a half later, and evict/reinitialize one object
 to check persisted limiter state. Figures not re-measured on the current
@@ -42,7 +42,7 @@ schema are marked as such and listed under
 Each row SQLite writes is billed, and so is each index entry, so the indexes
 a write touches decide most of its cost. The schema
 ([SPEC section 8, Schema versions](../SPEC.md#schema-versions); DDL in
-`SCHEMA_DDL`, `src/store.ts`) keeps only the indexes a query needs:
+`SCHEMA_DDL`, `src/store/schema.ts`) keeps only the indexes a query needs:
 
 - Every table keyed by text or by more than one column is `WITHOUT ROWID`,
   so its key is the table rather than a second index each insert writes.
@@ -544,7 +544,7 @@ registrations do: a wake claims at most `wakesPerMessage` users of
 **`joined`, for moderators.** Only a registered `admin` or `mod` keeps
 `joined` (`JOINED_WAKE_ROLES`), so `push_subscriptions_joined_idx` holds only
 their registrations. Every new message reads that index's live range once
-(`Store.joinedWakers`: 2/1 with one moderator; at most 32 users of 5
+(`SqliteStore.joinedWakers`: 2/1 with one moderator; at most 32 users of 5
 registrations, 176 reserved), and adds them as candidates after everyone
 else. The claim reads each one's identity row for the role and probes their
 membership of the room and, for a thread, its parent, and charges no sender:
@@ -638,7 +638,7 @@ push counted up `unread`), a sweep, a closed connection's change after its
 grace, a status snapshot, and the alarm unchanged. An unscoped mute that
 runs out is read as none and never written back (0 rows); a room mute that
 runs out while its user is connected costs one key range and a delete
-(`Store.expireRoomMutes`: 201/51 for 50 of 100, once), and one that runs out
+(`SqliteStore.expireRoomMutes`: 201/51 for 50 of 100, once), and one that runs out
 while they are away waits until they next mute a room at the cap. Fan-out is
 one `user` frame per connection that shares a room with the user (about 2 ms
 of CPU for 100 sockets, from the budget prototype), at most once a minute per
@@ -721,7 +721,7 @@ wakes past its ceiling. Until
 timer keeping the object awake 5,900 to 8,200 seconds a day (34% to 38% of
 its awake time, 2026-10-29 to 31), because it kept the object from
 hibernating through every quiet wait. A wake instead costs one request,
-the alarm write when it moves the alarm earlier (`Store.scheduleAlarm`,
+the alarm write when it moves the alarm earlier (`SqliteStore.scheduleAlarm`,
 3 writes, measured), a status-only alarm run, and about 10 s awake (1.28
 GB-s). The run costs 3 writes when the instance is still in memory, and 6
 after hibernation, when the cleanup time and the pending upload deadline
@@ -1050,7 +1050,7 @@ Which stored schemas are upgraded in place and which reset is in
   cost was not recorded here. Dropping the uploads' `content_type` rewrites
   the uploads table.
 - **Schema 9 to 11** rebuilds each table the current schema keys
-  differently (`Store.upgradeFromSchema9`), reading and writing every
+  differently (`SqliteStore.upgradeFromSchema9`), reading and writing every
   retained row once: measured 10,435 written and 13,937 read for a store of
   10,000 identities, and 445 written for a nearly empty one, when the
   rebuild targeted schema 10. A full store costs on the order of its row

@@ -10,7 +10,9 @@
 import { newTerminalOutputKey } from "./rows";
 import { storeExport, storeHead, storeRestore } from "./history";
 import type { SqliteStore } from "./sqlite-store";
-import type { Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Uploads } from "./parts";
+import type {
+  Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Uploads,
+} from "./parts";
 
 /** Accounts over SqliteStore. */
 export function sqliteAccounts(sqlite: SqliteStore): Accounts {
