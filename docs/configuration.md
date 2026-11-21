@@ -171,7 +171,7 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   of 768 on Paid; the size is read from the SQL handle, no query, at most
   hourly an instance from an alarm, and the told-once flag is one `_meta` row; told
   again only after the size falls under 40%), and when long room
-  descriptions fill `roomMetadataTotalLimit` (at the first save it refuses,
+  descriptions fill `roomMetadataTotalBytes` (at the first save it refuses,
   naming the public rooms holding the most past the minimum; told again only
   after a later save's check sees the total under 75%), the server posts a public message in `general` as the `admin`
   user that mentions and pushes to every user with the `admin` role (up to
@@ -736,23 +736,23 @@ maintenance writes (6 if the object was still in memory). See the
 
 History (the server-wide log) leaves the object's SQLite, the hot log, from
 its oldest end by three limits, and then, where the tiers below are bound,
-stays in D1 and R2 by two more ([History tiers](#history-tiers)). Each is a `LIMIT_*` var (`LIMIT_RETENTION_RECORDS`
+stays in D1 and R2 by two more ([History tiers](#history-tiers)). Each is a `LIMIT_*` var (`LIMIT_HISTORY_HOT_RECORDS`
 and so on), which both Wrangler configs write out:
 
 | Limit | Workers Paid | Workers Free |
 | --- | ---: | ---: |
-| `retentionRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
-| `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
+| `historyHotRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
+| `historyMaxAgeSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
 | `historyD1Records`: the D1 tier keeps the newest this many records that left | 100000 | 0 (off) |
 | `historyColdRecords`: the cold tier keeps the newest this many records past D1's | 0 (everything) | 0 (everything) |
 | `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
 
-A record leaves the hot log once it is past the latest `retentionRecords`, or
-once it is older than `retentionSeconds`. Without a tier below the hot log it
+A record leaves the hot log once it is past the latest `historyHotRecords`, or
+once it is older than `historyMaxAgeSeconds`. Without a tier below the hot log it
 expires then. Set
-`retentionRecords` to 0 for history by age alone, as on Free, or
-`retentionSeconds` to 0 for no age limit, as on Paid; at least one must be
-set. Each cleanup run reads up to `retentionRecords` index entries to find
+`historyHotRecords` to 0 for history by age alone, as on Free, or
+`historyMaxAgeSeconds` to 0 for no age limit, as on Paid; at least one must be
+set. Each cleanup run reads up to `historyHotRecords` index entries to find
 where the count ends, so it is at most 50,000; and the count, every record a
 largest snapshot (`maxSnapshotBytes`, twice over for its indexes and state
 rows), must fit under `databaseResumeLowWaterBytes`, so that cleanup at the
@@ -799,8 +799,8 @@ take it over. Registration picks another ID instead (registered IDs are
 
 ### Rooms and the caps
 
-The thread and private-room caps (`threadLimit`, `threadsPerUser`,
-`privateRoomLimit`, `privateRoomsPerUser`) count the rooms started within
+The thread and private-room caps (`threads`, `threadsPerUser`,
+`privateRooms`, `privateRoomsPerUser`) count the rooms started within
 `roomCreationWindowSeconds` (`LIMIT_ROOM_CREATION_WINDOW_SECONDS`, 30 days on
 both plans), by their creation log ID: they limit how fast rooms are started,
 not how many exist. Posting in, reacting in, saving, moving into or out of,
@@ -819,8 +819,9 @@ queries scan the table instead.
 
 What grows with the rooms kept, and its bounds:
 
-- A `room_list` names every top-level room and the 200 threads most recently
-  active (`LISTED_THREADS`); a maintenance listing the 400 most recently
+- A `room_list` names every top-level room and the threads most recently
+  active, twice `threads` and at least 200 (`listedThreads` in
+  `src/budget.ts`); a maintenance listing the 400 most recently
   active private rooms. An older thread is still listed by its `room_id`
   (`room_list` with `room_id`) and read by `history`, and an export names
   every room (`Store.allRooms`, read in pages).
@@ -1009,9 +1010,9 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   limits), renamed (`ada-2`) where the `user_id` is taken or retired, and
   `imported-<id>` where it cannot be an account here (a guest's, a bot's, a
   `~` notice's, or `admin`). An import that would make more placeholders
-  than `registeredIdentityCount` has room for is refused, and a dry run
+  than `registeredAccounts` has room for is refused, and a dry run
   shows the accounts in use. Holding a role, placeholders are never removed as idle (account upkeep),
-  and they count toward `registeredIdentityCount`. Kept log IDs may be at
+  and they count toward `registeredAccounts`. Kept log IDs may be at
   most five minutes past the clock; a file with later ones is refused:
   `renumber` gives every record a new log ID
   instead. A room holding nothing past its creation (a new server's
@@ -1074,7 +1075,7 @@ version stay as they are, and it adds tables (`history_chunks`) and `_meta`
 keys (`history:*`) that the older version ignores.
 
 **Fix forward; do not roll back** once records have moved below SQLite (after
-the first daily cleanup that finds more than `retentionRecords`' share):
+the first daily cleanup that finds more than `historyHotRecords`' share):
 
 - An older version knows neither the copy marker nor the tiers. It would
   finish a cleanup this version started, whose cutoff is by count and may be
@@ -1083,7 +1084,7 @@ the first daily cleanup that finds more than `retentionRecords`' share):
 - It removes thread and private rooms whose whole log is below its SQLite
   floor, with their memberships, where this version keeps them because their
   records are in D1 or R2.
-- It counts every thread row against `threadLimit`, however old, so it
+- It counts every thread row against `threads`, however old, so it
   refuses new threads until its own cleanup removes old ones (threads whose
   whole log is below its SQLite floor). It ignores the rooms' kind indexes,
   which SQLite keeps up to date for it.
@@ -1091,15 +1092,16 @@ the first daily cleanup that finds more than `retentionRecords`' share):
 Records already in D1 and R2 survive a rollback, and come back into history
 when this version is deployed again. If a rollback cannot wait, make it in the
 first days after the deploy, before anything has moved, or deploy this
-version with a higher `LIMIT_RETENTION_RECORDS` instead (up to what the
+version with a higher `LIMIT_HISTORY_HOT_RECORDS` instead (up to what the
 config check allows: about 13,600 on Workers Paid), which slows records
 moving without losing any.
 
 Roll back the code and its configuration together: revert the merge commit
 (so `wrangler.production.toml` goes back with the code) or use a Cloudflare
 version rollback. The older code refuses this version's configuration (it
-reads `LIMIT_RETENTION_SECONDS` of 0 as invalid and refuses `LIMIT_*` names
-it does not know), so deploying older code with this file would fail every
+reads `LIMIT_RETENTION_SECONDS` of 0 as invalid, and refuses `LIMIT_*` names
+it does not know, such as the ones renamed in November 2026: Runtime
+overrides), so deploying older code with this file would fail every
 request. Likewise, before deploying this version, make sure no production
 secret is named `LIMIT_*`: a deploy replaces vars but keeps secrets, and this
 version refuses unknown `LIMIT_*` names too.
@@ -1107,14 +1109,44 @@ version refuses unknown `LIMIT_*` names too.
 ## Runtime overrides
 
 Wrangler string variables use the exact names below. Every row of the numeric
-table accepts three names, in this precedence: the `LIMIT_`-prefixed
-uppercase snake case (`LIMIT_MAX_FRAME_BYTES`), plain uppercase snake case
-(`MAX_FRAME_BYTES`), then camelCase as in `src/budget.ts` (`maxFrameBytes`).
-Wrangler deployments should use the uppercase form; local tests may use
-camelCase. Omitted variables use the defaults. Each value must be a positive
+table is set as `LIMIT_` and its key in uppercase snake case
+(`maxFrameBytes` in `src/budget.ts` is `LIMIT_MAX_FRAME_BYTES`), and only so:
+the bare (`MAX_FRAME_BYTES`) or camelCase name, which earlier versions also
+took, is refused with the name to use, as is a `LIMIT_` name that is not a
+limit. Omitted variables use the defaults.
+
+Several limits were renamed in November 2026. A deployment that still sets
+one by its old name, in any of its spellings, is refused with the new name
+(`src/config.ts`, `RENAMED_LIMITS`), never silently ignored:
+
+| Old | New |
+| --- | --- |
+| `LIMIT_THREAD_LIMIT` | `LIMIT_THREADS` |
+| `LIMIT_PRIVATE_ROOM_LIMIT` | `LIMIT_PRIVATE_ROOMS` |
+| `ROOM_METADATA_LIMIT` | `LIMIT_ROOM_METADATA_BYTES` |
+| `ROOM_METADATA_MIN_LIMIT` | `LIMIT_ROOM_METADATA_MIN_BYTES` |
+| `ROOM_METADATA_TOTAL_LIMIT` | `LIMIT_ROOM_METADATA_TOTAL_BYTES` |
+| `LIMIT_HISTORY_DEFAULT_LIMIT` | `LIMIT_HISTORY_PAGE_SIZE` |
+| `LIMIT_HISTORY_MAX_LIMIT` | `LIMIT_HISTORY_MAX_PAGE_SIZE` |
+| `LIMIT_RETENTION_RECORDS` | `LIMIT_HISTORY_HOT_RECORDS` |
+| `LIMIT_RETENTION_SECONDS` | `LIMIT_HISTORY_MAX_AGE_SECONDS` |
+| `LIMIT_ANONYMOUS_POSTS_PER_MINUTE` | `LIMIT_GUEST_POSTS_PER_MINUTE` |
+| `LIMIT_ANONYMOUS_POSTS_PER_DAY` | `LIMIT_GUEST_POSTS_PER_DAY` |
+| `LIMIT_ANONYMOUS_CONNECTIONS_PER_IP` | `LIMIT_GUEST_CONNECTIONS_PER_IP` |
+| `LIMIT_REGISTERED_IDENTITY_COUNT` | `LIMIT_REGISTERED_ACCOUNTS` |
+| `LIMIT_LIMITER_RECORD_CAP` | `LIMIT_LIMITER_RECORDS` |
+| `LIMIT_CLEANUP_SECONDS` | `LIMIT_CLEANUP_INTERVAL_SECONDS` |
+| `LIMIT_UNAUTHENTICATED_TIMEOUT_SECONDS` | `LIMIT_AUTH_TIMEOUT_SECONDS` |
+| `LIMIT_REPEATED_POLICY_VIOLATIONS` | `LIMIT_POLICY_VIOLATIONS_BEFORE_CLOSE` |
+| `LIMIT_ROOM_LIST_MEMBERS` | `LIMIT_ROOM_LIST_MEMBERS_PER_ROOM` |
+| `ADMISSION_OFF=true` | `ADMISSION=false` |
+
+Older versions refuse the new names (an unknown `LIMIT_` name), so roll back
+the code and `wrangler.production.toml` together ([Upgrading and rolling
+back](#upgrading-and-rolling-back)). Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
-`Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
-`retentionSeconds`, `historyD1Records`, `historyColdRecords` and
+`Number.MAX_SAFE_INTEGER` fail startup. `historyHotRecords`,
+`historyMaxAgeSeconds`, `historyD1Records`, `historyColdRecords` and
 `roomCreationWindowSeconds` also take `0`, which turns that bound off (for
 `historyD1Records`, the D1 tier; for `historyColdRecords`, the cold tier
 keeps everything; for `roomCreationWindowSeconds`, the room caps count every
@@ -1132,7 +1164,7 @@ The worker validates relationships before it accepts an HTTP request or a
 WebSocket. These checks are part of the deployment policy, not alternate
 defaults:
 
-- `historyDefaultLimit` cannot exceed `historyMaxLimit`, which is at most 50;
+- `historyPageSize` cannot exceed `historyMaxPageSize`, which is at most 50;
   one snapshot plus response overhead must fit `historyMaxResponseBytes`, which
   is at most 256 KiB.
 - A user's history burst, minute and day allowances cannot exceed their IP's,
@@ -1148,17 +1180,17 @@ defaults:
   posting limits are at least the registered ones. Global posting,
   registration, identity, and processed-frame caps are fixed demo ceilings.
   Low, high, and hard storage watermarks must be strictly ordered.
-- At least one of `retentionRecords` and `retentionSeconds` is set;
-  `retentionRecords` is at most 50,000 and `historyD1Records` at most 100,000;
-  `retentionSeconds`, when set, is at least `cleanupSeconds`;
-  `retentionRecords` largest snapshots, twice over, fit under
+- At least one of `historyHotRecords` and `historyMaxAgeSeconds` is set;
+  `historyHotRecords` is at most 50,000 and `historyD1Records` at most 100,000;
+  `historyMaxAgeSeconds`, when set, is at least `cleanupIntervalSeconds`;
+  `historyHotRecords` largest snapshots, twice over, fit under
   `databaseResumeLowWaterBytes`. `sessionTtlSeconds` is at most 30 days;
   `idleAccountSeconds` is at least a day; `keptActiveAccounts` is at most
-  `registeredIdentityCount`.
-- `roomMetadataLimit` plus 1 KiB of envelope must fit `maxFrameBytes`;
-  `roomMetadataMinLimit` is at most `roomMetadataLimit`; and
-  `roomMetadataTotalLimit` is at least `roomMetadataLimit` less
-  `roomMetadataMinLimit` and at most 256 KiB.
+  `registeredAccounts`.
+- `roomMetadataBytes` plus 1 KiB of envelope must fit `maxFrameBytes`;
+  `roomMetadataMinBytes` is at most `roomMetadataBytes`; and
+  `roomMetadataTotalBytes` is at least `roomMetadataBytes` less
+  `roomMetadataMinBytes` and at most 256 KiB.
 - A moved message re-logs every reaction set in one record, so
   `reactionUsersPerMessage` times the per-user bound (emoji at most 64 UTF-8
   bytes each, escaped, plus the user's name) must fit `historyMaxResponseBytes`.
@@ -1180,7 +1212,8 @@ IP's minute), per-type throttles 60/minute, frame blocks
 minute), `room_list` registered members 200 per room, guest-number blocks
 10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
 database high-water 768 MiB and hard target 1 GiB, cleanup 100 records,
-thread rooms 100, a room's client fields 16 KiB and every room's past the
+the thread limit by the room listing it sizes (1 MiB at worst,
+`roomListingWorstBytes`), a room's client fields 16 KiB and every room's past the
 minimum together 256 KiB, private rooms 200 and 50
 memberships per user, reactions 64 users per message
 and 16 emoji per user, and credentials/challenges 16 KiB. The ceilings for
@@ -1224,7 +1257,7 @@ implementation and recalibrating its resource model.
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
 | `BACKUP_EVERY`, `BACKUP_KEEP`, `BACKUP_PRIVATE_ROOMS` | Backups of history to the `HISTORY_BLOB` bucket, gzip-compressed and not encrypted: a schedule (empty: on demand only), how many files of each kind are kept (default 14), whether private rooms are included (default `true`). See [Backups and imports](#backups-and-imports) |
-| `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
+| `ADMISSION` | `true` (the default) or `false`: operator admission switch; `false` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
 
@@ -1403,21 +1436,33 @@ wall-clock jump cannot reset them. Cleanup and deduplication run in bounded
 batches/records, while `foreground*` and `maintenance*` are daily SQL
 operation budgets.
 
-`threadLimit` counts active thread rooms (rooms with a `parent_room_id`)
+`threads` counts active thread rooms (rooms with a `parent_room_id`)
 and the top-level rooms admins and mods create (at most 16 of them);
-`threadsPerUser` (at most `threadLimit`) caps the active threads one
-registered user has created, so one account cannot take every slot.
-`privateRoomLimit` (at most 200) counts active private rooms apart from the
+`threadsPerUser` (at most `threads`) caps the active threads one
+registered user has created, so one account cannot take every slot; a user
+holding any role (one an admin gave, as for `trustedPostsPerMinute`) is held
+only to `threads`, since a moderator re-threading conversations starts
+many. `threads` has no fixed ceiling: a room listing names twice as many
+threads (at least 200) and is sent whole, so its worst case, every listed
+public room at `roomMetadataMinBytes` plus 256 bytes and
+`roomMetadataTotalBytes` besides, must stay within 1 MiB
+(`roomListingWorstBytes`, `MAX_ROOM_LISTING_BYTES`); at the default room
+metadata limits that allows up to 288 (the caller's private rooms, at most
+`privateMembershipsPerUser`, count too). Listing and room-count reservations
+scale with it; what a user's own listing and a connection's attachment carry
+(`MAX_USER_ROOMS`, `MAX_LISTED_USER_ROOMS`) stays fixed, calibrated at 100
+(`CALIBRATED_THREAD_LIMIT`).
+`privateRooms` (at most 200) counts active private rooms apart from the
 threads; `privateRoomsPerUser` caps the active private rooms one registered
 user has started, and `privateMembershipsPerUser` (at most 50, and at least
 `privateRoomsPerUser`) the private rooms one user is in, theirs and those
 others added them to, which `ext.settings.private_rooms` advertises.
-`roomMetadataLimit` (8 KiB) bounds a room's serialized client fields
+`roomMetadataBytes` (8 KiB) bounds a room's serialized client fields
 (`title`, `description`, `ext`), so a description can hold room notes or
 another evergreen document. Every bulk path carries every room's fields:
 the joined `room_list` at every connection, a parent's thread listing, and
-the retention `room_update`. So what rooms hold past `roomMetadataMinLimit`
-(1 KiB) counts against `roomMetadataTotalLimit` (256 KiB), all rooms
+the retention `room_update`. So what rooms hold past `roomMetadataMinBytes`
+(1 KiB) counts against `roomMetadataTotalBytes` (256 KiB), all rooms
 together, private rooms included. A `room_set` that would grow that total
 past it is `too_large`. A room within the minimum, or a save that does not
 grow its room's excess, is always accepted: a full total stops only long
@@ -1428,8 +1473,8 @@ check is one scan of the capped rooms table, made only by a save that grows
 its excess. The first save it refuses tells the admins (see Admin alert
 under [Budget guard](#budget-guard)), naming the public rooms holding the
 most past the minimum, so they know which to shorten. All three are set in the `[vars]` of `wrangler.toml` and
-`wrangler.production.toml` (`ROOM_METADATA_LIMIT`, `ROOM_METADATA_MIN_LIMIT`,
-`ROOM_METADATA_TOTAL_LIMIT`). A user's `ext` is at most 512 bytes serialized
+`wrangler.production.toml` (`LIMIT_ROOM_METADATA_BYTES`, `LIMIT_ROOM_METADATA_MIN_BYTES`,
+`LIMIT_ROOM_METADATA_TOTAL_BYTES`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
 of the user carries it in its attachment). The `anonymous*` variables
 configure the guest tier (the `guest` auth scheme).
@@ -1449,35 +1494,35 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- History: `retentionRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
+- History: `historyHotRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
   `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
-- Durations: `retentionSeconds` ([History
+- Durations: `historyMaxAgeSeconds` ([History
   retention](#history-retention)), `roomCreationWindowSeconds` ([Rooms and
-  the caps](#rooms-and-the-caps)), `cleanupSeconds`, `challengeTtlSeconds`,
+  the caps](#rooms-and-the-caps)), `cleanupIntervalSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
-  resume), `idleAccountSeconds` (account upkeep, above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  resume), `idleAccountSeconds` (account upkeep, above), `authTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
   `guestPresenceAlarmSeconds` (each at most 60, the last a multiple of the one
   before; see [User status](#user-status-presence)).
 - Payload/storage bytes: `maxFrameBytes`, `maxTextBytes`, `maxSnapshotBytes`,
   `maxRequestIdBytes`, `maxNameBytes`, `historyMaxResponseBytes`, `pendingBytesPerConnection`,
   `databaseHighWaterBytes`, `databaseHardTargetBytes`,
-  `databaseResumeLowWaterBytes`, `roomMetadataLimit`, `roomMetadataMinLimit`,
-  `roomMetadataTotalLimit`, `maxCredentialBytes`,
+  `databaseResumeLowWaterBytes`, `roomMetadataBytes`, `roomMetadataMinBytes`,
+  `roomMetadataTotalBytes`, `maxCredentialBytes`,
   `maxChallengeBytes`.
 - Parser, item, and concurrency counts: `maxJsonDepth`, `maxJsonNodes`,
   `maxNameCodePoints`, `maxEmbeds`,
-  `historyDefaultLimit`, `historyMaxLimit`, `guestHistoryDepth`, `concurrentHistoryPerConnection`,
-  `registeredIdentityCount`, `openConnections`, `anonymousConnectionsPerIp`,
+  `historyPageSize`, `historyMaxPageSize`, `guestHistoryDepth`, `concurrentHistoryPerConnection`,
+  `registeredAccounts`, `openConnections`, `guestConnectionsPerIp`,
   `registeredConnectionsPerUser`, `connectionsPerIp`,
-  `pendingFramesPerConnection`, `repeatedPolicyViolations`, `cleanupBatch`,
-  `threadLimit`, `threadsPerUser`, `privateRoomLimit`, `privateRoomsPerUser`,
+  `pendingFramesPerConnection`, `policyViolationsBeforeClose`, `cleanupBatch`,
+  `threads`, `threadsPerUser`, `privateRooms`, `privateRoomsPerUser`,
   `privateMembershipsPerUser`, `reactionUsersPerMessage`, `reactionEmojisPerUser`,
-  `limiterRecordCap`, `frameLease`, `roomListMembers`, `guestNumberBlock`,
+  `limiterRecords`, `frameLease`, `roomListMembersPerRoom`, `guestNumberBlock`,
   `activityMaxTypingSeconds`, `pingSeconds` (advertised as `server.ping`), `pingTimeoutSeconds`,
   `unpingedTimeoutSeconds` (seconds; the ping timeout must be at least twice
   the interval, and the timeout for a connection that never pinged at least
-  the ping timeout). `roomListMembers`
+  the ping timeout). `roomListMembersPerRoom`
   is how many registered members each room lists in `members`, in `user_id`
   order, besides every connected member; each costs two indexed reads per
   listed room. A room with more says how many members it has in
@@ -1494,7 +1539,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 - Minute budgets: `historyRequestsPerUserMinute` and
   `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
   `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle
-  limiter row), `anonymousPostsPerMinute`,
+  limiter row), `guestPostsPerMinute`,
   `registeredPostsPerMinute`, `trustedPostsPerMinute`, `ipPostsPerMinute`, `globalPostsPerMinute`,
   `authAttemptsPerIpMinute`, `framesPerConnectionMinute`,
   `framesPerIpMinute`, `connectionAdmissionsPerIpMinute`,
@@ -1504,7 +1549,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 - UTC-day budgets: `historyRequestsPerUserDay`, `historyRequestsPerIpDay`,
   `historyRequestsPerDay` (server-wide, on the day's budget row; past it,
   history waits for the reset and everything else goes on; a page a user's
-  or IP's limits refuse is not counted), `anonymousPostsPerDay`, `registeredPostsPerDay`, `trustedPostsPerDay`,
+  or IP's limits refuse is not counted), `guestPostsPerDay`, `registeredPostsPerDay`, `trustedPostsPerDay`,
   `ipPostsPerDay`, `globalPostsPerDay`, `registrationsPerIpDay`,
   `registrationsPerDay`, `connectionAdmissionsPerDay`,
   `processedFramesPerDay`, `sqlWritesPerDay`, `sqlReadsPerDay`,
@@ -1513,11 +1558,11 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionRecords` | 5000 | 0 |
-| `retentionSeconds` | 0 | 86400 |
+| `historyHotRecords` | 5000 | 0 |
+| `historyMaxAgeSeconds` | 0 | 86400 |
 | `historyD1Records` | 100000 | 0 |
 | `historyColdRecords` | 0 |  |
-| `cleanupSeconds` | 86400 | 3600 |
+| `cleanupIntervalSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
 | `idleAccountSeconds` | 2592000 |  |
@@ -1531,8 +1576,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `maxNameCodePoints` | 80 |  |
 | `maxNameBytes` | 320 |  |
 | `maxEmbeds` | 4 |  |
-| `historyDefaultLimit` | 20 |  |
-| `historyMaxLimit` | 50 |  |
+| `historyPageSize` | 20 |  |
+| `historyMaxPageSize` | 50 |  |
 | `historyMaxResponseBytes` | 262144 |  |
 | `historyRequestsPerUserMinute` | 20 | 10 |
 | `historyRequestsPerIpMinute` | 60 | 30 |
@@ -1543,39 +1588,39 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `historyRequestsPerDay` | 400000 | 5000 |
 | `guestHistoryDepth` | 200 |  |
 | `concurrentHistoryPerConnection` | 1 |  |
-| `anonymousPostsPerMinute` | 5 |  |
-| `anonymousPostsPerDay` | 200 | 100 |
+| `guestPostsPerMinute` | 5 |  |
+| `guestPostsPerDay` | 200 | 100 |
 | `registeredPostsPerMinute` | 20 |  |
 | `registeredPostsPerDay` | 1000 | 500 |
-| `trustedPostsPerMinute` | 50 |  |
+| `trustedPostsPerMinute` | 100 | 50 |
 | `trustedPostsPerDay` | 4000 | 2000 |
-| `ipPostsPerMinute` | 30 |  |
-| `ipPostsPerDay` | 2000 | 1000 |
+| `ipPostsPerMinute` | 120 | 30 |
+| `ipPostsPerDay` | 5000 | 1000 |
 | `globalPostsPerMinute` | 600 | 60 |
 | `globalPostsPerDay` | 60000 | 5000 |
 | `registrationsPerIpDay` | 20 | 3 |
 | `registrationsPerDay` | 5000 | 100 |
-| `registeredIdentityCount` | 50000 | 10000 |
+| `registeredAccounts` | 50000 | 10000 |
 | `authAttemptsPerIpMinute` | 64 | 10 |
 | `openConnections` | 500 | 100 |
-| `anonymousConnectionsPerIp` | 24 | 2 |
-| `registeredConnectionsPerUser` | 5 | 3 |
+| `guestConnectionsPerIp` | 24 | 2 |
+| `registeredConnectionsPerUser` | 8 | 3 |
 | `connectionsPerIp` | 32 | 10 |
 | `connectionAdmissionsPerIpMinute` | 30 | 5 |
 | `connectionAdmissionsPerDay` | 300000 | 2000 |
-| `unauthenticatedTimeoutSeconds` | 30 |  |
+| `authTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |
 | `pendingBytesPerConnection` | 65536 | 131072 |
 | `framesPerConnectionMinute` | 120 | 60 |
 | `framesPerIpMinute` | 480 | 120 |
 | `processedFramesPerDay` | 6000000 | 100000 |
-| `repeatedPolicyViolations` | 3 |  |
+| `policyViolationsBeforeClose` | 3 |  |
 | `globalFramesPerMinute` | 5000 | 300 |
 | `activityBroadcastsPerUserMinute` | 10 |  |
 | `roomListRequestsPerUserMinute` | 6 |  |
 | `activityMaxTypingSeconds` | 30 |  |
 | `frameLease` | 10 |  |
-| `roomListMembers` | 200 | 100 |
+| `roomListMembersPerRoom` | 200 | 100 |
 | `pingSeconds` | 45 |  |
 | `pingTimeoutSeconds` | 150 |  |
 | `unpingedTimeoutSeconds` | 900 |  |
@@ -1594,18 +1639,18 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `databaseHardTargetBytes` | 1073741824 | 134217728 |
 | `databaseResumeLowWaterBytes` | 671088640 | 83886080 |
 | `cleanupBatch` | 100 |  |
-| `threadLimit` | 100 |  |
+| `threads` | 100 |  |
 | `threadsPerUser` | 25 |  |
 | `roomCreationWindowSeconds` | 2592000 |  |
-| `roomMetadataLimit` | 8192 |  |
-| `roomMetadataMinLimit` | 1024 |  |
-| `roomMetadataTotalLimit` | 262144 |  |
-| `privateRoomLimit` | 100 |  |
+| `roomMetadataBytes` | 8192 |  |
+| `roomMetadataMinBytes` | 1024 |  |
+| `roomMetadataTotalBytes` | 262144 |  |
+| `privateRooms` | 100 |  |
 | `privateRoomsPerUser` | 5 |  |
 | `privateMembershipsPerUser` | 20 |  |
 | `reactionUsersPerMessage` | 32 |  |
 | `reactionEmojisPerUser` | 8 |  |
 | `dedupTtlSeconds` | 86400 |  |
-| `limiterRecordCap` | 500000 | 10000 |
+| `limiterRecords` | 500000 | 10000 |
 | `maxCredentialBytes` | 16384 |  |
 | `maxChallengeBytes` | 16384 |  |

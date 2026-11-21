@@ -27,7 +27,8 @@ export interface RuntimeConfig {
 	 * out. An admin's `/server` overrides each (ApronDemoServer.serverMetadata).
 	 */
 	server: ServerMetadata;
-	admissionOff: boolean;
+	/** Admit new connections; `ADMISSION=false` refuses them in the entry Worker with 503 before the limiter or object. */
+	admission: boolean;
 	/** Advertise and relay typing (cap `activity`); `ACTIVITY` overrides the plan's default. */
 	activityEnabled: boolean;
 	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
@@ -267,7 +268,7 @@ type EnvLike = {
 	SERVER_TITLE?: string;
 	SERVER_DESCRIPTION?: string;
 	SERVER_AVATAR?: string;
-	ADMISSION_OFF?: string;
+	ADMISSION?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
@@ -325,7 +326,7 @@ function envName(name: string): string {
 }
 
 /** Limits where 0 turns the bound off (docs/configuration.md, History retention); every other limit is positive. */
-const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds", "historyD1Records", "historyColdRecords", "roomCreationWindowSeconds"]);
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["historyHotRecords", "historyMaxAgeSeconds", "historyD1Records", "historyColdRecords", "roomCreationWindowSeconds"]);
 
 function limitError(name: string): ConfigError {
 	return new ConfigError(`${name} must be a ${OPTIONAL_LIMITS.has(name) ? "non-negative" : "positive"} safe integer`);
@@ -335,10 +336,56 @@ function validLimitValue(name: string, value: unknown): boolean {
 	return typeof value === "number" && Number.isSafeInteger(value) && (value > 0 || (value === 0 && OPTIONAL_LIMITS.has(name)));
 }
 
-function parsePositiveInt(env: EnvLike, name: string, fallback: number): number {
-	const upper = envName(name);
+/**
+ * Limits renamed in November 2026, old key to new. A deployment still setting
+ * one by its old name (`LIMIT_<OLD>`, or bare as the room metadata limits
+ * were) is refused with the new name, rather than its value being ignored.
+ */
+const RENAMED_LIMITS: Readonly<Record<string, keyof Limits>> = {
+	threadLimit: "threads",
+	privateRoomLimit: "privateRooms",
+	roomMetadataLimit: "roomMetadataBytes",
+	roomMetadataMinLimit: "roomMetadataMinBytes",
+	roomMetadataTotalLimit: "roomMetadataTotalBytes",
+	historyDefaultLimit: "historyPageSize",
+	historyMaxLimit: "historyMaxPageSize",
+	retentionRecords: "historyHotRecords",
+	retentionSeconds: "historyMaxAgeSeconds",
+	anonymousPostsPerMinute: "guestPostsPerMinute",
+	anonymousPostsPerDay: "guestPostsPerDay",
+	anonymousConnectionsPerIp: "guestConnectionsPerIp",
+	registeredIdentityCount: "registeredAccounts",
+	limiterRecordCap: "limiterRecords",
+	cleanupSeconds: "cleanupIntervalSeconds",
+	unauthenticatedTimeoutSeconds: "authTimeoutSeconds",
+	repeatedPolicyViolations: "policyViolationsBeforeClose",
+	roomListMembers: "roomListMembersPerRoom",
+};
+
+/**
+ * Refuses variables this version no longer reads: a renamed limit or switch
+ * by its old name, and a limit set without its `LIMIT_` prefix (bare, or by
+ * its camelCase key), which earlier versions also took.
+ */
+function assertCurrentNames(env: EnvLike): void {
 	const values = env as EnvLike & Record<string, unknown>;
-	const raw = values[`LIMIT_${upper}`] ?? values[upper] ?? values[name];
+	const set = (name: string) => values[name] !== undefined;
+	for (const [old, renamed] of Object.entries(RENAMED_LIMITS)) {
+		for (const name of [`LIMIT_${envName(old)}`, envName(old), old]) {
+			if (set(name)) throw new ConfigError(`${name} was renamed to LIMIT_${envName(renamed)} (docs/configuration.md)`);
+		}
+	}
+	if (set("ADMISSION_OFF")) throw new ConfigError("ADMISSION_OFF was renamed to ADMISSION, which is true unless set to false: ADMISSION_OFF=true is now ADMISSION=false");
+	for (const key of Object.keys(DEFAULT_LIMITS)) {
+		for (const name of [envName(key), key]) {
+			if (set(name)) throw new ConfigError(`${name} must be set as LIMIT_${envName(key)}`);
+		}
+	}
+}
+
+function parsePositiveInt(env: EnvLike, name: string, fallback: number): number {
+	const values = env as EnvLike & Record<string, unknown>;
+	const raw = values[`LIMIT_${envName(name)}`];
 	if (raw === undefined || raw === "") return fallback;
 	const value = typeof raw === "number" ? raw : Number(raw);
 	if (!validLimitValue(name, value)) throw limitError(name);
@@ -378,7 +425,7 @@ function validateLimits(limits: Limits): void {
 		fail("authentication payload exceeds the frame policy");
 	}
 
-	if (limits.historyMaxLimit > budget.MAX_HISTORY_LIMIT || limits.historyDefaultLimit > limits.historyMaxLimit) {
+	if (limits.historyMaxPageSize > budget.MAX_HISTORY_LIMIT || limits.historyPageSize > limits.historyMaxPageSize) {
 		fail("history default exceeds the bounded history maximum");
 	}
 	if (limits.historyMaxResponseBytes > budget.MAX_HISTORY_RESPONSE_BYTES || limits.maxSnapshotBytes + 1024 > limits.historyMaxResponseBytes) {
@@ -413,18 +460,18 @@ function validateLimits(limits: Limits): void {
 	}
 
 	if (limits.idleAccountSeconds < 86_400) fail("idleAccountSeconds must be at least a day");
-	if (limits.keptActiveAccounts > limits.registeredIdentityCount) fail("keptActiveAccounts must be at most registeredIdentityCount");
-	if (limits.registeredIdentityCount > budget.MAX_REGISTERED_IDENTITIES || limits.limiterRecordCap > budget.MAX_LIMITER_RECORDS) {
+	if (limits.keptActiveAccounts > limits.registeredAccounts) fail("keptActiveAccounts must be at most registeredAccounts");
+	if (limits.registeredAccounts > budget.MAX_REGISTERED_IDENTITIES || limits.limiterRecords > budget.MAX_LIMITER_RECORDS) {
 		fail("identity or limiter records exceed the calibrated bound");
 	}
-	if (limits.anonymousConnectionsPerIp > limits.connectionsPerIp || limits.connectionsPerIp > limits.openConnections || limits.registeredConnectionsPerUser > limits.openConnections) {
+	if (limits.guestConnectionsPerIp > limits.connectionsPerIp || limits.connectionsPerIp > limits.openConnections || limits.registeredConnectionsPerUser > limits.openConnections) {
 		fail("connection limits exceed their enclosing scope");
 	}
 	if (limits.connectionAdmissionsPerIpMinute > limits.connectionAdmissionsPerDay) {
 		fail("connection admission minute limit exceeds its daily limit");
 	}
 
-	if (limits.framesPerConnectionMinute > budget.MAX_CONNECTION_FRAME_RATE || limits.framesPerConnectionMinute > limits.framesPerIpMinute || limits.framesPerIpMinute > limits.processedFramesPerDay || limits.processedFramesPerDay > budget.MAX_PROCESSED_FRAMES || limits.repeatedPolicyViolations > limits.framesPerConnectionMinute) {
+	if (limits.framesPerConnectionMinute > budget.MAX_CONNECTION_FRAME_RATE || limits.framesPerConnectionMinute > limits.framesPerIpMinute || limits.framesPerIpMinute > limits.processedFramesPerDay || limits.processedFramesPerDay > budget.MAX_PROCESSED_FRAMES || limits.policyViolationsBeforeClose > limits.framesPerConnectionMinute) {
 		fail("connection attachment counters exceed bounded policy");
 	}
 	if (limits.framesPerIpMinute > limits.globalFramesPerMinute || limits.globalFramesPerMinute > budget.MAX_GLOBAL_FRAMES_PER_MINUTE || limits.globalFramesPerMinute > limits.processedFramesPerDay) {
@@ -433,10 +480,10 @@ function validateLimits(limits: Limits): void {
 	if (limits.activityBroadcastsPerUserMinute > budget.MAX_TYPE_THROTTLE_PER_MINUTE || limits.roomListRequestsPerUserMinute > budget.MAX_TYPE_THROTTLE_PER_MINUTE) {
 		fail("per-type throttles exceed their attachment bound");
 	}
-	if (limits.frameLease > budget.MAX_FRAME_LEASE || limits.frameLease > limits.framesPerConnectionMinute || limits.frameLease * limits.anonymousConnectionsPerIp > limits.framesPerIpMinute) {
+	if (limits.frameLease > budget.MAX_FRAME_LEASE || limits.frameLease > limits.framesPerConnectionMinute || limits.frameLease * limits.guestConnectionsPerIp > limits.framesPerIpMinute) {
 		fail("frame blocks exceed the per-connection or per-IP frame policy");
 	}
-	if (limits.roomListMembers > budget.MAX_ROOM_LIST_MEMBERS) {
+	if (limits.roomListMembersPerRoom > budget.MAX_ROOM_LIST_MEMBERS) {
 		fail("room_list members exceed the calibrated bound");
 	}
 	if (limits.presenceAlarmSeconds > MAX_STATUS_DELAY_SECONDS || limits.guestPresenceAlarmSeconds > MAX_STATUS_DELAY_SECONDS ||
@@ -458,7 +505,7 @@ function validateLimits(limits: Limits): void {
 	if (limits.globalPostsPerMinute > budget.MAX_GLOBAL_POSTS_PER_MINUTE || limits.globalPostsPerDay > budget.MAX_GLOBAL_POSTS_PER_DAY || limits.globalPostsPerMinute > limits.globalPostsPerDay) {
 		fail("global posting policy exceeds the demo ceiling");
 	}
-	if (limits.anonymousPostsPerMinute > limits.anonymousPostsPerDay || limits.registeredPostsPerMinute > limits.registeredPostsPerDay || limits.ipPostsPerMinute > limits.ipPostsPerDay || limits.trustedPostsPerMinute > limits.trustedPostsPerDay) {
+	if (limits.guestPostsPerMinute > limits.guestPostsPerDay || limits.registeredPostsPerMinute > limits.registeredPostsPerDay || limits.ipPostsPerMinute > limits.ipPostsPerDay || limits.trustedPostsPerMinute > limits.trustedPostsPerDay) {
 		fail("posting minute limit exceeds its daily limit");
 	}
 	if (limits.trustedPostsPerMinute < limits.registeredPostsPerMinute || limits.trustedPostsPerDay < limits.registeredPostsPerDay) {
@@ -474,37 +521,41 @@ function validateLimits(limits: Limits): void {
 	if (limits.databaseHighWaterBytes > budget.MAX_DATABASE_HIGH_WATER_BYTES || limits.databaseHardTargetBytes > budget.MAX_DATABASE_HARD_TARGET_BYTES) {
 		fail("resource ceilings exceed the demo allocation");
 	}
-	if (limits.retentionRecords === 0 && limits.retentionSeconds === 0) fail("retentionRecords or retentionSeconds must be set");
-	if (limits.retentionRecords > budget.MAX_RETENTION_RECORDS) fail("retentionRecords exceeds the calibrated bound");
+	if (limits.historyHotRecords === 0 && limits.historyMaxAgeSeconds === 0) fail("historyHotRecords or historyMaxAgeSeconds must be set");
+	if (limits.historyHotRecords > budget.MAX_RETENTION_RECORDS) fail("historyHotRecords exceeds the calibrated bound");
 	if (limits.historyD1Records > budget.MAX_HISTORY_D1_RECORDS) fail("historyD1Records exceeds the calibrated bound");
 	if (limits.cleanupThresholdPercent > 100) fail("cleanupThresholdPercent is a share of the limits, at most 100");
-	if (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.cleanupSeconds) fail("retentionSeconds must be at least one cleanup interval");
+	if (limits.historyMaxAgeSeconds > 0 && limits.historyMaxAgeSeconds < limits.cleanupIntervalSeconds) fail("historyMaxAgeSeconds must be at least one cleanup interval");
 	// Cleanup at the storage watermark moves what is past the count down: the
 	// records it keeps, even every one a largest snapshot (twice that, for
 	// their indexes and state rows), must fit under the watermark that
 	// resumes posting, or a flood could hold posting off with records the
 	// count keeps.
-	if (limits.retentionRecords > 0 && limits.retentionRecords * limits.maxSnapshotBytes * 2 > limits.databaseResumeLowWaterBytes) {
-		fail("retentionRecords of the largest snapshots must fit under databaseResumeLowWaterBytes");
+	if (limits.historyHotRecords > 0 && limits.historyHotRecords * limits.maxSnapshotBytes * 2 > limits.databaseResumeLowWaterBytes) {
+		fail("historyHotRecords of the largest snapshots must fit under databaseResumeLowWaterBytes");
 	}
 	if (!Number.isSafeInteger(limits.sessionTtlSeconds) || limits.sessionTtlSeconds <= 0 || limits.sessionTtlSeconds > 30 * 24 * 60 * 60) {
 		fail("session lifetime must be between one second and thirty days");
 	}
-	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.roomMetadataLimit > budget.MAX_ROOM_METADATA_LIMIT) {
+	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.roomMetadataBytes > budget.MAX_ROOM_METADATA_LIMIT) {
 		fail("metadata or cleanup exceeds calibrated bounds");
 	}
+	// The thread limit has no fixed ceiling: the listing it sizes must fit (budget.ts).
+	if (budget.roomListingWorstBytes(limits) > budget.MAX_ROOM_LISTING_BYTES) {
+		fail("threads (the thread limit) is too large for a room listing with these room metadata limits; lower it, roomMetadataMinBytes or roomMetadataTotalBytes");
+	}
 	// A room_set carries the fields in one frame, with its envelope.
-	if (limits.roomMetadataLimit + 1024 > limits.maxFrameBytes) fail("roomMetadataLimit must fit one frame");
-	if (limits.roomMetadataMinLimit > limits.roomMetadataLimit) fail("roomMetadataMinLimit cannot exceed roomMetadataLimit");
+	if (limits.roomMetadataBytes + 1024 > limits.maxFrameBytes) fail("roomMetadataBytes must fit one frame");
+	if (limits.roomMetadataMinBytes > limits.roomMetadataBytes) fail("roomMetadataMinBytes cannot exceed roomMetadataBytes");
 	// One room filled to its limit fits the total.
-	if (limits.roomMetadataTotalLimit > budget.MAX_ROOM_METADATA_TOTAL_LIMIT || limits.roomMetadataTotalLimit < limits.roomMetadataLimit - limits.roomMetadataMinLimit) {
-		fail("roomMetadataTotalLimit must be between roomMetadataLimit less roomMetadataMinLimit and the calibrated ceiling");
+	if (limits.roomMetadataTotalBytes > budget.MAX_ROOM_METADATA_TOTAL_LIMIT || limits.roomMetadataTotalBytes < limits.roomMetadataBytes - limits.roomMetadataMinBytes) {
+		fail("roomMetadataTotalBytes must be between roomMetadataBytes less roomMetadataMinBytes and the calibrated ceiling");
 	}
-	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
-		fail("threadsPerUser must be between 1 and threadLimit");
+	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threads) {
+		fail("threadsPerUser must be between 1 and the thread limit (threads)");
 	}
-	if (!Number.isSafeInteger(limits.privateRoomLimit) || limits.privateRoomLimit < 1 || limits.privateRoomLimit > budget.MAX_PRIVATE_ROOM_LIMIT) {
-		fail("privateRoomLimit must be between 1 and the calibrated private room ceiling");
+	if (!Number.isSafeInteger(limits.privateRooms) || limits.privateRooms < 1 || limits.privateRooms > budget.MAX_PRIVATE_ROOM_LIMIT) {
+		fail("privateRooms must be between 1 and the calibrated private room ceiling");
 	}
 	if (!Number.isSafeInteger(limits.privateMembershipsPerUser) || limits.privateMembershipsPerUser < 1 || limits.privateMembershipsPerUser > budget.MAX_PRIVATE_MEMBERSHIPS_PER_USER) {
 		fail("privateMembershipsPerUser must be between 1 and the calibrated per-user ceiling");
@@ -552,6 +603,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 }
 
 function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
+	assertCurrentNames(env);
 	const limits = { ...DEFAULT_LIMITS } as Limits;
 	for (const key of Object.keys(limits) as (keyof Limits)[]) {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
@@ -588,8 +640,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	// An origin outside RP_ID is a WebAuthn related origin: browsers allow it
 	// where https://<RP_ID>/.well-known/webauthn lists it, which the Worker
 	// answers when it serves RP_ID's host (handleRelatedOrigins).
-	if (env.ADMISSION_OFF !== undefined && !["true", "false"].includes(String(env.ADMISSION_OFF).toLowerCase())) throw new ConfigError("ADMISSION_OFF must be true or false");
-	const admissionOff = String(env.ADMISSION_OFF ?? "").toLowerCase() === "true";
+	const admission = parseSwitch(env.ADMISSION, "ADMISSION", true);
 	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
@@ -629,7 +680,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		rpOrigins,
 		rpName,
 		server,
-		admissionOff,
+		admission,
 		activityEnabled,
 		guestPosting,
 		presence,

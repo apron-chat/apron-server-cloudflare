@@ -30,7 +30,7 @@ function withoutObject(extra: Partial<Env> = {}): Env {
 it('stops admission before the DO and before spending an attempt', async () => {
 	const ip = '198.18.1.1';
 	for (let i = 0; i <= ADMISSION_BUDGET.requestsPerIpMinute; i++) {
-		const response = await fetchEntry(upgrade(ip), withoutObject({ ADMISSION_OFF: 'true' }));
+		const response = await fetchEntry(upgrade(ip), withoutObject({ ADMISSION: 'false' }));
 		expect(response.status).toBe(503);
 		expect(await response.text()).toContain('Demo admission is closed');
 	}

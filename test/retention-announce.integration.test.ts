@@ -19,7 +19,7 @@ it('tells members of expired thread rooms they left, even when the room listing 
 			// by age, as the plan's count is far from reached here, and no archive.
 			const store = (instance as unknown as { store: { config: Record<string, unknown> } }).store;
 			const config = store.config;
-			store.config = { ...config, retentionRecords: 0, retentionMs: 60_000, tiered: false };
+			store.config = { ...config, historyHotRecords: 0, retentionMs: 60_000, tiered: false };
 			state.storage.sql.exec('UPDATE records SET commit_ms = 0');
 			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0, cleanup_cursor = NULL, cleanup_cutoff_ms = NULL WHERE id = 1');
 			// Simulate an exhausted budget for the re-announcement listing.

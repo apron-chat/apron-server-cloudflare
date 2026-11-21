@@ -3,7 +3,7 @@ import { contentPolicy } from '../../src/content/policy';
 
 const policy = contentPolicy({
 	maxTextBytes: 64, maxEmbeds: 2, ogMediaHosts: [], maxNameBytes: 32, maxNameCodePoints: 16,
-	maxSnapshotBytes: 512, reactionEmojisPerUser: 3, roomMetadataLimit: 128,
+	maxSnapshotBytes: 512, reactionEmojisPerUser: 3, roomMetadataBytes: 128,
 });
 
 const record = (kind: string, value: Record<string, unknown>) => ({ room_id: 'lobby', log_id: 7, commit_ms: 7, kind, record_json: JSON.stringify(value) }) as Parameters<typeof policy.record>[0];

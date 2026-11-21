@@ -118,7 +118,7 @@ missed a ping, then the oldest.
 
 | Error | Limit | Usual cause |
 | --- | --- | --- |
-| `denied` "Signed out here: this account signed in on a newer connection, and at most 5 may be open at once. Sign in to use it here again." (an error with no `id`, then a 1008 close) | 5 signed-in connections per account, across all devices and addresses. A sign-in past it is not refused: another of the account's connections is closed instead, one that stopped answering pings if any, else the oldest, and the new one gets a `~private` notice saying how many were open and when the closed one opened. | More tabs, devices or test instances on one account than 5, or old sockets not yet closed or stale (see above). Bots count too: 5 per bot. Don't reconnect automatically after this error, or two clients will take turns closing each other. |
+| `denied` "Signed out here: this account signed in on a newer connection, and at most 8 may be open at once. Sign in to use it here again." (an error with no `id`, then a 1008 close) | 8 signed-in connections per account, across all devices and addresses. A sign-in past it is not refused: another of the account's connections is closed instead, one that stopped answering pings if any, else the oldest, and the new one gets a `~private` notice saying how many were open and when the closed one opened. | More tabs, devices or test instances on one account than 8, or old sockets not yet closed or stale (see above). Bots count too: 8 per bot. Don't reconnect automatically after this error, or two clients will take turns closing each other. |
 | `retry_after` "Authentication attempts limited" | 64 auth attempts a minute per address, failed ones included (each connection's `auth` is one, guests too) | Retrying a failing `auth` in a loop. |
 | `retry_after` "Registration limit reached for this network" / "Registration limit reached" | 20 registrations a day per address; 5,000 a day on the server. Adding a passkey and a first `/invite-bot` each count as one. | Creating test accounts from one network. |
 | `unsupported` "Passkeys are not offered to origin "https://x.example"" or "… to a connection that sends no Origin"; `denied` "Origin "https://x.example" is not configured for passkeys" or "This connection sends no Origin; …" (a passkey `finish` with a credential, or a passkey session `token`) | A passkey ceremony in the client, and the session it gives, work only from the configured origin (`https://web.apron.chat` on the demo). On the demo's host, every other client gets the passkey page in a begin's `external.url`; its bearer token resumes from any origin or none. | A third-party client on another origin, or a native client, which sends no Origin, running the ceremony itself. Use the passkey page, a guest, a bot token (`/invite-bot`) or a device token (`/invite-device`), which work from any origin or none. |
@@ -143,8 +143,8 @@ join or leave that changes nothing is free). Refusals carry `ext.limits`
 | Message | Limit |
 | --- | --- |
 | Guest posting limit reached | Guests (when the deployment lets them post): 5 a minute per address |
-| Posting limit reached | 20 a minute per account (50 with any role); 30 a minute per address; 600 a minute on the server |
-| Daily posting limit reached | 1,000 a day per account (4,000 with any role); 200 per guest address; 2,000 per address |
+| Posting limit reached | 20 a minute per account (100 with any role); 120 a minute per address; 600 a minute on the server |
+| Daily posting limit reached | 1,000 a day per account (4,000 with any role); 200 per guest address; 5,000 per address |
 | Daily posting limit reached for the server | 60,000 a day on the server |
 
 A request with an `id` that matches one accepted in the last 24 hours is
@@ -283,7 +283,7 @@ first.
 
 | Cap | Limit |
 | --- | ---: |
-| Threads a user has started in 30 days | 25 |
+| Threads a user has started in 30 days | 25 (no limit but the server's with any role) |
 | Threads started on the server in 30 days (`thread_limit`) | 100 |
 | Private rooms a user has started in 30 days / is a member of | 5 / 20 |
 | Private rooms started on the server in 30 days | 100 |
@@ -293,7 +293,7 @@ first.
 | Room mutes per user | 100 |
 | Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
-The thread and private-room caps count the rooms started in the last 30 days: they limit how fast rooms are started, not how many exist. A room stops counting 30 days after it was started, or as soon as everyone has left it; posting in, joining or leaving a room never needs a slot, however old. Rooms are kept as long as their history. A room list names every top-level room and the 200 most recently active threads; an older one is still there by its `room_id`. A user may be in at most 1,000 rooms; leave one to join another.
+The thread and private-room caps count the rooms started in the last 30 days: they limit how fast rooms are started, not how many exist. A room stops counting 30 days after it was started, or as soon as everyone has left it; posting in, joining or leaving a room never needs a slot, however old. Rooms are kept as long as their history. A room list names every top-level room and the most recently active threads, twice the server's thread limit (200); an older one is still there by its `room_id`. A user may be in at most 1,000 rooms; leave one to join another.
 
 ## Checklist: a well-behaved client
 
@@ -302,7 +302,7 @@ The thread and private-room caps count the rooms started in the last 30 days: th
 - [ ] Open one connection per signed-in client instance, and close it
       (`socket.close()`) before opening its replacement: on reconnect, sign
       out, component unmount, hot reload, and `pagehide`.
-- [ ] Keep at most 5 connections per account across all tabs and devices.
+- [ ] Keep at most 8 connections per account across all tabs and devices.
       Share one connection between views where you can, and use separate
       accounts for test instances.
 - [ ] Reconnect with exponential backoff and jitter (for example 1 s doubling

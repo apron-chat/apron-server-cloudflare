@@ -331,13 +331,16 @@ posts.
   one not joined, is not charged and reserves nothing.
 - `members` (`room_list` with `members: true`, and `room_update` `joined`)
   reads each listed room's registered members by primary-key range with one
-  identity lookup each, at most `roomListMembers` (200 on Paid, 100 on Free)
-  per room: the reservation is `8 + rooms × (4 + 2 × roomListMembers)`
+  identity lookup each, at most `roomListMembersPerRoom` (200 on Paid, 100 on Free)
+  per room: the reservation is `8 + rooms × (4 + 2 × roomListMembersPerRoom)`
   reads (`3 ×` with [user status](#user-status)). Connected members come
   from connection attachments. The worst case, all 101 rooms each at the
   cap, measured 40,401 reads at 200, which the 25,000,000 foreground reads a
   day allow about 600 times (about 20,200 at Free's 100, about 120 times its
-  2,500,000). A room whose page of registered members is full also reads its
+  2,500,000). That is at `threads` 100: a listing names up to
+  `1 + 16 + 2 × threads` public rooms and the caller's private ones, so at
+  the most the config check allows (288 on Paid) it is about 613 rooms and
+  about 248,000 reads, about 100 times the foreground reads a day. A room whose page of registered members is full also reads its
   `member_count` (one row, within the per-room slack).
 - Adding a passkey while signed in (§4.10) is one reservation of 96 reads
   and 48 writes, charged as a registration (the per-IP and daily
@@ -600,7 +603,7 @@ registered members, by what the members have stored:
 | worst: each with a status row (`dnd` and a mute) | 401 | 601 | 1.0 |
 | reserved | 420 | 620 | |
 
-The reservation per room is `4 + 3 × roomListMembers` (`4 + 2 ×` without
+The reservation per room is `4 + 3 × roomListMembersPerRoom` (`4 + 2 ×` without
 status); all 101 rooms at the cap, every member with a status row, read
 60,500 rows against the 61,020 reserved (40,401 without status).
 

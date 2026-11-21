@@ -46,7 +46,7 @@ declare global {
 		SERVER_TITLE?: string;
 		SERVER_DESCRIPTION?: string;
 		SERVER_AVATAR?: string;
-		ADMISSION_OFF?: string;
+		ADMISSION?: string;
 		ATTACK_PAUSE?: string;
 		BILL_CAP_DAY?: string;
 		BILL_CAP_MONTH?: string;
@@ -102,7 +102,7 @@ declare global {
 			SERVER_TITLE?: string;
 			SERVER_DESCRIPTION?: string;
 			SERVER_AVATAR?: string;
-			ADMISSION_OFF?: string;
+			ADMISSION?: string;
 			ATTACK_PAUSE?: string;
 			BILL_CAP_DAY?: string;
 			BILL_CAP_MONTH?: string;

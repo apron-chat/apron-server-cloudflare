@@ -34,77 +34,116 @@ tag = "v1"
 new_sqlite_classes = ["ApronDemoServer"]
 
 [vars]
-# A parent domain of this server's host: anything else on apron.chat may issue
-# passkeys for it, which this server cannot see. Leave SIGNAL_UNKNOWN_PASSKEYS
-# unset (off) unless this server is the sole user of this RP ID, or the
-# passkey page would ask devices to drop those passkeys
-# (docs/configuration.md).
+# Every variable is documented in docs/configuration.md. Limits are set as
+# LIMIT_<NAME>; those written out here are the paid plan's own values
+# (src/plans/paid.ts), so this file says what they are. npm run budget:check
+# loads this table as the Worker does, so a bad value fails before a deploy.
+
+# ---- Passkeys and origins ----
+# Which sites may connect and sign in. RP_ID is a parent domain of this
+# server's host: anything else on apron.chat may issue passkeys for it, which
+# this server cannot see, so SIGNAL_UNKNOWN_PASSKEYS stays unset (off) unless
+# this server is the sole user of the RP ID, or the passkey page would ask
+# devices to drop those passkeys.
 RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
-# The server frame's title, description and avatar (docs/configuration.md,
-# Server title, description and avatar); an admin's /server overrides each.
+
+# ---- Server identity ----
+# The server frame's title, description and avatar (the Apron icon, square at
+# 512px, served by apron-web); an admin's /server overrides each.
 SERVER_TITLE = "Apron Demo"
 SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."
-# The Apron icon, square at 512px, served by apron-web.
 SERVER_AVATAR = "https://web.apron.chat/icon-512.png"
-# Room titles and descriptions (docs/configuration.md, Runtime overrides), in
-# serialized bytes: a room's limit; what every room may always hold; and the
-# total of what rooms hold past that minimum, which bounds a listing of every
-# room. A save that would grow the total past it is refused.
-ROOM_METADATA_LIMIT = "8192"
-ROOM_METADATA_MIN_LIMIT = "1024"
-ROOM_METADATA_TOTAL_LIMIT = "262144"
+
+# ---- Cloudflare account ----
+# For the budget guard and /status: the account whose usage it reads, the
+# apron.chat zone where it turns the apron_budget_stop rule on and off (with
+# the ACCOUNT_ANALYTICS_TOKEN and EDGE_STOP_TOKEN secrets), and the dataset
+# METRICS (below) writes, for /status to read active users back
+# (src/active-users.ts; npm run budget:check holds the two equal).
 ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
-# The dataset METRICS (below) writes, for /status to read active users back
-# (src/active-users.ts); npm run budget:check holds the two equal.
-METRICS_DATASET = "apron_server_metrics"
-# The apron.chat zone, where the budget guard turns the apron_budget_stop rule
-# on and off (with the EDGE_STOP_TOKEN secret).
 ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
-# Uploads: the bucket's public domain, and where write URLs point. Uploads are
-# off until the UPLOAD_SIGNING_KEY secret is set too.
+METRICS_DATASET = "apron_server_metrics"
+
+# ---- Uploads ----
+# The MEDIA bucket's public domain, and this server's own origin, where write
+# URLs point. Uploads are off until the UPLOAD_SIGNING_KEY secret is set too.
+# The media host sends X-Content-Type-Options: nosniff (the
+# apron_media_nosniff edge rule, docs/edge-rules.generated.json), so
+# attachments may be text.
 MEDIA_ORIGIN = "https://media.apron.chat"
 PUBLIC_ORIGIN = "https://server.apron.chat"
-# The media host sends X-Content-Type-Options: nosniff (the apron_media_nosniff
-# edge rule, docs/edge-rules.generated.json), so attachments may be text.
 MEDIA_NOSNIFF = "true"
-# Push (src/webpush.ts): on only with the VAPID_PRIVATE_KEY secret set too.
-# The private key must match this public key.
+
+# ---- Push ----
+# Web push (src/webpush.ts), on only with the VAPID_PRIVATE_KEY secret set
+# too, which must match this public key. The push services registrations may
+# name: the browsers' own (src/config.ts DEFAULT_PUSH_HOSTS), and
+# push.stupidtech.net added to them.
 VAPID_PUBLIC_KEY = "BF-ztm22-yk6-AvyxkBGWzxaiA_CnO1c9vDAe1-RMg0WJ_EuNgmPhxxTyUq6J0nhaFxNxmcFsAc6KVfWLkdDl0M"
 VAPID_SUBJECT = "https://server.apron.chat"
-# The push services registrations may name: the browsers' own (the default,
-# src/config.ts DEFAULT_PUSH_HOSTS), and push.stupidtech.net added to them.
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
-# History (docs/configuration.md, History retention, History tiers, Backups
-# and imports): the paid plan's own limits, written out so this file says
-# what they are. SQLite keeps 5,000 records (moved down at once when the
-# database reaches its watermark), and no age limit; D1 (HISTORY_D1, below)
-# 100,000 more;
-# the cold tier (HISTORY_BLOB) keeps everything past that (0). Each daily
-# cleanup keeps 80% of each count.
-LIMIT_RETENTION_RECORDS = "5000"
-LIMIT_RETENTION_SECONDS = "0"
-LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+# ---- History and backups ----
+# How much history each tier keeps (History retention, History tiers): the
+# object's SQLite (the hot tier) 5,000 records, moved down at once when the
+# database reaches its watermark; D1 (HISTORY_D1, below) 100,000 more; the
+# cold tier (HISTORY_BLOB) everything past that (0). No age limit (0). Each
+# daily cleanup keeps 80% of each count.
+LIMIT_HISTORY_HOT_RECORDS = "5000"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_COLD_RECORDS = "0"
-# The thread and private-room caps count the rooms started in the last 30
-# days: they limit how fast rooms are started, not how many exist, and rooms
-# are kept as long as their history (docs/configuration.md, Rooms). 0 counts
-# every room that exists.
-LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
-# Backups to HISTORY_BLOB under backups/: one a day (and an admin's
-# `/history export`), the newest 14 of each kind kept, private rooms
-# included, gzip-compressed. They are not encrypted: the bucket being
-# private is what keeps them so.
+LIMIT_HISTORY_MAX_AGE_SECONDS = "0"
+LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+# Backups to HISTORY_BLOB under backups/ (Backups and imports): one a day (and
+# an admin's /history export), the newest 14 of each kind kept, private rooms
+# included, gzip-compressed. They are not encrypted: the bucket being private
+# is what keeps them so.
 BACKUP_EVERY = "1d"
 BACKUP_KEEP = "14"
 BACKUP_PRIVATE_ROOMS = "true"
 
+# ---- Rooms ----
+# How fast rooms may be started, and how much their titles and descriptions
+# hold (Rooms). The caps count rooms started in the last 30 days: they limit
+# how fast rooms are started, not how many exist, and rooms are kept as long
+# as their history (0 counts every room that exists).
+LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
+# Public rooms and threads started in that window, server-wide and per
+# registered user; a user holding any role (one an admin gave) is held only
+# to the server-wide limit. LIMIT_THREADS has no fixed ceiling: the deploy
+# check refuses one whose worst-case room listing would pass 1 MiB with the
+# room metadata limits below (288 with these).
+LIMIT_THREADS = "100"
+LIMIT_THREADS_PER_USER = "25"
+# Room titles and descriptions, in serialized bytes: a room's limit; what
+# every room may always hold; and the total of what rooms hold past that
+# minimum, which bounds a listing of every room. A save that would grow the
+# total past it is refused.
+LIMIT_ROOM_METADATA_BYTES = "8192"
+LIMIT_ROOM_METADATA_MIN_BYTES = "1024"
+LIMIT_ROOM_METADATA_TOTAL_BYTES = "262144"
+
+# ---- Posting ----
+# Posts (and reactions, moves, room saves) a minute and a day (Posting). Role
+# holders' allowance is kept under the 120 frames a connection may send a
+# minute, past which it is closed rather than slowed; one address's is shared
+# by the registered users behind it (guests stay at 5 a minute an address).
+LIMIT_TRUSTED_POSTS_PER_MINUTE = "100"
+LIMIT_TRUSTED_POSTS_PER_DAY = "4000"
+LIMIT_IP_POSTS_PER_MINUTE = "120"
+LIMIT_IP_POSTS_PER_DAY = "5000"
+
+# ---- Connections ----
+# Open connections one registered user may hold: a phone, a laptop and a few
+# tabs, with room for a stale socket or two. Past it, a sign-in closes the
+# account's oldest connection.
+LIMIT_REGISTERED_CONNECTIONS_PER_USER = "8"
+
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
 # tiers). Records there stay in history but become read-only: once the
-# object's own SQLite holds more than LIMIT_RETENTION_RECORDS, the oldest
+# object's own SQLite holds more than LIMIT_HISTORY_HOT_RECORDS, the oldest
 # move here, where history pages still read them, but their messages can no
 # longer be edited, reacted to or replied to. The tier keeps
 # LIMIT_HISTORY_D1_RECORDS of them, then they go on to the cold tier, or
@@ -160,44 +199,55 @@ crons = ["* * * * *"]
 # in ten) is inherited. No Preview secrets are needed; production's are not
 # inherited (`npx wrangler preview base-config secret put` adds them).
 [previews.vars]
+# The same groups as [vars], with what differs for Previews.
+
+# ---- Passkeys and origins ----
 # Preview passkeys belong to their own RP ID, never to production's
-# apron.chat; every Preview host is under it, so each serves the passkey page.
+# apron.chat; every Preview host is under it, so each serves the passkey
+# page. No client is on that RP ID's own origin, which nothing serves: every
+# client, web.apron.chat and apron-web Previews included, signs in through the
+# passkey page (RP_ORIGINS must list one exact origin when ALLOWED_ORIGINS is
+# *). Every Preview shares that RP ID with its own storage, so another
+# Preview's passkey is unknown here but not stale: the page must not ask the
+# device to drop it.
 RP_ID = "previews.apron.chat"
-# No client is on that RP ID's own origin, which nothing serves: every client,
-# web.apron.chat and apron-web Previews included, signs in through the passkey
-# page. (RP_ORIGINS must list one exact origin when ALLOWED_ORIGINS is *.)
 RP_ORIGINS = "https://previews.apron.chat"
-# Every Preview shares that RP ID with its own storage, so another Preview's
-# passkey is unknown here but not stale: the page must not ask the device to
-# drop it.
-SIGNAL_UNKNOWN_PASSKEYS = "false"
 ALLOWED_ORIGINS = "*"
-# The Previews' own dataset (below), never production's.
-METRICS_DATASET = "apron_server_metrics_preview"
+SIGNAL_UNKNOWN_PASSKEYS = "false"
+# Off in production; on here so Previews exercise external sign-in too.
+EXTERNAL_SIGN_IN = "true"
+
+# ---- Server identity ----
 SERVER_TITLE = "Apron Demo (preview)"
 SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."
 SERVER_AVATAR = "https://web.apron.chat/icon-512.png"
-# Off in production; on here so Previews exercise external sign-in too.
-EXTERNAL_SIGN_IN = "true"
-ROOM_METADATA_LIMIT = "8192"
-ROOM_METADATA_MIN_LIMIT = "1024"
-ROOM_METADATA_TOTAL_LIMIT = "262144"
+
+# ---- Cloudflare account ----
 # Inert without the ACCOUNT_ANALYTICS_TOKEN and EDGE_STOP_TOKEN secrets, which
-# Previews lack: the budget guard runs only in production.
+# Previews lack: the budget guard runs only in production. The Previews' own
+# metrics dataset (below), never production's.
 ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
 ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
-# Uploads, live text and push are off, empty here so that `wrangler preview`
-# sees them set: PUBLIC_ORIGIN is one fixed origin, where each Preview has its
-# own (npm run budget:check refuses one here), and push needs VAPID keys of
-# its own. Without uploads no MEDIA bucket is bound, which `wrangler preview`
-# lists as missing; that is expected.
+METRICS_DATASET = "apron_server_metrics_preview"
+
+# ---- Uploads and push ----
+# Off, empty here so that `wrangler preview` sees them set: PUBLIC_ORIGIN is
+# one fixed origin, where each Preview has its own (npm run budget:check
+# refuses one here), and push needs VAPID keys of its own. Without uploads no
+# MEDIA bucket is bound, which `wrangler preview` lists as missing; that is
+# expected. PUSH_HOSTS_EXTRA is for when push is on.
 MEDIA_ORIGIN = ""
 PUBLIC_ORIGIN = ""
 MEDIA_NOSNIFF = ""
 VAPID_PUBLIC_KEY = ""
 VAPID_SUBJECT = ""
-# For when push is on.
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
+
+# ---- Rooms ----
+# As in production. Every other limit is the plan's default, as in production.
+LIMIT_ROOM_METADATA_BYTES = "8192"
+LIMIT_ROOM_METADATA_MIN_BYTES = "1024"
+LIMIT_ROOM_METADATA_TOTAL_BYTES = "262144"
 
 [previews.version_metadata]
 binding = "CF_VERSION_METADATA"

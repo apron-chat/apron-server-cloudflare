@@ -2140,7 +2140,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 			const now = Date.now();
 			const old = now - 3 * SEEN_WRITE_GRANULARITY_MS;
 			store.settleSeen({ userId, at: old, now });
-			const seenOf = () => store.roomMembers(['general'], DEFAULT_LIMITS.roomListMembers, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
+			const seenOf = () => store.roomMembers(['general'], DEFAULT_LIMITS.roomListMembersPerRoom, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
 			expect(seenOf()).toBe(old);
 			const spy = vi.spyOn(store, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
 			expect(() => store.setStatus({ userId, choice: 'invisible', seenAt: now, now })).toThrow('status write failed');

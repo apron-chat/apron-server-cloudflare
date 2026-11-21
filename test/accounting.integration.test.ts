@@ -239,8 +239,8 @@ describe('measured storage accounting', () => {
 	it('charges rejected quota work and stops repeated denial before more SQL work', async () => {
 		const stub = env.DEMO.getByName('accounting-rejections-v1');
 		const config = defaultStoreConfig({
-			anonymousPostsPerMinute: 1,
-			anonymousPostsPerDay: 100,
+			guestPostsPerMinute: 1,
+			guestPostsPerDay: 100,
 			ipPostsPerMinute: 1,
 			ipPostsPerDay: 100,
 			globalPostsPerMinute: 100,
@@ -315,8 +315,8 @@ describe('measured storage accounting', () => {
 	it('preserves limiter state across object eviction and does not rewrite schema on reinitialization', async () => {
 		const stub = env.DEMO.getByName('accounting-persistence-v1');
 		const config = defaultStoreConfig({
-			anonymousPostsPerMinute: 100,
-			anonymousPostsPerDay: 1,
+			guestPostsPerMinute: 100,
+			guestPostsPerDay: 1,
 			ipPostsPerMinute: 100,
 			ipPostsPerDay: 100,
 			globalPostsPerMinute: 100,
@@ -399,25 +399,25 @@ describe('measured storage accounting', () => {
 			expect(joined.rooms).not.toContain('expired-thread');
 			expectWithinReserve(join);
 
-			// Members of every room at the listing cap: roomListMembers registered
+			// Members of every room at the listing cap: roomListMembersPerRoom registered
 			// members in each of the 101 rooms, read by primary-key range with a
 			// name lookup each.
 			state.storage.transactionSync(() => {
-				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembers; index += 1) {
+				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembersPerRoom; index += 1) {
 					state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', 0, 0)", `member-${index}`, `member-handle-${index}`, `Member ${index}`);
 					for (const room of rooms) state.storage.sql.exec('INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)', room.room_id, `member-${index}`);
 				}
 			});
 			const beforeMembers = snapshot(store);
-			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembers, clock.now());
+			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
 			const memberListing = costSince(store, beforeMembers);
-			expect([...members.values()].every((list) => list.length === DEFAULT_LIMITS.roomListMembers)).toBe(true);
+			expect([...members.values()].every((list) => list.length === DEFAULT_LIMITS.roomListMembersPerRoom)).toBe(true);
 			expectWithinReserve(memberListing);
 			// With status, at its worst: every member has a `user_status` row (a
 			// chosen status and a mute), with as many registrations and room mutes
 			// as a user may hold, which a listing does not read.
 			state.storage.transactionSync(() => {
-				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembers; index += 1) {
+				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembersPerRoom; index += 1) {
 					state.storage.sql.exec("INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, 'dnd', ?)", `member-${index}`, clock.now() + HOUR);
 					for (let registration = 0; registration < PUSH_POLICY!.subscriptionsPerUser; registration += 1) {
 						state.storage.sql.exec(
@@ -429,7 +429,7 @@ describe('measured storage accounting', () => {
 				}
 			});
 			const beforeStatus = snapshot(store);
-			const withStatus = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembers, clock.now(), undefined, true);
+			const withStatus = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now(), undefined, true);
 			const statusListing = costSince(store, beforeStatus);
 			expect(withStatus.get('general')?.find((member) => member.user_id === 'member-1')?.choice).toBe('dnd');
 			expectWithinReserve(statusListing);
@@ -439,13 +439,72 @@ describe('measured storage accounting', () => {
 		console.info('accounting-room-list', JSON.stringify(result));
 	});
 
+	it('scales room listing and counting reservations with a thread limit above the calibrated 100', async () => {
+		const stub = env.DEMO.getByName('accounting-room-list-scaled');
+		const result = await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const maxThreads = 250;
+			const store = new Store(state, defaultStoreConfig({ maxThreads }), clock);
+			store.initialize();
+			// More recent threads than the cap allows, as after a window lengthened
+			// since, and more rooms than a user's own listing (MAX_USER_ROOMS, 351).
+			const count = maxThreads + 150;
+			state.storage.transactionSync(() => {
+				for (let index = 1; index <= count; index += 1) {
+					state.storage.sql.exec(
+						`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+						 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
+						`thread-${index}`, clock.now() + 1_000 + index, clock.now() + 1_000 + index, clock.now() + 1_000 + index,
+						JSON.stringify({ title: `Thread ${index}`, description: `description ${index}` }), clock.now(), clock.now(),
+					);
+				}
+			});
+
+			const beforeListing = snapshot(store);
+			const rooms = store.listRooms(clock.now());
+			const listing = costSince(store, beforeListing);
+			// Every one is named: a listing names twice the thread limit.
+			expect(rooms).toHaveLength(count + 1);
+			expectWithinReserve(listing);
+
+			const beforeCounts = snapshot(store);
+			expect(store.roomCounts(clock.now()).public.recent).toBe(count);
+			const counting = costSince(store, beforeCounts);
+			expectWithinReserve(counting);
+
+			// A registration that starts in as many rooms as the thread limit.
+			const beforeRegistration = snapshot(store);
+			const registered = store.registerIdentity({
+				userId: 'lister', name: 'Lister', userHandle: 'lister-handle', now: clock.now(), ipKey: 'lister-ip',
+				credential: { credentialId: 'lister-credential', userId: 'lister', publicKey: 'key', counter: 0 },
+				rooms: ['general', ...Array.from({ length: maxThreads }, (_, index) => `thread-${index + 1}`)],
+			});
+			const registration = costSince(store, beforeRegistration);
+			expect(registered.broadcasts).toHaveLength(maxThreads + 1);
+			expectWithinReserve(registration);
+
+			// Members are filled in for every room the listing names, past MAX_USER_ROOMS too.
+			state.storage.transactionSync(() => {
+				for (const room of rooms) state.storage.sql.exec('INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)', room.room_id, 'lister');
+			});
+			const beforeMembers = snapshot(store);
+			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
+			const memberListing = costSince(store, beforeMembers);
+			expect(rooms.every((room) => members.get(room.room_id)?.some((member) => member.user_id === 'lister'))).toBe(true);
+			expectWithinReserve(memberListing);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { rooms: rooms.length, listing, counting, registration, memberListing };
+		});
+		console.info('accounting-room-list-scaled', JSON.stringify(result));
+	});
+
 	it('measures member listings with status by population, and reuses a listing until a write', async () => {
 		const stub = env.DEMO.getByName('accounting-member-status-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! }, memberCacheMs: MINUTE }), clock);
 			store.initialize();
-			const members = DEFAULT_LIMITS.roomListMembers;
+			const members = DEFAULT_LIMITS.roomListMembersPerRoom;
 			// Four rooms of `members` registered members each: none with status
 			// state; each with two live waking registrations and a room mute
 			// (neither read by a listing); a mix (a third with push, a tenth
@@ -586,7 +645,7 @@ describe('measured storage accounting', () => {
 			// The calibrated per-message and per-user ceilings, not the defaults.
 			reactionUsersPerMessage: 64,
 			reactionEmojisPerUser: 16,
-			anonymousPostsPerMinute: 1_000,
+			guestPostsPerMinute: 1_000,
 			ipPostsPerMinute: 1_000,
 			globalPostsPerMinute: 1_000,
 		});
@@ -715,8 +774,8 @@ describe('measured storage accounting', () => {
 		// Tiny ceilings are used only for deterministic exhaustion. All row-cost
 		// estimates and maintenance ceilings remain the deployment defaults.
 		const config = defaultStoreConfig({
-			anonymousPostsPerMinute: 1_000,
-			anonymousPostsPerDay: 1_000,
+			guestPostsPerMinute: 1_000,
+			guestPostsPerDay: 1_000,
 			ipPostsPerMinute: 1_000,
 			ipPostsPerDay: 1_000,
 			globalPostsPerMinute: 1_000,
@@ -1026,8 +1085,8 @@ describe('measured storage accounting', () => {
 			measure('room record lookup', () => store.getRoomState());
 			measure('room join lookup', () => store.getRoom(threadId));
 			measure('room listing', () => store.listRooms(clock.now()));
-			measure('room members (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now()));
-			measure('room members with status (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now(), undefined, true));
+			measure('room members (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembersPerRoom, clock.now()));
+			measure('room members with status (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembersPerRoom, clock.now(), undefined, true));
 			expect(measure('status inputs at sign-in, nothing stored', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
 			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
 			measure('status set', () => store.setStatus({ userId: 'matrix-user', choice: 'dnd', now: clock.now() }));

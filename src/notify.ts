@@ -97,7 +97,7 @@ export function noticeText(notice: TriggerNotice): string {
 				? ` The most past it: ${notice.rooms.map((room) => `${room.title ? `\`${shown(room.title)}\` ` : ""}(\`${room.room_id}\`, ${kib(room.bytes)})`).join(", ")}.`
 				: "";
 			// Raising the limit is advice only below its calibrated ceiling.
-			const raise = notice.limitBytes < notice.ceilingBytes ? `, or raise \`ROOM_METADATA_TOTAL_LIMIT\` (at most ${kib(notice.ceilingBytes)})` : "";
+			const raise = notice.limitBytes < notice.ceilingBytes ? `, or raise \`LIMIT_ROOM_METADATA_TOTAL_BYTES\` (at most ${kib(notice.ceilingBytes)})` : "";
 			return `**Long room descriptions are full: ${kib(notice.totalBytes)} past ${kib(notice.minBytes)} a room, of the ${kib(notice.limitBytes)} they may hold together.** A room's title and description can no longer grow past ${kib(notice.minBytes)}; rooms within it, new ones included, still save.${largest} Shorten one with its Edit${raise}. Told again only after it falls under ${kib(notice.rearmBytes)}.`;
 		}
 		case "history_stall": {

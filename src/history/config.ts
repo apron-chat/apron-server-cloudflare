@@ -29,8 +29,8 @@ import { type HeadStore, storeHead } from "./store-head";
 
 /** The history limits (src/budget.ts Limits). */
 export interface HistoryLimits {
-	retentionRecords: number;
-	retentionSeconds: number;
+	historyHotRecords: number;
+	historyMaxAgeSeconds: number;
 	historyD1Records: number;
 	historyColdRecords: number;
 	cleanupThresholdPercent: number;
@@ -148,8 +148,8 @@ export function d1Enabled(env: HistoryEnv, limits: Pick<HistoryLimits, "historyD
 /** The head's retention, from the limits: its own count and age ceiling. */
 export function headRetention(limits: HistoryLimits): Retention {
 	return {
-		...(limits.retentionRecords > 0 ? { records: limits.retentionRecords } : {}),
-		...(limits.retentionSeconds > 0 ? { ageMs: limits.retentionSeconds * 1_000 } : {}),
+		...(limits.historyHotRecords > 0 ? { records: limits.historyHotRecords } : {}),
+		...(limits.historyMaxAgeSeconds > 0 ? { ageMs: limits.historyMaxAgeSeconds * 1_000 } : {}),
 		thresholdPercent: limits.cleanupThresholdPercent,
 	};
 }

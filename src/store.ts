@@ -17,7 +17,10 @@ import {
   MAX_MEMBERSHIPS_PER_USER,
   MAX_PRIVATE_MEMBERSHIPS_PER_USER,
   MAX_PRIVATE_ROOM_LIMIT,
-  MAX_THREAD_LIMIT,
+  CALIBRATED_THREAD_LIMIT,
+  MAX_CREATED_ROOMS,
+  listedThreadScale,
+  listedThreads,
   SEEN_WRITE_GRANULARITY_MS,
   thresholdRecords,
   type LiveTextPolicy,
@@ -142,38 +145,25 @@ const ROOM_INDEX_DDL = [
   `CREATE INDEX IF NOT EXISTS ${ROOM_HEAD_INDEX} ON rooms (${ROOM_KIND}, latest_log_id)`,
   `CREATE INDEX IF NOT EXISTS ${ROOM_CREATED_INDEX} ON rooms (${ROOM_KIND}, created_log_id)`,
 ];
-/** Threads a listing names, the most recently active (listRooms): older ones are read by their room_id, and exported (allRooms). */
-const LISTED_THREADS = 2 * MAX_THREAD_LIMIT;
 /** Private rooms a maintenance listing names, the most recently active. */
 const LISTED_PRIVATE_ROOMS = 2 * MAX_PRIVATE_ROOM_LIMIT;
 /**
  * Most rooms one registered user's listing names as joined (userRooms), the
- * most recently active: the public rooms and threads a listing names, and
- * their share of private ones.
+ * most recently active: the public rooms and threads a listing names at
+ * CALIBRATED_THREAD_LIMIT, and their share of private ones. Fixed whatever
+ * `threads` is: it is what a connection's attachment carries
+ * (MAX_LISTED_USER_ROOMS), which has a fixed size, so a user in more rooms
+ * is delivered to in the most recently active of them.
  */
-const MAX_USER_ROOMS = 3 * MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
+const MAX_USER_ROOMS = 3 * CALIBRATED_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
 /**
  * A join past MAX_MEMBERSHIPS_PER_USER (budget.ts) is refused, so the reads
  * of a user's own rooms (userRooms, their private rooms, a purge or rename
  * of them) stay bounded and reserved for (MAX_MEMBERSHIP_ROWS).
  */
 const MEMBERSHIP_LIMIT_MESSAGE = `A user may be in at most ${MAX_MEMBERSHIPS_PER_USER} rooms; leave one to join another`;
-/**
- * Most public rows a listing reads (listRooms): `general` and the top-level
- * rooms (MAX_CREATED_ROOMS, well within one MAX_THREAD_LIMIT), and the
- * LISTED_THREADS threads it names.
- */
-const PUBLIC_ROOM_ROWS = MAX_THREAD_LIMIT + LISTED_THREADS + 1;
 /** Most private rows a maintenance listing reads: the ones it names. */
 const PRIVATE_ROOM_ROWS = LISTED_PRIVATE_ROOMS;
-/**
- * Reads for counting a kind's rooms created within the window
- * (recentRoomCount), or a user's among them: its range of
- * ROOM_CREATED_INDEX, which the caps keep within the ceilings (a room is
- * created, or restored inside the window, only while there is a slot), with
- * room for a window lengthened since, and index pages.
- */
-const ROOM_COUNT_READS = 2 * Math.max(PUBLIC_ROOM_ROWS, PRIVATE_ROOM_ROWS) + 16;
 /** The most members a private room may have for its members to see each other's read cursors (read receipts). */
 export const MAX_READ_RECEIPT_MEMBERS = 10;
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
@@ -227,14 +217,14 @@ export interface StoreConfig {
   /** Records older than this have expired whatever the count; 0 sets no age limit (retentionCutoff). */
   retentionMs: number;
   /** History keeps at least the latest this many records; 0 keeps no count (retentionCutoff). */
-  retentionRecords: number;
+  historyHotRecords: number;
   /**
    * Whether history tiers lie below this SQLite (the history chain,
    * src/history/: the D1 tier where it is bound): records leaving it are
    * copied down first, and history is published from the deepest tier's floor.
    */
   tiered: boolean;
-  /** The share of `retentionRecords` that each cleanup keeps, in percent (keptHotRecords). */
+  /** The share of `historyHotRecords` that each cleanup keeps, in percent (keptHotRecords). */
   cleanupThresholdPercent: number;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
@@ -261,11 +251,11 @@ export interface StoreConfig {
    */
   roomCreationWindowMs: number;
   /** Serialized client fields of one room record. */
-  roomMetadataLimit: number;
-  /** Serialized client fields every room may hold whatever the total (roomMetadataMinLimit). */
-  roomMetadataMinLimit: number;
-  /** Serialized client fields past roomMetadataMinLimit, of every room together (roomMetadataTotalLimit). */
-  roomMetadataTotalLimit: number;
+  roomMetadataBytes: number;
+  /** Serialized client fields every room may hold whatever the total (roomMetadataMinBytes). */
+  roomMetadataMinBytes: number;
+  /** Serialized client fields past roomMetadataMinBytes, of every room together (roomMetadataTotalBytes). */
+  roomMetadataTotalBytes: number;
   /** Private rooms (§4.2.4) that may exist at once, beside the threads. */
   maxPrivateRooms: number;
   /** Live private rooms one registered user may have created (`creator_id`) at once. */
@@ -275,7 +265,7 @@ export interface StoreConfig {
   reactionUsersPerMessage: number;
   reactionEmojisPerUser: number;
   maxHistoryLimit: number;
-  historyDefaultLimit: number;
+  historyPageSize: number;
   maxHistoryResponseBytes: number;
   historyRequestsPerUserMinute: number;
   historyRequestsPerIpMinute: number;
@@ -289,8 +279,8 @@ export interface StoreConfig {
    * `before` alone: the records past `before` must be fewer than this.
    */
   guestHistoryDepth: number;
-  anonymousPostsPerMinute: number;
-  anonymousPostsPerDay: number;
+  guestPostsPerMinute: number;
+  guestPostsPerDay: number;
   registeredPostsPerMinute: number;
   registeredPostsPerDay: number;
   /** A trusted user's posts (a registered user holding any role, which only an admin gives), in place of the registered limits; also their IP's allowance, when larger. */
@@ -302,7 +292,7 @@ export interface StoreConfig {
   globalPostsPerDay: number;
   registrationsPerIpDay: number;
   registrationsPerDay: number;
-  registeredIdentityCount: number;
+  registeredAccounts: number;
   authAttemptsPerIpMinute: number;
   framesPerIpMinute: number;
   processedFramesPerDay: number;
@@ -566,33 +556,33 @@ export interface UploadWrite {
 }
 
 const DEFAULT_CONFIG: StoreConfig = {
-  retentionMs: DEFAULT_LIMITS.retentionSeconds * 1000,
-  retentionRecords: DEFAULT_LIMITS.retentionRecords,
+  retentionMs: DEFAULT_LIMITS.historyMaxAgeSeconds * 1000,
+  historyHotRecords: DEFAULT_LIMITS.historyHotRecords,
   tiered: false,
   cleanupThresholdPercent: DEFAULT_LIMITS.cleanupThresholdPercent,
   idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
   keptActiveAccounts: DEFAULT_LIMITS.keptActiveAccounts,
   dedupTtlMs: DEDUP_TTL_MS,
-  cleanupIntervalMs: DEFAULT_LIMITS.cleanupSeconds * 1000,
+  cleanupIntervalMs: DEFAULT_LIMITS.cleanupIntervalSeconds * 1000,
   cleanupBatch: DEFAULT_LIMITS.cleanupBatch,
   maxSnapshotBytes: DEFAULT_LIMITS.maxSnapshotBytes,
   maxTextBytes: DEFAULT_LIMITS.maxTextBytes,
   maxNameBytes: DEFAULT_LIMITS.maxNameBytes,
   maxNameCodePoints: DEFAULT_LIMITS.maxNameCodePoints,
   maxEmbeds: DEFAULT_LIMITS.maxEmbeds,
-  maxThreads: DEFAULT_LIMITS.threadLimit,
+  maxThreads: DEFAULT_LIMITS.threads,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
   roomCreationWindowMs: DEFAULT_LIMITS.roomCreationWindowSeconds * 1000,
-  roomMetadataLimit: DEFAULT_LIMITS.roomMetadataLimit,
-  roomMetadataMinLimit: DEFAULT_LIMITS.roomMetadataMinLimit,
-  roomMetadataTotalLimit: DEFAULT_LIMITS.roomMetadataTotalLimit,
-  maxPrivateRooms: DEFAULT_LIMITS.privateRoomLimit,
+  roomMetadataBytes: DEFAULT_LIMITS.roomMetadataBytes,
+  roomMetadataMinBytes: DEFAULT_LIMITS.roomMetadataMinBytes,
+  roomMetadataTotalBytes: DEFAULT_LIMITS.roomMetadataTotalBytes,
+  maxPrivateRooms: DEFAULT_LIMITS.privateRooms,
   maxPrivateRoomsPerUser: DEFAULT_LIMITS.privateRoomsPerUser,
   maxPrivateMembershipsPerUser: DEFAULT_LIMITS.privateMembershipsPerUser,
   reactionUsersPerMessage: DEFAULT_LIMITS.reactionUsersPerMessage,
   reactionEmojisPerUser: DEFAULT_LIMITS.reactionEmojisPerUser,
-  maxHistoryLimit: DEFAULT_LIMITS.historyMaxLimit,
-  historyDefaultLimit: DEFAULT_LIMITS.historyDefaultLimit,
+  maxHistoryLimit: DEFAULT_LIMITS.historyMaxPageSize,
+  historyPageSize: DEFAULT_LIMITS.historyPageSize,
   maxHistoryResponseBytes: DEFAULT_LIMITS.historyMaxResponseBytes,
   historyRequestsPerUserMinute: DEFAULT_LIMITS.historyRequestsPerUserMinute,
   historyRequestsPerIpMinute: DEFAULT_LIMITS.historyRequestsPerIpMinute,
@@ -602,8 +592,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   historyRequestsPerIpDay: DEFAULT_LIMITS.historyRequestsPerIpDay,
   historyRequestsPerDay: DEFAULT_LIMITS.historyRequestsPerDay,
   guestHistoryDepth: DEFAULT_LIMITS.guestHistoryDepth,
-  anonymousPostsPerMinute: DEFAULT_LIMITS.anonymousPostsPerMinute,
-  anonymousPostsPerDay: DEFAULT_LIMITS.anonymousPostsPerDay,
+  guestPostsPerMinute: DEFAULT_LIMITS.guestPostsPerMinute,
+  guestPostsPerDay: DEFAULT_LIMITS.guestPostsPerDay,
   registeredPostsPerMinute: DEFAULT_LIMITS.registeredPostsPerMinute,
   registeredPostsPerDay: DEFAULT_LIMITS.registeredPostsPerDay,
   trustedPostsPerMinute: DEFAULT_LIMITS.trustedPostsPerMinute,
@@ -614,13 +604,13 @@ const DEFAULT_CONFIG: StoreConfig = {
   globalPostsPerDay: DEFAULT_LIMITS.globalPostsPerDay,
   registrationsPerIpDay: DEFAULT_LIMITS.registrationsPerIpDay,
   registrationsPerDay: DEFAULT_LIMITS.registrationsPerDay,
-  registeredIdentityCount: DEFAULT_LIMITS.registeredIdentityCount,
+  registeredAccounts: DEFAULT_LIMITS.registeredAccounts,
   authAttemptsPerIpMinute: DEFAULT_LIMITS.authAttemptsPerIpMinute,
   framesPerIpMinute: DEFAULT_LIMITS.framesPerIpMinute,
   processedFramesPerDay: DEFAULT_LIMITS.processedFramesPerDay,
   connectionAdmissionsPerIpMinute: DEFAULT_LIMITS.connectionAdmissionsPerIpMinute,
   connectionAdmissionsPerDay: DEFAULT_LIMITS.connectionAdmissionsPerDay,
-  principalLimitCap: DEFAULT_LIMITS.limiterRecordCap,
+  principalLimitCap: DEFAULT_LIMITS.limiterRecords,
   sqlReadsPerDay: DEFAULT_LIMITS.sqlReadsPerDay,
   sqlWritesPerDay: DEFAULT_LIMITS.sqlWritesPerDay,
   foregroundReadsPerDay: DEFAULT_LIMITS.foregroundReadsPerDay,
@@ -648,13 +638,13 @@ const DEFAULT_CONFIG: StoreConfig = {
 
 export function defaultStoreConfig(overrides: Partial<StoreConfig> = {}): StoreConfig {
   const merged = { ...DEFAULT_CONFIG, ...overrides };
-  if (merged.retentionMs < 0 || merged.retentionRecords < 0 || (merged.retentionMs === 0 && merged.retentionRecords === 0) || merged.dedupTtlMs <= 0) {
+  if (merged.retentionMs < 0 || merged.historyHotRecords < 0 || (merged.retentionMs === 0 && merged.historyHotRecords === 0) || merged.dedupTtlMs <= 0) {
     throw new Error("retention needs an age or a count, and dedup TTL must be positive");
   }
   if (merged.maxSnapshotBytes <= 0 || merged.maxTextBytes <= 0) {
     throw new Error("snapshot and text limits must be positive");
   }
-  if (merged.historyDefaultLimit <= 0 || merged.maxHistoryLimit < merged.historyDefaultLimit) {
+  if (merged.historyPageSize <= 0 || merged.maxHistoryLimit < merged.historyPageSize) {
     throw new Error("history limits are inconsistent");
   }
   // A limiter row idle for LIMITER_IDLE_MS is removed, so no limiter may still matter by then.
@@ -1107,11 +1097,6 @@ export const RESTORE_USERS_BATCH = 200;
 export const UNCLAIMED_ROLE = "unclaimed";
 /** The longest avatar URL an imported user keeps. */
 const MAX_RESTORED_AVATAR_BYTES = 2_048;
-/**
- * Reads for checkRoomFieldsTotal(): the rooms a listing names (listedRoomRows),
- * public and private, with slack for index pages.
- */
-const ROOM_FIELDS_TOTAL_READS = 16 + 2 * (PUBLIC_ROOM_ROWS + PRIVATE_ROOM_ROWS);
 /** A duration as a refusal names it: whole days (`30 days`), else hours. */
 function windowDays(ms: number): string {
   const days = ms / 86_400_000;
@@ -1119,8 +1104,8 @@ function windowDays(ms: number): string {
   const hours = Math.max(1, Math.round(ms / 3_600_000));
   return hours === 1 ? "1 hour" : `${hours} hours`;
 }
-/** Most removed rooms awaiting purge; cleanup removes no further room past it. */
-const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
+/** Most removed rooms awaiting purge; cleanup removes no further room past it. Fixed, like MAX_USER_ROOMS: a larger backlog waits for the next run. */
+const MAX_PURGE_ROOMS = CALIBRATED_THREAD_LIMIT;
 /**
  * Membership rows one user may hold: at most MAX_MEMBERSHIPS_PER_USER, and
  * those of removed rooms awaiting purge. What a purge or rename of them
@@ -1341,12 +1326,7 @@ export const BOT_NAME_RULE = "A bot's name must contain \"bot\"";
  * permanent, as `general` is: they neither expire nor go when emptied.
  */
 export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
-/**
- * Most top-level rooms created besides `general`. They also count against
- * the thread ceiling (`maxThreads`), which bounds the rooms table, and,
- * being permanent, this keeps them from taking all of its slots.
- */
-export const MAX_CREATED_ROOMS = 16;
+export { MAX_CREATED_ROOMS };
 /** Most rooms userRooms lists: MAX_USER_ROOMS, the top-level rooms, and a room just joined. What a connection's attachment carries. */
 export const MAX_LISTED_USER_ROOMS = MAX_USER_ROOMS + MAX_CREATED_ROOMS + 2;
 /** Most roles one user holds, so the column stays small. */
@@ -2183,9 +2163,9 @@ function settledMeta(key: string, initial: string): SettledMeta {
 
 /** What a room_set's total check saw (Store.takeRoomNotesCheck). */
 export interface RoomNotesCheck {
-  /** What rooms hold past roomMetadataMinLimit, together: with the save, or on a refusal as they are. */
+  /** What rooms hold past roomMetadataMinBytes, together: with the save, or on a refusal as they are. */
   total: number;
-  /** The save was refused: the total was past roomMetadataTotalLimit. */
+  /** The save was refused: the total was past roomMetadataTotalBytes. */
   full?: true;
   /** On a refusal, the public rooms holding the most past the minimum. */
   rooms?: Array<{ room_id: string; title?: string; bytes: number }>;
@@ -2198,6 +2178,43 @@ export class Store {
   private readonly durableStorage?: DurableStateLike["storage"];
   private readonly transactionSync?: <T>(closure: () => T) => T;
   private initialized = false;
+  /** Threads a listing names, the most recently active (listRooms, budget.ts listedThreads): older ones are read by their room_id, and exported (allRooms). */
+  private get listedThreadCount(): number {
+    return listedThreads(this.config.maxThreads);
+  }
+  /**
+   * Most public rows a listing reads (listRooms): `general` and the top-level
+   * rooms (MAX_CREATED_ROOMS, well within one thread scale), and the
+   * listedThreadCount threads it names.
+   */
+  private get publicRoomRows(): number {
+    return listedThreadScale(this.config.maxThreads) + this.listedThreadCount + 1;
+  }
+  /**
+   * Most rooms one `room_list` names, whose members roomMembers fills in:
+   * `general`, the created rooms, the listed threads and the caller's private
+   * rooms, or a user's own listing (MAX_USER_ROOMS), whichever is more.
+   */
+  private get listedRoomBound(): number {
+    return Math.max(MAX_USER_ROOMS, 1 + MAX_CREATED_ROOMS + this.listedThreadCount + this.config.maxPrivateMembershipsPerUser);
+  }
+  /**
+   * Reads for counting a kind's rooms created within the window
+   * (recentRoomCount), or a user's among them: its range of
+   * ROOM_CREATED_INDEX, which the caps keep within the ceilings (a room is
+   * created, or restored inside the window, only while there is a slot), with
+   * room for a window lengthened since, and index pages.
+   */
+  private get roomCountReads(): number {
+    return 2 * Math.max(this.publicRoomRows, PRIVATE_ROOM_ROWS) + 16;
+  }
+  /**
+   * Reads for checkRoomFieldsTotal(): the rooms a listing names (listedRoomRows),
+   * public and private, with slack for index pages.
+   */
+  private get roomFieldsTotalReads(): number {
+    return 16 + 2 * (this.publicRoomRows + PRIVATE_ROOM_ROWS);
+  }
   /** What the last room_set's total check saw, until taken (takeRoomNotesCheck). */
   private roomNotesCheck?: RoomNotesCheck;
   private inTransaction = false;
@@ -3270,7 +3287,7 @@ export class Store {
    * identities too, so the reservation allows twice the registration cap.
    */
   usersWithRole(role: string, limit: number, now = this.clock.now()): string[] {
-    return this.reserved({ reads: 2 * this.config.registeredIdentityCount + 64 }, false, now, () =>
+    return this.reserved({ reads: 2 * this.config.registeredAccounts + 64 }, false, now, () =>
       this.rawRows<{ user_id: string; roles_json: string }>("SELECT user_id, roles_json FROM identities WHERE roles_json LIKE ?", `%${JSON.stringify(role)}%`)
         .filter((row) => parseRoles(row.roles_json).includes(role))
         .map((row) => row.user_id)
@@ -3554,7 +3571,7 @@ export class Store {
 
   /**
    * What the last room_set's total check saw (checkRoomFieldsTotal), then
-   * forgotten: the total of what rooms hold past roomMetadataMinLimit, with
+   * forgotten: the total of what rooms hold past roomMetadataMinBytes, with
    * this save's room, and on a refusal `full` with the public rooms holding
    * the most past it. Undefined when that save ran no check (it did not grow
    * its room past the minimum). Kept outside the transaction, which a
@@ -3688,7 +3705,7 @@ export class Store {
   private roomListingReads(): number {
     // One room row per room, with slack for index pages;
     // test/accounting.integration.test.ts measures the cap.
-    return 32 + 4 * PUBLIC_ROOM_ROWS;
+    return 32 + 4 * this.publicRoomRows;
   }
 
   /**
@@ -3715,7 +3732,7 @@ export class Store {
   /**
    * The rooms a listing names, oldest first: every top-level public room
    * (`general` and those created, at most MAX_CREATED_ROOMS), and the
-   * LISTED_THREADS threads most recently active; `withPrivate`, the
+   * listedThreadCount threads most recently active; `withPrivate`, the
    * LISTED_PRIVATE_ROOMS private rooms most recently active. Rooms are kept
    * until their log has left every tier, so the threads and private rooms
    * are each a bounded range of ROOM_HEAD_INDEX, newest head first, however
@@ -3726,7 +3743,7 @@ export class Store {
     const newest = (kind: 0 | 1 | 2, limit: number) => this.rawRows<RawRoomRow>(
       `SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${roomKind(kind)} ORDER BY latest_log_id DESC LIMIT ?`, limit,
     );
-    const rows = [...newest(0, MAX_CREATED_ROOMS + 1), ...newest(1, LISTED_THREADS)];
+    const rows = [...newest(0, MAX_CREATED_ROOMS + 1), ...newest(1, this.listedThreadCount)];
     if (withPrivate) rows.push(...newest(2, LISTED_PRIVATE_ROOMS));
     return rows.sort((a, b) => integerColumn(a.created_log_id) - integerColumn(b.created_log_id) || (a.room_id < b.room_id ? -1 : 1));
   }
@@ -4148,7 +4165,7 @@ export class Store {
    * memberships come with the rooms' records (restoreRoom) and listings
    * (restoreMembers). IDs a guest or
    * an owner's bot has, or that an admin could not issue, are skipped.
-   * Each placeholder counts against registeredIdentityCount; a call that
+   * Each placeholder counts against registeredAccounts; a call that
    * would pass it is refused whole, before anything is written. At most
    * RESTORE_USERS_BATCH users a call; charged to maintenance, so a day's
    * exhausted budget refuses it with `retry_after`, and a retry skips what
@@ -4166,8 +4183,8 @@ export class Store {
       const fresh = [...unique.values()].filter((user) => !this.identityRow(user.user_id) && !this.retiredUserId(user.user_id));
       if (!fresh.length) return [];
       const count = this.metaNumber("identity_count");
-      if (count + fresh.length > this.config.registeredIdentityCount) {
-        throw new StoreError("denied", `registration_closed: ${fresh.length} new users would pass this server's ${this.config.registeredIdentityCount} accounts (it has ${count})`.slice(0, 200));
+      if (count + fresh.length > this.config.registeredAccounts) {
+        throw new StoreError("denied", `registration_closed: ${fresh.length} new users would pass this server's ${this.config.registeredAccounts} accounts (it has ${count})`.slice(0, 200));
       }
       const effective = this.effectiveNow(now);
       for (const user of fresh) {
@@ -4335,7 +4352,7 @@ export class Store {
     // its state row read and written (a member's identity too, and for a
     // private room their private rooms); and the log head.
     const cost = {
-      reads: 128 + EMPTY_ROOM_SCAN + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + ROOM_COUNT_READS + 4 * fresh.length + 8 * keys + 4 * named.size +
+      reads: 128 + EMPTY_ROOM_SCAN + this.roomFieldsTotalReads + MAX_CREATED_ROOMS + this.roomCountReads + 4 * fresh.length + 8 * keys + 4 * named.size +
         memberships.size * (MEMBERSHIP_COUNT_READS + (isPrivate ? this.userRoomsReads() : 0)),
       writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
     };
@@ -5029,7 +5046,7 @@ export class Store {
     // Ranking reads every identity twice, each with its passkeys and a bot
     // lookup; bots and the admin are identities beyond the cap.
     const perIdentity = 2 * (3 + MAX_PASSKEYS_PER_USER);
-    const found = this.reserved({ reads: 64 + perIdentity * (2 * this.config.registeredIdentityCount + 1) + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
+    const found = this.reserved({ reads: 64 + perIdentity * (2 * this.config.registeredAccounts + 1) + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
       const candidates = this.rawRows<{ user_id: string }>(
         `SELECT i.user_id FROM identities i
          WHERE i.roles_json = '[]' AND i.user_id != ? AND ${lastActiveSql("i")} < ?
@@ -5141,7 +5158,7 @@ export class Store {
   dueRetiredUserIds(now = this.clock.now()): string[] {
     this.ensureReady();
     const end = META_PURGED_PREFIX.slice(0, -1) + ";";
-    return this.reserved({ reads: 16 + 4 * this.config.registeredIdentityCount, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+    return this.reserved({ reads: 16 + 4 * this.config.registeredAccounts, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
       const state = this.logState();
       const legacy = this.rawRows<{ key: string }>(
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) <= 1 LIMIT ?", META_PURGED_PREFIX, end, RETIRED_SWEEP_BATCH,
@@ -5187,7 +5204,7 @@ export class Store {
    */
   clearExpiredMutes(now = this.clock.now()): number {
     this.ensureReady();
-    const cap = this.config.registeredIdentityCount;
+    const cap = this.config.registeredAccounts;
     return this.reserved({ reads: 16 + 2 * cap + 2 * MAX_ROOM_MUTES_PER_USER * 64, writes: 16 + 4 * 1_000 }, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       let changed = 0;
@@ -5266,7 +5283,7 @@ export class Store {
   ): Map<string, RoomMember[]> {
     this.ensureReady();
     // A listing holds the public rooms and the caller's private ones.
-    const ids = [...new Set(roomIds)].slice(0, MAX_USER_ROOMS);
+    const ids = [...new Set(roomIds)].slice(0, this.listedRoomBound);
     const perRoom = Math.max(0, Math.floor(limit));
     const members = new Map<string, RoomMember[]>();
     if (!ids.length || perRoom === 0) return members;
@@ -5282,7 +5299,7 @@ export class Store {
       // measured at one more read a member at worst.
       this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
         const generation = this.memberGeneration;
-        if (this.memberCache.size > 2 * MAX_USER_ROOMS) this.memberCache.clear();
+        if (this.memberCache.size > 2 * this.listedRoomBound) this.memberCache.clear();
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
@@ -5378,7 +5395,7 @@ export class Store {
     return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.metaNumber("identity_count"));
   }
 
-  /** The accounts in use and the most there may be (registeredIdentityCount): an import's placeholders must fit (restoreUsers). */
+  /** The accounts in use and the most there may be (registeredAccounts): an import's placeholders must fit (restoreUsers). */
   /**
    * Import (planning): why there is no room here for these new rooms, or
    * undefined. The same caps restoreRoom checks room by room, for all of
@@ -5389,7 +5406,7 @@ export class Store {
    */
   restoreRoomCapacity(listings: readonly RoomListing[], now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 24 + MAX_CREATED_ROOMS + listings.length + 2 * ROOM_COUNT_READS }, true, now, () => {
+    return this.reserved({ reads: 24 + MAX_CREATED_ROOMS + listings.length + 2 * this.roomCountReads }, true, now, () => {
       const privates = listings.filter((listing) => isPrivateRoomId(listing.room_id));
       const publics = listings.filter((listing) => !isPrivateRoomId(listing.room_id));
       const topLevel = publics.filter((listing) => typeof listing.parent_room_id !== "string");
@@ -5431,7 +5448,7 @@ export class Store {
 
   accountCapacity(now = this.clock.now()): { used: number; limit: number } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, true, now, () => ({ used: this.metaNumber("identity_count"), limit: this.config.registeredIdentityCount }));
+    return this.reserved({ reads: 8 }, true, now, () => ({ used: this.metaNumber("identity_count"), limit: this.config.registeredAccounts }));
   }
 
   private dedupRow(userId: string, requestId: string, now: number): RawDedupRow | null {
@@ -5547,7 +5564,7 @@ export class Store {
       ? { minute: this.config.trustedPostsPerMinute, day: this.config.trustedPostsPerDay }
       : tier === "registered"
         ? { minute: this.config.registeredPostsPerMinute, day: this.config.registeredPostsPerDay }
-        : { minute: this.config.anonymousPostsPerMinute, day: this.config.anonymousPostsPerDay };
+        : { minute: this.config.guestPostsPerMinute, day: this.config.guestPostsPerDay };
     const perIp = trusted
       ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.trustedPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.trustedPostsPerDay) }
       : { minute: this.config.ipPostsPerMinute, day: this.config.ipPostsPerDay };
@@ -5712,8 +5729,8 @@ export class Store {
     // The starting rooms are checked against the capped rooms table, and each
     // one takes a membership row and a logged membership record.
     // The scan reads the public range, archived threads included; the joins it writes are as before.
-    const rooms = MAX_THREAD_LIMIT + 1;
-    const reservation = this.reserveCost({ reads: 128 + 2 * PUBLIC_ROOM_ROWS, writes: 64 + 8 * rooms, registrations: 1 }, false, input.now);
+    const rooms = listedThreadScale(this.config.maxThreads) + 1;
+    const reservation = this.reserveCost({ reads: 128 + 2 * this.publicRoomRows, writes: 64 + 8 * rooms, registrations: 1 }, false, input.now);
     try {
       if (!input.userId || !input.userHandle || !input.ipKey) throw new StoreError("invalid_params", "registration identity is incomplete");
       ensureText(input.name, "name", this.config.maxNameBytes);
@@ -5722,7 +5739,7 @@ export class Store {
       ensureText(credential.publicKey, "public_key", 16 * 1024);
       if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
       if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
-      if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) {
+      if (this.metaNumber("identity_count") >= this.config.registeredAccounts) {
         throw new StoreError("denied", "registration_closed");
       }
       this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
@@ -5737,7 +5754,7 @@ export class Store {
         // credential is made usable; concurrent verification cannot overrun caps.
         if (this.idTaken(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
-        if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
+        if (this.metaNumber("identity_count") >= this.config.registeredAccounts) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);
         const joined = this.existingRooms(input.rooms ?? DEFAULT_JOINED_ROOMS);
         const publicKeyMetadata = JSON.stringify({
@@ -6296,12 +6313,12 @@ export class Store {
     // held to the registration cap, limits, or storage high-water.
     const alerting = this.alerting;
     try {
-      if (!alerting && this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
+      if (!alerting && this.metaNumber("identity_count") >= this.config.registeredAccounts) throw new StoreError("denied", "registration_closed");
       if (!alerting) this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
       const effective = this.effectiveNow(input.now);
       return this.transaction(() => {
         if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
-        if (!alerting && this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
+        if (!alerting && this.metaNumber("identity_count") >= this.config.registeredAccounts) throw new StoreError("denied", "registration_closed");
         if (!alerting) this.chargeRegistration(input.ipKey, effective);
         this.rawExec(
           "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)",
@@ -8476,7 +8493,7 @@ export class Store {
     // `private` is fixed at creation; on a save it is ignored like parent_room_id.
     const makePrivate = roomIdParam === undefined && params.private === true;
     // A store without private rooms (maxPrivateRooms 0) says so, as §4.2.4 requires. A
-    // deployment's privateRoomLimit is always positive (loadConfig), so only tests use it.
+    // deployment's privateRooms is always positive (loadConfig), so only tests use it.
     if (makePrivate && this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
     if (makePrivate && !registered) throw new StoreError("denied", "Sign in to start a private room");
     if (makePrivate && params.parent_room_id !== undefined) throw new StoreError("denied", "A private room cannot be a thread on this demo");
@@ -8533,8 +8550,10 @@ export class Store {
         if (isPrivateRoomId(parentId)) throw new StoreError("denied", "A private room has no threads on this demo");
         parentRoomId = parentId;
         // So one account cannot take every slot: the threads a registered user
-        // started within roomCreationWindowMs.
-        if (registered && this.recentThreadsCreatedBy(input.userId, this.creationCutoff(context.commitMs)) >= this.config.maxThreadsPerUser) {
+        // started within roomCreationWindowMs. A user holding any role (one an
+        // admin gave, as for the trusted posting limits) is held only to the
+        // server's maxThreads: a moderator re-threading starts many.
+        if (registered && !this.holdsAnyRole(input.userId) && this.recentThreadsCreatedBy(input.userId, this.creationCutoff(context.commitMs)) >= this.config.maxThreadsPerUser) {
           throw new StoreError("denied", this.config.roomCreationWindowMs > 0
             ? `You can start at most ${this.config.maxThreadsPerUser} threads in ${windowDays(this.config.roomCreationWindowMs)}; try again later`
             : `You can have at most ${this.config.maxThreadsPerUser} threads at once; one stops counting when everyone has left it`);
@@ -8619,7 +8638,7 @@ export class Store {
   }
 
   /**
-   * The rooms counted against a cap (ROOM_COUNT_READS): those created within
+   * The rooms counted against a cap (roomCountReads): those created within
    * roomCreationWindowMs. `public`, the top-level rooms and threads besides
    * `general`, against maxThreads; `private`, the private rooms, against
    * maxPrivateRooms. Each a range of ROOM_CREATED_INDEX.
@@ -8652,7 +8671,7 @@ export class Store {
    */
   roomCounts(now = this.clock.now()): { public: { recent: number; older: number }; private: { recent: number; older: number } } {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * ROOM_COUNT_READS }, false, now, () => {
+    return this.reserved({ reads: 16 + 2 * this.roomCountReads }, false, now, () => {
       const publicRecent = this.recentRoomCount("public", now);
       const privateRecent = this.recentRoomCount("private", now);
       return {
@@ -8726,23 +8745,23 @@ export class Store {
     return this.isMember(row.room_id, userId) ? row : null;
   }
 
-  /** A room's client fields (`title`, `description`, `ext`) fit roomMetadataLimit serialized. */
+  /** A room's client fields (`title`, `description`, `ext`) fit roomMetadataBytes serialized. */
   private checkRoomFields(fields: Record<string, unknown>): void {
     must(this.content.roomFields(fields));
   }
 
   /**
-   * Every room's client fields past roomMetadataMinLimit, together, with
+   * Every room's client fields past roomMetadataMinBytes, together, with
    * `fields` in place of the `existing` room's (or added, for a new room),
-   * fit roomMetadataTotalLimit serialized, so a listing of every room stays
-   * bounded. A room within roomMetadataMinLimit, or a save that does not
+   * fit roomMetadataTotalBytes serialized, so a listing of every room stays
+   * bounded. A room within roomMetadataMinBytes, or a save that does not
    * grow its room's excess, is never refused: a full total stops only long
    * room notes, and rooms can still shrink while the total is past a
    * lowered limit. One scan of the capped rooms table
-   * (ROOM_FIELDS_TOTAL_READS), only for a save that grows its excess.
+   * (roomFieldsTotalReads), only for a save that grows its excess.
    */
   private checkRoomFieldsTotal(fields: Record<string, unknown>, existing?: RawRoomRow): void {
-    const floor = this.config.roomMetadataMinLimit;
+    const floor = this.config.roomMetadataMinBytes;
     const excess = (bytes: number) => Math.max(0, bytes - floor);
     const added = excess(utf8Bytes(JSON.stringify(fields)));
     const before = existing ? excess(utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))) : 0;
@@ -8757,7 +8776,7 @@ export class Store {
       })
       .filter((row) => row.excess > 0);
     const others = rows.reduce((sum, row) => sum + integerColumn(row.excess), 0);
-    if (others + added <= this.config.roomMetadataTotalLimit) {
+    if (others + added <= this.config.roomMetadataTotalBytes) {
       this.roomNotesCheck = { total: others + added };
       return;
     }
@@ -8924,8 +8943,8 @@ export class Store {
     // Creating a thread reads the public rooms created within the window
     // twice (the creator's, and all of them against the cap), and joins its
     // creator, counting their memberships.
-    const roomScan = (!creating ? 0 : (input.params.private === true ? PRIVATE_ROOM_COUNT_READS : 2 * ROOM_COUNT_READS + MAX_CREATED_ROOMS + 2) + MEMBERSHIP_COUNT_READS) +
-      (method === "room_set" ? ROOM_FIELDS_TOTAL_READS : 0);
+    const roomScan = (!creating ? 0 : (input.params.private === true ? PRIVATE_ROOM_COUNT_READS : 2 * this.roomCountReads + MAX_CREATED_ROOMS + 2) + MEMBERSHIP_COUNT_READS) +
+      (method === "room_set" ? this.roomFieldsTotalReads : 0);
     // A move or an editor's save also raises the retired markers of the
     // users it logs again (noteRetiredRelog): its author, last editor and
     // reactors, each a key lookup and a row of the list it reads them from.
@@ -9108,7 +9127,7 @@ export class Store {
   }
 
   private historyLimit(query: StoreHistoryQuery): number {
-    return query.limit !== undefined && Number.isInteger(query.limit) && query.limit > 0 ? Math.min(query.limit, this.config.maxHistoryLimit) : this.config.historyDefaultLimit;
+    return query.limit !== undefined && Number.isInteger(query.limit) && query.limit > 0 ? Math.min(query.limit, this.config.maxHistoryLimit) : this.config.historyPageSize;
   }
 
   /** The rooms a history query names: one, or its distinct `roomIds`. */
@@ -9167,7 +9186,7 @@ export class Store {
     const hot = this.logState().history_floor;
     const after = this.historyBound(query.after, "after");
     const before = this.historyBound(query.before, "before");
-    const limit = positiveLimit(query.limit, this.config.historyDefaultLimit, this.config.maxHistoryLimit);
+    const limit = positiveLimit(query.limit, this.config.historyPageSize, this.config.maxHistoryLimit);
     const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
     // One room's log starts at its creation or the retention floor. The
     // joined rooms' log together (§4.3.3) starts where the server's does, at
@@ -9404,10 +9423,10 @@ export class Store {
 
   /**
    * The commit time before which records have expired (section 9): those
-   * past the latest `retentionRecords`, and any `retentionMs` old. Commit times are nondecreasing in log order, so the
+   * past the latest `historyHotRecords`, and any `retentionMs` old. Commit times are nondecreasing in log order, so the
    * count ends at a time too, the commit time of the Nth newest record. A
    * move's record is stored in both of its rooms and counts twice. 0 when
-   * nothing has expired. Reads up to `retentionRecords` index entries
+   * nothing has expired. Reads up to `historyHotRecords` index entries
    * (retentionCountReads).
    */
   private retentionCutoff(effective: number): number {
@@ -9431,9 +9450,9 @@ export class Store {
     return keep > 0 ? keep + 4 : 0;
   }
 
-  /** The records cleanup keeps in the hot log: `cleanupThresholdPercent` of `retentionRecords`, 0 without a count. */
+  /** The records cleanup keeps in the hot log: `cleanupThresholdPercent` of `historyHotRecords`, 0 without a count. */
   private keptHotRecords(): number {
-    return thresholdRecords(this.config.retentionRecords, this.config.cleanupThresholdPercent);
+    return thresholdRecords(this.config.historyHotRecords, this.config.cleanupThresholdPercent);
   }
 
   /**

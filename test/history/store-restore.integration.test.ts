@@ -18,7 +18,7 @@ import { errorCode, withStore, type TestClock } from "../helpers/store";
 const DAY_MS = 86_400_000;
 
 const CONFIG: Partial<StoreConfig> = {
-	anonymousPostsPerMinute: 1_000, registeredPostsPerMinute: 1_000, trustedPostsPerMinute: 1_000,
+	guestPostsPerMinute: 1_000, registeredPostsPerMinute: 1_000, trustedPostsPerMinute: 1_000,
 	ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000, registrationsPerIpDay: 1_000, registrationsPerDay: 1_000,
 };
 
@@ -111,7 +111,7 @@ function identityCount(state: DurableObjectState): number {
 }
 
 it("restores users as unclaimed placeholders, skipping existing, retired and unissuable IDs, all or nothing against the cap", async () => {
-	await withStore("restore-users", { ...CONFIG, registeredIdentityCount: 5 }, (store, clock, state) => {
+	await withStore("restore-users", { ...CONFIG, registeredAccounts: 5 }, (store, clock, state) => {
 		const overruns = watched(store);
 		store.createInvitedIdentity({ userId: "dan", name: "Dan", now: clock.value, ipKey: "ip" });
 		state.storage.sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:gone', '5'), ('renamed:moved', 'elsewhere')");
@@ -351,7 +351,7 @@ function messageRecord(roomId: string, logId: number, value: Record<string, unkn
 	return { room_id: roomId, log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: roomId, from: { user_id: "ada", name: "Ada" }, body: { text: `m${logId}` }, ...value }) };
 }
 
-const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
+const LIMITS = { historyHotRecords: 5_000, historyMaxAgeSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 
 it("refuses records past the clock, and raises the log head only by records it stores, never by a listing", async () => {
 	await withStore("restore-future", CONFIG, (store, clock) => {
@@ -403,7 +403,7 @@ it("takes a message here for the same one only in a room the import adds, never 
 // on its own in test/content/policy.test.ts): restoreRoom applies the Store's,
 // with the Store's limits, record by record.
 it("takes records only as a post would have made them: messages, reaction sets and room records through the Store's content policy, the rest dropped and counted", async () => {
-	await withStore("restore-normalize", { ...CONFIG, reactionEmojisPerUser: 3, roomMetadataLimit: 256 }, (store, clock) => {
+	await withStore("restore-normalize", { ...CONFIG, reactionEmojisPerUser: 3, roomMetadataBytes: 256 }, (store, clock) => {
 		const overruns = watched(store);
 		const base = clock.value - 60_000;
 		const reactions = (logId: number, from: Record<string, unknown>, emojis: unknown[]): ChatRecord => ({

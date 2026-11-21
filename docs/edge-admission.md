@@ -145,7 +145,7 @@ After applying rules, use a handful of requests, not a quota-exhaustion load tes
 On Workers Paid, the budget guard turns on `apron_budget_stop` by itself as
 usage nears the plan's allowances. To stop new Worker invocations by hand,
 enable the hostname-scoped `apron_admission_off`.
-If only DO admission must stop, set `ADMISSION_OFF=true` and deploy: the entry
+If only DO admission must stop, set `ADMISSION=false` and deploy: the entry
 Worker rejects before invoking the DO, but those HTTP requests still consume
 Worker quota. Existing sockets continue; their messages still consume DO request
 units even when application handlers reject them. Application frame limits close

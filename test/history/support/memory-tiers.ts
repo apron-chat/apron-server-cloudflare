@@ -290,7 +290,7 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 		for (const user of fresh) this.people.set(user.user_id, { ...user, roles: ["unclaimed"] });
 	}
 
-	/** The most accounts this head holds (Store: registeredIdentityCount). */
+	/** The most accounts this head holds (Store: registeredAccounts). */
 	accountLimit = 10_000;
 
 	/** The most rooms this head holds (Store: its caps on rooms, simplified to one count). */
