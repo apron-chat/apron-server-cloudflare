@@ -149,7 +149,7 @@ describe("planImport", () => {
 		expect(JSON.parse(plan.records[0]!.record_json).message_id).toBe("22");
 	});
 
-	it("renumbers after the target's latest, in order, with listings following", async () => {
+	it("renumbers after the target's latest, in order, with listings following; keeping IDs, refuses those past the clock", async () => {
 		const plan = await planImport(archive([message(10, "a", "ada"), message(500, "a", "ada")], [room("a"), room("empty", { history_log_id: null })]), memoryTarget({ latest: NOW + 50 }), options({ ids: "renumber" }));
 		expect(plan.records.map((record) => record.log_id)).toEqual([NOW + 51, NOW + 52]);
 		expect(plan.rooms.map((entry) => [entry.listing.room_id, entry.listing.log_id, entry.listing.history_log_id])).toEqual([
@@ -157,18 +157,11 @@ describe("planImport", () => {
 			["empty", String(NOW + 51 + 2 + 1), null],
 		]);
 		expect(plan.state.ids).toEqual({ mode: "renumber", base: NOW + 51 });
-	});
-
-	it("refuses log IDs past the clock unless renumbered", async () => {
+		// Kept, log IDs past the clock are refused.
 		const input = archive([message(NOW + 10 * 60_000, "a", "ada")], [room("a")]);
 		await expect(planImport(input, memoryTarget(), options())).rejects.toThrow(/later than this server's clock/);
 		await expect(planImport(input, memoryTarget(), options({ futureMs: 60 * 60_000 }))).resolves.toBeDefined();
 		await expect(planImport(input, memoryTarget(), options({ ids: "renumber" }))).resolves.toBeDefined();
-	});
-
-	it("reports a placeholder cap rather than throwing", async () => {
-		const plan = await planImport(archive([message(10, "a", "ada"), message(11, "a", "bob")], [room("a")]), memoryTarget(), options({ maxPlaceholders: 1 }));
-		expect(plan.report.refused).toMatch(/2 placeholder accounts, more than the 1/);
 	});
 
 	it("refuses an import that would make anyone a member of more rooms than the target allows", async () => {
@@ -182,7 +175,7 @@ describe("planImport", () => {
 		expect((await planImport(input, memoryTarget({ rooms: ["c"] }), options({ maxMembershipsPerUser: 3 }))).report.refused).toBeUndefined();
 	});
 
-	it("refuses more placeholders than the target has room for, saying how many fit", async () => {
+	it("refuses more placeholders than the target has room for, saying how many fit, or than one import may make", async () => {
 		const input = archive([message(10, "a", "ada"), message(11, "a", "bob"), message(12, "a", "cy")], [room("a")]);
 		const full = { ...memoryTarget(), accounts: async () => ({ used: 8, limit: 10 }) };
 		const refused = await planImport(input, full, options());
@@ -193,6 +186,8 @@ describe("planImport", () => {
 		// A resumed plan made its placeholders already: its run decides, not the count now.
 		const resumed = await planImport(input, full, options({ resume: (await planImport(input, roomy, options())).state }));
 		expect(resumed.report.refused).toBeUndefined();
+		// One import's own cap on placeholders, reported rather than thrown.
+		expect((await planImport(input, memoryTarget(), options({ maxPlaceholders: 2 }))).report.refused).toMatch(/3 placeholder accounts, more than the 2/);
 	});
 
 	it("asks the target about the rooms it would create, not those it skips or fills, and refuses past its caps", async () => {

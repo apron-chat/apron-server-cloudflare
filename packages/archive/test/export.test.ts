@@ -70,11 +70,15 @@ describe("exportArchive", () => {
 		expect(report).toEqual({ rooms: 3, users: 3, records: 4, truncated: [], sections: ["history"] });
 	});
 
-	it("leaves private rooms out when asked, and keeps only the rooms asked for", async () => {
+	it("leaves private rooms out when asked, keeps only the rooms asked for, and passes each page through prepare", async () => {
 		expect(isPrivateRoom(rooms[1]!)).toBe(true);
 		expect(isPrivateRoom({ listing: { room_id: "private_9" }, joined: false })).toBe(true);
 		const { text } = await exported(memorySource(rooms, records, users), { privateRooms: false, roomIds: ["general", "private_40"] });
 		expect(readArchive(text).rooms.map((room) => room.listing.room_id)).toEqual(["general"]);
+		const { text: prepared } = await exported(memorySource(rooms, records, users), {
+			prepare: async (page) => page.map((record) => ({ ...record, record_json: record.record_json.replace(/"m(\d+)"/, '"prepared $1"') })),
+		});
+		expect(readArchive(prepared).records.map((record) => JSON.parse(record.record_json).body.text)).toEqual(["prepared 10", "prepared 11", "prepared 12", "prepared 60"]);
 	});
 
 	it("clamps history_log_id to the source's floor, and keeps null", async () => {
@@ -85,14 +89,7 @@ describe("exportArchive", () => {
 		expect(readArchive(unclamped).rooms[0]!.listing.history_log_id).toBe("5");
 	});
 
-	it("passes each page through prepare", async () => {
-		const { text } = await exported(memorySource(rooms, records, users), {
-			prepare: async (page) => page.map((record) => ({ ...record, record_json: record.record_json.replace(/"m(\d+)"/, '"prepared $1"') })),
-		});
-		expect(readArchive(text).records.map((record) => JSON.parse(record.record_json).body.text)).toEqual(["prepared 10", "prepared 11", "prepared 12", "prepared 60"]);
-	});
-
-	it("bounds a listing's members: user ID order, at most the cap, member_count the true count, the truncation reported", async () => {
+	it("bounds a listing's members: user ID order, at most the cap and within one line's bytes, member_count the true count, the truncation reported", async () => {
 		const members = ["cy", "ada", "bob", "dee", "eve"].map((user_id) => ({ user_id }));
 		const big: ArchivedRoom[] = [{ listing: { room_id: "big", log_id: "1", members, member_count: 7 }, joined: false }, { listing: { room_id: "small", log_id: "2", members: [{ user_id: "zed" }] }, joined: false }];
 		const { text, report } = await exported(memorySource(big, [], []), { maxMembers: 3 });
@@ -102,9 +99,7 @@ describe("exportArchive", () => {
 		expect(report.truncated).toEqual([{ room_id: "big", members: 7, kept: 3 }]);
 		// A listing without members stays without.
 		expect(boundedMembers({ room_id: "none" })).toEqual({ listing: { room_id: "none" } });
-	});
-
-	it("keeps a listing's members within the bytes a reader takes on one line, whatever their IDs", () => {
+		// Within the bytes a reader takes on one line, whatever their IDs.
 		const long = Array.from({ length: MAX_LISTING_MEMBERS }, (_, index) => ({ user_id: `${String(index).padStart(5, "0")}${"x".repeat(251)}` }));
 		const { listing, truncated } = boundedMembers({ room_id: "wide", members: long });
 		const bytes = new TextEncoder().encode(JSON.stringify(listing.members)).length;

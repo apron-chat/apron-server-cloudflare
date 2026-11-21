@@ -70,14 +70,11 @@ describe("remapRecord", () => {
 		expect(JSON.parse(out.record_json)).toEqual(setAt(base, path, to));
 	});
 
-	it("maps the room and log ID columns", () => {
+	it("maps the room and log ID columns, moving commit_ms with the log ID only where they were equal", () => {
 		const out = remapRecord(record(base, { room_id: "private_101", log_id: 100, commit_ms: 100 }), sampleMap());
 		expect(out.room_id).toBe("private_201");
 		expect(out.log_id).toBe(200);
 		expect(out.record_json).toBe(JSON.stringify(base));
-	});
-
-	it("moves commit_ms with the log ID only where they were equal", () => {
 		expect(remapRecord(record(base, { log_id: 100, commit_ms: 100 }), sampleMap()).commit_ms).toBe(200);
 		expect(remapRecord(record(base, { log_id: 100, commit_ms: 99 }), sampleMap()).commit_ms).toBe(99);
 	});
@@ -102,7 +99,7 @@ describe("remapRecord", () => {
 });
 
 describe("remapListing and remapUser", () => {
-	it("maps a listing's rooms, log IDs and members", () => {
+	it("maps a listing's rooms, log IDs and members, and a user's ID", () => {
 		const listing: RoomListing = {
 			room_id: "private_100", log_id: "100", parent_room_id: "101", title: "t",
 			latest_log_id: "101", history_log_id: null, members: [{ user_id: "ada", name: "Ada" }, { user_id: "carol" }],
@@ -114,9 +111,6 @@ describe("remapListing and remapUser", () => {
 		expect(remapListing({ ...listing, history_log_id: "100" }, sampleMap()).history_log_id).toBe("200");
 		const untouched: RoomListing = { room_id: "general", log_id: "5", members: [{ user_id: "carol" }] };
 		expect(remapListing(untouched, sampleMap())).toBe(untouched);
-	});
-
-	it("maps a user's ID", () => {
 		const user: ArchivedUser = { user_id: "ada", name: "Ada", roles: ["admin"] };
 		expect(remapUser(user, sampleMap())).toEqual({ user_id: "ada-2", name: "Ada", roles: ["admin"] });
 		const other: ArchivedUser = { user_id: "carol" };
@@ -152,18 +146,16 @@ describe("nudging log IDs", () => {
 });
 
 describe("nextFree and freeUserId", () => {
-	it("finds the next free ID at or after a start", () => {
+	it("finds the next free log ID at or after a start, and the next free user ID", () => {
 		const taken = new Set([5, 6, 8]);
 		expect(nextFree((id) => taken.has(id), 5)).toBe(7);
 		expect(nextFree((id) => taken.has(id), 8)).toBe(9);
 		expect(nextFree((id) => taken.has(id), 4)).toBe(4);
-	});
-
-	it("numbers a taken user ID from 2", () => {
+		// A taken user ID is numbered from 2.
 		expect(freeUserId("ada", () => false)).toBe("ada");
 		expect(freeUserId("ada", (id) => id === "ada")).toBe("ada-2");
-		const taken = new Set(["ada", "ada-2", "ada-3"]);
-		expect(freeUserId("ada", (id) => taken.has(id))).toBe("ada-4");
+		const users = new Set(["ada", "ada-2", "ada-3"]);
+		expect(freeUserId("ada", (id) => users.has(id))).toBe("ada-4");
 	});
 });
 

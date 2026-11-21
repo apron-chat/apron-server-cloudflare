@@ -98,7 +98,7 @@ describe("codecs", () => {
 		}
 	});
 
-	it("fail on what is not gzip, or is cut short", async () => {
+	it("fail on what is not gzip, is cut short, or decodes past its bound", async () => {
 		const bytes = await written([gzip], async (writer) => {
 			await writer.header({ apron_archive: 1 });
 			await writer.listing({ not_joined: [{ room_id: "r", log_id: "1" }] });
@@ -107,9 +107,7 @@ describe("codecs", () => {
 		await expect(collectArchive(openArchive(streamOf([bytes.slice(0, bytes.byteLength - 4)]), { codecs: [gzip] }))).rejects.toThrow();
 		// Read without its codec, gzip is no archive.
 		await expect(collectArchive(openArchive(streamOf([bytes])))).rejects.toThrow();
-	});
-
-	it("bound what a small file may decode to", async () => {
+		// A small file may decode only so far.
 		const big = await written([gzip], async (writer) => {
 			await writer.header({ apron_archive: 1, padding: "x".repeat(200_000) });
 		});

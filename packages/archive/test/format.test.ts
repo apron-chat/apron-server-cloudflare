@@ -204,15 +204,33 @@ describe("jsonlReader tolerance (ARCHIVE.md §1)", () => {
 		expect((await partsOf(text)).map((part) => part.kind)).toEqual(["listing", "records", "extra"]);
 	});
 
-	it("requires a v1 header", async () => {
-		await expect(jsonlReader(linesOf("")).header()).rejects.toThrow(/no JSON object line/);
-		await expect(jsonlReader(linesOf("\n\nnope\n")).header()).rejects.toThrow(/no JSON object line/);
-		await expect(jsonlReader(linesOf(`{"rooms":[]}\n`)).header()).rejects.toThrow(/line 1 has no apron_archive/);
-		await expect(jsonlReader(linesOf(`\n{"apron_archive":2}\n`)).header()).rejects.toThrow(/unsupported Apron archive version 2/);
-		await expect(partsOf(`{"rooms":[]}\n`)).rejects.toThrow(/no apron_archive/);
+	it("gives its parts once", () => {
 		const reader = jsonlReader(linesOf(`${JSON.stringify(header)}\n`));
 		reader.parts();
 		expect(() => reader.parts()).toThrow(/once/);
+	});
+});
+
+// jsonlReader (async) and readArchive (sync) refuse the same files.
+describe("reader header and line limits", () => {
+	const v1 = '{"apron_archive":1}';
+	it.each([
+		["", /no JSON object line/],
+		["\n\nnope\n", /no JSON object line/],
+		['{"rooms":[]}\n', /line 1 has no apron_archive/],
+		['\n{"apron_archive":2}\n', /unsupported Apron archive version 2/],
+		// Longer than MAX_READ_LINE_BYTES in UTF-8 bytes, though not in characters.
+		[`${v1}\n{"messages":[{"room_id":"r","log_id":"1","text":"${"é".repeat(MAX_READ_LINE_BYTES / 2)}"}]}\n`, /line 2 is longer than/],
+	])("refuse %j", async (text, message) => {
+		await expect(collectArchive(jsonlReader(linesOf(text)))).rejects.toThrow(message);
+		expect(() => readArchive(text)).toThrow(message);
+	});
+
+	it("take a line just within MAX_READ_LINE_BYTES, and cap a stream's lines", async () => {
+		const fits = `{"messages":[{"room_id":"r","log_id":"1","text":"${"x".repeat(MAX_READ_LINE_BYTES - 100)}"}]}`;
+		expect((await collectArchive(jsonlReader(linesOf(`${v1}\n${fits}\n`)))).records).toHaveLength(0);
+		expect(readArchive(`${v1}\n${fits}\n`).records).toHaveLength(0);
+		await expect((async () => { for await (const _ of linesFromStream(streamOf([new TextEncoder().encode("x".repeat(64))]), 16)) { /* read */ } })()).rejects.toThrow(/longer than 16/);
 	});
 });
 
@@ -243,7 +261,7 @@ describe("line sources", () => {
 		expect(await collect("")).toEqual([]);
 	});
 
-	it("linesFromStream decodes UTF-8 and splits lines across chunk boundaries", async () => {
+	it("linesFromStream decodes UTF-8 and splits lines across chunk boundaries, the last with or without a newline", async () => {
 		const text = `${JSON.stringify(header)}\r\n${JSON.stringify({ messages: [{ message_id: "1", log_id: "1", room_id: "général", from: { user_id: "ada" }, body: { text: "👍🏽 é €" } }] })}\n\n`;
 		const bytes = new TextEncoder().encode(text);
 		for (const size of [1, 2, 3, 5, 7, 64, bytes.length]) {
@@ -257,12 +275,10 @@ describe("line sources", () => {
 			expect(JSON.parse(archive.records[0].record_json).body.text).toBe("👍🏽 é €");
 			expect(archive.records[0].room_id).toBe("général");
 		}
-	});
-
-	it("linesFromStream yields a last line without a newline", async () => {
-		const lines: string[] = [];
-		for await (const line of linesFromStream(streamOf([new TextEncoder().encode("a\nb")]))) lines.push(line);
-		expect(lines).toEqual(["a", "b"]);
+		// A last line without a newline is a line.
+		const last: string[] = [];
+		for await (const line of linesFromStream(streamOf([new TextEncoder().encode("a\nb")]))) last.push(line);
+		expect(last).toEqual(["a", "b"]);
 	});
 });
 
@@ -322,19 +338,6 @@ describe("scene fixtures", () => {
 	}
 });
 
-describe("reader limits", () => {
-	it("refuses a line longer than MAX_READ_LINE_BYTES, and a stream line past its cap", async () => {
-		const header = '{"apron_archive":1}';
-		const long = `{"messages":[{"room_id":"r","log_id":"1","text":"${"é".repeat(MAX_READ_LINE_BYTES / 2)}"}]}`;
-		await expect(collectArchive(jsonlReader(linesOf(`${header}\n${long}\n`)))).rejects.toThrow(/line 2 is longer than/);
-		const fits = `{"messages":[{"room_id":"r","log_id":"1","text":"${"x".repeat(MAX_READ_LINE_BYTES - 100)}"}]}`;
-		expect((await collectArchive(jsonlReader(linesOf(`${header}\n${fits}\n`)))).records).toHaveLength(0);
-		const bytes = new TextEncoder().encode("x".repeat(64));
-		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } });
-		await expect((async () => { for await (const _ of linesFromStream(stream, 16)) { /* read */ } })()).rejects.toThrow(/longer than 16/);
-	});
-});
-
 describe("readArchive", () => {
 	it("reads what collectArchive reads, synchronously", async () => {
 		for (const text of Object.values(sceneArchives)) {
@@ -345,12 +348,5 @@ describe("readArchive", () => {
 	it("keeps extensions' object sections as fields, in file order", () => {
 		const text = [JSON.stringify(header), JSON.stringify({ live: { a: [[0, "x"]] }, more: true }), JSON.stringify({ live: { b: [] } }), ""].join("\r\n");
 		expect(readArchive(text).fields).toEqual([{ key: "live", value: { a: [[0, "x"]] } }, { key: "live", value: { b: [] } }]);
-	});
-
-	it("requires a v1 header and caps lines, as jsonlReader does", () => {
-		expect(() => readArchive("")).toThrow(/no JSON object line/);
-		expect(() => readArchive('{"hello":1}\n')).toThrow(/has no apron_archive/);
-		expect(() => readArchive('{"apron_archive":2}\n')).toThrow(/unsupported Apron archive version 2/);
-		expect(() => readArchive(`${JSON.stringify(header)}\n${"x".repeat(MAX_READ_LINE_BYTES + 1)}\n`)).toThrow(/line 2 is longer than/);
 	});
 });

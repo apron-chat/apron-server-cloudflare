@@ -48,25 +48,17 @@ const log: ChatRecord[] = [
 describe("replayRecords", () => {
 	const state = replayRecords(log);
 
-	it("keeps the latest room record, without delivery fields", () => {
+	it("keeps the latest room record (without delivery fields) and snapshot (edits, moves and tombstones), and replays reactions and memberships per user", () => {
 		expect(state.rooms.get("general")).toMatchObject({ room_id: "general", log_id: 150, fields: { title: "General (ops)", ext: { topic: "deploys" } } });
 		expect(state.rooms.get("thread")?.fields).toEqual({ title: "Thread", parent_room_id: "general" });
-	});
-
-	it("keeps the latest snapshot: edits, moves and tombstones", () => {
 		expect(state.messages.get("110")).toMatchObject({ room_id: "general", log_id: 112, body: { text: "first, edited" }, deleted: false });
 		expect(state.messages.get("111")).toMatchObject({ room_id: "thread", from: { user_id: "bob" }, reply_to: "110", log_id: 120 });
 		expect(state.messages.get("130")?.value).toEqual(JSON.parse(log.find((r) => r.log_id === 132)!.record_json));
 		expect(state.messages.get("130")).toMatchObject({ message_id: "130", room_id: "general", log_id: 132, from: ada, deleted: true });
-	});
-
-	it("replays reactions per user, dropping cleared sets and a deleted message's", () => {
+		// Cleared sets and a deleted message's are dropped.
 		expect(state.reactions.get("110")).toEqual(new Map([["carol", ["🎉", "👍"]]]));
 		expect(state.reactions.get("111")).toEqual(new Map([["ada", ["❤️"]]]));
 		expect(state.reactions.has("130")).toBe(false);
-	});
-
-	it("replays memberships per user", () => {
 		expect(state.members.get("general")).toEqual(new Set(["ada", "carol"]));
 		expect(state.members.get("thread")).toEqual(new Set(["ada", "bob"]));
 	});
@@ -80,10 +72,14 @@ describe("replayRecords", () => {
 		expect([...state.memberships.get("general")!.keys()]).toEqual(["ada", "bob", "carol"]);
 	});
 
-	it("orders by the record's log_id, not its wire spelling", () => {
+	it("orders by the record's log_id, not its wire spelling, a tombstone winning at an equal log ID in either order", () => {
 		const first = message("general", 7, 7, { body: { text: "first" } });
 		const edit = { ...message("general", 8, 7, { body: { text: "edit" } }), record_json: JSON.stringify({ room_id: "general", log_id: "1", message_id: "7", from: ada, body: { text: "edit" } }) };
 		expect(replayRecords([edit, first]).messages.get("7")).toMatchObject({ log_id: 8, body: { text: "edit" } });
+		const live = message("general", 5, 5, { body: { text: "x" } });
+		const tomb = message("general", 5, 5, { deleted: true });
+		expect(replayRecords([live, tomb]).messages.get("5")?.deleted).toBe(true);
+		expect(replayRecords([tomb, live]).messages.get("5")?.deleted).toBe(true);
 	});
 
 	it("does not depend on record order or duplicates (property)", () => {
@@ -93,13 +89,6 @@ describe("replayRecords", () => {
 		fc.assert(fc.property(reordered, (records) => {
 			expect(compareReplayed(replayRecords(records), state)).toEqual({ equal: true, differences: [] });
 		}), { numRuns: 200 });
-	});
-
-	it("lets a tombstone win at an equal log ID, in either order", () => {
-		const live = message("general", 5, 5, { body: { text: "x" } });
-		const tomb = message("general", 5, 5, { deleted: true });
-		expect(replayRecords([live, tomb]).messages.get("5")?.deleted).toBe(true);
-		expect(replayRecords([tomb, live]).messages.get("5")?.deleted).toBe(true);
 	});
 
 	it("starts members from a listing, as of its latest_log_id", () => {
