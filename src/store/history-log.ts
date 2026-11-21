@@ -236,9 +236,12 @@ export class HistoryModule {
       setValue: (key, value) => {
         this.core.ensureReady();
         if (!this.core.config.tiered) return;
-        this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => sql.writeMeta(owned(key), value));
-        this.stateValues.set(key, value || undefined);
-        for (const prefix of [...this.stateEntries.keys()]) if (key.startsWith(prefix)) this.stateEntries.delete(prefix);
+        this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => {
+          sql.writeMeta(owned(key), value);
+          // Kept as written at once: the write stands even if settling the reservation then fails.
+          this.stateValues.set(key, value || undefined);
+          for (const prefix of [...this.stateEntries.keys()]) if (key.startsWith(prefix)) this.stateEntries.delete(prefix);
+        });
       },
       hotFloor: () => this.historyFloors().hot,
       publishedFloor: () => this.historyFloors().published,
@@ -257,10 +260,11 @@ export class HistoryModule {
           check({ reads: 4, writes: 4 });
           return;
         }
-        this.copyMarkerCache = this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => {
+        this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => {
           const stored = sql.metaNumber(META_HISTORY_THROUGH);
           if (through > stored) sql.writeMeta(META_HISTORY_THROUGH, String(through));
-          return Math.max(stored, through);
+          // Kept as written at once, as setValue's.
+          this.copyMarkerCache = Math.max(stored, through);
         });
       },
       entries: (prefix) => {
