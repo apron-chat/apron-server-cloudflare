@@ -50,6 +50,10 @@ export interface Sql {
   logState(): RawLogState;
   /** A retained message's current state and snapshot, or null; below `floor`, null. */
   currentMessage(messageId: string, floor?: number): RawMessageRow | null;
+  /** Writes a user's `seen` (protocol §4.5.2) without making reused member listings stale (core.patchMemberSeen updates them once committed). */
+  writeSeen(userId: string, seen: number): void;
+  /** Settles a user's `seen` at `at` where the stored one does not stand (SqliteStore.settleSeen): what is stored after, undefined for an unknown user. */
+  settleSeen(userId: string, at: number): number | undefined;
   /** Refuses (or pauses on) a write that would grow the database past its targets by `additionalBytes`. */
   ensureGrowthCapacity(additionalBytes: number): void;
   /** A limiter row (`principal_limits`), from the cache or read. */
@@ -87,6 +91,8 @@ export interface StoreCore {
    * Every use is listed in src/store/index.ts.
    */
   unmetered<T>(fn: (sql: Sql) => T): T;
+  /** Sets a committed `seen` in the member listings kept for reuse (no SQL). */
+  patchMemberSeen(userId: string, seen: number): void;
   /** Runs `fn` as an operator alert's storage work: charged, never refused (SqliteStore.alert). */
   alert<T>(fn: () => T): T;
   /** Whether an operator alert's work is running now. */

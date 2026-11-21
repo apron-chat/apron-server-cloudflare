@@ -35,9 +35,9 @@ export function sqliteAccounts(sqlite: SqliteStore): Accounts {
     markBotActive: (userId, now) => sqlite.markBotActive(userId, now),
     markBotSignedOut: (userId, now) => sqlite.markBotSignedOut(userId, now),
     idleBots: (input) => sqlite.idleBots(input),
-    setStatus: (input) => sqlite.setStatus(input),
-    setMute: (input) => sqlite.setMute(input),
-    clearExpiredMutes: (now) => sqlite.clearExpiredMutes(now),
+    setStatus: (input) => sqlite.readState.setStatus(input),
+    setMute: (input) => sqlite.readState.setMute(input),
+    clearExpiredMutes: (now) => sqlite.readState.clearExpiredMutes(now),
   };
 }
 
@@ -86,14 +86,14 @@ export function sqliteMessages(sqlite: SqliteStore): Messages {
 /** Reads over SqliteStore. */
 export function sqliteReads(sqlite: SqliteStore): Reads {
   return {
-    cursors: (userId, now) => sqlite.readCursors(userId, now),
-    saveCursors: (input) => sqlite.saveReadCursors(input),
-    roomCursors: (roomIds, except, now) => sqlite.roomReadCursors(roomIds, except, now),
-    settleSeen: (input) => sqlite.settleSeen(input),
-    setRoomMute: (input) => sqlite.setRoomMute(input),
-    expireRoomMutes: (userId, now) => sqlite.expireRoomMutes(userId, now),
-    presenceToggle: (now) => sqlite.presenceToggle(now),
-    statusInputs: (userId, now) => sqlite.statusInputs(userId, now),
+    cursors: (userId, now) => sqlite.readState.readCursors(userId, now),
+    saveCursors: (input) => sqlite.readState.saveReadCursors(input),
+    roomCursors: (roomIds, except, now) => sqlite.readState.roomReadCursors(roomIds, except, now),
+    settleSeen: (input) => sqlite.readState.settleSeen(input),
+    setRoomMute: (input) => sqlite.readState.setRoomMute(input),
+    expireRoomMutes: (userId, now) => sqlite.readState.expireRoomMutes(userId, now),
+    presenceToggle: (now) => sqlite.readState.presenceToggle(now),
+    statusInputs: (userId, now) => sqlite.readState.statusInputs(userId, now),
   };
 }
 

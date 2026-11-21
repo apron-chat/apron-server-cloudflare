@@ -1562,7 +1562,7 @@ describe('security review fixes', () => {
 		});
 		type Patched = Record<'setMute' | 'setRoomMute' | 'setStatus', (...args: unknown[]) => unknown>;
 		const fail = (on: boolean) => runInDurableObject(stub(), (instance) => {
-			const store = sqliteOf((instance as unknown as Runtime).store) as unknown as Patched;
+			const store = sqliteOf((instance as unknown as Runtime).store).readState as unknown as Patched;
 			for (const name of ['setMute', 'setRoomMute', 'setStatus'] as const) {
 				if (on) store[name] = () => { throw new Error('injected storage failure'); };
 				else delete (store as Record<string, unknown>)[name];

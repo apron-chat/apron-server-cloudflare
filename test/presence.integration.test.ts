@@ -752,7 +752,7 @@ describe('user status timing', () => {
 			await peer.next();
 			peer.send({ method: 'status', params: { idle: false } });
 			await runInDurableObject(stub(), (instance) => {
-				vi.spyOn(sqliteOf((instance as unknown as Runtime).store), 'statusInputs').mockImplementationOnce(() => { throw new Error('storage unavailable'); });
+				vi.spyOn(sqliteOf((instance as unknown as Runtime).store).readState, 'statusInputs').mockImplementationOnce(() => { throw new Error('storage unavailable'); });
 			});
 			// Signing in without them would show an invisible user as connected: the sign-in fails instead.
 			const failed = await request(peer, 'auth-failed', 'auth', { scheme: 'token', token });
@@ -1257,7 +1257,7 @@ describe('sign-ins, listings and attendance', () => {
 			const order: string[] = [];
 			await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as Runtime & { issueSession: Runtime['issueSession'] };
-				vi.spyOn(sqliteOf(runtime.store), 'statusInputs').mockImplementationOnce(() => { order.push('read'); throw new Error('storage unavailable'); });
+				vi.spyOn(sqliteOf(runtime.store).readState, 'statusInputs').mockImplementationOnce(() => { order.push('read'); throw new Error('storage unavailable'); });
 				const issue = runtime.issueSession.bind(runtime);
 				vi.spyOn(runtime, 'issueSession').mockImplementation((...args) => { order.push('issue'); return issue(...args); });
 			});
@@ -1892,9 +1892,9 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 	function replaceSettle(settle: (real: (input: { userId: string; at: number; now?: number }) => number | undefined, input: { userId: string; at: number; now?: number }, runtime: Runtime & Record<string, any>) => number | undefined): Promise<void> {
 		return runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime & Record<string, any>;
-			const sqlite = sqliteOf(runtime.store);
-			const real = sqlite.settleSeen.bind(sqlite);
-			vi.spyOn(sqlite, 'settleSeen').mockImplementation((input) => settle(real, input, runtime));
+			const reads = sqliteOf(runtime.store).readState;
+			const real = reads.settleSeen.bind(reads);
+			vi.spyOn(reads, 'settleSeen').mockImplementation((input) => settle(real, input, runtime));
 		});
 	}
 
@@ -2144,7 +2144,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 			store.reads.settleSeen({ userId, at: old, now });
 			const seenOf = () => store.rooms.members(['general'], DEFAULT_LIMITS.roomListMembersPerRoom, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
 			expect(seenOf()).toBe(old);
-			const spy = vi.spyOn(sqliteOf(store) as unknown as { writeUserStatus(): void }, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
+			const spy = vi.spyOn(sqliteOf(store).readState as unknown as { writeUserStatus(): void }, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
 			expect(() => store.accounts.setStatus({ userId, choice: 'invisible', seenAt: now, now })).toThrow('status write failed');
 			spy.mockRestore();
 			return { old, listed: seenOf(), stored: store.accounts.get(userId)?.seen };

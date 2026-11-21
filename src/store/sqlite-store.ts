@@ -13,6 +13,7 @@
 
 import { defaultStoreConfig, type StoreConfig } from "./config";
 import type { Sql, StoreCore, TransactionJournal } from "./core";
+import { ReadsModule } from "./reads";
 import { AdmissionModule } from "./admission";
 import { PushModule } from "./push";
 import type {
@@ -272,11 +273,15 @@ export class SqliteStore {
     logState: () => this.logState(),
     currentMessage: (messageId, floor) => this.currentMessage(messageId, floor),
     ensureGrowthCapacity: (bytes) => this.ensureGrowthCapacity(bytes),
+    writeSeen: (userId, seen) => this.writeSeen(userId, seen),
+    settleSeen: (userId, at) => this.settleSeenRow(userId, at),
     limitRow: (scope, key, now) => this.limitRow(scope, key, now),
     updateLimitRow: (row, updates, now, weight) => this.updateLimitRow(row, updates, now, weight),
   };
   /** The core the implementation modules run over (core.ts). */
   readonly core: StoreCore = this.makeCore();
+  /** Read cursors, user statuses and mutes, room mutes, `seen` and the presence toggle (reads.ts). */
+  readonly readState: ReadsModule;
   /** Rate limits and admission: the posting, event and registration charges, frames, connections, throttle trips, the attack pause (admission.ts). */
   readonly admission: AdmissionModule;
   /** Web Push registrations, wakes and claims (push.ts). */
@@ -291,6 +296,7 @@ export class SqliteStore {
       get alerting() { return store.alerting; },
       alert: (fn) => this.alert(fn),
       unmetered: (fn) => fn(this.sqlHandle),
+      patchMemberSeen: (userId, seen) => this.patchMemberSeen(userId, seen),
       ensureReady: () => this.ensureReady(),
       effectiveNow: (candidate) => this.effectiveNow(candidate),
       reserved: (operation, cost, maintenance, now, fn, unchecked) => this.reserved(operation, cost, maintenance, now, (unused) => fn(this.sqlHandle, unused), unchecked),
@@ -331,6 +337,7 @@ export class SqliteStore {
     }, this.config);
     this.pushes = new PushModule(this.core);
     this.admission = new AdmissionModule(this.core);
+    this.readState = new ReadsModule(this.core, this.pushes);
   }
 
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
@@ -3085,24 +3092,6 @@ export class SqliteStore {
   }
 
   /**
-   * Clears mutes that ran out: an account's (`user_status`, deleted when
-   * nothing else is left in it) and its rooms' (`room_mutes`). Otherwise
-   * they stay until the user mutes again. Returns the rows changed.
-   */
-  clearExpiredMutes(now = this.clock.now()): number {
-    this.ensureReady();
-    const cap = this.config.registeredAccounts;
-    return this.reserved("clearExpiredMutes", { reads: 16 + 2 * cap + 2 * MAX_ROOM_MUTES_PER_USER * 64, writes: 16 + 4 * 1_000 }, true, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      let changed = 0;
-      changed += this.rawExec("UPDATE user_status SET mute_until_ms = NULL WHERE user_id IN (SELECT user_id FROM user_status WHERE mute_until_ms IS NOT NULL AND mute_until_ms <= ? LIMIT 1000)", effective).rowsWritten ?? 0;
-      changed += this.rawExec("DELETE FROM user_status WHERE user_id IN (SELECT user_id FROM user_status WHERE status = 'online' AND mute_until_ms IS NULL LIMIT 1000)").rowsWritten ?? 0;
-      changed += this.rawExec("DELETE FROM room_mutes WHERE (user_id, room_id) IN (SELECT user_id, room_id FROM room_mutes WHERE mute_until_ms <= ? LIMIT 1000)", effective).rowsWritten ?? 0;
-      return changed;
-    }), false);
-  }
-
-  /**
    * Writes the log's head as kept here (logCache) to `log_state`, with
    * `floor` as its history floor if given, before records are deleted:
    * otherwise the newest record, which a later wake reads the head from,
@@ -4883,21 +4872,6 @@ export class SqliteStore {
   }
 
   /**
-   * The `presence` toggle (as toggle has it) and when presence was last
-   * turned on with it (META_PRESENCE_ON), if ever, in one statement: two
-   * primary-key lookups of `_meta`, of which a missing row reads nothing.
-   */
-  presenceToggle(now = this.clock.now()): { on: boolean | undefined; since?: number } {
-    this.ensureReady();
-    return this.reserved("presenceToggle", { reads: 4 }, false, now, () => {
-      const rows = this.rawRows<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key IN (?, ?)", META_TOGGLE_PREFIX + "presence", META_PRESENCE_ON);
-      const value = rows.find((row) => row.key === META_TOGGLE_PREFIX + "presence")?.value;
-      const since = Number(rows.find((row) => row.key === META_PRESENCE_ON)?.value);
-      return { on: value === "on" ? true : value === "off" ? false : undefined, ...(Number.isSafeInteger(since) && since > 0 ? { since } : {}) };
-    });
-  }
-
-  /**
    * Sets or, with undefined, clears an admin's `/toggle` of a feature. With
    * `uploads` off, new upload embeds and `/avatar` are `denied`; writes
    * already started still finish. With `since`, presence was turned on
@@ -5438,232 +5412,6 @@ export class SqliteStore {
   }
 
   /**
-   * `status` `mute` without `room_id` (protocol §4.5) for a registered user:
-   * until when they are muted, MUTE_FOREVER for `true`, or null to end it.
-   * Whether the stored mute changed, and `untilMs`, the end it leaves,
-   * absent when not muted. A mute is the user's, whichever connection set
-   * it. It is kept in the user's `user_status` row, which goes once it holds
-   * only defaults.
-   */
-  setMute(input: { userId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number } {
-    this.ensureReady();
-    const now = input.now ?? this.clock.now();
-    return this.reserved("setMute", { reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      if (!this.identityRow(input.userId)) return { changed: false };
-      const existing = this.userStatusRow(input.userId);
-      const stored = existing?.mute_until_ms ?? null;
-      const before = stored !== null && stored > effective ? stored : null;
-      if (input.untilMs === null || input.untilMs <= effective) {
-        if (stored !== null) this.writeUserStatus(input.userId, existing, { mute_until_ms: null });
-        return { changed: before !== null };
-      }
-      if (before === input.untilMs) return { changed: false, untilMs: input.untilMs };
-      this.writeUserStatus(input.userId, existing, { mute_until_ms: input.untilMs });
-      return { changed: true, untilMs: input.untilMs };
-    }));
-  }
-
-  /**
-   * `me` `status` (protocol §4.5) for a registered user: the value they
-   * chose, kept in their `user_status` row with the mute. Whether it changed.
-   * With `seenAt`, when choosing `invisible` shows them `offline` at that
-   * time (§4.5.2), their `seen` is settled too, from the identity row this
-   * reads anyway: the stored one if it stands (seenStands), else `seenAt`,
-   * written (writeSeen) in the same reservation and transaction, so the two
-   * cannot part. `seen` is what is stored after, absent for an unknown
-   * user. Listings kept for reuse get it only once it is committed.
-   */
-  setStatus(input: { userId: string; choice: StatusChoice; now?: number; seenAt?: number }): { changed: boolean; seen?: number } {
-    if (input.seenAt !== undefined) assertSeen(input.seenAt);
-    this.ensureReady();
-    const now = input.now ?? this.clock.now();
-    let written: number | undefined;
-    const result = this.reserved("setStatus", { reads: 16, writes: 16 }, false, now, () => this.transaction((): { changed: boolean; seen?: number } => {
-      this.effectiveNow(now);
-      const row = this.identityRow(input.userId);
-      if (!row) return { changed: false };
-      let seen: number | undefined;
-      if (input.seenAt !== undefined) {
-        seen = seenColumn(row.seen_ms);
-        if (!seenStands(seen, input.seenAt)) {
-          this.writeSeen(input.userId, input.seenAt);
-          seen = written = input.seenAt;
-        }
-      }
-      const existing = this.userStatusRow(input.userId);
-      if ((existing?.status ?? "online") === input.choice) return { changed: false, ...(seen !== undefined ? { seen } : {}) };
-      this.writeUserStatus(input.userId, existing, { status: input.choice });
-      return { changed: true, ...(seen !== undefined ? { seen } : {}) };
-    }));
-    // Committed: listings kept for reuse may carry it now (a rollback leaves them as they were).
-    if (written !== undefined) this.patchMemberSeen(input.userId, written);
-    return result;
-  }
-
-  /** A user's `user_status` row, if any, with an expired mute left as stored. */
-  private userStatusRow(userId: string): { status: StatusChoice; mute_until_ms: number | null } | undefined {
-    const row = this.rawRows<{ status: string; mute_until_ms: number | null }>(
-      "SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId,
-    )[0];
-    return row ? { status: choiceColumn(row.status), mute_until_ms: row.mute_until_ms === null ? null : integerColumn(row.mute_until_ms) } : undefined;
-  }
-
-  /** Writes a user's `user_status` row with `change` applied, deleting it once it holds only defaults. */
-  private writeUserStatus(userId: string, existing: { status: StatusChoice; mute_until_ms: number | null } | undefined, change: { status?: StatusChoice; mute_until_ms?: number | null }): void {
-    const next = { status: existing?.status ?? "online", mute_until_ms: existing?.mute_until_ms ?? null, ...change };
-    if (next.mute_until_ms === null && next.status === "online") {
-      if (existing) this.rawExec("DELETE FROM user_status WHERE user_id = ?", userId);
-      return;
-    }
-    this.rawExec(
-      `INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, ?, ?)
-       ON CONFLICT (user_id) DO UPDATE SET status = excluded.status, mute_until_ms = excluded.mute_until_ms`,
-      userId, next.status, next.mute_until_ms,
-    );
-  }
-
-  /**
-   * `status` `mute` with `room_id` (protocol §4.5) for a registered user:
-   * until when `roomId` and its threads are muted, MUTE_FOREVER for `true`,
-   * or null to end it. Kept in `room_mutes`, one row a room, at most
-   * MAX_ROOM_MUTES_PER_USER a user: a mute of another room past that first
-   * deletes the user's mutes that ran out, and is `refused` if that frees
-   * none. Whether it changed anything, and `untilMs`, the end it leaves,
-   * absent when not muted. A mute that ran out is deleted with no change.
-   */
-  setRoomMute(input: { userId: string; roomId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number; refused?: true } {
-    this.ensureReady();
-    const now = input.now ?? this.clock.now();
-    // The row and its key; at the cap, two counts of the user's mutes and a
-    // delete of those that ran out (a row and its key each), each at most
-    // the cap.
-    const cost = { reads: 24 + 4 * MAX_ROOM_MUTES_PER_USER, writes: 16 + 4 * MAX_ROOM_MUTES_PER_USER };
-    return this.reserved("setRoomMute", cost, false, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      const row = this.rawRows<{ mute_until_ms: number }>("SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id = ? LIMIT 1", input.userId, input.roomId)[0];
-      const stored = row ? integerColumn(row.mute_until_ms) : null;
-      const before = stored !== null && stored > effective ? stored : null;
-      if (input.untilMs === null || input.untilMs <= effective) {
-        if (stored !== null) this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
-        return { changed: before !== null };
-      }
-      if (before === input.untilMs) return { changed: false, untilMs: input.untilMs };
-      if (stored === null) {
-        if (!this.identityRow(input.userId)) return { changed: false };
-        const count = () => integerColumn(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = ?", input.userId)[0]?.count);
-        if (count() >= MAX_ROOM_MUTES_PER_USER) {
-          this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND mute_until_ms <= ?", input.userId, effective);
-          if (count() >= MAX_ROOM_MUTES_PER_USER) return { changed: false, refused: true };
-        }
-      }
-      this.rawExec(
-        `INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)
-         ON CONFLICT (user_id, room_id) DO UPDATE SET mute_until_ms = excluded.mute_until_ms`,
-        input.userId, input.roomId, input.untilMs,
-      );
-      return { changed: true, untilMs: input.untilMs };
-    }));
-  }
-
-  /**
-   * The room mutes of a user that ran out by `now` (protocol §4.5), deleted
-   * here, so each is told once: their rooms, and when the next of those left
-   * runs out (absent when none is timed). One range of the user's rows, at
-   * most MAX_ROOM_MUTES_PER_USER, and a delete of the expired ones.
-   */
-  expireRoomMutes(userId: string, now = this.clock.now()): { expired: string[]; next?: number } {
-    this.ensureReady();
-    return this.reserved("expireRoomMutes", { reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 + 4 * MAX_ROOM_MUTES_PER_USER }, false, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      const rows = this.roomMuteRows(userId);
-      const expired = rows.filter((row) => row.untilMs <= effective).map((row) => row.roomId);
-      if (expired.length) this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND mute_until_ms <= ?", userId, effective);
-      return { expired, ...nextRoomMuteEnd(rows.filter((row) => row.untilMs > effective)) };
-    }));
-  }
-
-  /** A user's room mutes as stored, expired ones included, in `room_id` order. */
-  private roomMuteRows(userId: string): RoomMute[] {
-    return this.rawRows<{ room_id: string; mute_until_ms: number }>(
-      "SELECT room_id, mute_until_ms FROM room_mutes WHERE user_id = ? ORDER BY room_id LIMIT ?", userId, MAX_ROOM_MUTES_PER_USER,
-    ).map((row) => ({ roomId: row.room_id, untilMs: integerColumn(row.mute_until_ms) }));
-  }
-
-  /**
-   * A registered user's stored `status` state (protocol §4.5), read once at
-   * sign-in: the `status` they chose, their unscoped mute's end (absent when
-   * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
-   * primary-key read and one range of the user's room mutes, at most
-   * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
-   * Their `seen` is not read here: every sign-in reads their identity row
-   * anyway (getIdentity), which carries it. Signing in brings them back, so
-   * it also zeroes their `unread` (clearPushUnread), in the same
-   * reservation: one more primary-key probe, written only when it held a count.
-   */
-  statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
-    this.ensureReady();
-    return this.reserved("statusInputs", { reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 }, false, now, () => {
-      if (this.config.push) this.pushes.zeroPushUnread(this.sqlHandle, userId);
-      const effective = this.effectiveNow(now);
-      const row = this.userStatusRow(userId);
-      const until = row?.mute_until_ms ?? 0;
-      return {
-        choice: row?.status ?? "online",
-        ...(until > effective ? { muteUntil: until } : {}),
-        roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
-      };
-    });
-  }
-
-  /**
-   * A registered user's read cursors (protocol §4.6): the `read_message_id`
-   * kept for each room they joined that has one, by room. One range of the
-   * user's rows, at most one a membership; none costs nothing.
-   */
-  readCursors(userId: string, now = this.clock.now()): Map<string, string> {
-    this.ensureReady();
-    const rows = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
-    return this.reserved("readCursors", { reads: 8 + 2 * rows }, false, now, () => new Map(this.rawRows<{ room_id: string; message_id: number }>(
-      "SELECT room_id, message_id FROM read_cursors WHERE user_id = ? LIMIT ?", userId, rows,
-    ).map((row) => [row.room_id, idString(integerColumn(row.message_id))])));
-  }
-
-  /**
-   * The read cursors of a private room's members (read receipts, protocol
-   * §4.6), for the rooms of at most MAX_READ_RECEIPT_MEMBERS members: for
-   * each, the members other than `except` (the lister) with a cursor kept
-   * there and the `read_message_id` each read through, leaving out members
-   * who chose `invisible`. A larger room is absent from the result; one with
-   * no cursor to show is present, empty. Per room, a range of at most one
-   * more membership than the limit, by key, then each member's cursor and
-   * `user_status` row by primary key: bounded whatever the room's size.
-   */
-  roomReadCursors(roomIds: readonly string[], except: string, now = this.clock.now()): Map<string, Array<[userId: string, messageId: string]>> {
-    const rooms = roomIds.filter(isPrivateRoomId).slice(0, MAX_PRIVATE_MEMBERSHIPS_PER_USER);
-    const found = new Map<string, Array<[string, string]>>();
-    if (!rooms.length) return found;
-    this.ensureReady();
-    const limit = MAX_READ_RECEIPT_MEMBERS;
-    return this.reserved("roomReadCursors", { reads: 8 + rooms.length * (4 + (limit + 1) + 3 * limit) }, false, now, () => {
-      for (const roomId of rooms) {
-        const members = this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? LIMIT ?", roomId, limit + 1);
-        if (members.length > limit) continue;
-        const rows = this.rawRows<{ user_id: string; message_id: number }>(
-          `SELECT read_cursors.user_id, read_cursors.message_id
-           FROM (SELECT user_id FROM memberships WHERE room_id = ? AND user_id != ? LIMIT ?) AS members
-           JOIN read_cursors ON read_cursors.user_id = members.user_id AND read_cursors.room_id = ?
-           LEFT JOIN user_status ON user_status.user_id = members.user_id
-           WHERE user_status.status IS NULL OR user_status.status != 'invisible'`,
-          roomId, except, limit, roomId,
-        );
-        found.set(roomId, rows.map((row) => [row.user_id, idString(integerColumn(row.message_id))]));
-      }
-      return found;
-    });
-  }
-
-  /**
    * How many registered members a room has (its row's `member_count`),
    * undefined for an unknown room: one primary-key read. Read receipts go
    * only to rooms of at most MAX_READ_RECEIPT_MEMBERS (roomReadCursors).
@@ -5676,78 +5424,25 @@ export class SqliteStore {
     });
   }
 
-  /**
-   * Keeps a registered user's read cursors (protocol §4.6), each a room and
-   * the `read_message_id` read through, in `read_cursors`: only in rooms
-   * they are a member of, so a cursor goes with its membership (a leave,
-   * an expired room, `/purge`) and the table holds at most one a
-   * membership; and only forward, so cursors written from several
-   * connections, in any order, keep the furthest. Each is a primary-key
-   * probe of the membership (read alone, so member listings kept for reuse
-   * stay valid) and an upsert: a new cursor writes its row and its room
-   * index entry, a moved one its row, a cursor not past the kept one
-   * nothing.
-   */
-  saveReadCursors(input: { userId: string; cursors: ReadonlyArray<readonly [roomId: string, messageId: string]>; now?: number }): void {
-    const cursors = input.cursors.slice(0, MAX_USER_ROOMS);
-    if (!cursors.length) return;
-    this.ensureReady();
-    const now = input.now ?? this.clock.now();
-    this.reserved("saveReadCursors", { reads: 8 + 4 * cursors.length, writes: 8 + 4 * cursors.length }, false, now, () => this.transaction(() => {
-      this.effectiveNow(now);
-      for (const [roomId, messageId] of cursors) {
-        if (!this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, input.userId).length) continue;
-        this.rawExec(
-          `INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)
-           ON CONFLICT (user_id, room_id) DO UPDATE SET message_id = excluded.message_id WHERE excluded.message_id > read_cursors.message_id`,
-          input.userId, roomId, Number(messageId),
-        );
-      }
-    }));
-  }
-
-  /**
-   * Settles a registered user's `seen` (protocol §4.5.2) for a change of
-   * the status others see of them to `offline` at `at` (epoch
-   * milliseconds) that is not a chosen `invisible` (setStatus settles that
-   * one with the choice): their last connection closing. The store decides,
-   * so every caller agrees with what it holds, however stale the copy it
-   * decided from (several tabs closing together, each handled as the last;
-   * an eviction in between): the stored one if it stands (seenStands), with
-   * no write, else `at`, written. Returns what is stored after, or
-   * undefined for an unknown user.
-   *
-   * One conditional update of the identity row, which writes only where the
-   * stored one does not stand (1 read, 1 write when it writes); where it
-   * stands, or for an unknown user, a primary-key read of `seen_ms` follows
-   * (2 reads, no write). Listings kept for reuse are patched in place, not
-   * invalidated (patchMemberSeen).
-   */
-  settleSeen(input: { userId: string; at: number; now?: number }): number | undefined {
-    assertSeen(input.at);
-    this.ensureReady();
-    const now = input.now ?? this.clock.now();
-    return this.reserved("settleSeen", { reads: 8, writes: 8 }, false, now, () => {
-      this.effectiveNow(now);
-      const at = input.at;
-      // Written only where the stored one does not stand (seenStands, in SQL).
-      const cursor = this.sql.exec(
-        "UPDATE identities SET seen_ms = ? WHERE user_id = ? AND (seen_ms <= 0 OR seen_ms > ? OR seen_ms < ?)",
-        at, input.userId, at, at - SEEN_WRITE_GRANULARITY_MS,
-      );
-      this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
-      this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
-      if ((cursor.rowsWritten ?? 0) > 0) {
-        this.patchMemberSeen(input.userId, at);
-        return at;
-      }
-      // It stands (or the user is unknown; or the SQL adapter does not
-      // report rows written, which this read covers too): what is stored.
-      const row = this.rawRows<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = ? LIMIT 1", input.userId)[0];
-      const stored = row ? seenColumn(row.seen_ms) : undefined;
-      if (stored === at) this.patchMemberSeen(input.userId, at);
-      return stored;
-    });
+  /** settleSeen's statements, in its reservation: `seen` written where the stored one does not stand, and what is stored after. */
+  private settleSeenRow(userId: string, at: number): number | undefined {
+    // Written only where the stored one does not stand (seenStands, in SQL).
+    const cursor = this.sql.exec(
+      "UPDATE identities SET seen_ms = ? WHERE user_id = ? AND (seen_ms <= 0 OR seen_ms > ? OR seen_ms < ?)",
+      at, userId, at, at - SEEN_WRITE_GRANULARITY_MS,
+    );
+    this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
+    this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
+    if ((cursor.rowsWritten ?? 0) > 0) {
+      this.patchMemberSeen(userId, at);
+      return at;
+    }
+    // It stands (or the user is unknown; or the SQL adapter does not
+    // report rows written, which this read covers too): what is stored.
+    const row = this.rawRows<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = ? LIMIT 1", userId)[0];
+    const stored = row ? seenColumn(row.seen_ms) : undefined;
+    if (stored === at) this.patchMemberSeen(userId, at);
+    return stored;
   }
 
   /**
