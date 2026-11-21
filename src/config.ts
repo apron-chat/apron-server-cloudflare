@@ -493,9 +493,9 @@ function validateLimits(limits: Limits): void {
 	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.roomMetadataLimit > budget.MAX_ROOM_METADATA_LIMIT) {
 		fail("metadata or cleanup exceeds calibrated bounds");
 	}
-	// threadLimit has no fixed ceiling: the listing it sizes must fit (budget.ts).
+	// The thread limit has no fixed ceiling: the listing it sizes must fit (budget.ts).
 	if (budget.roomListingWorstBytes(limits) > budget.MAX_ROOM_LISTING_BYTES) {
-		fail("threadLimit is too large for a room listing with these room metadata limits; lower threadLimit, roomMetadataMinLimit or roomMetadataTotalLimit");
+		fail("threads (the thread limit) is too large for a room listing with these room metadata limits; lower it, roomMetadataMinLimit or roomMetadataTotalLimit");
 	}
 	// A room_set carries the fields in one frame, with its envelope.
 	if (limits.roomMetadataLimit + 1024 > limits.maxFrameBytes) fail("roomMetadataLimit must fit one frame");
@@ -504,8 +504,8 @@ function validateLimits(limits: Limits): void {
 	if (limits.roomMetadataTotalLimit > budget.MAX_ROOM_METADATA_TOTAL_LIMIT || limits.roomMetadataTotalLimit < limits.roomMetadataLimit - limits.roomMetadataMinLimit) {
 		fail("roomMetadataTotalLimit must be between roomMetadataLimit less roomMetadataMinLimit and the calibrated ceiling");
 	}
-	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
-		fail("threadsPerUser must be between 1 and threadLimit");
+	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threads) {
+		fail("threadsPerUser must be between 1 and the thread limit (threads)");
 	}
 	if (!Number.isSafeInteger(limits.privateRoomLimit) || limits.privateRoomLimit < 1 || limits.privateRoomLimit > budget.MAX_PRIVATE_ROOM_LIMIT) {
 		fail("privateRoomLimit must be between 1 and the calibrated private room ceiling");

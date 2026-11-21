@@ -151,7 +151,7 @@ const LISTED_PRIVATE_ROOMS = 2 * MAX_PRIVATE_ROOM_LIMIT;
  * Most rooms one registered user's listing names as joined (userRooms), the
  * most recently active: the public rooms and threads a listing names at
  * CALIBRATED_THREAD_LIMIT, and their share of private ones. Fixed whatever
- * `threadLimit` is: it is what a connection's attachment carries
+ * `threads` is: it is what a connection's attachment carries
  * (MAX_LISTED_USER_ROOMS), which has a fixed size, so a user in more rooms
  * is delivered to in the most recently active of them.
  */
@@ -570,7 +570,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxNameBytes: DEFAULT_LIMITS.maxNameBytes,
   maxNameCodePoints: DEFAULT_LIMITS.maxNameCodePoints,
   maxEmbeds: DEFAULT_LIMITS.maxEmbeds,
-  maxThreads: DEFAULT_LIMITS.threadLimit,
+  maxThreads: DEFAULT_LIMITS.threads,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
   roomCreationWindowMs: DEFAULT_LIMITS.roomCreationWindowSeconds * 1000,
   roomMetadataLimit: DEFAULT_LIMITS.roomMetadataLimit,

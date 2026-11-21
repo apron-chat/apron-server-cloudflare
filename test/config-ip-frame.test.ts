@@ -211,15 +211,15 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ ROOM_METADATA_TOTAL_LIMIT: String(256 * 1024 + 1) })).toThrow(/roomMetadataTotalLimit/);
 	});
 
-	it('takes threadLimit from the wrangler vars, bounded by the room listing it sizes rather than a fixed ceiling', () => {
-		expect(config().limits.threadLimit).toBe(DEFAULT_LIMITS.threadLimit);
-		expect(config({ LIMIT_THREAD_LIMIT: '250', LIMIT_THREADS_PER_USER: '50' }).limits).toMatchObject({ threadLimit: 250, threadsPerUser: 50 });
+	it('takes the thread limit (LIMIT_THREADS) from the wrangler vars, bounded by the room listing it sizes rather than a fixed ceiling', () => {
+		expect(config().limits.threads).toBe(DEFAULT_LIMITS.threads);
+		expect(config({ LIMIT_THREADS: '250', LIMIT_THREADS_PER_USER: '50' }).limits).toMatchObject({ threads: 250, threadsPerUser: 50 });
 		// At the default room metadata limits a worst-case listing fits up to 298 threads.
-		expect(config({ LIMIT_THREAD_LIMIT: '298' }).limits.threadLimit).toBe(298);
-		expect(() => config({ LIMIT_THREAD_LIMIT: '299' })).toThrow(/threadLimit is too large for a room listing/);
+		expect(config({ LIMIT_THREADS: '298' }).limits.threads).toBe(298);
+		expect(() => config({ LIMIT_THREADS: '299' })).toThrow(/threads \(the thread limit\) is too large for a room listing/);
 		// Smaller room fields leave a listing room for more threads.
-		expect(config({ LIMIT_THREAD_LIMIT: '1000', ROOM_METADATA_LIMIT: '512', ROOM_METADATA_MIN_LIMIT: '128', ROOM_METADATA_TOTAL_LIMIT: '65536' }).limits.threadLimit).toBe(1000);
-		expect(() => config({ LIMIT_THREADS_PER_USER: String(DEFAULT_LIMITS.threadLimit + 1) })).toThrow(/threadsPerUser must be between 1 and threadLimit/);
+		expect(config({ LIMIT_THREADS: '1000', ROOM_METADATA_LIMIT: '512', ROOM_METADATA_MIN_LIMIT: '128', ROOM_METADATA_TOTAL_LIMIT: '65536' }).limits.threads).toBe(1000);
+		expect(() => config({ LIMIT_THREADS_PER_USER: String(DEFAULT_LIMITS.threads + 1) })).toThrow(/threadsPerUser must be between 1 and the thread limit/);
 	});
 
 	it('takes an optional APRON_ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {

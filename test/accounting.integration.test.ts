@@ -439,7 +439,7 @@ describe('measured storage accounting', () => {
 		console.info('accounting-room-list', JSON.stringify(result));
 	});
 
-	it('scales room listing and counting reservations with a threadLimit above the calibrated 100', async () => {
+	it('scales room listing and counting reservations with a threads above the calibrated 100', async () => {
 		const stub = env.DEMO.getByName('accounting-room-list-scaled');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());

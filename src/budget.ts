@@ -219,12 +219,12 @@ export interface Limits {
 	databaseHardTargetBytes: number;
 	databaseResumeLowWaterBytes: number;
 	cleanupBatch: number;
-	/** Public rooms and threads (`general` aside) that may be started within roomCreationWindowSeconds. */
-	threadLimit: number;
+	/** The thread limit (`LIMIT_THREADS`): public rooms and threads (`general` aside) that may be started within roomCreationWindowSeconds. */
+	threads: number;
 	/** Threads one registered user may start within roomCreationWindowSeconds. */
 	threadsPerUser: number;
 	/**
-	 * The window the room caps (`threadLimit`, `threadsPerUser`,
+	 * The window the room caps (`threads`, `threadsPerUser`,
 	 * `privateRoomLimit`, `privateRoomsPerUser`) count rooms started in, by
 	 * their creation: they limit how fast rooms are started, not how many
 	 * exist, so posting in, joining or leaving an older room never needs a
@@ -248,7 +248,7 @@ export interface Limits {
 	 * grow the total past it is refused.
 	 */
 	roomMetadataTotalLimit: number;
-	/** Private rooms (§4.2.4) that may be started within roomCreationWindowSeconds; they do not count against threadLimit. */
+	/** Private rooms (§4.2.4) that may be started within roomCreationWindowSeconds; they do not count against `threads`. */
 	privateRoomLimit: number;
 	/** Private rooms one registered user may start within roomCreationWindowSeconds. */
 	privateRoomsPerUser: number;
@@ -622,29 +622,29 @@ export function thresholdRecords(limit: number, percent: number): number {
 /**
  * The thread limit the fixed per-user sizes were calibrated at (store.ts:
  * MAX_USER_ROOMS, what a connection's attachment carries, and
- * MAX_PURGE_ROOMS). A `threadLimit` above it scales what scales with the
+ * MAX_PURGE_ROOMS). A `threads` limit above it scales what scales with the
  * threads (listedThreadScale); one below it lists as this does, so lowering
  * the limit never shortens a listing.
  */
 export const CALIBRATED_THREAD_LIMIT = 100;
 /**
  * Most top-level rooms created besides `general`. They also count against
- * `threadLimit`, which bounds the rooms table, and, being permanent, this
+ * `threads`, which bounds the rooms table, and, being permanent, this
  * keeps them from taking all of its slots.
  */
 export const MAX_CREATED_ROOMS = 16;
-/** The thread count listings and the public room scans are sized for: `threadLimit`, at least CALIBRATED_THREAD_LIMIT. */
-export function listedThreadScale(threadLimit: number): number {
-	return Math.max(threadLimit, CALIBRATED_THREAD_LIMIT);
+/** The thread count listings and the public room scans are sized for: `threads`, at least CALIBRATED_THREAD_LIMIT. */
+export function listedThreadScale(threads: number): number {
+	return Math.max(threads, CALIBRATED_THREAD_LIMIT);
 }
 /** Threads a listing names, the most recently active (store.ts, listRooms): twice the thread scale. */
-export function listedThreads(threadLimit: number): number {
-	return 2 * listedThreadScale(threadLimit);
+export function listedThreads(threads: number): number {
+	return 2 * listedThreadScale(threads);
 }
 /**
  * The largest a room listing (`room_list`) may be at its worst: it goes out
  * as one frame and is never cut to fit (ApronDemoServer.boundedListing), so
- * this bounds `threadLimit` against the room metadata limits
+ * this bounds `threads` against the room metadata limits
  * (roomListingWorstBytes, checked by validateLimits). The runtime allows
  * far larger messages; this keeps a listing a modest frame for clients and
  * for the object's memory.
@@ -656,10 +656,10 @@ export const ROOM_LISTING_ENTRY_BYTES = 256;
  * A room listing's worst size: every public room it names (`general`, the
  * created rooms, listedThreads) at roomMetadataMinLimit each, and what they
  * hold past that together (roomMetadataTotalLimit). At the defaults, about
- * 530 KiB; with them, `threadLimit` may go up to 298.
+ * 530 KiB; with them, `threads` may go up to 298.
  */
-export function roomListingWorstBytes(limits: Pick<Limits, "threadLimit" | "roomMetadataMinLimit" | "roomMetadataTotalLimit">): number {
-	return (1 + MAX_CREATED_ROOMS + listedThreads(limits.threadLimit)) * (limits.roomMetadataMinLimit + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalLimit;
+export function roomListingWorstBytes(limits: Pick<Limits, "threads" | "roomMetadataMinLimit" | "roomMetadataTotalLimit">): number {
+	return (1 + MAX_CREATED_ROOMS + listedThreads(limits.threads)) * (limits.roomMetadataMinLimit + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalLimit;
 }
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinLimit is bounded together by at most one history

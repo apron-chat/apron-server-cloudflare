@@ -99,7 +99,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		databaseHardTargetBytes: 128 * 1024 * 1024,
 		databaseResumeLowWaterBytes: 80 * 1024 * 1024,
 		cleanupBatch: 100,
-		threadLimit: 100,
+		threads: 100,
 		// So one account cannot take every thread slot: a quarter of them.
 		threadsPerUser: 25,
 		// A quiet thread or private room stops counting after 30 days.

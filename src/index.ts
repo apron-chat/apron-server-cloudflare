@@ -1177,7 +1177,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxNameBytes: limits.maxNameBytes,
 		maxNameCodePoints: limits.maxNameCodePoints,
 		maxEmbeds: limits.maxEmbeds,
-		maxThreads: limits.threadLimit,
+		maxThreads: limits.threads,
 		maxThreadsPerUser: limits.threadsPerUser,
 		roomCreationWindowMs: limits.roomCreationWindowSeconds * 1_000,
 		roomMetadataLimit: limits.roomMetadataLimit,
@@ -9637,7 +9637,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const window = limits.roomCreationWindowSeconds > 0 ? ` started in ${Math.round(limits.roomCreationWindowSeconds / 86_400)} days` : "";
 		const older = (n: number) => (n ? `, ${n.toLocaleString("en-US")} older` : "");
 		return [
-			`- Rooms and threads: ${rooms.public.recent.toLocaleString("en-US")} / ${limits.threadLimit.toLocaleString("en-US")}${window}${older(rooms.public.older)}`,
+			`- Rooms and threads: ${rooms.public.recent.toLocaleString("en-US")} / ${limits.threads.toLocaleString("en-US")}${window}${older(rooms.public.older)}`,
 			...(limits.privateRoomLimit > 0 ? [`- Private rooms: ${rooms.private.recent.toLocaleString("en-US")} / ${limits.privateRoomLimit.toLocaleString("en-US")}${window}${older(rooms.private.older)}`] : []),
 		];
 	}
@@ -10179,7 +10179,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private noteRoom(roomId: string, exists: boolean): void {
 		this.knownRooms.delete(roomId);
 		// The rooms table is capped; unknown IDs are bounded by the same size.
-		if (this.knownRooms.size >= 2 * (this.config.limits.threadLimit + 1 + this.config.limits.privateRoomLimit)) this.knownRooms.delete(this.knownRooms.keys().next().value!);
+		if (this.knownRooms.size >= 2 * (this.config.limits.threads + 1 + this.config.limits.privateRoomLimit)) this.knownRooms.delete(this.knownRooms.keys().next().value!);
 		this.knownRooms.set(roomId, exists);
 	}
 
