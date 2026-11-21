@@ -113,6 +113,8 @@ export interface StoreCore {
    * Every use is listed in src/store/index.ts.
    */
   unmetered<T>(fn: (sql: Sql) => T): T;
+  /** The log's hot floor, published floor and newest log ID where all are known in memory (no SQL), else undefined. */
+  knownFloors(): { hot: number; published: number; latest: number } | undefined;
   /** Whether the server is degraded now: a daily share past DEGRADE_SHARE (no SQL). */
   degraded(now: number): boolean;
   /** Sets a committed `seen` in the member listings kept for reuse (no SQL). */

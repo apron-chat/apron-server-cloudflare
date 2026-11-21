@@ -294,6 +294,7 @@ export class SqliteStore {
       unmetered: (fn) => fn(this.sqlHandle),
       patchMemberSeen: (userId, seen) => this.patchMemberSeen(userId, seen),
       degraded: (now) => this.degraded(now),
+      knownFloors: () => this.knownFloors(),
       ensureReady: () => this.ensureReady(),
       effectiveNow: (candidate) => this.effectiveNow(candidate),
       reserved: (operation, cost, maintenance, now, fn, unchecked) => this.reserved(operation, cost, maintenance, now, (unused) => fn(this.sqlHandle, unused), unchecked),
@@ -858,6 +859,7 @@ export class SqliteStore {
     this.memberGeneration += 1;
     this.memberCache.clear();
     this.uploads.emojiCache = null;
+    this.historyLog.forgetState();
     this.uploads.serverCache = null;
     this.initialized = false;
     this.logCache = null;
@@ -1722,6 +1724,12 @@ export class SqliteStore {
       const state = this.logState();
       return { latest_log_id: idString(state.last_log_id), history_floor: idString(this.publishedFloor()) };
     });
+  }
+
+  /** The floors historyFloors reports, where the log head and the published floor are both in memory already: no SQL. */
+  private knownFloors(): { hot: number; published: number; latest: number } | undefined {
+    if (!this.logCache || (this.config.tiered && this.publishedCache === undefined)) return undefined;
+    return { hot: this.logCache.history_floor, published: this.publishedFloor(), latest: this.logCache.last_log_id };
   }
 
   /**
@@ -5015,6 +5023,7 @@ export class SqliteStore {
         );
         for (const row of stale) this.writeMeta(row.key, null);
         this.publishedCache = undefined;
+        if (stale.length) this.historyLog.forgetState();
       }
       const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);

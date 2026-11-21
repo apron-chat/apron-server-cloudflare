@@ -1,6 +1,6 @@
 {
-	"version": "b86bd94-dirty",
-	"commit": "b86bd94bcf4e5476b51f5957acfc8a4842f8546f",
+	"version": "4091af1-dirty",
+	"commit": "4091af1b5eb0c54b3d226ae2f727176c47f7c30a",
 	"heldAlarms": 0,
 	"steps": [
 		{
@@ -280,10 +280,10 @@
 		},
 		{
 			"step": "alarm (full: maintenance due)",
-			"reads": 246,
-			"writes": 149,
-			"reservedReads": 323354,
-			"reservedWrites": 7566
+			"reads": 60,
+			"writes": 28,
+			"reservedReads": 321854,
+			"reservedWrites": 6598
 		},
 		{
 			"step": "alarm (again: nothing due)",

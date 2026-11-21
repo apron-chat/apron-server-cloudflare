@@ -15,14 +15,68 @@ import { type ChainStatePort, MAX_KEPT_GROUPS } from "../history/state";
 import { StoreError } from "../store-error";
 import { HISTORY_SCAN_BATCH, HISTORY_SCAN_PAGES, HISTORY_TARGET_SCAN, MAX_HISTORY_REWRITES, RETAINED_SCAN_CAP } from "./limits";
 import { META_HISTORY_EXPORT, META_HISTORY_IMPORT, META_HISTORY_IMPORT_PROGRESS, META_HISTORY_KEPT, META_HISTORY_LINK, META_HISTORY_OPS, META_HISTORY_OPS_SEQ, META_HISTORY_THROUGH, META_HISTORY_TIER } from "./meta";
-import { type MembershipRecord, type RawRecordRow, type RawRoomRow, type ReactionsRecord, idString, integerColumn, numericBigInt, numericId, parseJson, positiveLimit, roomHistoryFloor, roomHistoryLogId, terminalOutputBytes, utf8Bytes } from "./rows";
+import { type MembershipRecord, type RawRecordRow, type RawRoomRow, type ReactionsRecord, clone, idString, integerColumn, numericBigInt, numericId, parseJson, positiveLimit, roomHistoryFloor, roomHistoryLogId, terminalOutputBytes, utf8Bytes } from "./rows";
 import type { MessageSnapshot, PendingHistory, RoomRecord, StoreHistoryQuery, StoreHistoryResult } from "./types";
 import type { Sql, StoreCore } from "./core";
 import type { AdmissionModule } from "./admission";
 
 /** History over the store's core: history pages (the Messages part's), the head and state the history chain runs over, and the History part's bookkeeping. */
 export class HistoryModule {
-  constructor(private readonly core: StoreCore, private readonly admission: AdmissionModule) {}
+  constructor(private readonly core: StoreCore, private readonly admission: AdmissionModule) {
+    // A transaction that rolls back may have written state these caches hold: they are read again.
+    core.journal({ begin: () => {}, commit: () => {}, rollback: () => this.forgetState() });
+  }
+
+  /**
+   * The history chain's state and rewrite queue, kept in memory: this
+   * instance is their only writer (cleanup forgets them when tiers are off,
+   * and a reset wipes them, each calling forgetState). Each is read once, under its
+   * reservation, then from memory, and every write here updates it once
+   * written; a rollback forgets them all. So a history cycle's snapshots,
+   * one a step, read no SQL and reserve nothing once the state is known.
+   * `_meta` values by key (undefined: absent), groups of kept rewrites by
+   * prefix, the copy marker, the queue (META_HISTORY_OPS) and the newest
+   * rewrite's number (META_HISTORY_OPS_SEQ).
+   */
+  private readonly stateValues = new Map<string, string | undefined>();
+  private readonly stateEntries = new Map<string, Array<[string, string]>>();
+  private copyMarkerCache: number | undefined;
+  /** Whether every tier and link state key was read at once (loadChainState): a key not in stateValues is then absent. */
+  private stateLoaded = false;
+  private queueCache: QueuedRewrite[] | undefined;
+  private loggedCache: number | undefined;
+
+  /**
+   * Reads the chain's state at once, under one reservation, the first time a
+   * snapshot needs any of it: every tier's and link's value (a few: one a
+   * tier), the copy marker and the newest rewrite's number. A cycle plans
+   * each step from a snapshot of all of these, so reading them one at a time
+   * would reserve, and settle, once each.
+   */
+  private loadChainState(): void {
+    if (this.stateLoaded) return;
+    const range = (prefix: string) => [prefix, prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1)] as const;
+    const limit = 64;
+    this.core.reserved("unknown", { reads: 16 + 2 * (8 + limit) }, true, this.core.clock.now(), (sql) => {
+      const tiers = sql.metaRange(...range(META_HISTORY_TIER), limit);
+      const links = sql.metaRange(...range(META_HISTORY_LINK), limit);
+      this.copyMarkerCache ??= sql.metaNumber(META_HISTORY_THROUGH);
+      this.loggedCache ??= sql.metaNumber(META_HISTORY_OPS_SEQ);
+      for (const [key, value] of [...tiers, ...links]) if (!this.stateValues.has(key)) this.stateValues.set(key, value || undefined);
+      // A range cut at its limit (never, with a tier a key) leaves the rest to be read one at a time.
+      this.stateLoaded = tiers.length < limit && links.length < limit;
+    });
+  }
+
+  /** Forgets the history state kept in memory (above): read again on next need. */
+  forgetState(): void {
+    this.stateValues.clear();
+    this.stateEntries.clear();
+    this.copyMarkerCache = undefined;
+    this.stateLoaded = false;
+    this.queueCache = undefined;
+    this.loggedCache = undefined;
+  }
 
   /** The cold tiers' chunk indexes, as loaded from this SQLite, by tier name (chunkIndex). */
   private readonly chunkIndexes = new Map<string, Map<number, ChunkRef>>();
@@ -50,6 +104,9 @@ export class HistoryModule {
    */
   historyFloors(now = this.core.clock.now()): { hot: number; published: number; latest: number } {
     this.core.ensureReady();
+    // The log head and the published floor are kept in memory once read (SqliteStore's logState and publishedFloor).
+    const known = this.core.knownFloors();
+    if (known) return known;
     return this.core.reserved("historyFloors", { reads: 8 }, true, now, (sql) => {
       const state = sql.logState();
       return { hot: state.history_floor, published: sql.publishedFloor(), latest: state.last_log_id };
@@ -156,30 +213,49 @@ export class HistoryModule {
     return {
       value: (key) => {
         this.core.ensureReady();
-        return this.core.reserved("unknown", { reads: 4 }, true, this.core.clock.now(), (sql) => sql.metaValue(owned(key)) || undefined);
+        owned(key);
+        if (!key.startsWith(META_HISTORY_KEPT)) this.loadChainState();
+        if (this.stateValues.has(key)) return this.stateValues.get(key);
+        if (this.stateLoaded && !key.startsWith(META_HISTORY_KEPT)) return undefined;
+        const value = this.core.reserved("unknown", { reads: 4 }, true, this.core.clock.now(), (sql) => sql.metaValue(owned(key)) || undefined);
+        this.stateValues.set(key, value);
+        return value;
       },
       setValue: (key, value) => {
         this.core.ensureReady();
         if (!this.core.config.tiered) return;
         this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => sql.writeMeta(owned(key), value));
+        this.stateValues.set(key, value || undefined);
+        for (const prefix of [...this.stateEntries.keys()]) if (key.startsWith(prefix)) this.stateEntries.delete(prefix);
       },
       hotFloor: () => this.historyFloors().hot,
       publishedFloor: () => this.historyFloors().published,
       copyMarker: () => {
         this.core.ensureReady();
-        return this.core.reserved("unknown", { reads: 4 }, true, this.core.clock.now(), (sql) => sql.metaNumber(META_HISTORY_THROUGH));
+        this.loadChainState();
+        this.copyMarkerCache ??= this.core.reserved("unknown", { reads: 4 }, true, this.core.clock.now(), (sql) => sql.metaNumber(META_HISTORY_THROUGH));
+        return this.copyMarkerCache;
       },
       raiseCopyMarker: (through) => {
         this.core.ensureReady();
         if (!this.core.config.tiered) return;
-        this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => {
-          if (through > sql.metaNumber(META_HISTORY_THROUGH)) sql.writeMeta(META_HISTORY_THROUGH, String(through));
+        // Never lowered: a marker known to be there already needs no write.
+        if (this.copyMarkerCache !== undefined && through <= this.copyMarkerCache) return;
+        this.copyMarkerCache = this.core.reserved("unknown", { reads: 4, writes: 4 }, true, this.core.clock.now(), (sql) => {
+          const stored = sql.metaNumber(META_HISTORY_THROUGH);
+          if (through > stored) sql.writeMeta(META_HISTORY_THROUGH, String(through));
+          return Math.max(stored, through);
         });
       },
       entries: (prefix) => {
         this.core.ensureReady();
+        owned(prefix);
+        const known = this.stateEntries.get(prefix);
+        if (known) return known.map(([key, value]) => [key, value] as [string, string]);
         const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
-        return this.core.reserved("unknown", { reads: 16 + MAX_KEPT_GROUPS }, true, this.core.clock.now(), (sql) => sql.metaRange(owned(prefix), end, MAX_KEPT_GROUPS));
+        const entries = this.core.reserved("unknown", { reads: 16 + MAX_KEPT_GROUPS }, true, this.core.clock.now(), (sql) => sql.metaRange(owned(prefix), end, MAX_KEPT_GROUPS));
+        this.stateEntries.set(prefix, entries.map(([key, value]) => [key, value] as [string, string]));
+        return entries;
       },
     };
   }
@@ -188,13 +264,16 @@ export class HistoryModule {
   historyRewrites(now = this.core.clock.now()): QueuedRewrite[] {
     this.core.ensureReady();
     if (!this.core.config.tiered) return [];
-    return this.core.reserved("historyRewrites", { reads: 4 }, true, now, (sql) => this.queuedRewrites(sql));
+    this.queueCache ??= this.core.reserved("historyRewrites", { reads: 4 }, true, now, (sql) => this.queuedRewrites(sql));
+    return clone(this.queueCache);
   }
 
   /** The newest rewrite's number ever given (0: none), delivered or not. */
   historyRewritesLogged(now = this.core.clock.now()): number {
     this.core.ensureReady();
-    return this.core.reserved("historyRewritesLogged", { reads: 4 }, true, now, (sql) => sql.metaNumber(META_HISTORY_OPS_SEQ));
+    this.loadChainState();
+    this.loggedCache ??= this.core.reserved("historyRewritesLogged", { reads: 4 }, true, now, (sql) => sql.metaNumber(META_HISTORY_OPS_SEQ));
+    return this.loggedCache;
   }
 
   private queuedRewrites(sql: Sql): QueuedRewrite[] {
@@ -208,6 +287,7 @@ export class HistoryModule {
     this.core.reserved("amendHistoryPurge", { reads: 4, writes: 4 }, true, now, (sql) => {
       const next = this.queuedRewrites(sql).map((entry) => entry.seq === seq && entry.rewrite.into === null ? { seq, rewrite: { ...entry.rewrite, messages: [...new Set([...(entry.rewrite.messages ?? []), ...messageIds])] } } : entry);
       sql.writeMeta(META_HISTORY_OPS, JSON.stringify(next));
+      this.queueCache = clone(next);
     });
   }
 
@@ -217,6 +297,7 @@ export class HistoryModule {
     this.core.reserved("dropHistoryRewrites", { reads: 4, writes: 4 }, true, now, (sql) => {
       const kept = this.queuedRewrites(sql).filter((entry) => entry.seq > seq);
       sql.writeMeta(META_HISTORY_OPS, kept.length ? JSON.stringify(kept) : null);
+      this.queueCache = clone(kept);
     });
   }
 
@@ -229,20 +310,17 @@ export class HistoryModule {
    */
   chunkIndex(tier: string): ChunkIndex {
     // As historyStatePort's: run by the cold tier, so named `unknown`.
-    const prepare = () => {
-      this.core.ensureReady();
-      if (this.chunkTableReady) return;
-      this.core.reserved("unknown", { reads: 8, writes: 8 }, true, this.core.clock.now(), (sql) => {
-        sql.exec("CREATE TABLE IF NOT EXISTS history_chunks (tier TEXT NOT NULL, first INTEGER NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (tier, first)) WITHOUT ROWID");
-      });
-      this.chunkTableReady = true;
-    };
     const loaded = (): Map<number, ChunkRef> => {
       const cached = this.chunkIndexes.get(tier);
       if (cached) return cached;
-      prepare();
-      // Charged for the rows there are: a count first, then the rows.
-      const count = this.core.reserved("unknown", { reads: 24 }, true, this.core.clock.now(), (sql) => Number(sql.rows<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = ?", tier)[0]?.count ?? 0));
+      this.core.ensureReady();
+      // Charged for the rows there are: a count first (with, once a wake, the
+      // table made where it is missing), then the rows.
+      const count = this.core.reserved("unknown", { reads: 32, writes: 8 }, true, this.core.clock.now(), (sql) => {
+        if (!this.chunkTableReady) sql.exec("CREATE TABLE IF NOT EXISTS history_chunks (tier TEXT NOT NULL, first INTEGER NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (tier, first)) WITHOUT ROWID");
+        return Number(sql.rows<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = ?", tier)[0]?.count ?? 0);
+      });
+      this.chunkTableReady = true;
       const rows = this.core.reserved("unknown", { reads: 24 + count }, true, this.core.clock.now(), (sql) => sql.rows<{ first: number; ref: string }>("SELECT first, ref FROM history_chunks WHERE tier = ?", tier));
       const refs = new Map(rows.map((row) => [Number(row.first), JSON.parse(row.ref) as ChunkRef]));
       this.chunkIndexes.set(tier, refs);
@@ -314,6 +392,8 @@ export class HistoryModule {
     const added = rewrites.map((rewrite) => ({ seq: (seq += 1), rewrite }));
     sql.writeMeta(META_HISTORY_OPS_SEQ, String(seq));
     sql.writeMeta(META_HISTORY_OPS, JSON.stringify([...queued, ...added]));
+    this.loggedCache = seq;
+    this.queueCache = clone([...queued, ...added]);
   }
 
   /**

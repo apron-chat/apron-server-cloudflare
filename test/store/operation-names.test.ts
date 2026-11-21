@@ -116,7 +116,7 @@ it("names each operation's reservations as before", async () => {
 			"liveText.open": [],
 			"history.hotRecords": ["hotRecords"],
 			"history.state": ["unknown"],
-			"history.chunkIndex": ["unknown", "unknown", "unknown"],
+			"history.chunkIndex": ["unknown", "unknown"],
 			"history.restore.roomIsEmpty": ["roomIsEmpty"],
 			"history.restore.accounts": ["accountCapacity"],
 			"ops.status": ["status"],
