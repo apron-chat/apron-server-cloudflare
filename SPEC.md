@@ -466,14 +466,14 @@ Every other `retry_after` carries no category; the daily SQL budget's has `data.
 | trusted_posts_per_day | 4,000 (Free: 2,000) | Same, in place of `registered_posts_per_day`; also their IP's daily limit when larger |
 | ip_posts_per_minute | 120 (Free: 30) | IP across guest/registered identities |
 | ip_posts_per_day | 5,000 (Free: 1,000) | IP across identities |
-| global_posts_per_minute | 120 (Free: 60) | Entire demo |
-| global_posts_per_day | 10,000 (Free: 5,000) | Entire demo |
-| registrations_per_ip_day | 5 (Free: 3) | Successful registrations |
-| registrations_per_day | 300 (Free: 100) | Entire demo |
-| registered_accounts | 10,000 | Persistent total |
-| auth_attempts_per_ip_minute | 10 | Begin/finish/guest/failed attempts |
+| global_posts_per_minute | 600 (Free: 60) | Entire demo |
+| global_posts_per_day | 60,000 (Free: 5,000) | Entire demo |
+| registrations_per_ip_day | 20 (Free: 3) | Successful registrations |
+| registrations_per_day | 5,000 (Free: 100) | Entire demo |
+| registered_accounts | 50,000 (Free: 10,000) | Persistent total |
+| auth_attempts_per_ip_minute | 64 (Free: 10) | Begin/finish/guest/failed attempts |
 
-Posting includes message creates, edits, deletes, restores, moves, reaction changes, room creation and saves, `me` name and `ext` changes, and room joins and leaves, a guest's included. The `anonymous_*` rows apply to guest identities. The `trusted_*` rows apply to registered users holding any role but `unclaimed` (read with the identity row as each post is charged), since only an admin gives those (an import gives `unclaimed`); an owner's bot (tier `bot`) is never trusted. The global rows still apply to trusted users, and so do the IP rows, raised to the trusted ones for their posts. Count only newly accepted operations against posting quotas; matching deduplicated retries do not post again. Invalid requests and rejected attempts still spend frame/read/verification budgets. Notifications receive no exemption.
+Posting includes message creates, edits, deletes, restores, moves, reaction changes, room creation and saves, `me` name and `ext` changes, and room joins and leaves, a guest's included. The `guest_*` rows apply to guest identities. The `trusted_*` rows apply to registered users holding any role but `unclaimed` (read with the identity row as each post is charged), since only an admin gives those (an import gives `unclaimed`); an owner's bot (tier `bot`) is never trusted. The global rows still apply to trusted users, and so do the IP rows, raised to the trusted ones for their posts. Count only newly accepted operations against posting quotas; matching deduplicated retries do not post again. Invalid requests and rejected attempts still spend frame/read/verification budgets. Notifications receive no exemption.
 
 ### Payload and query bounds
 
@@ -493,8 +493,8 @@ Posting includes message creates, edits, deletes, restores, moves, reaction chan
 | history_requests_per_user_minute | 20 (Free: 10) |
 | history_requests_per_ip_minute | 60 (Free: 30) |
 | history_burst_per_user / per_ip | 60 / 120 (Free: 30 / 60) |
-| history_requests_per_user_day / per_ip_day | 3,000 / 6,000 (Free: 1,000 / 2,000) |
-| history_requests_per_day (server-wide) | 40,000 (Free: 5,000) |
+| history_requests_per_user_day / per_ip_day | 3,000 / 30,000 (Free: 1,000 / 2,000) |
+| history_requests_per_day (server-wide) | 400,000 (Free: 5,000) |
 | concurrent_history_per_connection | 1 |
 
 The smaller frame limit is a documented demo exception to the protocol's advisory 256 KiB recommendation. UTF-8 byte size is not JavaScript string length. The final authoritative snapshot must fit after server-owned fields are added. No truncation of accepted text/extensions. Decode and validate depth/nodes after the raw byte check; reject object/array top-level batches and pathological structures. Bound the byte sizes of auth options, credential IDs, public keys, and all persisted metadata as well.
@@ -503,17 +503,17 @@ The smaller frame limit is a documented demo exception to the protocol's advisor
 
 | Key | Default |
 | --- | ---: |
-| open_connections | 100 total, including pending auth and closing sockets |
-| guest_connections_per_ip | 6, including unauthenticated sockets (Free: 2) |
+| open_connections | 500 total, including pending auth and closing sockets (Free: 100) |
+| guest_connections_per_ip | 24, including unauthenticated sockets (Free: 2) |
 | registered_connections_per_user | 8 (Free: 3); a sign-in past it closes the account's oldest connections, stale ones first (below) |
-| connections_per_ip | 10 total |
-| connection_admissions_per_ip_minute | 12 (Free: 5) |
-| connection_admissions_per_day | 4,000 globally (Free: 2,000) |
+| connections_per_ip | 32 total (Free: 10) |
+| connection_admissions_per_ip_minute | 30 (Free: 5) |
+| connection_admissions_per_day | 300,000 globally (Free: 2,000) |
 | auth_timeout_seconds | 30 |
-| pending_frames_per_connection | 8, additionally bounded to 128 KiB |
+| pending_frames_per_connection | 8, additionally bounded to 64 KiB (Free: 128 KiB) |
 | frames_per_connection_minute | 120 (Free: 60) |
-| frames_per_ip_minute | 120 |
-| global_frames_per_minute | 600 server-wide, in memory, before SQL (Free: 300) |
+| frames_per_ip_minute | 480 (Free: 120) |
+| global_frames_per_minute | 5,000 server-wide, in memory, before SQL (Free: 300) |
 | frame_lease | 10 frames reserved per block, per connection |
 | activity_broadcasts_per_user_minute | 10 relayed typing updates |
 | room_list_requests_per_user_minute | 6 |
@@ -523,7 +523,7 @@ The smaller frame limit is a documented demo exception to the protocol's advisor
 | unpinged_timeout_seconds | 900 without a frame since it opened, for a connection that never pinged; at least `ping_timeout_seconds` |
 | status_coalesce_seconds | 60: a user's change towards `idle` or `offline` is announced at most once in this long after the last announcement, the latest change winning; coming back goes out at once; at most 60 |
 | offline_grace_seconds | 60: a change a closed connection caused waits this long, so a reconnect within it shows nothing; at most 60 |
-| processed_frames_per_day | 150,000 globally (Free: 100,000) |
+| processed_frames_per_day | 6,000,000 globally (Free: 100,000) |
 | policy_violations_before_close | Close after 3 within 60 seconds; severe oversized/binary input closes immediately |
 
 Minute limits other than posting may use a documented token bucket with a burst no greater than the listed minute allowance. First-check cheap frame/connection gates precede JSON parsing, SQL queries, and cryptographic work. WebSocket control frames are not application frames.
