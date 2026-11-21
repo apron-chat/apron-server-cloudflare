@@ -248,7 +248,7 @@ describe('push over the socket', () => {
 			const long = `https://push.example.net/${'x'.repeat(600)}`;
 			const removed = await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as Runtime;
-				const spy = vi.spyOn(sqliteOf(runtime.store), 'removePushSubscription');
+				const spy = vi.spyOn(runtime.store.push!, 'remove');
 				return { spy, restore: () => spy.mockRestore() };
 			});
 			try {

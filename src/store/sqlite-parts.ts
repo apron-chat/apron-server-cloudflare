@@ -196,15 +196,15 @@ export function sqliteHistory(sqlite: SqliteStore): History {
 /** Push over SqliteStore. */
 export function sqlitePush(sqlite: SqliteStore): Push {
   return {
-    register: (input) => sqlite.registerPushSubscription(input),
-    remove: (input) => sqlite.removePushSubscription(input),
-    joinedWakers: (now) => sqlite.joinedWakers(now),
-    claim: (input) => sqlite.claimPushes(input),
-    clearUnread: (userId, now) => sqlite.clearPushUnread(userId, now),
-    clearSubscriptions: (userId, now) => sqlite.clearPushSubscriptions(userId, now),
-    forgetSubscriptions: (gone, now) => sqlite.forgetPushSubscriptions(gone, now),
-    message: (messageId, now) => sqlite.pushedMessage(messageId, now),
-    sentToday: (now) => sqlite.pushesToday(now),
+    register: (input) => sqlite.pushes.registerPushSubscription(input),
+    remove: (input) => sqlite.pushes.removePushSubscription(input),
+    joinedWakers: (now) => sqlite.pushes.joinedWakers(now),
+    claim: (input) => sqlite.pushes.claimPushes(input),
+    clearUnread: (userId, now) => sqlite.pushes.clearPushUnread(userId, now),
+    clearSubscriptions: (userId, now) => sqlite.pushes.clearPushSubscriptions(userId, now),
+    forgetSubscriptions: (gone, now) => sqlite.pushes.forgetPushSubscriptions(gone, now),
+    message: (messageId, now) => sqlite.pushes.pushedMessage(messageId, now),
+    sentToday: (now) => sqlite.pushes.pushesToday(now),
   };
 }
 

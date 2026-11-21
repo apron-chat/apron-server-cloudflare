@@ -478,7 +478,7 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token })).result.you).toBeDefined();
 		// As when the day's budget refuses the push clear's reservation.
 		await runInDurableObject(stub(), (instance) => {
-			const store = sqliteIn(instance) as unknown as Patchable;
+			const store = sqliteIn(instance).pushes as unknown as Patchable;
 			store.clearPushSubscriptions = () => { throw new Error('budget refused'); };
 		});
 		expect((await command(owner, 'device-phone-again', '/invite-device add phone')).frame.error).toBeDefined();
@@ -486,7 +486,7 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 		expect(owner.closed()).toBeUndefined();
 	} finally {
 		await runInDurableObject(stub(), (instance) => {
-			const store = sqliteIn(instance) as unknown as Partial<Patchable>;
+			const store = sqliteIn(instance).pushes as unknown as Partial<Patchable>;
 			delete store.clearPushSubscriptions;
 		});
 		phone?.close(); owner.close();
