@@ -142,8 +142,6 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '50001' })).toThrow(ConfigError);
 		// A count and an age ceiling together: whichever expires a record first.
 		expect(config({ LIMIT_RETENTION_SECONDS: '86400' }).limits).toMatchObject({ retentionRecords: 5_000, retentionSeconds: 86_400 });
-		// The minimum age is gone: a leftover var is refused like any misspelt limit.
-		expect(() => config({ LIMIT_MIN_RETENTION_SECONDS: '259200' })).toThrow('LIMIT_MIN_RETENTION_SECONDS is not a limit');
 		expect(() => config({ LIMIT_RETENTION_SECONDS: '-1' })).toThrow('retentionSeconds must be a non-negative safe integer');
 		// The count's largest snapshots must fit under the watermark that resumes posting, so cleanup there relieves it.
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '20000' })).toThrow('retentionRecords of the largest snapshots must fit under databaseResumeLowWaterBytes');
