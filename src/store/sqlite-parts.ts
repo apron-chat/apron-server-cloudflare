@@ -229,10 +229,10 @@ export function sqliteUploads(sqlite: SqliteStore): Uploads {
 /** LiveText over SqliteStore. */
 export function sqliteLiveText(sqlite: SqliteStore): LiveText {
   return {
-    open: (now) => sqlite.openLiveTexts(now),
-    start: (input) => sqlite.startLiveCommand(input),
-    claim: (key, now) => sqlite.claimLiveText(key, now),
-    finish: (key, kept, now, stored) => sqlite.finishLiveText(key, kept, now, stored),
-    expire: (streaming, now) => sqlite.expireLiveTexts(streaming, now),
+    open: (now) => sqlite.live.openLiveTexts(now),
+    start: (input) => sqlite.live.startLiveCommand(input),
+    claim: (key, now) => sqlite.live.claimLiveText(key, now),
+    finish: (key, kept, now, stored) => sqlite.live.finishLiveText(key, kept, now, stored),
+    expire: (streaming, now) => sqlite.live.expireLiveTexts(streaming, now),
   };
 }

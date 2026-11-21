@@ -540,7 +540,7 @@ describe('store live text', () => {
 			expect(created.result.embeds).toBeUndefined();
 			expect((created.message!.body!.embeds as Array<Record<string, unknown>>)[0]).toMatchObject({ kind: 'terminal', url: 'https://example.com/t' });
 			expect(store.liveText).toBeUndefined();
-			expect(sqliteOf(store).openLiveTexts(clock.value)).toEqual([] as LiveEntry[]);
+			expect(sqliteOf(store).live.openLiveTexts(clock.value)).toEqual([] as LiveEntry[]);
 		});
 	});
 });

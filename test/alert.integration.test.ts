@@ -182,7 +182,7 @@ it('runs the full alarm for a live text past its deadline, or open texts a lost 
 		const runtime = instance as unknown as LiveRuntime;
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
 		sqliteOf(runtime.store).forgetCleanupDue();
-		const expire = vi.spyOn(sqliteOf(runtime.store), 'expireLiveTexts');
+		const expire = vi.spyOn(sqliteOf(runtime.store).live, 'expireLiveTexts');
 		// No open text to recover: a light alarm.
 		await runtime.alarm();
 		expect(expire).not.toHaveBeenCalled();
@@ -196,8 +196,8 @@ it('runs the full alarm for a live text past its deadline, or open texts a lost 
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
 		sqliteOf(runtime.store).forgetCleanupDue();
 		// Open in storage, from an instance that was evicted or redeployed.
-		vi.spyOn(sqliteOf(runtime.store), 'openLiveTexts').mockReturnValue([{} as ReturnType<LiveText['open']>[number]]);
-		const expire = vi.spyOn(sqliteOf(runtime.store), 'expireLiveTexts').mockReturnValue({ broadcasts: [], ended: [], next: undefined } as unknown as ReturnType<LiveText['expire']>);
+		vi.spyOn(sqliteOf(runtime.store).live, 'openLiveTexts').mockReturnValue([{} as ReturnType<LiveText['open']>[number]]);
+		const expire = vi.spyOn(sqliteOf(runtime.store).live, 'expireLiveTexts').mockReturnValue({ broadcasts: [], ended: [], next: undefined } as unknown as ReturnType<LiveText['expire']>);
 		await runtime.alarm();
 		expect(expire).toHaveBeenCalledTimes(1);
 	});

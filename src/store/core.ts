@@ -15,8 +15,8 @@
 import type { CostEstimate } from "../budget-ledger";
 import type { RawLimitRow } from "../limiter-cache";
 import type { StoreConfig } from "./config";
-import type { RawIdentityRow, RawLogState, RawMessageRow } from "./rows";
-import type { Broadcast, MessageSnapshot, SqlCursorLike, StoreClock } from "./types";
+import type { RawIdentityRow, RawLogState, RawMessageRow, RawRoomRow } from "./rows";
+import type { Broadcast, LiveEntry, MessageSnapshot, SqlCursorLike, StoreClock, StoreMutationInput, StoreMutationResult } from "./types";
 
 /**
  * What a reservation's callback may do with SQLite: its own queries, a
@@ -56,6 +56,12 @@ export interface Sql {
   settleSeen(userId: string, at: number): number | undefined;
   /** A retained message's current snapshot and one of its embeds, or null where either is gone (or the message is deleted). */
   retainedEmbed(messageId: string, embedId: string): { message: RawMessageRow; snapshot: MessageSnapshot; embed: Record<string, unknown> } | null;
+  /** A room the user may see (a private one only to its members), or null. */
+  visibleRoomRow(roomId: string, userId: string): RawRoomRow | null;
+  /** A `reply_to`-style reference checked as a post's is (SqliteStore.messageReference): the message ID, or undefined without one; refuses a bad one. */
+  messageReference(value: unknown, field: string, floor: number, options: { viewer: string; roomId: string; self?: string; unchanged?: string }): string | undefined;
+  /** Posts a live text command's message as its write is claimed: one commit of the log (the commit path's commitMessage). */
+  commitLivePost(input: StoreMutationInput, effective: number, entry: LiveEntry): StoreMutationResult;
   /**
    * Commits a new snapshot of `message` with embed `embedId` replaced (or
    * removed, with null) and, with `text`, its text: the commit path's log

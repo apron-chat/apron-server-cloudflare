@@ -13,6 +13,7 @@
 
 import { defaultStoreConfig, type StoreConfig } from "./config";
 import type { Sql, StoreCore, TransactionJournal } from "./core";
+import { LiveTextModule } from "./live-text";
 import { UploadsModule } from "./uploads";
 import { ReadsModule } from "./reads";
 import { AdmissionModule } from "./admission";
@@ -163,12 +164,7 @@ export class SqliteStore {
   private logCache: RawLogState | null = null;
   /** The published floor as stored (META_HISTORY_PUBLISHED), 0 for none; read once a wake. */
   private publishedCache: number | undefined;
-  /**
-   * The open live texts (META_LIVE_TEXTS) as last read or saved, undefined
-   * until read: every change goes through this instance, and a rolled-back
-   * transaction restores it.
-   */
-  private liveCache: LiveEntry[] | undefined;
+
   /** Principals' limiter rows, written every few charges (limiter-cache.ts). */
   private readonly limiters = new LimiterCache({ write: (row, now) => this.writeLimitRow(row, now, true) });
   /** The daily budget rows and today's cached copy (budget-ledger.ts), over this store's metered SQL. */
@@ -269,6 +265,9 @@ export class SqliteStore {
     ensureGrowthCapacity: (bytes) => this.ensureGrowthCapacity(bytes),
     writeSeen: (userId, seen) => this.writeSeen(userId, seen),
     retainedEmbed: (messageId, embedId) => this.retainedEmbed(messageId, embedId),
+    visibleRoomRow: (roomId, userId) => this.visibleRoomRow(roomId, userId),
+    messageReference: (value, field, floor, options) => this.messageReference(value, field, floor, options),
+    commitLivePost: (input, effective, entry) => this.commitLivePost(input, effective, entry),
     rewriteEmbed: (message, snapshot, embedId, replacement, now, text) => this.rewriteEmbed(message, snapshot, embedId, replacement, now, text),
     settleSeen: (userId, at) => this.settleSeenRow(userId, at),
     limitRow: (scope, key, now) => this.limitRow(scope, key, now),
@@ -276,6 +275,8 @@ export class SqliteStore {
   };
   /** The core the implementation modules run over (core.ts). */
   readonly core: StoreCore = this.makeCore();
+  /** Open live texts: their start, claim, finish and expiry (live-text.ts). */
+  readonly live: LiveTextModule;
   /** Uploads in R2, avatars, the server's metadata, custom emoji and toggles (uploads.ts). */
   readonly uploads: UploadsModule;
   /** Read cursors, user statuses and mutes, room mutes, `seen` and the presence toggle (reads.ts). */
@@ -337,6 +338,7 @@ export class SqliteStore {
     this.admission = new AdmissionModule(this.core);
     this.readState = new ReadsModule(this.core, this.pushes);
     this.uploads = new UploadsModule(this.core);
+    this.live = new LiveTextModule(this.core, this.admission, this.uploads);
   }
 
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
@@ -1037,7 +1039,6 @@ export class SqliteStore {
     this.limiters.begin();
     for (const journal of this.journals) journal.begin();
     const logCache = this.logCache;
-    const liveCache = this.liveCache;
     try {
       const result = this.transactionInner(fn);
       this.limiters.commit();
@@ -1045,12 +1046,11 @@ export class SqliteStore {
       return result;
     } catch (error) {
       // The rows the transaction wrote are rolled back: so are the cached ones
-      // it changed, the log head its commit kept (finishCommit), the open
-      // live texts it saved, and the modules' caches (journal).
+      // it changed, the log head its commit kept (finishCommit), and the
+      // modules' caches (journal: the open live texts it saved).
       this.limiters.rollback();
       for (const journal of this.journals) journal.rollback();
       this.logCache = logCache;
-      this.liveCache = liveCache;
       throw error;
     }
   }
@@ -4218,6 +4218,16 @@ export class SqliteStore {
    * With `liveClaim`, the message a command's live text posts when its write
    * arrives (claimLiveText): its new live embed is that text's.
    */
+  /** A live text command's message, posted as its write is claimed (claimLiveText): one commit of the log. */
+  private commitLivePost(input: StoreMutationInput, effective: number, entry: LiveEntry): StoreMutationResult {
+    const state = this.logState();
+    const startLogId = state.last_log_id;
+    const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
+    const committed = this.commitMessage(input, context, state.history_floor, entry);
+    this.finishCommit(context, startLogId);
+    return committed;
+  }
+
   private commitMessage(input: StoreMutationInput, context: CommitContext, floor: number, liveClaim?: LiveEntry): StoreMutationResult {
     const params = input.params;
     if (params.log_id !== undefined) throw new StoreError("invalid_params", "log_id is server assigned");
@@ -4437,7 +4447,7 @@ export class SqliteStore {
         let entry: LiveEntry;
         if (liveClaim) entry = liveClaim;
         else {
-          entry = this.startLiveText(kind, input, now, { messageId, embedId: id, text });
+          entry = this.live.startLiveText(this.sqlHandle, kind, input, now, { messageId, embedId: id, text });
           liveStarted.push(entry);
           writes.push(liveResultEmbed(entry, live!));
         }
@@ -4460,301 +4470,8 @@ export class SqliteStore {
       .map((embed) => embed.embed_id as string);
     // A save that leaves out a live text's embed (or deletes its message) ends it early (§4.8.3).
     const endedIds = [...earlier.values()].filter((embed) => isLive(embed.kind) && !kept.has(embed.embed_id as string)).map((embed) => embed.embed_id as string);
-    const liveEnded = endedIds.length ? this.dropLiveTexts((entry) => entry.messageId === messageId && endedIds.includes(entry.embedId)) : [];
+    const liveEnded = endedIds.length ? this.live.dropLiveTexts(this.sqlHandle, (entry) => entry.messageId === messageId && endedIds.includes(entry.embedId)) : [];
     return { embeds: identified, writes, uploads, removed, liveStarted, liveEnded };
-  }
-
-  /**
-   * Records a terminal's output stored in R2 (publishLiveText) as an attached
-   * file of its message and embed: written, kept `fileRetentionSeconds`,
-   * and released with them, so removing the embed, deleting the message or
-   * purging its owner deletes it, and the bucket's lifecycle rule for `f/`
-   * catches what is left. Counts toward `storedBytesCap`, not the upload
-   * counts; undefined, keeping the output in the snapshot, when uploads are
-   * off or the cap is reached.
-   */
-  private storeTerminalOutput(stored: TerminalStored, entry: LiveEntry, now: number): TerminalOutputRef | undefined {
-    const policy = this.config.uploads;
-    if (!policy || !entry.messageId || !/^f\/[A-Za-z0-9_-]{22}$/.test(stored.key)) return undefined;
-    const bytes = utf8Bytes(stored.output);
-    const total = this.metaNumber(META_UPLOAD_BYTES);
-    if (total + bytes > policy.storedBytesCap) return undefined;
-    this.uploads.setUploadBytes(this.sqlHandle, total + bytes);
-    this.rawExec(
-      `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
-       VALUES (?, ?, 'file', ?, ?, 'done', ?, ?, ?, ?)`,
-      stored.key, entry.owner, entry.messageId, entry.embedId, bytes, now, now + policy.fileRetentionSeconds * 1_000, now,
-    );
-    return { key: stored.key, bytes: utf8Bytes(JSON.stringify(stored.output)) };
-  }
-
-  /** The open live texts (META_LIVE_TEXTS): one `_meta` row, absent while there are none. */
-  private liveTexts(): LiveEntry[] {
-    if (!this.liveCache) {
-      this.liveCache = this.metaJson(META_LIVE_TEXTS, (value) => Array.isArray(value) ? value.filter(isLiveEntry) : undefined, []);
-    }
-    // Callers change what they get before they save it.
-    return clone(this.liveCache) as LiveEntry[];
-  }
-
-  private saveLiveTexts(entries: readonly LiveEntry[]): void {
-    this.writeMeta(META_LIVE_TEXTS, entries.length ? JSON.stringify(entries) : null);
-    this.liveCache = clone(entries) as LiveEntry[];
-  }
-
-  /** Forgets the open live texts `match` picks, publishing nothing; returns their write keys. */
-  private dropLiveTexts(match: (entry: LiveEntry) => boolean): string[] {
-    const entries = this.liveTexts();
-    const gone = entries.filter(match);
-    if (gone.length) this.saveLiveTexts(entries.filter((entry) => !match(entry)));
-    return gone.map((entry) => entry.key);
-  }
-
-  /** Live text: configured, and on unless an admin turned it off (or on, against the default). */
-  private liveTextOn(): boolean {
-    const live = this.config.liveText;
-    if (!live) return false;
-    const value = this.metaValue(META_TOGGLE_PREFIX + "livetext");
-    return value === "on" ? true : value === "off" ? false : live.enabled;
-  }
-
-  /**
-   * Starts a live text (§4.8.3) within the policy: one open text per user,
-   * unexpired pending writes included; at most `concurrent` server-wide (liveHolds); and the
-   * user's (a guest's: their IP's), the IP's and the server's starts,
-   * charged as `live` limiter rows (a burst, then a rate, and a count a UTC
-   * day). Its time limit is the owner's: `moderatorMaxSeconds` for an
-   * `admin` or `mod`, else `maxSeconds`. An append may add what the message
-   * text limit leaves of `text`, at most `appendMaxBytes`.
-   */
-  private startLiveText(kind: LiveKind, input: Pick<StoreMutationInput, "userId" | "ipKey">, now: number, link: { messageId?: string; embedId: string; text: string; post?: LiveEntry["post"] }): LiveEntry {
-    const policy = this.config.liveText;
-    if (!policy) throw new StoreError("unsupported", "Live text is not available here");
-    if (!this.liveTextOn()) throw new StoreError("denied", "Live text is turned off here");
-    this.assertNotDegraded("Live text", now);
-    // A command's write that never came leaves nothing to publish: it goes now.
-    const entries = this.liveTexts().filter((entry) => entry.post === undefined || entry.writeExpiresMs >= now);
-    // Only a text that can still stream holds a slot (liveHolds). One whose
-    // write_url expired stays listed until the alarm ends its message
-    // (expireLiveTexts), but no longer counts against its owner or the server;
-    // the list itself stays bounded, at twice the concurrent texts.
-    const holding = entries.filter((entry) => liveHolds(entry, now));
-    if (holding.some((entry) => entry.owner === input.userId)) {
-      throw new StoreError("denied", "You already have a live text open; finish it, or let its write_url expire, before you start another");
-    }
-    if (holding.length >= policy.concurrent || entries.length >= 2 * policy.concurrent) {
-      const soonest = Math.min(...(holding.length ? holding : entries).map(liveDeadline));
-      throw new StoreError("retry_after", "Live text is busy on this server; try again shortly", { retryAfterMs: Math.max(1_000, soonest - now) });
-    }
-    const limit = kind === "terminal" ? policy.terminalKeepBytes : Math.min(policy.appendMaxBytes, this.config.maxTextBytes - utf8Bytes(link.text));
-    if (limit <= 0) throw new StoreError("too_large", "The message text leaves no room to append to");
-    const registered = this.identityRow(input.userId) !== null;
-    const principal = registered ? `user:${input.userId}` : `anonymous:${input.ipKey}`;
-    const window = policy.startWindowMinutes;
-    this.admission.chargeEvent(this.sqlHandle, "live", principal, now, { perMinute: policy.startsPerUser / window, burst: policy.startsPerUser }, "Live text limit reached",
-      { limit: policy.startsPerUserDay, message: "Daily live text limit reached" });
-    this.admission.chargeEvent(this.sqlHandle, "live", `ip:${input.ipKey}`, now, { perMinute: policy.startsPerIp / window, burst: policy.startsPerIp }, "Live text limit reached");
-    this.admission.chargeEvent(this.sqlHandle, "live", "global", now, { perMinute: policy.startsPerDay }, "Daily live text limit reached for the server",
-      { limit: policy.startsPerDay, message: "Daily live text limit reached for the server" });
-    const long = registered && this.holdsRole(input.userId, LIVE_TEXT_LONG_ROLES);
-    const entry: LiveEntry = {
-      key: `l/${randomKey()}`,
-      id: randomKey(),
-      kind,
-      owner: input.userId,
-      ip: input.ipKey,
-      state: "pending",
-      writeExpiresMs: now + policy.writeWindowSeconds * 1_000,
-      maxMs: (long ? policy.moderatorMaxSeconds : policy.maxSeconds) * 1_000,
-      limit,
-      embedId: link.embedId,
-      ...(link.messageId !== undefined ? { messageId: link.messageId } : {}),
-      ...(link.post ? { post: link.post } : {}),
-    };
-    this.saveLiveTexts([...entries, entry]);
-    return entry;
-  }
-
-  /**
-   * The open live texts: one `_meta` row read the first time after a wake,
-   * then from memory, since every change goes through this instance
-   * (liveCache), so a reader's `GET` of an ended text costs no SQL.
-   */
-  openLiveTexts(now = this.clock.now()): LiveEntry[] {
-    this.ensureReady();
-    if (!this.config.liveText) return [];
-    if (this.liveCache) return this.liveTexts();
-    return this.reserved("openLiveTexts", { reads: 4 }, false, now, () => this.liveTexts());
-  }
-
-  /**
-   * `/embed-terminal [title]` and `/embed-append [markdown]`: a live text
-   * whose message is posted when its write arrives (claimLiveText), from
-   * `userId`, in `roomId`, replying to `replyTo`. Everything is checked and
-   * charged now, its post included (the posting limits), so the write
-   * cannot be refused for them later.
-   */
-  startLiveCommand(input: { userId: string; ipKey: string; identity: Identity; kind: LiveKind; roomId: string; title?: string; text?: string; replyTo?: string; now?: number }): LiveEntry {
-    this.ensureReady();
-    const now = input.now ?? this.clock.now();
-    return this.reserved("startLiveCommand", { reads: 64, writes: 48 + LIVE_WRITES }, false, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      if (!this.visibleRoomRow(input.roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
-      const text = ensureText(input.text ?? "", "body.text", this.config.maxTextBytes);
-      const replyTo = input.replyTo === undefined ? undefined
-        : this.messageReference({ message_id: input.replyTo }, "reply_to", this.logState().history_floor, { viewer: input.userId, roomId: input.roomId });
-      const title = input.kind === "terminal" ? uploadTitle(input.title) : undefined;
-      const tier: Tier = this.identityRow(input.userId) ? "registered" : "anonymous";
-      this.admission.chargePosting(this.sqlHandle, { userId: input.userId, tier, ipKey: input.ipKey, now: effective });
-      return this.startLiveText(input.kind, input, effective, {
-        embedId: `embed_${randomKey()}`,
-        text,
-        post: { roomId: input.roomId, ...(title ? { title } : {}), ...(text ? { text } : {}), ...(replyTo ? { replyTo } : {}), identity: clone(input.identity) },
-      });
-    }));
-  }
-
-  /**
-   * The write of a live text arrived (§4.8.3): a pending one within its
-   * window starts streaming, once. A command's message is posted now, with
-   * the embed's `url`; a message's is republished with it (§4.8.5). Null
-   * when the write cannot start: unknown, used, or expired. A command's
-   * message that can no longer be posted (its room or reply gone) throws,
-   * and its text is forgotten.
-   */
-  claimLiveText(key: string, now = this.clock.now()): { entry: LiveEntry; broadcasts: Broadcast[]; message?: MessageSnapshot } | null {
-    this.ensureReady();
-    if (!this.config.liveText) return null;
-    try {
-      return this.reserved("claimLiveText", { reads: 256, writes: 96 + LIVE_WRITES }, false, now, () => this.transaction(() => {
-        const effective = this.effectiveNow(now);
-        const entries = this.liveTexts();
-        const entry = entries.find((candidate) => candidate.key === key);
-        if (!entry || entry.state !== "pending" || effective > entry.writeExpiresMs) return null;
-        let broadcasts: Broadcast[] = [];
-        let message: MessageSnapshot | undefined;
-        if (entry.post) {
-          this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
-          const post = entry.post;
-          const state = this.logState();
-          const startLogId = state.last_log_id;
-          const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
-          const params: Record<string, unknown> = {
-            room_id: post.roomId,
-            body: {
-              text: post.text ?? "",
-              ...(entry.kind === "append" ? { format: "markdown" } : {}),
-              embeds: [{ kind: entry.kind, ...(post.title ? { title: post.title } : {}) }],
-            },
-            ...(post.replyTo ? { reply_to: { message_id: post.replyTo } } : {}),
-          };
-          const committed = this.commitMessage({ userId: entry.owner, ipKey: entry.ip, params, identity: post.identity }, context, state.history_floor, entry);
-          this.finishCommit(context, startLogId);
-          broadcasts = committed.broadcasts;
-          message = committed.message;
-          entry.messageId = message!.message_id;
-          delete entry.post;
-        } else if (entry.messageId) {
-          const found = this.retainedEmbed(entry.messageId, entry.embedId);
-          if (found) {
-            this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
-            broadcasts = this.rewriteEmbed(found.message, found.snapshot, entry.embedId, { ...found.embed, url: liveUrl(this.config.liveText!, entry) }, effective);
-          }
-        }
-        entry.state = "live";
-        entry.startedMs = effective;
-        this.saveLiveTexts(entries);
-        return { entry, broadcasts, ...(message ? { message } : {}) };
-      }));
-    } catch (error) {
-      // A message that cannot be posted any more will not be later either.
-      if (error instanceof StoreError && ["invalid_params", "denied", "too_large"].includes(error.code)) {
-        this.reserved("claimLiveText", { reads: 4, writes: 4 }, true, now, () => this.transaction(() => this.dropLiveTexts((entry) => entry.key === key)));
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Ends a live text exactly once (§4.8.3) and publishes what it kept: a
-   * terminal's message gets its embed with `output` (§4.8.6), and an
-   * append's the kept text, after its edits, appended to `body.text` and
-   * its embed removed (§4.8.5); with nothing kept, the embed is removed (a
-   * message left with nothing is a tombstone). A text already ended, or whose message or
-   * embed is gone, publishes nothing. Finishing work already admitted, it is
-   * charged as maintenance, so an exhausted foreground budget cannot lose it.
-   */
-  finishLiveText(key: string, kept: Uint8Array | null, now = this.clock.now(), stored?: TerminalStored): LiveFinish {
-    this.ensureReady();
-    if (!this.config.liveText) return { broadcasts: [] };
-    // A stored output adds its upload row and the stored-bytes count.
-    return this.reserved("finishLiveText", { reads: 96 + (stored ? 16 : 0), writes: 64 + LIVE_WRITES + (stored ? 16 : 0) }, true, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      const entries = this.liveTexts();
-      const entry = entries.find((candidate) => candidate.key === key);
-      if (!entry) return { broadcasts: [] };
-      this.saveLiveTexts(entries.filter((candidate) => candidate !== entry));
-      const published = { stored: false };
-      const broadcasts = this.publishLiveText(entry, kept, effective, stored, published);
-      return { entry, broadcasts, stored: published.stored };
-    }));
-  }
-
-  /**
-   * Ends the live texts that fell due: a write that never came by its
-   * window's end (its message, if posted, loses the embed), and a text
-   * marked streaming that `streaming` (the runtime's own) does not hold:
-   * the object that streamed it was evicted or redeployed and its bytes are
-   * gone, so its embed is removed. Maintenance work, bounded by twice
-   * `concurrent` entries (startLiveText), which its reservation covers; `next` is when the next one falls due.
-   */
-  expireLiveTexts(streaming: ReadonlySet<string>, now = this.clock.now()): { broadcasts: Broadcast[]; ended: LiveEntry[]; next?: number } {
-    this.ensureReady();
-    if (!this.config.liveText) return { broadcasts: [], ended: [] };
-    // Known to be none: nothing to read or reserve, so the alarm pays nothing for the feature.
-    if (this.liveCache?.length === 0) return { broadcasts: [], ended: [] };
-    return this.reserved("expireLiveTexts", { reads: 32 + 64 * this.config.liveText.concurrent, writes: 8 + 32 * this.config.liveText.concurrent }, true, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      const entries = this.liveTexts();
-      const due = entries.filter((entry) => entry.state === "pending" ? effective > entry.writeExpiresMs : !streaming.has(entry.key));
-      const remaining = entries.filter((entry) => !due.includes(entry));
-      const next = remaining.length ? Math.min(...remaining.map(liveDeadline)) : undefined;
-      if (!due.length) return { broadcasts: [], ended: [], ...(next !== undefined ? { next } : {}) };
-      this.saveLiveTexts(remaining);
-      const broadcasts = due.flatMap((entry) => this.publishLiveText(entry, null, effective));
-      return { broadcasts, ended: due, ...(next !== undefined ? { next } : {}) };
-    }));
-  }
-
-  /**
-   * The snapshot that ends a live text (finishLiveText). A terminal's output
-   * the runtime stored in R2 (`stored`) is kept there, the snapshot holding
-   * a TerminalOutputRef to it and its upload row counting its bytes like an
-   * attached file's, while uploads are on and their stored-bytes cap allows;
-   * otherwise in the snapshot, as `output`.
-   */
-  private publishLiveText(entry: LiveEntry, kept: Uint8Array | null, now: number, stored?: TerminalStored, published?: { stored: boolean }): Broadcast[] {
-    if (!entry.messageId) return [];
-    const found = this.retainedEmbed(entry.messageId, entry.embedId);
-    if (!found) return [];
-    const { message, snapshot, embed } = found;
-    // What the entry keeps, whatever the caller held: the last part of a terminal, the first of an append.
-    if (entry.kind === "terminal") {
-      const output = terminalOutput(keepLast(kept ?? new Uint8Array(0), entry.limit));
-      // Its `url` ends with the text: the output is the embed's now (§4.8.6).
-      const { url: _url, ...rest } = embed;
-      void _url;
-      if (!output) return this.rewriteEmbed(message, snapshot, entry.embedId, null, now);
-      const ref = stored && stored.output === output ? this.storeTerminalOutput(stored, entry, now) : undefined;
-      if (ref && published) published.stored = true;
-      return this.rewriteEmbed(message, snapshot, entry.embedId, ref ? { ...rest, output_ref: ref } : { ...rest, output }, now);
-    }
-    const base = typeof snapshot.body?.text === "string" ? snapshot.body.text : "";
-    // A save may have lengthened the text while it streamed: the body stays within the text limit.
-    // The edits (§4.8.5) apply to the appended text only, never to `base`.
-    const room = Math.max(0, this.config.maxTextBytes - utf8Bytes(base));
-    const added = keepAppend(kept ?? new Uint8Array(0), Math.min(entry.limit, room));
-    return this.rewriteEmbed(message, snapshot, entry.embedId, null, now, base + liveTextString(added));
   }
 
   /**
@@ -5310,7 +5027,7 @@ export class SqliteStore {
     // Rows stored before this version name their method; they expire within the dedup TTL.
     delete stored.__method;
     if (Array.isArray(stored.embeds)) {
-      const live = this.config.liveText ? this.liveTexts() : [];
+      const live = this.config.liveText ? this.live.liveTexts(this.sqlHandle) : [];
       stored.embeds = stored.embeds.map((embed: unknown) => {
         if (!isPlainObject(embed) || !isPlainObject(embed.write) || typeof embed.write.key !== "string") return embed;
         const key = embed.write.key;

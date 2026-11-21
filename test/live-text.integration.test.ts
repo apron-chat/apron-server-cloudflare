@@ -479,9 +479,9 @@ describe('live text end to end', () => {
 			let expiry: Promise<void> | undefined;
 			await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as { store: Store; expireLive(now: number): Promise<void> };
-				const sqlite = sqliteOf(runtime.store);
-				const claim = sqlite.claimLiveText.bind(sqlite);
-				vi.spyOn(sqlite, 'claimLiveText').mockImplementationOnce((key, now) => {
+				const live = sqliteOf(runtime.store).live;
+				const claim = live.claimLiveText.bind(live);
+				vi.spyOn(live, 'claimLiveText').mockImplementationOnce((key, now) => {
 					const claimed = claim(key, now);
 					expiry = runtime.expireLive(Date.now());
 					return claimed;
