@@ -127,7 +127,7 @@ it('opens a connection with the deployment\'s defaults when the admins\' toggles
 	await runInDurableObject(stub, (instance) => {
 		const runtime = instance as unknown as { toggles: Map<string, unknown>; store: Store };
 		runtime.toggles.clear();
-		vi.spyOn(sqliteOf(runtime.store), 'toggle').mockImplementation(() => { throw new Error('storage unavailable'); });
+		vi.spyOn(sqliteOf(runtime.store).uploads, 'toggle').mockImplementation(() => { throw new Error('storage unavailable'); });
 		vi.spyOn(sqliteOf(runtime.store).readState, 'presenceToggle').mockImplementation(() => { throw new Error('storage unavailable'); });
 	});
 	const peer = await open(stub);

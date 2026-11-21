@@ -1171,7 +1171,7 @@ describe('uploads end to end', () => {
 
 			// Stored values survive a restart and override the variables; clearing one falls back to its variable.
 			await setVariables({ title: 'From Variable', description: 'Variable *description*.', avatar: 'https://example.com/icon.png' });
-			await runInDurableObject(stub(), (instance) => { (sqliteIn(instance) as unknown as { serverCache: unknown }).serverCache = null; });
+			await runInDurableObject(stub(), (instance) => { sqliteIn(instance).uploads.serverCache = null; });
 			const restarted = await connect();
 			expect((await restarted.next()).params).toMatchObject({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.', avatar });
 			restarted.close();

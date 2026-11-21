@@ -16,7 +16,7 @@ import type { CostEstimate } from "../budget-ledger";
 import type { RawLimitRow } from "../limiter-cache";
 import type { StoreConfig } from "./config";
 import type { RawIdentityRow, RawLogState, RawMessageRow } from "./rows";
-import type { SqlCursorLike, StoreClock } from "./types";
+import type { Broadcast, MessageSnapshot, SqlCursorLike, StoreClock } from "./types";
 
 /**
  * What a reservation's callback may do with SQLite: its own queries, a
@@ -54,6 +54,14 @@ export interface Sql {
   writeSeen(userId: string, seen: number): void;
   /** Settles a user's `seen` at `at` where the stored one does not stand (SqliteStore.settleSeen): what is stored after, undefined for an unknown user. */
   settleSeen(userId: string, at: number): number | undefined;
+  /** A retained message's current snapshot and one of its embeds, or null where either is gone (or the message is deleted). */
+  retainedEmbed(messageId: string, embedId: string): { message: RawMessageRow; snapshot: MessageSnapshot; embed: Record<string, unknown> } | null;
+  /**
+   * Commits a new snapshot of `message` with embed `embedId` replaced (or
+   * removed, with null) and, with `text`, its text: the commit path's log
+   * append. Its broadcast.
+   */
+  rewriteEmbed(message: RawMessageRow, snapshot: MessageSnapshot, embedId: string, replacement: Record<string, unknown> | null, now: number, text?: string): Broadcast[];
   /** Refuses (or pauses on) a write that would grow the database past its targets by `additionalBytes`. */
   ensureGrowthCapacity(additionalBytes: number): void;
   /** A limiter row (`principal_limits`), from the cache or read. */

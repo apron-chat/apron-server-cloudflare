@@ -100,15 +100,15 @@ export function sqliteReads(sqlite: SqliteStore): Reads {
 /** Server over SqliteStore. */
 export function sqliteServer(sqlite: SqliteStore): Server {
   return {
-    metadata: (now) => sqlite.serverMetadata(now),
-    setText: (field, value, now) => sqlite.setServerText(field, value, now),
-    clearAvatar: (now) => sqlite.clearServerAvatar(now),
-    emojiCatalog: (now) => sqlite.emojiCatalog(now),
-    emojiDraft: (edit, now) => sqlite.emojiDraft(edit, now),
-    commitEmoji: (draft, now) => sqlite.commitEmoji(draft, now),
-    toggle: (feature, now) => sqlite.toggle(feature, now),
-    setToggle: (feature, on, now, since) => sqlite.setToggle(feature, on, now, since),
-    startAvatarUpload: (input) => sqlite.startServerAvatarUpload(input),
+    metadata: (now) => sqlite.uploads.serverMetadata(now),
+    setText: (field, value, now) => sqlite.uploads.setServerText(field, value, now),
+    clearAvatar: (now) => sqlite.uploads.clearServerAvatar(now),
+    emojiCatalog: (now) => sqlite.uploads.emojiCatalog(now),
+    emojiDraft: (edit, now) => sqlite.uploads.emojiDraft(edit, now),
+    commitEmoji: (draft, now) => sqlite.uploads.commitEmoji(draft, now),
+    toggle: (feature, now) => sqlite.uploads.toggle(feature, now),
+    setToggle: (feature, on, now, since) => sqlite.uploads.setToggle(feature, on, now, since),
+    startAvatarUpload: (input) => sqlite.uploads.startServerAvatarUpload(input),
   };
 }
 
@@ -212,17 +212,17 @@ export function sqlitePush(sqlite: SqliteStore): Push {
 export function sqliteUploads(sqlite: SqliteStore): Uploads {
   return {
     terminalOutputKey: () => newTerminalOutputKey(),
-    startAvatar: (input) => sqlite.startAvatarUpload(input),
-    startEmoji: (input) => sqlite.startEmojiUpload(input),
-    owner: (key, now) => sqlite.uploadOwner(key, now),
-    finish: (write, now) => sqlite.finishUpload(write, now),
-    claim: (key, now) => sqlite.claimUpload(key, now),
-    expirePending: (now) => sqlite.expirePendingUploads(now),
-    nextDeadline: (now) => sqlite.nextUploadDeadline(now),
-    cleanup: (now) => sqlite.cleanupUploads(now),
-    avatarRefreshDue: (userId, now) => sqlite.avatarRefreshDue(userId, now),
-    renewAvatar: (input) => sqlite.renewAvatar(input),
-    clearAvatar: (input) => sqlite.clearAvatar(input),
+    startAvatar: (input) => sqlite.uploads.startAvatarUpload(input),
+    startEmoji: (input) => sqlite.uploads.startEmojiUpload(input),
+    owner: (key, now) => sqlite.uploads.uploadOwner(key, now),
+    finish: (write, now) => sqlite.uploads.finishUpload(write, now),
+    claim: (key, now) => sqlite.uploads.claimUpload(key, now),
+    expirePending: (now) => sqlite.uploads.expirePendingUploads(now),
+    nextDeadline: (now) => sqlite.uploads.nextUploadDeadline(now),
+    cleanup: (now) => sqlite.uploads.cleanupUploads(now),
+    avatarRefreshDue: (userId, now) => sqlite.uploads.avatarRefreshDue(userId, now),
+    renewAvatar: (input) => sqlite.uploads.renewAvatar(input),
+    clearAvatar: (input) => sqlite.uploads.clearAvatar(input),
   };
 }
 

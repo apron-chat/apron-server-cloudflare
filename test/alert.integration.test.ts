@@ -209,8 +209,8 @@ it('runs the full alarm for an upload deadline stored before a wake, which the i
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
 		sqliteOf(runtime.store).forgetCleanupDue();
 		// Claimed by an earlier instance: only storage knows its deadline.
-		const stored = vi.spyOn(sqliteOf(runtime.store), 'nextUploadDeadline').mockReturnValue(Date.now() - 1);
-		const expire = vi.spyOn(sqliteOf(runtime.store), 'expirePendingUploads');
+		const stored = vi.spyOn(sqliteOf(runtime.store).uploads, 'nextUploadDeadline').mockReturnValue(Date.now() - 1);
+		const expire = vi.spyOn(sqliteOf(runtime.store).uploads, 'expirePendingUploads');
 		await runtime.alarm();
 		expect(stored).toHaveBeenCalledTimes(1);
 		expect(expire).toHaveBeenCalledTimes(1);
