@@ -234,14 +234,14 @@ it('degrades at 70% of a daily ceiling: live text, uploads and older history are
 		const upload = refusal(() => busy.uploads!.startAvatar({ userId: 'degrade_user', now }));
 		expect(upload.data?.reason).toBe(DEGRADED);
 		// A page more than a page back from the head is older history.
-		const older = refusal(() => sqliteOf(busy).history({ roomId: 'general', before: '1', limit: 1, now, userId: 'degrade_user', ipKey: 'ip-degrade' }));
+		const older = refusal(() => sqliteOf(busy).historyLog.history({ roomId: 'general', before: '1', limit: 1, now, userId: 'degrade_user', ipKey: 'ip-degrade' }));
 		expect(older.data?.reason).toBe(DEGRADED);
 		// The latest page still loads, asked for with no bound or with `before` the head (§4.3.5).
-		const latest = sqliteOf(busy).history({ roomId: 'general', now, userId: 'degrade_user', ipKey: 'ip-degrade' });
-		expect(() => sqliteOf(busy).history({ roomId: 'general', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
-		expect(() => sqliteOf(busy).history({ roomId: 'general', before: '9007199254740990', now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		const latest = sqliteOf(busy).historyLog.history({ roomId: 'general', now, userId: 'degrade_user', ipKey: 'ip-degrade' });
+		expect(() => sqliteOf(busy).historyLog.history({ roomId: 'general', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		expect(() => sqliteOf(busy).historyLog.history({ roomId: 'general', before: '9007199254740990', now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
 		// A window bounded by both stays off, as before.
-		expect(refusal(() => sqliteOf(busy).history({ roomId: 'general', after: '1', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).data?.reason).toBe(DEGRADED);
+		expect(refusal(() => sqliteOf(busy).historyLog.history({ roomId: 'general', after: '1', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).data?.reason).toBe(DEGRADED);
 	});
 });
 

@@ -61,7 +61,7 @@ it("names each operation's reservations as before", async () => {
 			userId: "ada", ipKey: "ip-ada", requestId: "r1", method: "message", now: now(), params: { body: { text: "hello" } }, identity: { user_id: "ada" },
 		}));
 		pin("messages.historyAcrossTiers", () => store.messages.historyAcrossTiers({ roomId: "general", now: now(), userId: "ada", tier: "registered", ipKey: "ip-ada" } as never));
-		pin("sqlite.history", () => sqliteOf(store).history({ roomId: "general", now: now(), userId: "ada", tier: "registered", ipKey: "ip-ada" } as never));
+		pin("sqlite.history", () => sqliteOf(store).historyLog.history({ roomId: "general", now: now(), userId: "ada", tier: "registered", ipKey: "ip-ada" } as never));
 		pin("reads.setRoomMute", () => store.reads.setRoomMute({ userId: "ada", roomId: "general", untilMs: now() + 60_000, now: now() }));
 		pin("reads.statusInputs", () => store.reads.statusInputs("ada", now()));
 		pin("reads.cursors", () => store.reads.cursors("ada", now()));

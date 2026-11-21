@@ -78,7 +78,7 @@ it("the caps count rooms started within the window: older rooms stay listed and 
 		// The cap is full, yet the older rooms take posts and saves: activity never needs a slot.
 		say(store, clock, first, "after");
 		store.messages.mutate(op(clock, "alice", "room_set", { room_id: second, title: "Renamed" }));
-		expect(messagesOf(sqliteOf(store).historyPage({ roomId: first, after: "0", limit: 50, now: clock.value })).map((message) => message.body?.text)).toEqual(["before", "after"]);
+		expect(messagesOf(sqliteOf(store).historyLog.historyPage({ roomId: first, after: "0", limit: 50, now: clock.value })).map((message) => message.body?.text)).toEqual(["before", "after"]);
 		expect(store.rooms.counts(clock.value).public).toEqual({ recent: 2, older: 2 });
 	});
 });

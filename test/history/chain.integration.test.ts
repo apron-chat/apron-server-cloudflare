@@ -204,8 +204,8 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 			runtime.store.accounts.purge({ userIds: ["archive-victim"] });
 			expect(runtime.store.history.rewrites()).toEqual([{ seq: 1, rewrite: { user: "archive-victim", into: null, messages: [] } }]);
 			// A tier that finds more of the user's messages adds them to the rewrite, once each; another seq is left alone.
-			sqliteOf(runtime.store).amendHistoryPurge(1, ["no-such-message", "no-such-message"]);
-			sqliteOf(runtime.store).amendHistoryPurge(9, ["other"]);
+			sqliteOf(runtime.store).historyLog.amendHistoryPurge(1, ["no-such-message", "no-such-message"]);
+			sqliteOf(runtime.store).historyLog.amendHistoryPurge(9, ["other"]);
 			expect(runtime.store.history.rewrites()).toEqual([{ seq: 1, rewrite: { user: "archive-victim", into: null, messages: ["no-such-message"] } }]);
 		});
 		expect(await inD1()).toEqual(logs.slice(3, 7));
@@ -270,12 +270,12 @@ it("moves a flood at the storage watermark down to D1 at once, never before D1 h
 		await runtime.alarm();
 		expect(object.jobRunning()).toBe(true);
 
-		const links = chainStateStore(sqliteOf(runtime.store).historyStatePort(), "hot");
+		const links = chainStateStore(sqliteOf(runtime.store).historyLog.historyStatePort(), "hot");
 		for (let round = 0; round < 40 && object.hotLogs().length > 3; round += 1) {
 			object.continueJob();
 			await runtime.alarm();
 			// Copy before delete: SQLite's floor never passes what the link into D1 has copied.
-			const { hot } = sqliteOf(runtime.store).historyFloors(Date.now());
+			const { hot } = sqliteOf(runtime.store).historyLog.historyFloors(Date.now());
 			expect(hot).toBeLessThanOrEqual((await links.loadLink("hot")).through + 1);
 		}
 		expect(object.hotLogs().length).toBe(3);

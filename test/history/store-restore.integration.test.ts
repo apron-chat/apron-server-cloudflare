@@ -83,8 +83,8 @@ async function source(): Promise<Source> {
 		store.rooms.changeMembership({ userId: "bob", ipKey: "ada-ip", roomId: secret, join: true, now: (clock.value += 1_000), actorId: "ada" });
 		store.messages.mutate(input(clock, "bob", "message", { room_id: secret, body: { format: "plain", text: "psst" } }));
 		const restored = [lobby, thread, secret];
-		const records = sqliteOf(store).historyScan(1, 100, clock.value).filter((record) => restored.includes(record.room_id));
-		const view = (roomId: string) => sqliteOf(store).history({ roomId, after: 0n, limit: 100, now: clock.value });
+		const records = sqliteOf(store).historyLog.historyScan(1, 100, clock.value).filter((record) => restored.includes(record.room_id));
+		const view = (roomId: string) => sqliteOf(store).historyLog.history({ roomId, after: 0n, limit: 100, now: clock.value });
 		const members = store.rooms.members(restored, 10, clock.value);
 		return {
 			lobby, thread, secret, m1, m2, records,
@@ -178,7 +178,7 @@ it("restores a room and its thread from another server's records, with the histo
 		// What the source showed: the rooms, their history, their members.
 		for (const roomId of [src.lobby, src.thread, src.secret]) {
 			expect(store.rooms.get(roomId, clock.value)).toEqual(src.rooms[roomId]);
-			expect(sqliteOf(store).history({ roomId, after: 0n, limit: 100, now: clock.value })).toEqual(src.pages[roomId]);
+			expect(sqliteOf(store).historyLog.history({ roomId, after: 0n, limit: 100, now: clock.value })).toEqual(src.pages[roomId]);
 			expect((store.rooms.members([roomId], 10, clock.value).get(roomId) ?? []).map((member) => member.user_id)).toEqual(src.members[roomId]);
 		}
 		expect(src.members[src.lobby]).toEqual(["ada", "bob"]);
@@ -227,7 +227,7 @@ it("rebuilds the same state from a room's records sent newest batch first", asyn
 		const third = Math.ceil(lobbyRecords.length / 3);
 		for (const start of [2 * third, third, 0]) sqliteOf(store).restoreRoom(archived(src.rooms[src.lobby]), lobbyRecords.slice(start, start + third), clock.value);
 		expect(store.rooms.get(src.lobby, clock.value)).toEqual(src.rooms[src.lobby]);
-		expect(sqliteOf(store).history({ roomId: src.lobby, after: 0n, limit: 100, now: clock.value })).toEqual(src.pages[src.lobby]);
+		expect(sqliteOf(store).historyLog.history({ roomId: src.lobby, after: 0n, limit: 100, now: clock.value })).toEqual(src.pages[src.lobby]);
 		expect((store.rooms.members([src.lobby], 10, clock.value).get(src.lobby) ?? []).map((member) => member.user_id)).toEqual(["ada", "bob"]);
 		const sql = state.storage.sql;
 		expect(sql.exec<{ user_id: string }>("SELECT user_id FROM reaction_state WHERE message_id = ?", src.m1).toArray()).toEqual([{ user_id: "bob" }]);
@@ -436,11 +436,11 @@ it("takes records only as a post would have made them: messages, reaction sets a
 			...refused,
 		], clock.value);
 		expect(result).toEqual({ created: true, stored: 3, rejected: 4 + refused.length });
-		const [message] = sqliteOf(store).historyLookup([base + 1]).map((record) => JSON.parse(record.record_json));
+		const [message] = sqliteOf(store).historyLog.historyLookup([base + 1]).map((record) => JSON.parse(record.record_json));
 		expect(message.from).toEqual({ user_id: "ada", name: "Ada" });
 		expect(message.body).toEqual({ text: "hi", format: "plain", embeds: [{ kind: "link", og: { title: "T" } }] });
-		expect(sqliteOf(store).historyLookup([base + 2]).map((record) => JSON.parse(record.record_json).reactions)).toEqual([[{ from: { user_id: "bob" }, emojis: ["❤️", "👍"] }]]);
-		expect(sqliteOf(store).historyLookup([base + 3, base + 4, base + 5, base + 6, ...refused.map((record) => record.log_id)])).toEqual([]);
+		expect(sqliteOf(store).historyLog.historyLookup([base + 2]).map((record) => JSON.parse(record.record_json).reactions)).toEqual([[{ from: { user_id: "bob" }, emojis: ["❤️", "👍"] }]]);
+		expect(sqliteOf(store).historyLog.historyLookup([base + 3, base + 4, base + 5, base + 6, ...refused.map((record) => record.log_id)])).toEqual([]);
 		expect(overruns).toEqual([]);
 	});
 });
@@ -461,7 +461,7 @@ it("takes a room with only joins and leaves past its creation as empty, so a fre
 		membership("ada", true);
 		membership("bob", true);
 		membership("bob", false);
-		expect(sqliteOf(store).historyLookup([clock.value]).map((record) => record.kind)).toEqual(["membership"]);
+		expect(sqliteOf(store).historyLog.historyLookup([clock.value]).map((record) => record.kind)).toEqual(["membership"]);
 		expect(sqliteOf(store).roomIsEmpty("general")).toBe(true);
 		// A message, or a room record past its creation, puts it in use.
 		store.messages.mutate(input(clock, "ada", "message", { room_id: "general", body: { text: "hello" } }));

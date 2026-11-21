@@ -82,7 +82,7 @@ it("hides a private room from everyone outside it, as if it did not exist", asyn
 		const unknown = "999";
 		for (const id of [roomId, missing]) {
 			expect(errorCode(() => post(store, clock, "bob", id))).toBe("invalid_params");
-			expect(errorCode(() => sqliteOf(store).history({ roomId: id, userId: "bob" }))).toBe("invalid_params");
+			expect(errorCode(() => sqliteOf(store).historyLog.history({ roomId: id, userId: "bob" }))).toBe("invalid_params");
 			expect(errorCode(() => store.messages.mutate(op(clock, "bob", "room_set", { room_id: id, title: "x" })))).toBe("invalid_params");
 			expect(errorCode(() => store.messages.mutate(op(clock, "bob", "room_set", { parent_room_id: id, title: "x" })))).toBe("invalid_params");
 			// Nobody joins one by themselves, and only a member adds others.
@@ -95,7 +95,7 @@ it("hides a private room from everyone outside it, as if it did not exist", asyn
 		}
 		// Ada's own edit of it still works; her members' view is the full one.
 		expect(post(store, clock, "ada", roomId, { message_id: secret, body: { text: "edited" } }).message?.body).toMatchObject({ text: "edited" });
-		expect(sqliteOf(store).history({ roomId, userId: "ada" }).messages?.every((message) => message.message_id === secret)).toBe(true);
+		expect(sqliteOf(store).historyLog.history({ roomId, userId: "ada" }).messages?.every((message) => message.message_id === secret)).toBe(true);
 	});
 });
 
@@ -109,7 +109,7 @@ it("lets members add others, who then see the room, and keeps messages from cros
 		expect(added.rooms).toContain(roomId);
 		// Bob is a member now: he posts, reads, and adds Cy in turn.
 		const fromBob = String(post(store, clock, "bob", roomId).result.message_id);
-		expect(sqliteOf(store).history({ roomId, userId: "bob" }).messages?.map((message) => message.message_id)).toContain(fromBob);
+		expect(sqliteOf(store).historyLog.history({ roomId, userId: "bob" }).messages?.map((message) => message.message_id)).toContain(fromBob);
 		expect(add(store, clock, "bob", roomId, "cy").changed).toBe(true);
 		// A private room's messages stay in it, and no other room's come in.
 		const outside = String(post(store, clock, "bob", "general").result.message_id);

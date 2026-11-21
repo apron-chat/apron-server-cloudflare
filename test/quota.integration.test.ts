@@ -222,7 +222,7 @@ describe('history quota', () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-burst'), (_instance, state) => {
 			let now = noon();
 			const store = openStore(state, { historyBurstPerUser: 6, historyRequestsPerUserMinute: 2, historyBurstPerIp: 8, historyRequestsPerIpMinute: 4 }, { now: () => now });
-			const page = (userId: string) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId, ipKey: 'shared-nat' });
+			const page = (userId: string) => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId, ipKey: 'shared-nat' });
 			for (let index = 0; index < 6; index++) page('reader');
 			const refused = refusal(() => page('reader'));
 			expect(refused.message).toBe('History request limit reached');
@@ -243,7 +243,7 @@ describe('history quota', () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-daily'), (_instance, state) => {
 			let now = noon();
 			const store = openStore(state, { historyRequestsPerUserDay: 3, historyRequestsPerIpDay: 5 }, { now: () => now });
-			const page = (userId: string, ipKey = 'home') => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId, ipKey });
+			const page = (userId: string, ipKey = 'home') => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId, ipKey });
 			for (let index = 0; index < 3; index++) page('reader');
 			const daily = refusal(() => page('reader'));
 			expect(daily.message).toBe('Daily history limit reached');
@@ -265,7 +265,7 @@ describe('history quota', () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-server'), (_instance, state) => {
 			const now = noon();
 			const store = openStore(state, { historyRequestsPerDay: 4, historyBurstPerUser: 2, historyRequestsPerUserMinute: 1 }, { now: () => now });
-			const page = (userId: string) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId, ipKey: `${userId}-ip` });
+			const page = (userId: string) => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId, ipKey: `${userId}-ip` });
 			page('reader');
 			page('reader');
 			// Refused by the reader's own limit: it gives its server count back.
@@ -285,7 +285,7 @@ describe('history quota', () => {
 			expect(store.messages.mutate({ userId: 'poster', ipKey: 'poster-ip', method: 'message', now,
 				identity: { user_id: 'poster' }, params: { room_id: 'general', body: { text: 'still posting' } } }).result.message_id).toBeTruthy();
 			// Pages for internal use are not counted.
-			sqliteOf(store).historyPage({ roomId: 'general', limit: 1, now });
+			sqliteOf(store).historyLog.historyPage({ roomId: 'general', limit: 1, now });
 			expect(sqliteOf(store).budget(now).history).toBe(4);
 		});
 	});
@@ -295,16 +295,16 @@ describe('history quota', () => {
 			const now = noon();
 			const store = openStore(state, { historyRequestsPerDay: 4, historyBurstPerUser: 2, historyRequestsPerUserDay: 2 }, { now: () => now });
 			const invalid = (query: { roomId?: string; after?: string }) => {
-				try { sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip', ...query }); expect.unreachable(); }
+				try { sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip', ...query }); expect.unreachable(); }
 				catch (error) { expect(error).toBeInstanceOf(StoreError); expect((error as StoreError).code).toBe('invalid_params'); }
 			};
 			for (let index = 0; index < 6; index++) invalid({ roomId: 'no-such-room' });
 			invalid({ after: 'not-a-log-id' });
 			expect(sqliteOf(store).budget(now).history).toBe(0);
 			// The prober's own limits were rolled back with the page: they still read their two.
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip' });
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip' });
-			expect(sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'other', ipKey: 'other-ip' }).latest_log_id).toBeTruthy();
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip' });
+			expect(sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'other', ipKey: 'other-ip' }).latest_log_id).toBeTruthy();
 			expect(sqliteOf(store).budget(now).history).toBe(3);
 		});
 	});
@@ -313,7 +313,7 @@ describe('history quota', () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-cost'), (_instance, state) => {
 			let now = noon();
 			const store = openStore(state, {}, { now: () => now });
-			const page = () => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			const page = () => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			page();
 			const charged = (fn: () => unknown, by = store) => {
 				const before = sqliteOf(by).budget(now).writes;
@@ -333,8 +333,8 @@ describe('history quota', () => {
 			expect(charged(page)).toBe(5);
 			// A refused page is charged only the budget row.
 			const limited = openStore(state, { historyBurstPerUser: 1, historyRequestsPerUserMinute: 1 }, { now: () => now });
-			sqliteOf(limited).history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' });
-			expect(charged(() => refusal(() => sqliteOf(limited).history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' })), limited)).toBe(1);
+			sqliteOf(limited).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' });
+			expect(charged(() => refusal(() => sqliteOf(limited).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' })), limited)).toBe(1);
 		});
 	});
 
@@ -358,11 +358,11 @@ describe('history quota', () => {
 			// One user, five pages a wake, against a daily cap of 3: 21 were served when a wake
 			// forgot every charge since the row's last write. Each wake writes its first charge:
 			// now 3, then 2, then 1 (within the cap plus 6, limiter-cache.ts).
-			const user = cycles({ historyRequestsPerUserDay: 3 }, (store) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'reader-ip' }));
+			const user = cycles({ historyRequestsPerUserDay: 3 }, (store) => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'reader-ip' }));
 			expect(user).toBe(6);
 			expect(sqliteOf(openStore(state, {}, { now: () => now })).admission.limiterDay('history', 'user:reader', now).posts_day).toBe(3);
 			// The IP's cap, which keeps one network from using up the server's count, the same way.
-			const network = cycles({ historyRequestsPerIpDay: 3 }, (store, index) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: `neighbour-${now}-${index}`, ipKey: 'shared-ip' }));
+			const network = cycles({ historyRequestsPerIpDay: 3 }, (store, index) => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: `neighbour-${now}-${index}`, ipKey: 'shared-ip' }));
 			expect(network).toBe(6);
 			expect(sqliteOf(openStore(state, {}, { now: () => now })).admission.limiterDay('history', 'ip:shared-ip', now).posts_day).toBe(3);
 		});
@@ -372,7 +372,7 @@ describe('history quota', () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-cleanup'), (_instance, state) => {
 			let now = noon() + 10 * 3_600_000;
 			const config = { historyRequestsPerUserDay: 2 };
-			const page = (store: Store) => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			const page = (store: Store) => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			page(openStore(state, config, { now: () => now }));
 			// 00:30 the next day, after an eviction: the first page is written, the second held.
 			const lastWritten = now;
@@ -397,20 +397,20 @@ describe('history quota', () => {
 		const config = { historyRequestsPerUserDay: 3 };
 		await runInDurableObject(stub, (_instance, state) => {
 			const store = openStore(state, config, { now: () => now });
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			now += 61_000;
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			now += 1_000;
 			// Held in memory: lost to the eviction below.
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			expect(sqliteOf(store).admission.limiterDay('history', 'user:reader', now).posts_day).toBe(3);
 		});
 		await evictDurableObject(stub);
 		await runInDurableObject(stub, (_instance, state) => {
 			const store = openStore(state, config, { now: () => now });
 			expect(sqliteOf(store).admission.limiterDay('history', 'user:reader', now).posts_day).toBe(2);
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
-			expect(refusal(() => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' })).message).toBe('Daily history limit reached');
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			expect(refusal(() => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' })).message).toBe('Daily history limit reached');
 		});
 	});
 });
@@ -424,8 +424,8 @@ describe('limiter row count', () => {
 		await runInDurableObject(env.DEMO.getByName('quota-limiter-count-purge'), (_instance, state) => {
 			const now = noon();
 			const store = openStore(state, {}, { now: () => now });
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'leaver', ipKey: 'home' });
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'stayer', ipKey: 'home' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'leaver', ipKey: 'home' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'stayer', ipKey: 'home' });
 			expect(count(state)).toEqual([3]);
 			store.accounts.purge({ userIds: ['leaver', 'nobody'], now });
 			expect(rows(state)).toBe(2);
@@ -438,10 +438,10 @@ describe('limiter row count', () => {
 			const now = noon();
 			const store = openStore(state, { principalLimitCap: 3 }, { now: () => now });
 			state.storage.sql.exec("DELETE FROM _meta WHERE key = 'principal_limit_count'");
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'first', ipKey: 'home' });
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'first', ipKey: 'home' });
 			expect(count(state)).toEqual([2]);
-			sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'second', ipKey: 'home' });
-			expect(() => sqliteOf(store).history({ roomId: 'general', limit: 1, now, userId: 'third', ipKey: 'home' })).toThrow('Demo capacity reached');
+			sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'second', ipKey: 'home' });
+			expect(() => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now, userId: 'third', ipKey: 'home' })).toThrow('Demo capacity reached');
 		});
 	});
 });

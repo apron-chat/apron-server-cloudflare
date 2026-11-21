@@ -210,7 +210,7 @@ it("publishes a floor before a failed physical delete and resumes after restart"
 		// The seeded general record and the message are both still stored.
 		expect(Number(rowValue<{ count: number }>(state, "SELECT COUNT(*) AS count FROM records").count)).toBe(2);
 		expect(Number(rowValue<{ count: number }>(state, "SELECT COUNT(*) AS count FROM message_state").count)).toBe(1);
-		const hidden = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const hidden = sqliteOf(store).historyLog.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(hidden.messages).toBeUndefined();
 		expect(hidden.latest_log_id).toBe(head);
 		expect(hidden.history_log_id).toBeNull();
@@ -228,7 +228,7 @@ it("publishes a floor before a failed physical delete and resumes after restart"
 		expect(last?.latest_id).toBe(head);
 		expect(Number(rowValue<{ count: number }>(state, "SELECT COUNT(*) AS count FROM records").count)).toBe(0);
 		expect(Number(rowValue<{ count: number }>(state, "SELECT COUNT(*) AS count FROM message_state").count)).toBe(0);
-		expect(messagesOf(sqliteOf(restarted).history({ roomId: "general", after: 0n, limit: 50, now: clock.value }))).toEqual([]);
+		expect(messagesOf(sqliteOf(restarted).historyLog.history({ roomId: "general", after: 0n, limit: 50, now: clock.value }))).toEqual([]);
 	});
 });
 
@@ -242,7 +242,7 @@ it("keeps the latest historyHotRecords records however old, expiring older ones 
 			clock.value += 1_000;
 			return oneLog(store.messages.mutate(messageInput(clock, `count-${text}`, text)));
 		});
-		const visible = () => messagesOf(sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id));
+		const visible = () => messagesOf(sqliteOf(store).historyLog.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id));
 
 		// Past the count, an hour old: all but the latest three go at the next
 		// cleanup, whatever their age: the general room record and two messages.
@@ -267,7 +267,7 @@ it("expires records past historyMaxAgeSeconds whatever the count", async () => {
 		clock.value += 8 * DAY_MS;
 		const expired = store.lifecycle.runCleanup(clock.value);
 		expect(expired.history_floor).toBe(String(last + 1n));
-		expect(messagesOf(sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value }))).toEqual([]);
+		expect(messagesOf(sqliteOf(store).historyLog.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value }))).toEqual([]);
 	});
 });
 
@@ -287,17 +287,17 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		clock.value += 2 * DAY_MS;
 
 		// No job yet: no target. Past the count, but nothing copied: nothing leaves, and the job waits.
-		expect(sqliteOf(store).historyTarget(clock.value)).toBeUndefined();
+		expect(sqliteOf(store).historyLog.historyTarget(clock.value)).toBeUndefined();
 		const waiting = store.lifecycle.runCleanup(clock.value);
 		expect(waiting.deleted_records).toBe(0);
 		expect(waiting.next_due_ms).toBe(clock.value + 1_000);
 		expect(hotRecords()).toBe(9);
 
 		// The job's target: the first record it keeps. The records below it, oldest first.
-		expect(sqliteOf(store).historyTarget(clock.value)).toBe(Number(logs[5]));
-		const scanned = sqliteOf(store).historyScan(Number(general), 100, clock.value).filter((row) => row.log_id < Number(logs[5]));
+		expect(sqliteOf(store).historyLog.historyTarget(clock.value)).toBe(Number(logs[5]));
+		const scanned = sqliteOf(store).historyLog.historyScan(Number(general), 100, clock.value).filter((row) => row.log_id < Number(logs[5]));
 		expect(scanned.map((row) => BigInt(row.log_id))).toEqual([general, ...logs.slice(0, 5)]);
-		const tiers = chainStateStore(sqliteOf(store).historyStatePort(), "hot");
+		const tiers = chainStateStore(sqliteOf(store).historyLog.historyStatePort(), "hot");
 		await tiers.saveLink("hot", { through: Number(logs[4]) });
 		expect(await tiers.load(["hot", "recent"])).toEqual({
 			tiers: [{ floor: 1, target: 1 }, { floor: 1, target: 1 }],
@@ -329,7 +329,7 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect(moved.deleted_records).toBe(6);
 		// The published floor stays where it was: the tier below holds what left.
 		expect(moved.history_floor).toBe(moved.previous_floor);
-		expect(sqliteOf(store).historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor), latest: Number(logs[7]) });
+		expect(sqliteOf(store).historyLog.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor), latest: Number(logs[7]) });
 		expect(hotRecords()).toBe(3);
 
 		// History reads SQLite, and asks the tiers below for what is under it.
@@ -340,13 +340,13 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect(messagesOf(page).map((entry) => BigInt(entry.log_id))).toEqual(logs);
 		expect(page.more).toBe(false);
 		// Without them, SQLite's part alone.
-		expect(messagesOf(sqliteOf(store).history({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5));
+		expect(messagesOf(sqliteOf(store).historyLog.history({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5));
 
 		// The chain raises the published floor, never past the hot floor, and makes cleanup due.
 		sqliteOf(store).publishHistoryFloor(Number(logs[1]), clock.value);
 		expect(sqliteOf(store).logBounds().history_floor).toBe(String(logs[1]));
 		sqliteOf(store).publishHistoryFloor(Number(logs[7]), clock.value);
-		expect(sqliteOf(store).historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(logs[4] + 1n), latest: Number(logs[7]) });
+		expect(sqliteOf(store).historyLog.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(logs[4] + 1n), latest: Number(logs[7]) });
 		expect(store.lifecycle.cleanupDue(clock.value)).toBe(true);
 		const narrowed = store.messages.historyAcrossTiers({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
 		expect("below" in narrowed).toBe(false);
@@ -447,7 +447,7 @@ describe("cleanup at the storage watermark", () => {
 			const relieved = store.lifecycle.runCleanup(clock.value);
 			expect(relieved.deleted_records).toBe(4);
 			expect(records()).toBe(3);
-			expect(messagesOf(sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3));
+			expect(messagesOf(sqliteOf(store).historyLog.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3));
 
 			// Still over the watermark (here, by construction): not due again at the next alarm, only five minutes on, and then it finds nothing to do and leaves the schedule alone.
 			expect(store.lifecycle.cleanupDue(clock.value + 1_000)).toBe(false);
@@ -505,8 +505,8 @@ describe("cleanup at the storage watermark", () => {
 			expect(store.lifecycle.cleanupDue(clock.value)).toBe(true);
 
 			// Its target is the first record the count keeps; once the chain copied up to it, those go.
-			expect(sqliteOf(store).historyTarget(clock.value)).toBe(Number(logs[5]));
-			await chainStateStore(sqliteOf(store).historyStatePort(), "hot").saveLink("hot", { through: Number(logs[4]) });
+			expect(sqliteOf(store).historyLog.historyTarget(clock.value)).toBe(Number(logs[5]));
+			await chainStateStore(sqliteOf(store).historyLog.historyStatePort(), "hot").saveLink("hot", { through: Number(logs[4]) });
 			const moved = store.lifecycle.runCleanup(clock.value);
 			expect(moved.deleted_records).toBe(6);
 			expect(records()).toBe(3);

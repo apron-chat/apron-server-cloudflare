@@ -217,7 +217,7 @@ function rowsOf(sql: SqlStorage, table: string, columns: string[]): unknown[] {
 
 /** A message's latest text in its room's history: its last record there. */
 function latestText(store: Store, messageId: string, now: number): string | undefined {
-	return messagesOf(sqliteOf(store).history({ roomId: 'general', after: 0n, now })).filter((message) => message.message_id === messageId).pop()?.body?.text;
+	return messagesOf(sqliteOf(store).historyLog.history({ roomId: 'general', after: 0n, now })).filter((message) => message.message_id === messageId).pop()?.body?.text;
 }
 
 const SHARED_COLUMNS: Record<string, string[]> = {
@@ -264,7 +264,7 @@ it('upgrades a schema 9 store to the current schema in place: every row kept, re
 			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", `filler_${index}`, `hf${index}`, `F${index}`, now, now);
 		}
 		const rows = Object.fromEntries(Object.entries(SHARED_COLUMNS).map(([table, columns]) => [table, rowsOf(sql, table, columns)]));
-		return { rows, page: messagesOf(sqliteOf(store).history({ roomId: 'general', after: 0n, now })), writes: writesReserved(sql), reads: readsReserved(sql), messageId: String(first.result.message_id) };
+		return { rows, page: messagesOf(sqliteOf(store).historyLog.history({ roomId: 'general', after: 0n, now })), writes: writesReserved(sql), reads: readsReserved(sql), messageId: String(first.result.message_id) };
 	});
 	expect(before.rows.message_state).toHaveLength(2);
 	expect(before.rows.reaction_state).toHaveLength(1);
@@ -293,7 +293,7 @@ it('upgrades a schema 9 store to the current schema in place: every row kept, re
 		expect(writesReserved(sql) - before.writes).toBeLessThanOrEqual(4);
 		expect(readsReserved(sql) - before.reads).toBeLessThan(64);
 		// The store reads the same: history, the edited message's current snapshot, reactions, status.
-		expect(messagesOf(sqliteOf(store).history({ roomId: 'general', after: 0n, now }))).toEqual(before.page);
+		expect(messagesOf(sqliteOf(store).historyLog.history({ roomId: 'general', after: 0n, now }))).toEqual(before.page);
 		expect(latestText(store, before.messageId, now)).toBe('first, edited');
 		expect(store.reads.statusInputs('bob')).toEqual({ choice: 'dnd', roomMutes: [] });
 		// And it writes: an edit of the upgraded message, and a new post.
@@ -444,7 +444,7 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(before.head);
 		expect(store.accounts.get('kept_user')?.name).toBe('Kept');
 		// The upgraded limiters work: a page is charged to the new bucket.
-		sqliteOf(store).history({ roomId: 'general', limit: 1, now: Date.now(), userId: 'kept_user', ipKey: 'ip-kept_user' });
+		sqliteOf(store).historyLog.history({ roomId: 'general', limit: 1, now: Date.now(), userId: 'kept_user', ipKey: 'ip-kept_user' });
 		expect(sql.exec<{ level: number }>("SELECT level FROM principal_limits WHERE scope = 'history' AND principal_key = 'user:kept_user'").one().level).toBe(1);
 	});
 });

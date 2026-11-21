@@ -15,7 +15,7 @@
 import type { CostEstimate } from "../budget-ledger";
 import type { RawLimitRow } from "../limiter-cache";
 import type { StoreConfig } from "./config";
-import type { RawIdentityRow, RawLogState, RawMessageRow, RawRoomRow } from "./rows";
+import type { RawIdentityRow, RawLogState, RawMaintenanceRow, RawMessageRow, RawRoomRow } from "./rows";
 import type { Broadcast, LiveEntry, MessageSnapshot, SqlCursorLike, StoreClock, StoreMutationInput, StoreMutationResult } from "./types";
 
 /**
@@ -36,6 +36,8 @@ export interface Sql {
   metaNumber(key: string): number;
   /** A JSON `_meta` record as `decode` makes it, `fallback` when absent, unreadable or refused. */
   metaJson<T>(key: string, decode: (value: unknown) => T | undefined, fallback: T): T;
+  /** The `_meta` entries with keys from `start` up to `end`, in key order, at most `limit`. */
+  metaRange(start: string, end: string, limit: number): Array<[string, string]>;
   /** Sets a `_meta` value; null deletes it. */
   writeMeta(key: string, value: string | null): void;
   /** An identity's row, or null. */
@@ -48,6 +50,12 @@ export interface Sql {
   isMember(roomId: string, userId: string): boolean;
   /** The log's head and floor, read once and then kept. */
   logState(): RawLogState;
+  /** The floor below which records may leave this SQLite: the hot floor, or with tiers, what every link has copied. */
+  publishedFloor(): number;
+  /** A room's row, or null. */
+  roomRow(roomId: string): RawRoomRow | null;
+  /** The maintenance row: cleanup's schedule and cursor. */
+  maintenanceRow(): RawMaintenanceRow;
   /** A retained message's current state and snapshot, or null; below `floor`, null. */
   currentMessage(messageId: string, floor?: number): RawMessageRow | null;
   /** Writes a user's `seen` (protocol §4.5.2) without making reused member listings stale (core.patchMemberSeen updates them once committed). */
@@ -105,6 +113,8 @@ export interface StoreCore {
    * Every use is listed in src/store/index.ts.
    */
   unmetered<T>(fn: (sql: Sql) => T): T;
+  /** Whether the server is degraded now: a daily share past DEGRADE_SHARE (no SQL). */
+  degraded(now: number): boolean;
   /** Sets a committed `seen` in the member listings kept for reuse (no SQL). */
   patchMemberSeen(userId: string, seen: number): void;
   /** Runs `fn` as an operator alert's storage work: charged, never refused (SqliteStore.alert). */

@@ -676,7 +676,7 @@ export interface Ops {
   setRoomNotesAlerted(alerted: boolean, now?: number): void;
   /**
    * What the last room_set's total check saw (checkRoomFieldsTotal), then
-   * forgotten: the total of what rooms hold past roomMetadataMinLimit, with
+   * forgotten: the total of what rooms hold past roomMetadataMinBytes, with
    * this save's room, and on a refusal `full` with the public rooms holding
    * the most past it. Undefined when that save ran no check (it did not grow
    * its room past the minimum). Kept outside the transaction, which a

@@ -180,7 +180,7 @@ describe('measured storage accounting', () => {
 
 			clock.set(clock.now() + 11 * HOUR);
 			const cleanup = measure('cleanup', () => store.lifecycle.runCleanup(clock.now()));
-			const history = measure('history after cleanup', () => sqliteOf(store).historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			const history = measure('history after cleanup', () => sqliteOf(store).historyLog.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
 			const room = sqliteOf(store).getRoomState();
 			const observed = sqliteOf(store).storageAccounting();
 			const budget = sqliteOf(store).budget();
@@ -664,7 +664,7 @@ describe('measured storage accounting', () => {
 			});
 
 			const before = snapshot(store);
-			const page = sqliteOf(store).historyPage({ roomId: 'general', after: '0', limit: 50, now: clock.now() });
+			const page = sqliteOf(store).historyLog.historyPage({ roomId: 'general', after: '0', limit: 50, now: clock.now() });
 			const cost = costSince(store, before);
 			expect((page.rooms?.length ?? 0) + messagesOf(page).length + (page.reactions?.length ?? 0)).toBe(50);
 			expect(page.rooms).toHaveLength(17);
@@ -727,7 +727,7 @@ describe('measured storage accounting', () => {
 			const recordBytes = new TextEncoder().encode(JSON.stringify(moved.broadcasts[1].params)).byteLength;
 			expectWithinReserve(move);
 			// The re-logged record still fits one history response.
-			const page = sqliteOf(store).historyPage({ roomId: String(thread.result.room_id), after: '0', limit: 50, now: clock.now() });
+			const page = sqliteOf(store).historyLog.historyPage({ roomId: String(thread.result.room_id), after: '0', limit: 50, now: clock.now() });
 			expect(page.reactions?.[0].reactions).toHaveLength(64);
 			expect(recordBytes).toBeLessThan(config.maxHistoryResponseBytes);
 			return { reaction: reactionCost, move, recordBytes };
@@ -782,10 +782,10 @@ describe('measured storage accounting', () => {
 			// Maximum snapshots fill a history response before its record limit,
 			// so the 18 accepted transitions span pages.
 			const accepted: ReturnType<typeof messagesOf> = [];
-			let page = sqliteOf(store).historyPage({ roomId: 'general', limit: 50, now: clock.now() });
+			let page = sqliteOf(store).historyLog.historyPage({ roomId: 'general', limit: 50, now: clock.now() });
 			accepted.push(...messagesOf(page));
 			while (page.more && page.first_log_id) {
-				page = sqliteOf(store).historyPage({ roomId: 'general', limit: 50, before: page.first_log_id, now: clock.now() });
+				page = sqliteOf(store).historyLog.historyPage({ roomId: 'general', limit: 50, before: page.first_log_id, now: clock.now() });
 				accepted.push(...messagesOf(page));
 			}
 			// As the store holds it: a principal's row is written at most once a minute.
@@ -1117,9 +1117,9 @@ describe('measured storage accounting', () => {
 				userId: 'matrix-user', ipKey: 'matrix-nick-ip', requestId: 'matrix-nick', method: 'me', now: clock.now(),
 				params: { name: 'Matrix renamed' }, identity,
 			}));
-			measure('history page', () => sqliteOf(store).historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			measure('history page', () => sqliteOf(store).historyLog.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
 			// With the quota: the first page creates the user's and the IP's limiter rows; the next, within a minute, writes neither.
-			const charged = () => sqliteOf(store).history({ roomId: 'general', limit: 50, now: clock.now(), userId: 'matrix-reader', ipKey: 'matrix-reader-ip' });
+			const charged = () => sqliteOf(store).historyLog.history({ roomId: 'general', limit: 50, now: clock.now(), userId: 'matrix-reader', ipKey: 'matrix-reader-ip' });
 			measure('charged history page, a new user and IP', charged);
 			measure('charged history page, again within a minute', charged);
 			measure('room record lookup', () => sqliteOf(store).getRoomState());

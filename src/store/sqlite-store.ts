@@ -13,6 +13,7 @@
 
 import { defaultStoreConfig, type StoreConfig } from "./config";
 import type { Sql, StoreCore, TransactionJournal } from "./core";
+import { HistoryModule } from "./history-log";
 import { LiveTextModule } from "./live-text";
 import { UploadsModule } from "./uploads";
 import { ReadsModule } from "./reads";
@@ -238,10 +239,7 @@ export class SqliteStore {
 
   /** The rooms one roomMembers call read, when nothing is kept. */
   private readonly uncachedMembers = new Map<string, MemberCacheEntry>();
-  /** The cold tiers' chunk indexes, as loaded from this SQLite, by tier name (chunkIndex). */
-  private readonly chunkIndexes = new Map<string, Map<number, ChunkRef>>();
-  /** Whether the chunk table exists, this instance (chunkIndex). */
-  private chunkTableReady = false;
+
   /** What this server takes as content, for a post and an import alike (content/policy.ts), from its limits. */
   readonly content: ContentPolicy;
   /** The caches the modules keep that a transaction puts back as it rolls back (StoreCore.journal). */
@@ -264,6 +262,10 @@ export class SqliteStore {
     currentMessage: (messageId, floor) => this.currentMessage(messageId, floor),
     ensureGrowthCapacity: (bytes) => this.ensureGrowthCapacity(bytes),
     writeSeen: (userId, seen) => this.writeSeen(userId, seen),
+    metaRange: (start, end, limit) => this.metaRange(start, end, limit),
+    publishedFloor: () => this.publishedFloor(),
+    roomRow: (roomId) => this.roomRow(roomId),
+    maintenanceRow: () => this.maintenanceRow(),
     retainedEmbed: (messageId, embedId) => this.retainedEmbed(messageId, embedId),
     visibleRoomRow: (roomId, userId) => this.visibleRoomRow(roomId, userId),
     messageReference: (value, field, floor, options) => this.messageReference(value, field, floor, options),
@@ -275,6 +277,8 @@ export class SqliteStore {
   };
   /** The core the implementation modules run over (core.ts). */
   readonly core: StoreCore = this.makeCore();
+  /** History: pages of the log, the head's records and floors, the chain's state, rewrite log, chunk index and import journal (history-log.ts). */
+  readonly historyLog: HistoryModule;
   /** Open live texts: their start, claim, finish and expiry (live-text.ts). */
   readonly live: LiveTextModule;
   /** Uploads in R2, avatars, the server's metadata, custom emoji and toggles (uploads.ts). */
@@ -296,6 +300,7 @@ export class SqliteStore {
       alert: (fn) => this.alert(fn),
       unmetered: (fn) => fn(this.sqlHandle),
       patchMemberSeen: (userId, seen) => this.patchMemberSeen(userId, seen),
+      degraded: (now) => this.degraded(now),
       ensureReady: () => this.ensureReady(),
       effectiveNow: (candidate) => this.effectiveNow(candidate),
       reserved: (operation, cost, maintenance, now, fn, unchecked) => this.reserved(operation, cost, maintenance, now, (unused) => fn(this.sqlHandle, unused), unchecked),
@@ -339,6 +344,7 @@ export class SqliteStore {
     this.readState = new ReadsModule(this.core, this.pushes);
     this.uploads = new UploadsModule(this.core);
     this.live = new LiveTextModule(this.core, this.admission, this.uploads);
+    this.historyLog = new HistoryModule(this.core, this.admission);
   }
 
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
@@ -1740,162 +1746,6 @@ export class SqliteStore {
   }
 
   /**
-   * The records the hot log holds from the hot floor on, for `/status`:
-   * counted up to RETAINED_SCAN_CAP (one index entry each, refunded past
-   * what is found), and that cap and one more past it.
-   */
-  hotRecords(now = this.clock.now()): number {
-    this.ensureReady();
-    return this.reserved("hotRecords", { reads: 16 + RETAINED_SCAN_CAP + 1 }, false, now, () => integerColumn(this.rawRows<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx WHERE log_id >= ? LIMIT ?)",
-      this.logState().history_floor, RETAINED_SCAN_CAP + 1,
-    )[0]?.count));
-  }
-
-  /**
-   * The hot floor, the published floor (publishedFloor) and the log head
-   * (the last log ID issued, `latest`), for the history chain: an import
-   * that renumbers its records places them past the head.
-   */
-  historyFloors(now = this.clock.now()): { hot: number; published: number; latest: number } {
-    this.ensureReady();
-    return this.reserved("historyFloors", { reads: 8 }, true, now, () => {
-      const state = this.logState();
-      return { hot: state.history_floor, published: this.publishedFloor(), latest: state.last_log_id };
-    });
-  }
-
-  /**
-   * The head's target (HistoryHead.floorFor): while a cleanup job runs, the
-   * log ID of the first record its pinned cutoff keeps, below which records
-   * are copied down before cleanup removes them. A log ID is never below its
-   * commit time, so every record before the cutoff's own log ID has expired;
-   * past it, at most HISTORY_TARGET_SCAN entries are read, and if none is
-   * kept the last read is a target low enough. Undefined without a job.
-   */
-  historyTarget(now = this.clock.now()): number | undefined {
-    this.ensureReady();
-    if (!this.config.tiered) return undefined;
-    return this.reserved("historyTarget", { reads: 24 + HISTORY_TARGET_SCAN }, true, now, () => {
-      const maintenance = this.maintenanceRow();
-      if (maintenance.cleanup_cursor === null || maintenance.cleanup_cutoff_ms === null) return undefined;
-      const cutoff = maintenance.cleanup_cutoff_ms;
-      const state = this.logState();
-      const rows = this.rawRows<{ log_id: number; commit_ms: number }>(
-        "SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT ?",
-        Math.max(state.history_floor, cutoff), HISTORY_TARGET_SCAN,
-      );
-      const kept = rows.find((row) => integerColumn(row.commit_ms) >= cutoff);
-      if (kept) return integerColumn(kept.log_id);
-      if (rows.length === HISTORY_TARGET_SCAN) return integerColumn(rows[rows.length - 1].log_id);
-      return state.last_log_id + 1;
-    });
-  }
-
-  /**
-   * Records from `from` on, oldest first: those of at most `limit` distinct
-   * log IDs, every room's copy of each (HistoryHead.scan, for the copy down).
-   */
-  /** The most log IDs historyScan returns at once (HistoryTier.scanLimit): a copy gathers a larger batch over several scans. */
-  readonly historyScanLimit = HISTORY_SCAN_BATCH;
-
-  historyScan(from: number, limit = HISTORY_SCAN_BATCH, now = this.clock.now()): ChatRecord[] {
-    this.ensureReady();
-    const capped = Math.max(0, Math.min(limit, HISTORY_SCAN_BATCH));
-    return this.reserved("historyScan", { reads: 24 + 6 * capped }, true, now, () => this.rawRows<ChatRecord>(
-      `SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE log_id IN (
-         SELECT DISTINCT log_id FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT ?)
-       ORDER BY log_id, room_id`, from, capped,
-    ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
-  }
-
-  /**
-   * The records of `roomIds` in a window, as HistoryTier.read gives them
-   * (the first `limit` distinct log IDs nearest the page's start), outside
-   * the history quota: for exports and the chain's own reads.
-   */
-  historyRecords(query: HistoryQuery, now = this.clock.now()): ChatRecord[] {
-    this.ensureReady();
-    const limit = Math.max(0, Math.min(query.limit, 1_000));
-    if (!query.roomIds.length || query.lower > query.upper || !limit) return [];
-    if (query.roomIds.length === 1) {
-      // One room (exports page room by room): its own key range, a page at most.
-      return this.reserved("historyRecords", { reads: 24 + limit + 1 }, true, now, () => this.rawRows<ChatRecord>(
-        `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
-         WHERE room_id = ? AND log_id >= ? AND log_id <= ? ORDER BY log_id ${query.forward ? "ASC" : "DESC"} LIMIT ?`,
-        query.roomIds[0], Math.max(query.lower, this.logState().history_floor), query.upper, limit,
-      ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
-    }
-    return this.reserved("historyRecords", { reads: 24 + 4 * limit * Math.min(query.roomIds.length, 8) }, true, now, () => this.rawRows<ChatRecord>(
-      `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
-       WHERE room_id IN (SELECT value FROM json_each(?)) AND log_id IN (
-         SELECT DISTINCT log_id FROM records
-         WHERE room_id IN (SELECT value FROM json_each(?)) AND log_id >= ? AND log_id <= ?
-         ORDER BY log_id ${query.forward ? "ASC" : "DESC"} LIMIT ?)
-       ORDER BY log_id ${query.forward ? "ASC" : "DESC"}`,
-      JSON.stringify(query.roomIds), JSON.stringify(query.roomIds), Math.max(query.lower, this.logState().history_floor), query.upper, limit,
-    ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
-  }
-
-  /** The records with these log IDs, any room (import's duplicate check). */
-  historyLookup(logIds: readonly number[], now = this.clock.now()): ChatRecord[] {
-    this.ensureReady();
-    const ids = [...new Set(logIds)].slice(0, 1_000);
-    if (!ids.length) return [];
-    return this.reserved("historyLookup", { reads: 24 + 4 * ids.length }, true, now, () => this.rawRows<ChatRecord>(
-      "SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE log_id IN (SELECT value FROM json_each(?)) ORDER BY log_id, room_id",
-      JSON.stringify(ids),
-    ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
-  }
-
-  /**
-   * The history chain's state, as plain values (src/history/state.ts keeps
-   * its rules): values under `history:tier:`, `history:link:` and
-   * `history:kept:` (at most MAX_KEPT_GROUPS read a call), the hot
-   * and published floors, and the copy marker, which cleanup stops at
-   * (runCleanup).
-   */
-  historyStatePort(): ChainStatePort {
-    // Its functions run when the history chain calls them, outside any store
-    // operation: their reservations are named `unknown` (accounting.ts).
-    const owned = (key: string) => {
-      if (!key.startsWith(META_HISTORY_TIER) && !key.startsWith(META_HISTORY_LINK) && !key.startsWith(META_HISTORY_KEPT)) throw new Error(`not a history chain state key: ${key}`);
-      return key;
-    };
-    return {
-      value: (key) => {
-        this.ensureReady();
-        return this.reserved("unknown", { reads: 4 }, true, this.clock.now(), () => this.metaValue(owned(key)) || undefined);
-      },
-      setValue: (key, value) => {
-        this.ensureReady();
-        if (!this.config.tiered) return;
-        this.reserved("unknown", { reads: 4, writes: 4 }, true, this.clock.now(), () => this.writeMeta(owned(key), value));
-      },
-      hotFloor: () => this.historyFloors().hot,
-      publishedFloor: () => this.historyFloors().published,
-      copyMarker: () => {
-        this.ensureReady();
-        return this.reserved("unknown", { reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_THROUGH));
-      },
-      raiseCopyMarker: (through) => {
-        this.ensureReady();
-        if (!this.config.tiered) return;
-        this.reserved("unknown", { reads: 4, writes: 4 }, true, this.clock.now(), () => {
-          if (through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(through));
-        });
-      },
-      entries: (prefix) => {
-        this.ensureReady();
-        const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
-        return this.reserved("unknown", { reads: 16 + MAX_KEPT_GROUPS }, true, this.clock.now(), () => this.rawRows<{ key: string; value: string }>(
-          "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", owned(prefix), end, MAX_KEPT_GROUPS,
-        ).map((row) => [row.key, row.value] as [string, string]));
-      },
-    };
-  }
-
-  /**
    * Raises the published floor (HistoryHead.publish), never past the hot
    * floor: history starts there from now on. Rooms whose whole log is below
    * it go on the next cleanup, made due now.
@@ -1911,42 +1761,6 @@ export class SqliteStore {
       this.writeMeta(META_HISTORY_ROOMS_DUE, "1");
       this.cleanupDueCache = undefined;
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = MIN(next_cleanup_ms, ?) WHERE id = 1", this.effectiveNow(now));
-    });
-  }
-
-  /** The `/purge` and `/rename` some link has yet to deliver, oldest first. */
-  historyRewrites(now = this.clock.now()): QueuedRewrite[] {
-    this.ensureReady();
-    if (!this.config.tiered) return [];
-    return this.reserved("historyRewrites", { reads: 4 }, true, now, () => this.queuedRewrites());
-  }
-
-  /** The newest rewrite's number ever given (0: none), delivered or not. */
-  historyRewritesLogged(now = this.clock.now()): number {
-    this.ensureReady();
-    return this.reserved("historyRewritesLogged", { reads: 4 }, true, now, () => this.metaNumber(META_HISTORY_OPS_SEQ));
-  }
-
-  private queuedRewrites(): QueuedRewrite[] {
-    return this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedRewrite[] : undefined, []);
-  }
-
-  /** Adds `messageIds` to queued purge `seq` (RewriteLog.amend): messages of its user a tier below found. */
-  amendHistoryPurge(seq: number, messageIds: readonly string[], now = this.clock.now()): void {
-    this.ensureReady();
-    if (!messageIds.length) return;
-    this.reserved("amendHistoryPurge", { reads: 4, writes: 4 }, true, now, () => {
-      const next = this.queuedRewrites().map((entry) => entry.seq === seq && entry.rewrite.into === null ? { seq, rewrite: { ...entry.rewrite, messages: [...new Set([...(entry.rewrite.messages ?? []), ...messageIds])] } } : entry);
-      this.writeMeta(META_HISTORY_OPS, JSON.stringify(next));
-    });
-  }
-
-  /** Forgets the rewrites through `seq`, once every link delivered them. */
-  dropHistoryRewrites(seq: number, now = this.clock.now()): void {
-    this.ensureReady();
-    this.reserved("dropHistoryRewrites", { reads: 4, writes: 4 }, true, now, () => {
-      const kept = this.queuedRewrites().filter((entry) => entry.seq > seq);
-      this.writeMeta(META_HISTORY_OPS, kept.length ? JSON.stringify(kept) : null);
     });
   }
 
@@ -2415,79 +2229,6 @@ export class SqliteStore {
   }
 
   /**
-   * A cold tier's chunk index (ChunkIndex), in this SQLite: one row a chunk
-   * in `history_chunks`, keyed by tier name and the chunk's first log ID,
-   * created on first use. The rows are read once a wake (a chunk holds
-   * about 10,000 log IDs, so they are few) and kept in memory (this object
-   * is the only writer); each read and write is charged to maintenance.
-   */
-  chunkIndex(tier: string): ChunkIndex {
-    // As historyStatePort's: run by the cold tier, so named `unknown`.
-    const prepare = () => {
-      this.ensureReady();
-      if (this.chunkTableReady) return;
-      this.reserved("unknown", { reads: 8, writes: 8 }, true, this.clock.now(), () => {
-        this.rawExec("CREATE TABLE IF NOT EXISTS history_chunks (tier TEXT NOT NULL, first INTEGER NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (tier, first)) WITHOUT ROWID");
-      });
-      this.chunkTableReady = true;
-    };
-    const loaded = (): Map<number, ChunkRef> => {
-      const cached = this.chunkIndexes.get(tier);
-      if (cached) return cached;
-      prepare();
-      // Charged for the rows there are: a count first, then the rows.
-      const count = this.reserved("unknown", { reads: 24 }, true, this.clock.now(), () => Number(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM history_chunks WHERE tier = ?", tier)[0]?.count ?? 0));
-      const rows = this.reserved("unknown", { reads: 24 + count }, true, this.clock.now(), () => this.rawRows<{ first: number; ref: string }>("SELECT first, ref FROM history_chunks WHERE tier = ?", tier));
-      const refs = new Map(rows.map((row) => [Number(row.first), JSON.parse(row.ref) as ChunkRef]));
-      this.chunkIndexes.set(tier, refs);
-      return refs;
-    };
-    return {
-      list: async () => [...loaded().values()].map((ref) => ({ ...ref })),
-      update: async ({ put = [], remove = [] }) => {
-        const refs = loaded();
-        this.reserved("unknown", { reads: 8 + put.length + remove.length, writes: 2 * (put.length + remove.length) }, true, this.clock.now(), () => {
-          for (const first of remove) this.rawExec("DELETE FROM history_chunks WHERE tier = ? AND first = ?", tier, first);
-          for (const ref of put) this.rawExec("INSERT OR REPLACE INTO history_chunks (tier, first, ref) VALUES (?, ?, ?)", tier, ref.first, JSON.stringify(ref));
-        });
-        for (const first of remove) refs.delete(first);
-        for (const ref of put) refs.set(ref.first, { ...ref });
-      },
-    };
-  }
-
-  /** A backup schedule's number in `_meta` (a key under `history:export:`), 0 when absent. */
-  historyMetaNumber(key: string, now = this.clock.now()): number {
-    this.ensureReady();
-    if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
-    return this.reserved("historyMetaNumber", { reads: 4 }, true, now, () => this.metaNumber(key));
-  }
-
-  /** The running import's journal (`history:import`, RestorePort.journal): what a retry needs to finish it. */
-  historyImportJournal(now = this.clock.now()): string | undefined {
-    this.ensureReady();
-    return this.reserved("historyImportJournal", { reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT) || undefined);
-  }
-
-  /** Writes or clears the running import's journal (its size is the importer's to bound: MAX_JOURNAL_BYTES). */
-  setHistoryImportJournal(value: string | null, now = this.clock.now()): void {
-    this.ensureReady();
-    this.reserved("setHistoryImportJournal", { reads: 4, writes: 4 + Math.ceil((value?.length ?? 0) / 4_096) }, true, now, () => this.writeMeta(META_HISTORY_IMPORT, value));
-  }
-
-  /** How far the running import's writes got (`history:import_progress`, RestorePort.progress): a small JSON value. */
-  historyImportProgress(now = this.clock.now()): string | undefined {
-    this.ensureReady();
-    return this.reserved("historyImportProgress", { reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT_PROGRESS) || undefined);
-  }
-
-  /** Writes or clears the running import's progress. */
-  setHistoryImportProgress(value: string | null, now = this.clock.now()): void {
-    this.ensureReady();
-    this.reserved("setHistoryImportProgress", { reads: 4, writes: 4 }, true, now, () => this.writeMeta(META_HISTORY_IMPORT_PROGRESS, value));
-  }
-
-  /**
    * Whether a room exists with nothing logged past its creation: the seeded
    * `general` of a new server, which an import may fill (restoreRoom merges).
    */
@@ -2520,29 +2261,6 @@ export class SqliteStore {
     if (own?.kind !== "room") return undefined;
     const later = this.rawRows<{ kind: string }>("SELECT kind FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?", row.room_id, created, EMPTY_ROOM_SCAN);
     return later.length < EMPTY_ROOM_SCAN && later.every((record) => record.kind === "membership") ? created : undefined;
-  }
-
-  /** Writes a backup schedule's value in `_meta` (a key under `history:export:`), or removes it for null. */
-  setHistoryMeta(key: string, value: string | null, now = this.clock.now()): void {
-    this.ensureReady();
-    if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
-    this.reserved("setHistoryMeta", { reads: 4, writes: 4 }, true, now, () => this.writeMeta(key, value));
-  }
-
-  /**
-   * Queues what a `/purge` or `/rename` did here for the links to deliver
-   * down the chain (historyRewrites), within the operation's transaction,
-   * numbered in order. A full log refuses the operation: the links must
-   * catch up first.
-   */
-  private queueHistoryRewrites(rewrites: readonly Rewrite[]): void {
-    if (!this.config.tiered || !rewrites.length) return;
-    const queued = this.queuedRewrites();
-    if (queued.length + rewrites.length > MAX_HISTORY_REWRITES) throw new StoreError("retry_after", "older history has yet to catch up with earlier changes");
-    let seq = this.metaNumber(META_HISTORY_OPS_SEQ);
-    const added = rewrites.map((rewrite) => ({ seq: (seq += 1), rewrite }));
-    this.writeMeta(META_HISTORY_OPS_SEQ, String(seq));
-    this.writeMeta(META_HISTORY_OPS, JSON.stringify([...queued, ...added]));
   }
 
   private identityRow(userId: string): RawIdentityRow | null {
@@ -2701,7 +2419,7 @@ export class SqliteStore {
           this.rewriteRecord(row, JSON.stringify({ ...membership, members: membership.members.map((member) => ({ ...member, user: renamed(member.user) })) }));
         }
       }
-      this.queueHistoryRewrites([{ user: from, into: to }]);
+      this.historyLog.queueHistoryRewrites(this.sqlHandle, [{ user: from, into: to }]);
       // A message's current snapshot is its latest record, renamed above.
       for (const row of found.messages) this.rawExec("UPDATE message_state SET author_id = ? WHERE message_id = ?", to, row.message_id);
       for (const row of found.reactions) {
@@ -2822,7 +2540,7 @@ export class SqliteStore {
       if (messages.length) this.rawExec(`DELETE FROM reaction_state WHERE message_id IN (${messageMarks})`, ...messages);
       this.rawExec(`DELETE FROM message_state WHERE author_id IN (${marks})`, ...ids);
       // The tiers below do the same to what they hold, as the links deliver it (src/history/chain.ts).
-      this.queueHistoryRewrites(ids.map((user) => ({ user, into: null, messages })));
+      this.historyLog.queueHistoryRewrites(this.sqlHandle, ids.map((user) => ({ user, into: null, messages })));
       const uploads = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
          FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id IN (${marks})`,
@@ -3690,6 +3408,13 @@ export class SqliteStore {
     } catch {
       return fallback;
     }
+  }
+
+  /** The `_meta` entries with keys from `start` up to `end`, in key order, at most `limit`. */
+  private metaRange(start: string, end: string, limit: number): Array<[string, string]> {
+    return this.rawRows<{ key: string; value: string }>(
+      "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", start, end, limit,
+    ).map((row) => [row.key, row.value] as [string, string]);
   }
 
   private metaNumber(key: string): number {
@@ -5160,334 +4885,6 @@ export class SqliteStore {
   /** Runtime adapter: commits a private copy of the request parameters. */
   mutate(input: StoreMutationInput): StoreMutationResult {
     return this.commitMutation({ ...input, params: clone(input.params) });
-  }
-
-  /**
-   * History with the history quota charged (§4.3): the user's and the IP's
-   * limiters (a burst, then a rate a minute, and a count a day, one row each)
-   * and the server's count a day, kept on the day's budget row, which every
-   * reservation updates anyway. A request that serves no page (refused by the
-   * user's or IP's limits, or an unknown room or bad bounds, whose rollback
-   * undoes their charges) gives its server count back, so such requests
-   * cannot use up everyone's history for the day.
-   */
-  history(query: StoreHistoryQuery): StoreHistoryResult {
-    return this.historyImpl(query, false) as StoreHistoryResult;
-  }
-
-  /**
-   * history, for a runtime with tiers below: a page that reaches below the
-   * hot floor is a PendingHistory, which the runtime completes with the
-   * records it asks of them (HistoryChain.read). Charged and checked as
-   * history is, before they are read.
-   */
-  historyAcrossTiers(query: StoreHistoryQuery): StoreHistoryResult | PendingHistory {
-    return this.historyImpl(query, true);
-  }
-
-  private historyImpl(query: StoreHistoryQuery, allowTiers: boolean): StoreHistoryResult | PendingHistory {
-    this.ensureReady();
-    const operationNow = query.now ?? this.clock.now();
-    const charged = Boolean(query.userId && query.ipKey);
-    // `before` alone pages back from the head: how far back it starts, in
-    // records past `before`, decides whether a guest may have it and whether
-    // the degraded tier counts it as older history. The newest page is
-    // neither: its `before` is the head, give or take the records since.
-    const backward = query.before !== undefined && query.after === undefined;
-    const limit = this.historyLimit(query);
-    // The degraded tier lets through a page within two pages of the head: a
-    // room viewed without joining knows its head only from a listing.
-    const newestReach = 2 * limit;
-    const guestReach = Math.max(this.config.guestHistoryDepth, limit);
-    const depthCap = Math.max(newestReach, query.guest ? guestReach : 0);
-    return this.reserved("historyImpl", {
-      ...this.config.historyCost,
-      // Measuring a backward page reads the rooms again (a private one's
-      // membership too) and at most `depthCap` records and one more a room.
-      reads: this.historyReads(query) + (backward ? depthCap + 3 * this.historyRoomCount(query) : 0),
-      // A page writes only its two limiter rows and the budget row: about 20
-      // rows for a first request, which creates both limiter rows.
-      writes: Math.max(32, this.config.historyCost.writes ?? 0),
-      history: charged ? 1 : 0,
-    }, false, operationNow, (unused) => {
-      // A page refused once measured read rows to find out: it stays charged,
-      // to the user's and IP's limiters and the server's count, so refusals
-      // cost what a page does and cannot be repeated for free.
-      let measuredRefusal: StoreError | undefined;
-      try {
-        const now = this.effectiveNow(operationNow);
-        // Scrolling back, the costliest reads, is the history the degraded
-        // tier turns off (today's budget is in memory), and a guest's
-        // reaches only `guestHistoryDepth` records back: past that, older
-        // pages are for accounts. A page near the head is the newest, open
-        // to everyone in every tier.
-        const degraded = query.before !== undefined && this.degraded(operationNow);
-        if (degraded && !backward) this.assertNotDegraded("Loading older history", operationNow);
-        const page = this.transaction(() => {
-          if (charged && !query.guest) {
-            this.admission.chargeEvent(this.sqlHandle, "history", `user:${query.userId}`, now,
-              { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
-              "History request limit reached",
-              { limit: this.config.historyRequestsPerUserDay, message: "Daily history limit reached" }, "read");
-          }
-          if (charged) {
-            this.admission.chargeEvent(this.sqlHandle, "history", `ip:${query.ipKey}`, now,
-              { perMinute: this.config.historyRequestsPerIpMinute, burst: this.config.historyBurstPerIp },
-              "History request limit reached",
-              { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" }, "read");
-          }
-          if (backward && (query.guest || degraded)) {
-            const depth = this.recordsAfter(query, depthCap);
-            try {
-              if (degraded && depth >= newestReach) this.assertNotDegraded("Loading older history", operationNow);
-              if (query.guest && depth >= guestReach) throw new StoreError("denied", "Sign in to load older history");
-            } catch (error) {
-              // Returned rather than thrown, so the transaction keeps the charges.
-              measuredRefusal = error as StoreError;
-              return undefined;
-            }
-          }
-          return this.historyPageInternal({ ...query, now }, allowTiers);
-        });
-        if (measuredRefusal) throw measuredRefusal;
-        return page!;
-      } catch (error) {
-        // No page was served, and the rollback undid the user's and IP's charges: the server-wide count goes back too.
-        if (error !== measuredRefusal) unused.history = 1;
-        throw error;
-      }
-    });
-  }
-
-  /** History without quota bookkeeping, for internal and calibration use. */
-  historyPage(query: StoreHistoryQuery): StoreHistoryResult {
-    this.ensureReady();
-    const operationNow = query.now ?? this.clock.now();
-    return this.reserved("historyPage", {
-      ...this.config.historyCost,
-      reads: this.historyReads(query),
-      writes: Math.max(32, this.config.historyCost.writes ?? 0),
-    }, false, operationNow, () => {
-      const now = this.effectiveNow(operationNow);
-      return this.transaction(() => this.historyPageInternal({ ...query, now }) as StoreHistoryResult);
-    });
-  }
-
-  /**
-   * The rows a history page may read: one room's page, or for several rooms
-   * each one's row and at most a page and one more of its records, besides
-   * the limiter and budget rows.
-   */
-  private historyReads(query: StoreHistoryQuery): number {
-    const single = Math.max(256, this.config.historyCost.reads ?? 0);
-    if (query.roomId !== undefined || !query.roomIds) return single;
-    const limit = this.historyLimit(query);
-    // The scan of the log reads an index entry and a row for each record.
-    return Math.max(single, 64 + 2 * HISTORY_SCAN_PAGES * (limit + 1) + new Set(query.roomIds).size * (limit + 3));
-  }
-
-  private historyLimit(query: StoreHistoryQuery): number {
-    return query.limit !== undefined && Number.isInteger(query.limit) && query.limit > 0 ? Math.min(query.limit, this.config.maxHistoryLimit) : this.config.historyPageSize;
-  }
-
-  /** The rooms a history query names: one, or its distinct `roomIds`. */
-  private historyRoomCount(query: StoreHistoryQuery): number {
-    return query.roomId === undefined && query.roomIds !== undefined ? new Set(query.roomIds).size : 1;
-  }
-
-  /** The rooms whose log a history query reads, the requester's visible ones (see historyPageInternal). */
-  private historySources(query: StoreHistoryQuery): { multiple: boolean; sources: RawRoomRow[] } {
-    const multiple = query.roomId === undefined && query.roomIds !== undefined;
-    const roomIds = multiple ? [...new Set(query.roomIds)] : [query.roomId === undefined ? ROOM_ID : query.roomId];
-    for (const roomId of roomIds) {
-      if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
-    }
-    // A requester's private room only if they are in it; internal pages, with no requester, see every room.
-    const visible = (roomId: string) => query.userId === undefined ? this.roomRow(roomId) : this.visibleRoomRow(roomId, query.userId);
-    return { multiple, sources: roomIds.map(visible).filter((room): room is RawRoomRow => room !== null) };
-  }
-
-  /**
-   * How many records the query's rooms hold past its `before`, counted up to
-   * `cap`: how far back from the head a page that ends there starts. At most
-   * `cap` rows and one a room are read.
-   */
-  private recordsAfter(query: StoreHistoryQuery, cap: number): number {
-    const before = this.historyBound(query.before, "before");
-    if (before === undefined) return 0;
-    // Records below the hot floor are in the tiers below, where they are not
-    // counted: a page whose stretch after `before` reaches below the hot
-    // floor, in a room whose history goes there, counts as `cap` deep.
-    const hot = this.logState().history_floor;
-    const published = this.config.tiered ? this.publishedFloor() : hot;
-    let total = 0;
-    for (const room of this.historySources(query).sources) {
-      if (total >= cap || before >= room.latest_log_id) continue;
-      if (Math.max(before + 1, roomHistoryFloor(room, published)) < hot) return cap;
-      total += this.rawRows<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records WHERE room_id = ? AND log_id > ? LIMIT ?)",
-        room.room_id, before, cap - total,
-      )[0]?.count ?? 0;
-    }
-    return total;
-  }
-
-  private historyBound(value: string | bigint | undefined, field: string): number | undefined {
-    if (value === undefined) return undefined;
-    return numericId(typeof value === "bigint" ? numericBigInt(value, field) : value, field);
-  }
-
-  private historyPageInternal(query: StoreHistoryQuery, allowTiers = false): StoreHistoryResult | PendingHistory {
-    const { multiple, sources } = this.historySources(query);
-    if (!multiple && !sources.length) throw new StoreError("invalid_params", "unknown room");
-    // History starts at the published floor; the hot log holds records from
-    // the hot floor on, and the tiers below those between them.
-    const floor = this.publishedFloor();
-    const hot = this.logState().history_floor;
-    const after = this.historyBound(query.after, "after");
-    const before = this.historyBound(query.before, "before");
-    const limit = positiveLimit(query.limit, this.config.historyPageSize, this.config.maxHistoryLimit);
-    const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
-    // One room's log starts at its creation or the retention floor. The
-    // joined rooms' log together (§4.3.3) starts where the server's does, at
-    // the default room's creation or the floor, whichever rooms they are, so
-    // its lower bound never moves back with a join, nor ahead with a leave.
-    // Its head is the greatest of theirs; with nothing retrievable, such as
-    // in no rooms, it is empty and ends just before its start.
-    const lowerBound = multiple ? Math.max(floor, this.roomRow(ROOM_ID)?.created_log_id ?? 1) : roomHistoryFloor(sources[0], floor);
-    let head = sources.reduce((greatest, room) => Math.max(greatest, room.latest_log_id), 0);
-    if (multiple && head < lowerBound) head = lowerBound - 1;
-    const latestLogId = idString(head);
-    const historyLogId = lowerBound <= head ? idString(lowerBound) : null;
-    // An empty slice has neither bound and omits every array (§4.3.2).
-    const empty = (): StoreHistoryResult => ({ more: false, latest_log_id: latestLogId, history_log_id: historyLogId });
-    const forward = after !== undefined;
-    // One contiguous slice of the log across every record kind; the limit
-    // counts records of any kind (§4.3.2). Each room's slice is read from its
-    // own key range, a page and one more at most, and a room with nothing in
-    // the window is not read at all: the slices merge by log_id. A moved
-    // message's snapshot is in both rooms' logs, and once in theirs together.
-    // A window bounded to one log_id (after == before) in one room is that
-    // record in this room's log only: a moved message's earlier snapshot is
-    // fetched from the room its prev_room_id names.
-    const windows = new Map<string, { lower: number; upper: number }>();
-    for (const room of sources) {
-      const lower = Math.max(roomHistoryFloor(room, floor), after ?? 0);
-      const upper = Math.min(room.latest_log_id, before ?? room.latest_log_id);
-      if (lower <= upper && roomHistoryLogId(room, floor) !== null) windows.set(room.room_id, { lower, upper });
-    }
-    const order = (a: RawRecordRow, b: RawRecordRow) => forward ? a.log_id - b.log_id : b.log_id - a.log_id;
-    const byLogId = new Map<number, RawRecordRow>();
-    const take = (row: RawRecordRow) => {
-      const window = windows.get(row.room_id);
-      if (window && row.log_id >= window.lower && row.log_id <= window.upper && !byLogId.has(row.log_id)) byLogId.set(row.log_id, row);
-    };
-    // The hot log's part of each window.
-    const hotWindows = new Map([...windows].filter(([, window]) => window.upper >= hot).map(([roomId, window]) => [roomId, { lower: Math.max(window.lower, hot), upper: window.upper }]));
-    const roomSlice = (roomId: string, window: { lower: number; upper: number }) => this.rawRows<RawRecordRow>(
-      `SELECT room_id, log_id, kind, record_json FROM records
-       WHERE room_id = ? AND log_id >= ? AND log_id <= ?
-       ORDER BY log_id ${forward ? "ASC" : "DESC"} LIMIT ?`,
-      roomId, window.lower, window.upper, limit + 1,
-    );
-    if (!hotWindows.size) {
-      // Nothing of the window is in the hot log.
-    } else if (!multiple || hotWindows.size <= 1) {
-      for (const [roomId, window] of hotWindows) for (const row of roomSlice(roomId, window)) take(row);
-    } else {
-      // Several rooms: first the log itself, by log_id across every room, at
-      // most HISTORY_SCAN_PAGES pages of it. That is the cheapest read when
-      // these rooms hold most of the log; when they hold little of it, each
-      // room's slice is read instead, a page and one more at most.
-      const lower = Math.min(...[...hotWindows.values()].map((window) => window.lower));
-      const upper = Math.max(...[...hotWindows.values()].map((window) => window.upper));
-      const scanned = this.rawRows<RawRecordRow>(
-        `SELECT room_id, log_id, kind, record_json FROM records INDEXED BY records_log_idx
-         WHERE log_id >= ? AND log_id <= ?
-         ORDER BY log_id ${forward ? "ASC" : "DESC"} LIMIT ?`,
-        lower, upper, HISTORY_SCAN_PAGES * (limit + 1),
-      );
-      for (const row of scanned) take(row);
-      if (byLogId.size <= limit && scanned.length === HISTORY_SCAN_PAGES * (limit + 1)) {
-        byLogId.clear();
-        for (const [roomId, window] of hotWindows) for (const row of roomSlice(roomId, window)) take(row);
-      }
-    }
-    // The tiers' part: below the hot floor. A forward page starts there;
-    // a backward one reaches it when the hot log has less than a page.
-    const lowered = [...windows].filter(([, window]) => window.lower < hot);
-    if (allowTiers && this.config.tiered && lowered.length && (forward || byLogId.size <= limit)) {
-      const below: HistoryQuery = {
-        roomIds: lowered.map(([roomId]) => roomId),
-        lower: Math.min(...lowered.map(([, window]) => window.lower)),
-        upper: Math.min(hot - 1, Math.max(...lowered.map(([, window]) => window.upper))),
-        forward,
-        limit: limit + 1,
-      };
-      return { below, assemble: (rows) => {
-        for (const row of rows) take(row);
-        return assemble();
-      } };
-    }
-    return assemble();
-    function assemble(): StoreHistoryResult {
-      const rows = [...byLogId.values()].sort(order).slice(0, limit + 1);
-      if (rows.length === 0) return empty();
-      const roomFields = new Map(sources.map((room) => [room.room_id, { latest_log_id: idString(room.latest_log_id), history_log_id: roomHistoryLogId(room, floor) }]));
-      // The runtime wraps this result in a reply.  Reserve a fixed
-      // envelope allowance for id/result keys, decimal IDs, commas and
-      // first/last/more fields.  An empty page is always valid even when a
-      // caller supplies a tiny maxBytes value, so apply this allowance only
-      // while considering a non-empty entry.
-      // A 128-byte request ID can require 768 JSON bytes when escaped.
-      const responseOverhead = 1024;
-      let bytes = utf8Bytes(JSON.stringify({
-        rooms: [], messages: [], reactions: [], memberships: [], first_log_id: latestLogId, last_log_id: latestLogId,
-        more: false, latest_log_id: latestLogId, history_log_id: historyLogId,
-      }));
-      let stoppedForBytes = false;
-      const selected: Array<{ logId: number; kind: string; value: Record<string, unknown> }> = [];
-      for (const row of rows.slice(0, limit + 1)) {
-        const value = parseJson<Record<string, unknown>>(row.record_json);
-        // Room records carry this client's delivery fields, as `room_list` and `room_update` records do.
-        if (row.kind === "room") Object.assign(value, roomFields.get(row.room_id));
-        // A stored terminal's output is put back before the page is sent.
-        const entryBytes = utf8Bytes(JSON.stringify(value)) + terminalOutputBytes(value);
-        if (entryBytes + bytes + responseOverhead + 1 > maxBytes) {
-          if (selected.length === 0) throw new StoreError("too_large", "history record exceeds response budget");
-          stoppedForBytes = true;
-          break;
-        }
-        selected.push({ logId: row.log_id, kind: row.kind, value });
-        bytes += entryBytes + 1;
-        if (selected.length >= limit) break;
-      }
-      const more = stoppedForBytes || rows.length > selected.length;
-      if (!forward) selected.reverse();
-      if (!selected.length) return empty();
-      const rooms: RoomRecord[] = [];
-      const messages: MessageSnapshot[] = [];
-      const reactions: ReactionsRecord[] = [];
-      const membership: MembershipRecord[] = [];
-      for (const record of selected) {
-        if (record.kind === "room") rooms.push(record.value as unknown as RoomRecord);
-        else if (record.kind === "reactions") reactions.push(record.value as unknown as ReactionsRecord);
-        else if (record.kind === "membership") membership.push(record.value as unknown as MembershipRecord);
-        else messages.push(record.value as unknown as MessageSnapshot);
-      }
-      // Records keep the user objects they were logged with; history carries no `users` (§3.3).
-      return {
-        ...(rooms.length ? { rooms } : {}),
-        ...(messages.length ? { messages } : {}),
-        ...(reactions.length ? { reactions } : {}),
-        ...(membership.length ? { memberships: membership } : {}),
-        first_log_id: idString(selected[0].logId),
-        last_log_id: idString(selected[selected.length - 1].logId),
-        more,
-        latest_log_id: latestLogId,
-        history_log_id: historyLogId,
-      };
-    }
   }
 
   /** The withheld control rows can persist one deferral and its reset alarm. */

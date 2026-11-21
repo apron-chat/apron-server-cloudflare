@@ -64,7 +64,7 @@ it("goes on from the line it got to in a new Store after a failure midway, to wh
 		const options = { clock: clock.clock, checkpoint: 250, batch: 100 };
 		await expect(importArchive(archiveChain(undefined, { store: store.history, limits: LIMITS, clock: clock.clock }), failing, textSource(text), options)).rejects.toThrow("injected failure");
 		expect(store.history.importJournal()).toBeDefined();
-		const saved = JSON.parse(sqliteOf(store).historyImportProgress()!) as { line: number; offset: number; entry: number };
+		const saved = JSON.parse(sqliteOf(store).historyLog.historyImportProgress()!) as { line: number; offset: number; entry: number };
 		expect(saved.entry).toBeGreaterThan(0);
 
 		// A new Store over the same object, as after a restart.
@@ -75,7 +75,7 @@ it("goes on from the line it got to in a new Store after a failure midway, to wh
 		expect(report).toMatchObject({ resumed: true, records: 1_500 });
 		expect(stats.skipped).toBe(saved.offset);
 		expect(again.history.importJournal()).toBeUndefined();
-		expect(sqliteOf(again).historyImportProgress()).toBeUndefined();
+		expect(sqliteOf(again).historyLog.historyImportProgress()).toBeUndefined();
 		const got = contents(state);
 		expect(got.rooms).toContainEqual(expect.objectContaining({ room_id: String(base + 1), parent_room_id: "lobby" }));
 		expect(got).toEqual(expected);

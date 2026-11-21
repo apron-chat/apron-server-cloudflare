@@ -7,7 +7,7 @@
  */
 
 import { newTerminalOutputKey } from "./rows";
-import { storeExport, storeHead, storeRestore } from "./history";
+import { type HeadStore, type RestoreStore, storeExport, storeHead, storeRestore } from "./history";
 import type { SqliteStore } from "./sqlite-store";
 import type {
   Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Uploads,
@@ -79,7 +79,7 @@ export function sqliteMessages(sqlite: SqliteStore): Messages {
     mutate: (input) => sqlite.mutate(input),
     commit: (input) => sqlite.commitMutation(input),
     author: (messageId, now) => sqlite.messageAuthor(messageId, now),
-    historyAcrossTiers: (query) => sqlite.historyAcrossTiers(query),
+    historyAcrossTiers: (query) => sqlite.historyLog.historyAcrossTiers(query),
   };
 }
 
@@ -177,19 +177,63 @@ export function sqliteLifecycle(sqlite: SqliteStore): Lifecycle {
   };
 }
 
+/** What the history chain's head reads and writes (history.ts): the history module, and the log rewrites the commit path makes. */
+function headStore(sqlite: SqliteStore): HeadStore {
+  const log = sqlite.historyLog;
+  return {
+    historyFloors: () => log.historyFloors(),
+    historyTarget: () => log.historyTarget(),
+    historyScan: (from, limit) => log.historyScan(from, limit),
+    historyScanLimit: log.historyScanLimit,
+    historyRecords: (query) => log.historyRecords(query),
+    historyLookup: (logIds) => log.historyLookup(logIds),
+    hotRecords: () => log.hotRecords(),
+    publishHistoryFloor: (floor) => sqlite.publishHistoryFloor(floor),
+    historyRewrites: () => log.historyRewrites(),
+    historyRewritesLogged: () => log.historyRewritesLogged(),
+    dropHistoryRewrites: (seq) => log.dropHistoryRewrites(seq),
+    amendHistoryPurge: (seq, messageIds) => log.amendHistoryPurge(seq, messageIds),
+    dropReactionsOn: (messageIds) => sqlite.dropReactionsOn(messageIds),
+    purgeUsers: (input) => sqlite.purgeUsers(input),
+    renameIdentity: (input) => sqlite.renameIdentity(input),
+  };
+}
+
+/** What an import writes through (history.ts): the restore of rooms and users, and the history module's import journal. */
+function restoreStore(sqlite: SqliteStore): RestoreStore {
+  const log = sqlite.historyLog;
+  return {
+    getRoom: (roomId) => sqlite.getRoom(roomId),
+    roomIsEmpty: (roomId) => sqlite.roomIsEmpty(roomId),
+    identityExists: (userId) => sqlite.identityExists(userId),
+    isRetiredUserId: (userId) => sqlite.isRetiredUserId(userId),
+    historyFloors: () => log.historyFloors(),
+    content: sqlite.content,
+    restoreUsers: (users) => sqlite.restoreUsers(users),
+    accountCapacity: () => sqlite.accountCapacity(),
+    restoreRoomCapacity: (rooms) => sqlite.restoreRoomCapacity(rooms),
+    restoreRoom: (room, records, now, options) => sqlite.restoreRoom(room, records, now, options),
+    restoreMembers: (roomId, changes) => sqlite.restoreMembers(roomId, changes),
+    historyImportJournal: () => log.historyImportJournal(),
+    setHistoryImportJournal: (value) => log.setHistoryImportJournal(value),
+    historyImportProgress: () => log.historyImportProgress(),
+    setHistoryImportProgress: (value) => log.setHistoryImportProgress(value),
+  };
+}
+
 /** History over SqliteStore. */
 export function sqliteHistory(sqlite: SqliteStore): History {
   return {
-    head: (name) => storeHead(name, sqlite),
-    state: () => sqlite.historyStatePort(),
-    restore: () => storeRestore(sqlite),
+    head: (name) => storeHead(name, headStore(sqlite)),
+    state: () => sqlite.historyLog.historyStatePort(),
+    restore: () => storeRestore(restoreStore(sqlite)),
     export: () => storeExport(sqlite),
-    hotRecords: (now) => sqlite.hotRecords(now),
-    rewrites: (now) => sqlite.historyRewrites(now),
-    metaNumber: (key, now) => sqlite.historyMetaNumber(key, now),
-    setMeta: (key, value, now) => sqlite.setHistoryMeta(key, value, now),
-    importJournal: (now) => sqlite.historyImportJournal(now),
-    chunkIndex: (tier) => sqlite.chunkIndex(tier),
+    hotRecords: (now) => sqlite.historyLog.hotRecords(now),
+    rewrites: (now) => sqlite.historyLog.historyRewrites(now),
+    metaNumber: (key, now) => sqlite.historyLog.historyMetaNumber(key, now),
+    setMeta: (key, value, now) => sqlite.historyLog.setHistoryMeta(key, value, now),
+    importJournal: (now) => sqlite.historyLog.historyImportJournal(now),
+    chunkIndex: (tier) => sqlite.historyLog.chunkIndex(tier),
   };
 }
 

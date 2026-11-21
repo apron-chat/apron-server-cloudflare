@@ -51,7 +51,7 @@ it("starts general with only its seeded creation record", async () => {
 		});
 		expect(room.log_id).toMatch(/^[1-9][0-9]*$/);
 
-		const page = sqliteOf(store).history({ roomId: "general", after: 0n, now: clock.value });
+		const page = sqliteOf(store).historyLog.history({ roomId: "general", after: 0n, now: clock.value });
 		expect(page.rooms).toEqual([room]);
 		expect(page.messages).toBeUndefined();
 		expect(page.reactions).toBeUndefined();
@@ -74,7 +74,7 @@ it("returns inclusive, bounded forward and backward pages with true bounds", asy
 			}))));
 		}
 
-		const forward = sqliteOf(store).history({ roomId: "general", after: logs[0], limit: 2, now: clock.value });
+		const forward = sqliteOf(store).historyLog.history({ roomId: "general", after: logs[0], limit: 2, now: clock.value });
 		expect(messagesOf(forward).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
 		expect(forward.first_log_id).toBe(String(logs[0]));
 		expect(forward.last_log_id).toBe(String(logs[1]));
@@ -82,31 +82,31 @@ it("returns inclusive, bounded forward and backward pages with true bounds", asy
 		expect(forward.latest_log_id).toBe(String(logs[50]));
 		expect(forward.history_log_id).toBe(general.log_id);
 
-		const forwardContinuation = sqliteOf(store).history({ roomId: "general", after: logs[1] + 1n, limit: 2, now: clock.value });
+		const forwardContinuation = sqliteOf(store).historyLog.history({ roomId: "general", after: logs[1] + 1n, limit: 2, now: clock.value });
 		expect(messagesOf(forwardContinuation).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
 
-		const backward = sqliteOf(store).history({ roomId: "general", before: logs[50], limit: 2, now: clock.value });
+		const backward = sqliteOf(store).historyLog.history({ roomId: "general", before: logs[50], limit: 2, now: clock.value });
 		expect(messagesOf(backward).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(49, 51));
 		expect(backward.first_log_id).toBe(String(logs[49]));
 		expect(backward.last_log_id).toBe(String(logs[50]));
 		expect(backward.more).toBe(true);
 
-		const backwardContinuation = sqliteOf(store).history({ roomId: "general", before: BigInt(backward.first_log_id!) - 1n, limit: 2, now: clock.value });
+		const backwardContinuation = sqliteOf(store).historyLog.history({ roomId: "general", before: BigInt(backward.first_log_id!) - 1n, limit: 2, now: clock.value });
 		expect(messagesOf(backwardContinuation).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(47, 49));
 
-		const bounded = sqliteOf(store).history({ roomId: "general", after: logs[0], limit: 500, now: clock.value });
+		const bounded = sqliteOf(store).historyLog.history({ roomId: "general", after: logs[0], limit: 500, now: clock.value });
 		expect(messagesOf(bounded)).toHaveLength(50);
 		expect(bounded.first_log_id).toBe(String(logs[0]));
 		expect(bounded.last_log_id).toBe(String(logs[49]));
 		expect(bounded.more).toBe(true);
-		const finalPage = sqliteOf(store).history({ roomId: "general", after: logs[49] + 1n, limit: 50, now: clock.value });
+		const finalPage = sqliteOf(store).historyLog.history({ roomId: "general", after: logs[49] + 1n, limit: 50, now: clock.value });
 		expect(messagesOf(finalPage).map((entry) => BigInt(entry.log_id))).toEqual([logs[50]]);
 		expect(finalPage.more).toBe(false);
 
-		const limitedEmpty = sqliteOf(store).history({ roomId: "general", after: logs[50] + 1n, limit: 50, now: clock.value });
+		const limitedEmpty = sqliteOf(store).historyLog.history({ roomId: "general", after: logs[50] + 1n, limit: 50, now: clock.value });
 		expect(limitedEmpty).toEqual({ more: false, latest_log_id: String(logs[50]), history_log_id: general.log_id });
 
-		const exactRange = sqliteOf(store).history({ roomId: "general", after: logs[10], before: logs[11], limit: 50, now: clock.value });
+		const exactRange = sqliteOf(store).historyLog.history({ roomId: "general", after: logs[10], before: logs[11], limit: 50, now: clock.value });
 		expect(messagesOf(exactRange).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(10, 12));
 		expect(exactRange.more).toBe(false);
 	});
@@ -122,7 +122,7 @@ it("counts records of every kind toward limit and spans first_log_id/last_log_id
 		const renamed = store.messages.mutate(op(clock, "rename", "room_set", { room_id: roomId, title: "Renamed" }, "bob"));
 		const all = [created, message, reaction, edit, renamed].map((result) => String(logId(result)));
 
-		const first = sqliteOf(store).history({ roomId, after: 0n, limit: 2, now: clock.value });
+		const first = sqliteOf(store).historyLog.history({ roomId, after: 0n, limit: 2, now: clock.value });
 		expect(first.rooms?.map((room) => room.log_id)).toEqual([all[0]]);
 		expect(messagesOf(first).map((entry) => entry.log_id)).toEqual([all[1]]);
 		expect(first.reactions).toBeUndefined();
@@ -130,25 +130,25 @@ it("counts records of every kind toward limit and spans first_log_id/last_log_id
 		// Room records in history carry the room's delivery fields, as room_list's do.
 		expect(first.rooms?.[0]).toMatchObject({ title: "Mixed", latest_log_id: all[4], history_log_id: all[0] });
 
-		const second = sqliteOf(store).history({ roomId, after: BigInt(first.last_log_id!) + 1n, limit: 2, now: clock.value });
+		const second = sqliteOf(store).historyLog.history({ roomId, after: BigInt(first.last_log_id!) + 1n, limit: 2, now: clock.value });
 		expect(second.rooms).toBeUndefined();
 		expect(second.reactions?.map((record) => record.log_id)).toEqual([all[2]]);
 		expect(messagesOf(second).map((entry) => entry.log_id)).toEqual([all[3]]);
 		expect([second.first_log_id, second.last_log_id, second.more]).toEqual([all[2], all[3], true]);
 
-		const third = sqliteOf(store).history({ roomId, after: BigInt(second.last_log_id!) + 1n, limit: 2, now: clock.value });
+		const third = sqliteOf(store).historyLog.history({ roomId, after: BigInt(second.last_log_id!) + 1n, limit: 2, now: clock.value });
 		expect(third.rooms?.map((room) => room.title)).toEqual(["Renamed"]);
 		expect(third.messages).toBeUndefined();
 		expect([third.first_log_id, third.last_log_id, third.more]).toEqual([all[4], all[4], false]);
 
-		const newest = sqliteOf(store).history({ roomId, limit: 3, now: clock.value });
+		const newest = sqliteOf(store).historyLog.history({ roomId, limit: 3, now: clock.value });
 		expect([newest.first_log_id, newest.last_log_id, newest.more]).toEqual([all[2], all[4], true]);
 		expect(newest.reactions?.map((record) => record.log_id)).toEqual([all[2]]);
 		expect(messagesOf(newest).map((entry) => entry.log_id)).toEqual([all[3]]);
 		expect(newest.rooms?.map((room) => room.log_id)).toEqual([all[4]]);
 
 		// The thread's log is separate from its parent's.
-		const parent = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const parent = sqliteOf(store).historyLog.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(parent.messages).toBeUndefined();
 		expect(parent.rooms?.map((room) => room.room_id)).toEqual(["general"]);
 	});
@@ -160,13 +160,13 @@ it("stops at a UTF-8 response byte cap without skipping a contiguous record", as
 		const second = logId(store.messages.mutate(messageInput(clock, "byte-2", { body: { format: "plain", text: "second" } })));
 		const large = logId(store.messages.mutate(messageInput(clock, "byte-3", { body: { format: "plain", text: "x".repeat(3_800) } })));
 
-		const capped = sqliteOf(store).history({ roomId: "general", after: first, limit: 50, maxBytes: 4_500, now: clock.value });
+		const capped = sqliteOf(store).historyLog.history({ roomId: "general", after: first, limit: 50, maxBytes: 4_500, now: clock.value });
 		expect(messagesOf(capped).map((entry) => BigInt(entry.log_id))).toEqual([first, second]);
 		expect(capped.first_log_id).toBe(String(first));
 		expect(capped.last_log_id).toBe(String(second));
 		expect(capped.more).toBe(true);
 
-		const continuation = sqliteOf(store).history({ roomId: "general", after: second + 1n, limit: 50, maxBytes: 256 * 1024, now: clock.value });
+		const continuation = sqliteOf(store).historyLog.history({ roomId: "general", after: second + 1n, limit: 50, maxBytes: 256 * 1024, now: clock.value });
 		expect(messagesOf(continuation).map((entry) => BigInt(entry.log_id))).toEqual([large]);
 		expect(continuation.more).toBe(false);
 	});
@@ -177,14 +177,14 @@ it("rejects unknown rooms and returns a known empty thread's creation record", a
 		const created = store.messages.mutate(op(clock, "empty-thread", "room_set", { parent_room_id: "general", title: "No messages yet" }));
 		const roomId = String(created.result.room_id);
 		store.messages.mutate(messageInput(clock, "outside-thread", { body: { format: "plain", text: "outside the empty thread" } }));
-		const empty = sqliteOf(store).history({ roomId, limit: 50, now: clock.value });
+		const empty = sqliteOf(store).historyLog.history({ roomId, limit: 50, now: clock.value });
 		expect(empty.rooms?.map((room) => room.room_id)).toEqual([roomId]);
 		expect(empty.messages).toBeUndefined();
 		expect(empty.latest_log_id).toBe(roomId);
 		expect(empty.history_log_id).toBe(roomId);
 
-		expect(errorCode(() => sqliteOf(store).history({ roomId: "missing", now: clock.value }))).toBe("invalid_params");
-		expect(errorCode(() => sqliteOf(store).history({ roomId: "", now: clock.value }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).historyLog.history({ roomId: "missing", now: clock.value }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).historyLog.history({ roomId: "", now: clock.value }))).toBe("invalid_params");
 	});
 });
 
@@ -200,22 +200,22 @@ it("lets a guest page back guestHistoryDepth records from each room's head, and 
 		const head = logs[logs.length - 1];
 		const guest = { roomId: "general", limit: 2, now: clock.value, guest: true };
 		// The newest page, as a client without a checkpoint asks for it: `before` the head (§4.3.5).
-		const newest = sqliteOf(store).history({ ...guest, before: head });
+		const newest = sqliteOf(store).historyLog.history({ ...guest, before: head });
 		expect(messagesOf(newest).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(-2));
 		// A head the client captured a little earlier is still the newest page.
-		expect(messagesOf(sqliteOf(store).history({ ...guest, before: logs[6] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5, 7));
+		expect(messagesOf(sqliteOf(store).historyLog.history({ ...guest, before: logs[6] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5, 7));
 		// Scrolling back while fewer than four records lie past `before`.
-		expect(messagesOf(sqliteOf(store).history({ ...guest, before: logs[4] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3, 5));
+		expect(messagesOf(sqliteOf(store).historyLog.history({ ...guest, before: logs[4] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3, 5));
 		// Four past it is as far as a guest goes: older pages are for accounts.
-		const denied = (() => { try { sqliteOf(store).history({ ...guest, before: logs[3] }); } catch (error) { return error as { code: string; message: string }; } })();
+		const denied = (() => { try { sqliteOf(store).historyLog.history({ ...guest, before: logs[3] }); } catch (error) { return error as { code: string; message: string }; } })();
 		expect(denied).toMatchObject({ code: "denied", message: "Sign in to load older history" });
-		expect(messagesOf(sqliteOf(store).history({ roomId: "general", limit: 2, now: clock.value, before: logs[3] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
+		expect(messagesOf(sqliteOf(store).historyLog.history({ roomId: "general", limit: 2, now: clock.value, before: logs[3] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
 		// A window bounded by both, and catching up with `after`, stay open.
-		expect(messagesOf(sqliteOf(store).history({ ...guest, after: logs[0], before: logs[1] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
+		expect(messagesOf(sqliteOf(store).historyLog.history({ ...guest, after: logs[0], before: logs[1] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
 		// Every room is measured from its own head: a quiet thread opens however busy general is.
-		const threadPage = sqliteOf(store).history({ roomId: thread, limit: 2, now: clock.value, guest: true, before: logs[0] });
+		const threadPage = sqliteOf(store).historyLog.history({ roomId: thread, limit: 2, now: clock.value, guest: true, before: logs[0] });
 		expect(threadPage.rooms?.map((room) => room.room_id)).toEqual([thread]);
-		expect(errorCode(() => sqliteOf(store).history({ ...guest, roomId: "missing", before: head }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).historyLog.history({ ...guest, roomId: "missing", before: head }))).toBe("invalid_params");
 	});
 });
 
@@ -234,13 +234,13 @@ it("counts a guest's page reaching below the hot floor as deep as it may go: wha
 		reopened.lifecycle.initialize();
 		const guest = { roomId: "general", limit: 1, now: clock.value, guest: true };
 		// Three records lie past logs[2] (one in D1): as deep as a guest goes, though SQLite holds two of them.
-		expect(errorCode(() => sqliteOf(reopened).history({ ...guest, before: logs[2] }))).toBe("denied");
-		expect(errorCode(() => sqliteOf(reopened).history({ ...guest, before: logs[1] }))).toBe("denied");
+		expect(errorCode(() => sqliteOf(reopened).historyLog.history({ ...guest, before: logs[2] }))).toBe("denied");
+		expect(errorCode(() => sqliteOf(reopened).historyLog.history({ ...guest, before: logs[1] }))).toBe("denied");
 		// SQLite alone holds fewer than three past logs[2]: counted there only, the page would pass.
 		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE room_id = 'general' AND log_id > ?", Number(logs[2])).one().count).toBeLessThan(3);
 		// Within SQLite, guests page as before; accounts page anywhere.
-		expect(() => sqliteOf(reopened).history({ ...guest, before: logs[5] })).not.toThrow();
-		expect(() => sqliteOf(reopened).history({ roomId: "general", limit: 1, now: clock.value, before: logs[2] })).not.toThrow();
+		expect(() => sqliteOf(reopened).historyLog.history({ ...guest, before: logs[5] })).not.toThrow();
+		expect(() => sqliteOf(reopened).historyLog.history({ roomId: "general", limit: 1, now: clock.value, before: logs[2] })).not.toThrow();
 	});
 });
 
@@ -266,7 +266,7 @@ it("keeps a refused guest page charged to its address, since measuring it read r
 			"SELECT COUNT(*) AS count FROM principal_limits WHERE scope = 'history' AND principal_key = 'ip:guest-ip'").one().count;
 		const guest = { roomId: "general", limit: 1, now: clock.value, guest: true, userId: "guest_1", ipKey: "guest-ip" };
 		expect(ipRows()).toBe(0);
-		expect(errorCode(() => sqliteOf(store).history({ ...guest, before: logs[0] }))).toBe("denied");
+		expect(errorCode(() => sqliteOf(store).historyLog.history({ ...guest, before: logs[0] }))).toBe("denied");
 		expect(ipRows()).toBe(1);
 	});
 });
@@ -287,7 +287,7 @@ it("advances a fully expired head past the room and keeps future IDs valid", asy
 		expect(room.history_log_id).toBeNull();
 		expect(room.latest_log_id).toBe(String(logs[2]));
 
-		const empty = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const empty = sqliteOf(store).historyLog.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(empty).toEqual({ more: false, latest_log_id: String(logs[2]), history_log_id: null });
 
 		const future = logId(store.messages.mutate(messageInput(clock, "after-expiry", { body: { format: "plain", text: "new" } })));
@@ -329,7 +329,7 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		const room = sqliteOf(store).getRoomState();
 		expect(BigInt(room.history_log_id!)).toBe(lastExpiredLog + 1n);
 		expect(BigInt(room.latest_log_id)).toBe(departureLog);
-		const history = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const history = sqliteOf(store).historyLog.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(history.history_log_id).toBe(room.history_log_id);
 		expect(messagesOf(history).map((entry) => BigInt(entry.log_id))).toEqual([recentRootLog, departureLog]);
 		expect(messagesOf(history)[0].body?.text).toBe("root-recent");
@@ -344,7 +344,7 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		expect(retained).toMatchObject({ log_id: threadId, title: "Retained thread", latest_log_id: String(departureLog) });
 		expect(retained.description).toBe("About the root");
 		expect(retained.history_log_id).toBe(room.history_log_id);
-		const threadHistory = sqliteOf(store).history({ roomId: threadId, limit: 50, now: clock.value });
+		const threadHistory = sqliteOf(store).historyLog.history({ roomId: threadId, limit: 50, now: clock.value });
 		expect(messagesOf(threadHistory).map((entry) => BigInt(entry.log_id))).toEqual([departureLog]);
 		expect(threadHistory.rooms).toBeUndefined();
 	});
@@ -369,7 +369,7 @@ it("removes thread rooms whose entire log expired and keeps rooms with retained 
 		expect(removed).toEqual([stale]);
 		expect(store.rooms.get(stale)).toBeNull();
 		expect(errorCode(() => store.messages.mutate(op(clock, "late", "message", { room_id: stale, body: { text: "late" } })))).toBe("invalid_params");
-		expect(errorCode(() => sqliteOf(store).history({ roomId: stale, now: clock.value }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).historyLog.history({ roomId: stale, now: clock.value }))).toBe("invalid_params");
 
 		// The active thread's creation record expired, so its room record is
 		// still listed (with its original log_id) while history starts later.
@@ -602,17 +602,17 @@ it("logs registered memberships in the room's log and returns them in history's 
 		expect(errorCode(() => store.rooms.changeMembership({ userId: "guest_x", ipKey: "ip", roomId, join: true, now: clock.value }))).toBe("denied");
 		expect(errorCode(() => store.rooms.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId: "missing", join: true, now: clock.value }))).toBe("invalid_params");
 
-		const page = sqliteOf(store).history({ roomId, after: 0n, limit: 50, now: clock.value });
+		const page = sqliteOf(store).historyLog.history({ roomId, after: 0n, limit: 50, now: clock.value });
 		expect(page.rooms?.map((room) => room.room_id)).toEqual([roomId]);
 		expect(page.messages).toBeUndefined();
 		expect(page.memberships).toEqual([created.membership?.params, leave.membership?.params, rejoin.membership?.params]);
 		expect([page.first_log_id, page.last_log_id]).toEqual([roomId, rejoin.membership?.params.log_id]);
 		// A membership counts toward limit like any record, in log order.
-		const firstTwo = sqliteOf(store).history({ roomId, after: 0n, limit: 2, now: clock.value });
+		const firstTwo = sqliteOf(store).historyLog.history({ roomId, after: 0n, limit: 2, now: clock.value });
 		expect(firstTwo.rooms).toHaveLength(1);
 		expect(firstTwo.memberships).toEqual([created.membership?.params]);
 		expect(firstTwo.more).toBe(true);
-		const generalPage = sqliteOf(store).history({ roomId: "general", after: BigInt(start), before: BigInt(start), now: clock.value });
+		const generalPage = sqliteOf(store).historyLog.history({ roomId: "general", after: BigInt(start), before: BigInt(start), now: clock.value });
 		expect(generalPage.memberships).toEqual([identity.broadcasts[0].params]);
 
 		// Members are listed from storage, in user_id order, with current names.

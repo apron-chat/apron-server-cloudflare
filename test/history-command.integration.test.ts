@@ -276,7 +276,7 @@ it('refuses /purge and /rename while an unfinished import\'s journal remains, wi
 		await runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime;
 			expect(runtime.historySchedule.holder).toBeUndefined();
-			sqliteOf(runtime.store).setHistoryImportJournal(JSON.stringify({ archive: 'left-over', users: {}, ids: { mode: 'original', moved: [] }, rooms: [] }));
+			sqliteOf(runtime.store).historyLog.setHistoryImportJournal(JSON.stringify({ archive: 'left-over', users: {}, ids: { mode: 'original', moved: [] }, rooms: [] }));
 		});
 		for (const text of ['/purge nobody-here', '/rename nobody-here someone-else']) {
 			const refused = await command(admin, `pending-${text.length}`, text);
@@ -286,7 +286,7 @@ it('refuses /purge and /rename while an unfinished import\'s journal remains, wi
 		// Each refusal gave its lease back.
 		await runInDurableObject(stub(), (instance) => expect((instance as unknown as Runtime).historySchedule.holder).toBeUndefined());
 	} finally {
-		await runInDurableObject(stub(), (instance) => sqliteOf((instance as unknown as Runtime).store).setHistoryImportJournal(null));
+		await runInDurableObject(stub(), (instance) => sqliteOf((instance as unknown as Runtime).store).historyLog.setHistoryImportJournal(null));
 		admin.close();
 	}
 });

@@ -375,7 +375,7 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "unknown", "room_set", { room_id: "404", title: "x" })))).toBe("invalid_params");
 
 		// Room records are logged in their own room.
-		const history = sqliteOf(store).historyPage({ roomId, after: "0", limit: 50, now: clock.value });
+		const history = sqliteOf(store).historyLog.historyPage({ roomId, after: "0", limit: 50, now: clock.value });
 		expect(history.rooms?.map((room) => room.log_id)).toEqual([roomId, saved.room?.log_id]);
 		expect(history.rooms?.[0]).toMatchObject({ title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(history.messages).toBeUndefined();
@@ -492,13 +492,13 @@ it("moves a message into both rooms' logs and re-logs its reactions in the desti
 
 		// The move belongs to the source and destination logs; earlier history
 		// of the message stays in the source room.
-		const source = sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
+		const source = sqliteOf(store).historyLog.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
 		expect(messagesOf(source).map((entry) => [entry.log_id, entry.room_id])).toEqual([
 			[messageId, "general"],
 			[snapshot.log_id, threadId],
 		]);
 		expect(source.reactions?.map((record) => record.room_id)).toEqual(["general", "general"]);
-		const destination = sqliteOf(store).historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value });
+		const destination = sqliteOf(store).historyLog.historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value });
 		expect(destination.rooms?.map((room) => room.room_id)).toEqual([threadId]);
 		expect(messagesOf(destination).map((entry) => entry.log_id)).toEqual([snapshot.log_id]);
 		expect(destination.reactions?.map((record) => record.log_id)).toEqual([reactions.log_id]);
@@ -554,7 +554,7 @@ it("sets, clears, collapses, and deduplicates reactions", async () => {
 			message_id: messageId, emojis: Array.from({ length: 9 }, (_, index) => `e${index}`),
 		})))).toBe("denied");
 
-		const history = sqliteOf(store).historyPage({ roomId: "general", after: target.message!.log_id, limit: 50, now: clock.value });
+		const history = sqliteOf(store).historyLog.historyPage({ roomId: "general", after: target.message!.log_id, limit: 50, now: clock.value });
 		expect(messagesOf(history).map((entry) => entry.message_id)).toEqual([messageId]);
 		expect(history.reactions?.map((record) => record.reactions[0].emojis)).toEqual([["👍", "🎉"], []]);
 	});
@@ -757,7 +757,7 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		// Out of the thread, back to the room it came from.
 		const back = store.messages.mutate(op(clock, "mia", "mia-unthread", "message", resubmit(moved.message, "general")));
 		expect(back.message).toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
-		expect(messagesOf(sqliteOf(store).historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value })).map((entry) => entry.room_id))
+		expect(messagesOf(sqliteOf(store).historyLog.historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value })).map((entry) => entry.room_id))
 			.toEqual([threadId, threadId, "general"]);
 
 		// A mover may only move: not edit in place, not edit while moving, not touch ext or reply_to, not delete.
@@ -767,7 +767,7 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "ext-while-moving", "message", { ...resubmit(current, threadId), ext: { mod: true } })))).toBe("denied");
 		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "reply-while-moving", "message", { ...resubmit(current, threadId), reply_to: { message_id: replyId } })))).toBe("denied");
 		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "delete-while-moving", "message", { ...resubmit(current, threadId), deleted: true })))).toBe("denied");
-		expect(sqliteOf(store).historyPage({ roomId: "general", after: back.message!.log_id, limit: 50, now: clock.value }).messages?.at(-1)?.log_id).toBe(back.message!.log_id);
+		expect(sqliteOf(store).historyLog.historyPage({ roomId: "general", after: back.message!.log_id, limit: 50, now: clock.value }).messages?.at(-1)?.log_id).toBe(back.message!.log_id);
 
 		// An admin moves a tombstone, and the author can still edit what was moved for them.
 		const deleted = post(store, clock, "alice", "delete-reply", { message_id: replyId, room_id: threadId, deleted: true });
@@ -802,7 +802,7 @@ it("drops an output_ref a client sends: only the server refers to stored termina
 		const posted = post(store, clock, "alice", "forged", { body: { text: "x", embeds: [{ kind: "x", output_ref: { key: "f/AAAAAAAAAAAAAAAAAAAAAA", bytes: 1e12 } }] } });
 		expect(posted.message!.body!.embeds).toEqual([expect.objectContaining({ kind: "x" })]);
 		expect((posted.message!.body!.embeds as Array<Record<string, unknown>>)[0].output_ref).toBeUndefined();
-		const page = sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
+		const page = sqliteOf(store).historyLog.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
 		expect(JSON.stringify(page)).not.toContain("output_ref");
 	});
 });
