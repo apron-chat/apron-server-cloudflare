@@ -18,31 +18,12 @@ const tier = (name: string, floor: number, target = floor, rewrites = true): Tie
 const link = (through: number, delivered = 0): LinkState => ({ through, delivered, stall: NOT_STALLED });
 const round = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>(), waiting: new Map<number, number>(), oldest: 1 });
 
+// The model runs below drive planStep through every step of every
+// composition, checking the invariants after each (rewrites delivered in
+// order, copies before trims, a waiting link); these cover what they
+// cannot reach: a link that starts after rewrites left the log, and
+// copyNow's cases at a tier's limit.
 describe("planStep", () => {
-	it("delivers rewrites down each link in order, bottom-up, a link only what the tier above holds", () => {
-		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10), tier("recent", 5), tier("cold", 1, 1, false)], links: [link(9), link(4)], published: 1, logged: 2, ...round() };
-		for (const index of [0, 1, 2]) snapshot.targeted.add(index);
-		snapshot.trimmed.set(2, 1);
-		// The link into cold waits for recent to hold rewrite 1: the head's link delivers first.
-		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 0, seq: 1 });
-		snapshot.links = [link(9, 1), link(4)];
-		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 1, seq: 1 });
-	});
-
-	it("copies only from a tier that holds every rewrite", () => {
-		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10, 10), tier("recent", 5, 8), tier("cold", 1)], links: [link(9, 1), link(4, 0)], published: 1, logged: 2, ...round() };
-		for (const index of [0, 1, 2]) snapshot.targeted.add(index);
-		snapshot.trimmed.set(2, 1);
-		// recent has rewrite 1 of 2: no copy into cold, which waits for the head's link to deliver 2 first.
-		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 1, seq: 1 });
-		snapshot.links = [link(9, 1), link(4, 1)];
-		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 0, seq: 2 });
-		snapshot.links = [link(9, 2), link(4, 1)];
-		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 1, seq: 2 });
-		snapshot.links = [link(9, 2), link(4, 2)];
-		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 1, start: 5, below: 8 });
-	});
-
 	it("starts a new link at the oldest rewrite still logged, and acknowledges what the log no longer holds", () => {
 		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10), tier("recent", 5)], links: [link(9, 0)], published: 1, logged: 6, ...round(), oldest: 5 };
 		snapshot.targeted.add(0);
@@ -52,22 +33,6 @@ describe("planStep", () => {
 		// Nothing left in the log (oldest is past what was logged): the step acknowledges up to what the head holds.
 		snapshot.oldest = 7;
 		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 0, seq: 6 });
-	});
-
-	it("leaves a waiting link until more arrives in the tier above it", () => {
-		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10, 10), tier("recent", 5, 8), tier("cold", 1)], links: [link(9), link(4)], published: 1, logged: 0, ...round() };
-		for (const index of [0, 1, 2]) snapshot.targeted.add(index);
-		snapshot.trimmed.set(2, 1);
-		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 1, start: 5, below: 8 });
-		// The copy found less than a whole batch due: the link waits, recent keeps its floor, and the round moves up.
-		snapshot.waiting.set(1, 9);
-		expect(planStep(snapshot)).toEqual({ kind: "trim", tier: 1, below: 5 });
-		snapshot.trimmed.set(1, 5);
-		snapshot.trimmed.set(0, 10);
-		expect(planStep(snapshot)).toEqual({ kind: "idle" });
-		// Records arrived in recent (the head's link copied more): the link looks again.
-		snapshot.links = [link(12), link(4)];
-		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 1, start: 5, below: 8 });
 	});
 
 	it("copies into a batched tier a whole batch at a time, unless the tier above is at its limit or has none by count", () => {

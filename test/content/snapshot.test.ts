@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { contentBytes, hasAppend, messageContent, sharesText, withEditedBy, withoutOutputs } from '../../src/content/snapshot';
+import { asPublic, withoutOutputs as publicWithoutOutputs } from '../../src/history/records';
+import { refsOf, withoutOutputRefs } from '../../src/content/output-ref';
 
 const snapshot = { message_id: '5', log_id: '5', room_id: 'general', from: { user_id: 'ada' }, body: { text: 'hi', embeds: [] as unknown[] } };
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
@@ -60,5 +62,25 @@ describe('ext:editors', () => {
 		expect(withEditedBy(untouched, undefined)).toBe(untouched);
 		expect(withEditedBy(undefined, 'bob')).toBeUndefined();
 		expect(withEditedBy({ a: 1 }, 'bob')).toEqual({ a: 1 });
+	});
+});
+
+const stored = (embeds: unknown[]) => ({ room_id: 'general', log_id: 5, commit_ms: 5, kind: 'message' as const, record_json: JSON.stringify({ message_id: '5', log_id: '5', room_id: 'general', from: { user_id: 'ada' }, body: { text: '', embeds } }) });
+const refEmbed = { kind: 'terminal', title: 'build', output_ref: { key: 'f/AAAAAAAAAAAAAAAAAAAAAA', bytes: 8 } };
+
+describe('internal output references', () => {
+	it('are found by one check, and dropped without output put back', () => {
+		expect(refsOf(stored([refEmbed]))).toBeDefined();
+		expect(refsOf(stored([{ kind: 'link', title: 'output_ref' }]))).toBeUndefined();
+		expect(refsOf({ ...stored([refEmbed]), kind: 'reactions' })).toBeUndefined();
+		const dropped = withoutOutputRefs(stored([refEmbed]));
+		expect(JSON.parse(dropped.record_json).body.embeds).toEqual([{ kind: 'terminal', title: 'build' }]);
+		expect(withoutOutputRefs(stored([]))).toEqual(stored([]));
+	});
+
+	it('never leave as public records: one still holding a reference is an error', async () => {
+		expect(() => asPublic([stored([refEmbed])])).toThrow(/still holds an internal output reference/);
+		const published = await publicWithoutOutputs([stored([refEmbed])]);
+		expect(refsOf(published[0])).toBeUndefined();
 	});
 });
