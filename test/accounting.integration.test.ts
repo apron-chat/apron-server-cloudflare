@@ -498,6 +498,39 @@ describe('measured storage accounting', () => {
 		console.info('accounting-room-list-scaled', JSON.stringify(result));
 	});
 
+	it('reserves a registration by the rooms a guest carries over, past the thread limit too', async () => {
+		const stub = env.DEMO.getByName('accounting-registration-guest-rooms');
+		const result = await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig(), clock);
+			store.initialize();
+			// A guest joins older threads too, so more rooms than the thread limit.
+			const count = 3 * DEFAULT_LIMITS.threads;
+			state.storage.transactionSync(() => {
+				for (let index = 1; index <= count; index += 1) {
+					state.storage.sql.exec(
+						`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+						 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
+						`thread-${index}`, clock.now() + 1_000 + index, clock.now() + 1_000 + index, clock.now() + 1_000 + index,
+						JSON.stringify({ title: `Thread ${index}` }), clock.now(), clock.now(),
+					);
+				}
+			});
+			const before = snapshot(store);
+			const registered = store.registerIdentity({
+				userId: 'carrier', name: 'Carrier', userHandle: 'carrier-handle', now: clock.now(), ipKey: 'carrier-ip',
+				credential: { credentialId: 'carrier-credential', userId: 'carrier', publicKey: 'key', counter: 0 },
+				rooms: ['general', ...Array.from({ length: count }, (_, index) => `thread-${index + 1}`)],
+			});
+			const registration = costSince(store, before);
+			expect(registered.broadcasts).toHaveLength(count + 1);
+			expectWithinReserve(registration);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { rooms: count + 1, registration };
+		});
+		console.info('accounting-registration-guest-rooms', JSON.stringify(result));
+	});
+
 	it('measures member listings with status by population, and reuses a listing until a write', async () => {
 		const stub = env.DEMO.getByName('accounting-member-status-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {

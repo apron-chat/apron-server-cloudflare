@@ -187,6 +187,8 @@ describe('configuration policy boundaries', () => {
 			['LIMIT_ANONYMOUS_POSTS_PER_MINUTE', 'LIMIT_GUEST_POSTS_PER_MINUTE'],
 			['anonymousPostsPerMinute', 'LIMIT_GUEST_POSTS_PER_MINUTE'],
 		]) expect(() => config({ [old]: '10' })).toThrow(`${old} was renamed to ${renamed}`);
+		// Empty is unset, for an old or bare name as for a LIMIT_ one.
+		expect(config({ ROOM_METADATA_LIMIT: '', HISTORY_MAX_PAGE_SIZE: '', LIMIT_HISTORY_MAX_PAGE_SIZE: '' }).limits.historyMaxPageSize).toBe(DEFAULT_LIMITS.historyMaxPageSize);
 	});
 
 	it('takes ADMISSION as a switch, on by default, and refuses the old ADMISSION_OFF', () => {
