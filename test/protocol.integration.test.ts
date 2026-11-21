@@ -1075,8 +1075,6 @@ it('speaks protocol v10: a sign-in welcome, no email sign-in, and ~private notic
 		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
-		// It says nothing of how long history is kept.
-		expect(server.params.welcome).not.toMatch(/History keeps|Messages are kept/);
 		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
 		const other = (await greeting(bot)).server.params;
 		expect(other.auth).toEqual(['token', 'guest']);

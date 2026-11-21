@@ -54,29 +54,26 @@ function message(roomId: string, logId: number, from: { user_id: string; name: s
 }
 
 describe("ColdHistoryTier chunks", () => {
-	it("makes one chunk a copied range, keyed by its first log ID through the codecs, an ARCHIVE.md file", async () => {
-		const { tier, store, index } = coldTier({ codecs: [] });
-		const log = sampleLog();
-		await tier.append(toRange(log));
-		const [ref] = await index.list();
-		expect(ref).toMatchObject({ first: 1001, last: 1012, key: "history/test/0000000000001001.jsonl", records: log.length, rooms: ["a", "b"] });
-		// Written once, only trimmed: it takes no /purge or /rename.
-		expect((tier as HistoryTier).rewrite).toBeUndefined();
-		// Without codecs, the object is the archive itself: apron-web can open it.
-		const archive = await collectArchive(jsonlReader(linesOf(await (await store.get(ref.key))!.text())));
-		expect(archive.header).toMatchObject({ apron_archive: 1, server: "wss://test.example/" });
-		// The move is held once, in its destination, and named in both rooms by the `copies` line.
-		expect(archive.extras).toEqual([{ key: "copies", values: [{ log_id: "1008", rooms: ["a", "b"] }] }]);
-		expect((await tier.scan(0, 100)).records).toEqual(log);
-	});
-
-	it("stores chunks through its codec chain, and reads them back through what each records", async () => {
-		const { tier, store, index } = coldTier();
-		await tier.append(toRange(sampleLog()));
-		const [ref] = await index.list();
-		expect(ref.key).toBe(`history/test/0000000000001001.jsonl${HISTORY_CODECS.map((codec) => codec.extension).join("")}`);
-		expect((await store.get(ref.key))!.metadata).toEqual({ codecs: HISTORY_CODECS.map((codec) => codec.name).join(",") });
-		expect((await tier.scan(0, 100)).records).toEqual(sampleLog());
+	it("makes one chunk a copied range, keyed by its first log ID through its codec chain, an ARCHIVE.md file, read back through what it records", async () => {
+		for (const codecs of [[], HISTORY_CODECS]) {
+			const { tier, store, index } = coldTier({ codecs });
+			const log = sampleLog();
+			await tier.append(toRange(log));
+			const [ref] = await index.list();
+			expect(ref).toMatchObject({ first: 1001, last: 1012, key: `history/test/0000000000001001.jsonl${codecs.map((codec) => codec.extension).join("")}`, records: log.length, rooms: ["a", "b"] });
+			expect((await tier.scan(0, 100)).records).toEqual(log);
+			if (codecs.length) {
+				expect((await store.get(ref.key))!.metadata).toEqual({ codecs: codecs.map((codec) => codec.name).join(",") });
+				continue;
+			}
+			// Written once, only trimmed: it takes no /purge or /rename.
+			expect((tier as HistoryTier).rewrite).toBeUndefined();
+			// Without codecs, the object is the archive itself: apron-web can open it.
+			const archive = await collectArchive(jsonlReader(linesOf(await (await store.get(ref.key))!.text())));
+			expect(archive.header).toMatchObject({ apron_archive: 1, server: "wss://test.example/" });
+			// The move is held once, in its destination, and named in both rooms by the `copies` line.
+			expect(archive.extras).toEqual([{ key: "copies", values: [{ log_id: "1008", rooms: ["a", "b"] }] }]);
+		}
 	});
 
 	it("rewrites the same key when a copy is retried, and splits a range overlapping chunks at their bounds", async () => {

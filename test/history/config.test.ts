@@ -1,9 +1,9 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { ConfigError, loadConfig } from "../../src/config";
 import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { type BlobStoreChoice, type HistoryEnv, type ChainStore, type HistoryLimits, WORKER_BLOB_STORES, blobStoreOf, buildHistoryChain, d1Off, historyLayout, layoutTiered } from "../../src/history/config";
 import { MemoryBlobStore, memoryBlobStores } from "./support/memory-blob-store";
+import { withStore } from "../helpers/store";
 
 const LIMITS: HistoryLimits = { retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 const clock = { now: () => 0 };
@@ -25,10 +25,11 @@ describe("history tiers from bindings", () => {
 		expect(names(all)).toEqual(["hot", "recent", "cold"]);
 		expect(names(build({}, LIMITS, { chunkIndex: index, ...memory }))).toEqual(["hot", "cold"]);
 		// The cold tier keeps everything at 0, else LIMIT_HISTORY_COLD_RECORDS.
-		const kept = async (historyColdRecords: number) => {
-			const chain = build({}, { ...LIMITS, historyColdRecords }, { chunkIndex: index, ...memory })!;
-			return (chain as unknown as { retentions: Array<{ records?: number }> }).retentions[1].records;
-		};
+		const kept = (historyColdRecords: number) => withStore(`history-config-cold-${historyColdRecords}`, {}, async (real) => {
+			const limits = { ...LIMITS, historyColdRecords };
+			const chain = buildHistoryChain({ layout: historyLayout({}, limits, memory), limits, store: real, clock, chunkIndex: (tier) => real.chunkIndex(tier) })!;
+			return (await chain.stats())[1].retention.records;
+		});
 		expect(await kept(0)).toBeUndefined();
 		expect(await kept(1_000_000)).toBe(1_000_000);
 		expect(layoutTiered(historyLayout({}, LIMITS))).toBe(false);
@@ -46,34 +47,5 @@ describe("history tiers from bindings", () => {
 		expect(blobStoreOf({ HISTORY_BLOB: env.HISTORY_BLOB })).toBeDefined();
 		expect(() => blobStoreOf({}, { blobProvider: "memory" })).toThrow("no blob store provider memory is registered here (r2)");
 		expect(() => build({}, LIMITS, { chunkIndex: () => new MemoryChunkIndex(), blobProvider: "fs" })).toThrow(/no blob store provider fs/);
-	});
-});
-
-describe("backup vars", () => {
-	const config = (vars: Record<string, string> = {}) => loadConfig({ NODE_ENV: "test", ...vars } as never);
-
-	it.each([
-		[{}, { keep: 14, privateRooms: true }],
-		[{ BACKUP_EVERY: "" }, { keep: 14, privateRooms: true }],
-		[{ BACKUP_EVERY: "6h", BACKUP_KEEP: "3", BACKUP_PRIVATE_ROOMS: "false" }, { everySeconds: 21_600, keep: 3, privateRooms: false }],
-		[{ BACKUP_EVERY: "45s", BACKUP_KEEP: "1000" }, { everySeconds: 45, keep: 1000, privateRooms: true }],
-		[{ BACKUP_EVERY: "30m" }, { everySeconds: 1_800, keep: 14, privateRooms: true }],
-		[{ BACKUP_EVERY: "1d", BACKUP_PRIVATE_ROOMS: "true" }, { everySeconds: 86_400, keep: 14, privateRooms: true }],
-	])("read %j as %j (on demand, 14 kept, private rooms in, by default)", (vars, backups) => {
-		expect(config(vars).backups).toEqual(backups);
-	});
-
-	it("refuse what they cannot use, naming the var", () => {
-		for (const [vars, message] of [
-			[{ BACKUP_EVERY: "1 week" }, /BACKUP_EVERY must be a duration/],
-			[{ BACKUP_EVERY: "0h" }, /BACKUP_EVERY must be a duration/],
-			[{ BACKUP_KEEP: "0" }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
-			[{ BACKUP_KEEP: "1001" }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
-			[{ BACKUP_KEEP: "many" }, /BACKUP_KEEP/],
-			[{ BACKUP_PRIVATE_ROOMS: "no" }, /BACKUP_PRIVATE_ROOMS must be true or false/],
-		] as const) {
-			expect(() => config(vars), JSON.stringify(vars)).toThrow(ConfigError);
-			expect(() => config(vars), JSON.stringify(vars)).toThrow(message);
-		}
 	});
 });

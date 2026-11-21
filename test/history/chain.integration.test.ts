@@ -28,6 +28,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 type Runtime = {
 	store: Store & { config: Record<string, unknown> }; config: { limits: Record<string, number> }; history?: HistoryChain;
 	runtimeEnv: Record<string, unknown>; d1Held?: boolean; historySchedule: HistorySchedule;
+	deadlines: { maintenance: { at?: number; clear(): void } };
+	underHistoryLease(holder: { kind: "job"; job: "export" }, fn: () => Promise<void>): Promise<void>;
 	d1Missing(): Promise<string | undefined>; historyStatus(now: number): Promise<string[]>; alarm(): Promise<void>;
 };
 
@@ -324,21 +326,22 @@ it("with D1 dropped after its first copy: the chain stops, SQLite keeps everythi
 	});
 });
 
-it("waits minutes, not a second, while a history job holds the lock, and the job's release asks for the cycle", async () => {
+it("waits minutes, not a second, while a history job holds the lock, and the job's end asks for the cycle", async () => {
 	await inObject("cleanup-wait-job", 100, async (object) => {
 		await object.post(10);
 		await object.cycles(6);
 		await object.post(10);
-		const lease = object.runtime.historySchedule.acquire({ kind: "job", job: "export" });
-		if ("refused" in lease) throw new Error("expected the lease");
-		for (let round = 0; round < 3; round += 1) {
-			const { wait, waiting } = await object.nextCleanupAfterAlarm();
-			expect(waiting).toBe(true);
-			expect(wait).toBeGreaterThan(60_000);
-			// The cycle it holds up is left due.
-			expect(object.runtime.historySchedule.want.kind).toBe("due");
-		}
-		// Released, the cycle it held up is asked for, and the copy goes on.
-		expect(lease.release().cycleSoon).toBe(true);
+		await object.runtime.underHistoryLease({ kind: "job", job: "export" }, async () => {
+			for (let round = 0; round < 3; round += 1) {
+				const { wait, waiting } = await object.nextCleanupAfterAlarm();
+				expect(waiting).toBe(true);
+				expect(wait).toBeGreaterThan(60_000);
+				// The cycle it holds up is left due.
+				expect(object.runtime.historySchedule.want.kind).toBe("due");
+			}
+			object.runtime.deadlines.maintenance.clear();
+		});
+		// Ended, the job asked for the cycle it held up, in a second: the copy goes on.
+		expect(object.runtime.deadlines.maintenance.at ?? Infinity).toBeLessThanOrEqual(Date.now() + 1_000);
 	});
 });

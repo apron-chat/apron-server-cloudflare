@@ -33,33 +33,24 @@ describe("backup size", () => {
 		expect(decodedBytes).toBe(new TextEncoder().encode(plain).length);
 	});
 
-	it("refuses to import past the limit, naming it, decoded as well as stored", async () => {
+	it("warns of a backup past what an import takes, by records or decoded bytes, and says nothing below it", () => {
+		const mib = (MAX_IMPORT_BYTES / 1024 / 1024).toFixed(1);
+		expect(importableWarning(MAX_IMPORT_RECORDS, MAX_IMPORT_BYTES)).toBe("");
+		expect(importableWarning(MAX_IMPORT_RECORDS + 1, 1_000)).toContain(`holds ${MAX_IMPORT_RECORDS + 1} records, more than the ${MAX_IMPORT_RECORDS} \`/history import\` takes`);
+		expect(importableWarning(10, MAX_IMPORT_BYTES + 1)).toContain(`holds ${mib} MiB decoded, more than the ${mib} MiB \`/history import\` takes`);
+	});
+
+	it("refuses to import past the limit, naming it, stored or decoded, whole or streamed; streamed, reads it twice", async () => {
 		const backups = new BackupStore(new MemoryBlobStore(), HISTORY_CODECS);
 		const { decodedBytes } = await backups.write("backups/big.jsonl.gz", async (archive) => {
 			await archive.header(header);
 			await archive.records(records(2_000));
 			await archive.close();
 		});
-		// Gzip shrinks it far below what it decodes to: the decoded bound refuses it.
+		// Opened whole: gzip shrinks it far below what it decodes to, and the decoded bound refuses it.
 		await expect(backups.open("backups/big.jsonl.gz", Math.floor(decodedBytes / 2))).rejects.toThrow(String(Math.floor(decodedBytes / 2)));
 		expect((await backups.open("backups/big.jsonl.gz", decodedBytes + 1))?.archive.records).toHaveLength(2_000);
-	});
-
-	it("warns of a backup past what an import takes, by records or decoded bytes, and says nothing below it", () => {
-		expect(MAX_IMPORT_BYTES).toBe(256 * 1024 * 1024);
-		expect(MAX_IMPORT_RECORDS).toBe(250_000);
-		expect(importableWarning(MAX_IMPORT_RECORDS, MAX_IMPORT_BYTES)).toBe("");
-		expect(importableWarning(MAX_IMPORT_RECORDS + 1, 1_000)).toMatch(/holds 250001 records, more than the 250000 `\/history import` takes/);
-		expect(importableWarning(10, MAX_IMPORT_BYTES + 1)).toMatch(/holds 256\.0 MiB decoded, more than the 256\.0 MiB `\/history import` takes/);
-	});
-
-	it("reads a backup for an import as a stream, twice, refusing one past the limit before reading it", async () => {
-		const backups = new BackupStore(new MemoryBlobStore(), HISTORY_CODECS);
-		const { decodedBytes } = await backups.write("backups/big.jsonl.gz", async (archive) => {
-			await archive.header(header);
-			await archive.records(records(2_000));
-			await archive.close();
-		});
+		// Streamed: past the limit as stored, refused before reading it.
 		await expect(backups.source("backups/big.jsonl.gz", 100)).rejects.toThrow("an import reads at most 100");
 		expect(await backups.source("backups/none.jsonl.gz", decodedBytes)).toBeUndefined();
 		// Gzip shrinks it below what it decodes to: the decoded bound fails a read.

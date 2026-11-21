@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_USER_EXT_BYTES, SERVER_USER_EXT_KEYS, clientUserExt, recordedUser, userExtFits } from '../../src/content/user';
+import { MAX_USER_EXT_BYTES, clientUserExt, recordedUser, userExtFits } from '../../src/content/user';
 
 describe('users as records carry them, and their ext (§3.3, §4.13)', () => {
 	it('drops the keys the server owns from a user\'s ext', () => {
-		expect(SERVER_USER_EXT_KEYS).toEqual(['permissions']);
 		expect(clientUserExt({ tz: 'UTC', permissions: { write: true } })).toEqual({ tz: 'UTC' });
 		expect(clientUserExt({ permissions: { write: true } })).toBeUndefined();
 		const kept = { tz: 'UTC' };

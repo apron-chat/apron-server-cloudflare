@@ -225,7 +225,7 @@ it("a user in hundreds of rooms joins and leaves within their reservations, and 
 		register(store, clock, "bob_1");
 		register(store, clock, "cleo_1");
 		const sql = state.storage.sql;
-		// 300 rooms bob is in, older than the window: more than the old fixed reservation for a user's rooms allowed.
+		// 300 rooms bob is in, older than the window.
 		const base = clock.value - 400 * DAY;
 		const join = (count: number, offset: number) => {
 			for (let i = 0; i < count; i += 1) {

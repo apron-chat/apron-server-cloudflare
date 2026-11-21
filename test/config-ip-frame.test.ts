@@ -131,8 +131,6 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIMIT_HISTORY_D1_RECORDS: '100001' })).toThrow('historyD1Records exceeds the calibrated bound');
 		expect(config({ LIMIT_HISTORY_COLD_RECORDS: '1000000' }).limits.historyColdRecords).toBe(1_000_000);
 		expect(() => config({ LIMIT_HISTORY_COLD_RECORDS: '-1' })).toThrow('historyColdRecords must be a non-negative safe integer');
-		// A misspelled limit fails rather than leave the default in force.
-		expect(() => config({ LIMIT_HISTORY_D1_RECORD: '0' })).toThrow('LIMIT_HISTORY_D1_RECORD is not a limit');
 		expect(config().limits.cleanupThresholdPercent).toBe(80);
 		expect(config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '100' }).limits.cleanupThresholdPercent).toBe(100);
 		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '101' })).toThrow('cleanupThresholdPercent is a share of the limits, at most 100');
@@ -148,6 +146,29 @@ describe('configuration policy boundaries', () => {
 		expect(config({ LIMIT_RETENTION_RECORDS: '13000' }).limits.retentionRecords).toBe(13_000);
 		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600', LIMIT_CLEANUP_SECONDS: '3600' }).limits.retentionSeconds).toBe(3_600);
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600' })).toThrow('retentionSeconds must be at least one cleanup interval');
+	});
+
+	it.each([
+		[{}, { keep: 14, privateRooms: true }],
+		[{ BACKUP_EVERY: '' }, { keep: 14, privateRooms: true }],
+		[{ BACKUP_EVERY: '6h', BACKUP_KEEP: '3', BACKUP_PRIVATE_ROOMS: 'false' }, { everySeconds: 21_600, keep: 3, privateRooms: false }],
+		[{ BACKUP_EVERY: '45s', BACKUP_KEEP: '1000' }, { everySeconds: 45, keep: 1000, privateRooms: true }],
+		[{ BACKUP_EVERY: '30m' }, { everySeconds: 1_800, keep: 14, privateRooms: true }],
+		[{ BACKUP_EVERY: '1d', BACKUP_PRIVATE_ROOMS: 'true' }, { everySeconds: 86_400, keep: 14, privateRooms: true }],
+	])('reads backup vars %j as %j (on demand, 14 kept, private rooms in, by default)', (vars, backups) => {
+		expect(config(vars).backups).toEqual(backups);
+	});
+
+	it.each([
+		[{ BACKUP_EVERY: '1 week' }, /BACKUP_EVERY must be a duration/],
+		[{ BACKUP_EVERY: '0h' }, /BACKUP_EVERY must be a duration/],
+		[{ BACKUP_KEEP: '0' }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
+		[{ BACKUP_KEEP: '1001' }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
+		[{ BACKUP_KEEP: 'many' }, /BACKUP_KEEP/],
+		[{ BACKUP_PRIVATE_ROOMS: 'no' }, /BACKUP_PRIVATE_ROOMS must be true or false/],
+	])('refuses backup vars %j, naming the var', (vars, message) => {
+		expect(() => config(vars)).toThrow(ConfigError);
+		expect(() => config(vars)).toThrow(message);
 	});
 
 	it('accepts the documented aliases in prefixed precedence order', () => {

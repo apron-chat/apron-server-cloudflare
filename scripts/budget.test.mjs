@@ -420,6 +420,4 @@ test("production writes out the plan's own history limits, and daily backups", (
 		assert.equal(config.limits[key], DEFAULT_LIMITS[key], key);
 	}
 	assert.deepEqual(config.backups, { everySeconds: 86_400, keep: 14, privateRooms: true });
-	// A typo is caught here, before a deploy, not by every request failing after one.
-	assert.throws(() => loadConfig({ ...vars, BACKUP_EVERY: '1 day' }), /BACKUP_EVERY must be a duration/);
 });

@@ -115,8 +115,6 @@ type Runtime = {
 	runtimeEnv: Record<string, unknown>;
 	history?: unknown;
 	historySchedule: HistorySchedule;
-	deadlines: { maintenance: { at?: number; clear(): void; soonest(at: number): boolean } };
-	runHistory(now: number): Promise<void>;
 	d1Held?: boolean;
 	backupUnboundWarned: boolean;
 	announce(alert: Record<string, unknown>): void;
@@ -291,26 +289,8 @@ it('refuses /purge and /rename while an unfinished import\'s journal remains, wi
 	}
 });
 
-it('does not poll while a job holds the history lock: the cycle waits, and the job\'s end asks for it', async () => {
-	const result = await runInDurableObject(stub(), async (instance) => {
-		const runtime = instance as unknown as Runtime;
-		const lease = runtime.historySchedule.acquire({ kind: 'job', job: 'export' });
-		if (isRefusal(lease)) throw new Error('the history lock is held');
-		const now = Date.now();
-		const before = runtime.deadlines.maintenance.at;
-		runtime.deadlines.maintenance.clear();
-		await runtime.runHistory(now);
-		// No maintenance a second away: nothing would change until the job ends.
-		const polled = (runtime.deadlines.maintenance.at ?? Infinity) <= now + 1_000;
-		const wanted = runtime.historySchedule.want.kind;
-		const released = lease.release();
-		if (before !== undefined) runtime.deadlines.maintenance.soonest(before);
-		return { polled, wanted, released };
-	});
-	expect(result).toEqual({ polled: false, wanted: 'due', released: { cycleSoon: true } });
-});
-
-it('takes the D1 tier for off only once it holds history, and says why: unbound, or no count to keep', async () => {
+it('takes the D1 tier for off only once it holds history; then /history status shows why, exports wait, and admins are alerted after six hours', async () => {
+	// Off only once it holds history: unbound, or with no count to keep.
 	const fresh = await runInDurableObject(stub(), async (instance, state) => {
 		const runtime = instance as unknown as Runtime;
 		const known = state.storage.sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key = 'history:tier:recent'").toArray().length > 0;
@@ -341,9 +321,6 @@ it('takes the D1 tier for off only once it holds history, and says why: unbound,
 		}
 	});
 	expect(fresh).toEqual({ unused: undefined, held: 'unbound', disabled: 'disabled', bound: undefined });
-});
-
-it('while the D1 tier is unbound, it shows in /history status, exports wait, and admins are alerted after six hours', async () => {
 	const admin = await signedInAdmin();
 	try {
 		await changed((runtime) => {

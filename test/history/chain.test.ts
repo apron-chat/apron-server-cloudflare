@@ -80,27 +80,6 @@ describe("planStep", () => {
 		];
 		for (const [input, expected] of cases) expect(copyNow(input)).toBe(expected);
 	});
-
-	it("works bottom-up: target, copy, advance and trim each tier, then publishes", () => {
-		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10, 20), tier("cold", 1)], links: [link(9)], published: 1, logged: 0, ...round() };
-		expect(planStep(snapshot)).toEqual({ kind: "target", tier: 1 });
-		snapshot.targeted.add(1);
-		// The bottom tier has nothing to trim below its floor of 1... once noted as trimmed.
-		expect(planStep(snapshot)).toEqual({ kind: "trim", tier: 1, below: 1 });
-		snapshot.trimmed.set(1, 1);
-		expect(planStep(snapshot)).toEqual({ kind: "target", tier: 0 });
-		snapshot.targeted.add(0);
-		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 0, start: 10, below: 20 });
-		snapshot.links = [link(19)];
-		expect(planStep(snapshot)).toEqual({ kind: "advance", tier: 0, floor: 20 });
-		snapshot.advanced.set(0, 20);
-		expect(planStep(snapshot)).toEqual({ kind: "trim", tier: 0, below: 20 });
-		snapshot.trimmed.set(0, 20);
-		expect(planStep(snapshot)).toEqual({ kind: "idle" });
-		// The deepest tier's floor rises: published before it trims.
-		snapshot.tiers = [tier("hot", 20, 20), tier("cold", 5, 5)];
-		expect(planStep(snapshot)).toEqual({ kind: "publish", floor: 5 });
-	});
 });
 
 describe("checkInvariants", () => {

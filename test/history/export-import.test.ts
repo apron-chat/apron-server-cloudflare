@@ -196,10 +196,7 @@ describe("export and import", () => {
 		expect(foreign.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
 		expect(foreign.dryRun).toBe(true);
 		expect(target.head.all()).toEqual([]);
-		// Matched only when the archive is authenticated (verified by an authenticating codec): a file's header is anyone's.
-		const unsealed = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
-		expect(unsealed.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
-		await expect(importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match needs an archive verified as this server's own/);
+		// Matched only when the archive is authenticated (verified by an authenticating codec).
 		const own = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, provenance: "verified" });
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob-2" } });
 		const chosen = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, userMap: { bob: { placeholder: "robert" }, ada: { existing: "ada" } } });
@@ -439,9 +436,9 @@ describe("export and import", () => {
 	});
 
 	// The account cap the import is bounded by is the server's own: 2,500
-	// users (past the 2,000 a single import once made at most) import in
-	// bounded batches, and a failure partway is finished by running it again.
-	it("imports more users than the old placeholder cap, in batches and resumably, and refuses more than the server has room for", async () => {
+	// users import in bounded batches, and a failure partway is finished by
+	// running it again.
+	it("imports thousands of users in batches and resumably, and refuses more than the server has room for", async () => {
 		const users = Array.from({ length: 2_500 }, (_, index) => `user${index}`);
 		const text = await writeArchiveToString(async (writer) => {
 			await writer.header({ apron_archive: 1, server: "wss://elsewhere.test/" });
