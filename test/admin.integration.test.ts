@@ -161,7 +161,7 @@ it('/status leads with the server state, then the Cloudflare usage and the demo 
 		// Each against the ceiling that refuses work, and from the counter that does.
 		expect(text).toMatch(new RegExp(`^- Foreground SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.foregroundWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
 		expect(text).toMatch(new RegExp(`^- Frames: [1-9][\\d,]* / ${DEFAULT_LIMITS.processedFramesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
-		expect(text).toMatch(new RegExp(`^- Registered users: [\\d,]+ / ${DEFAULT_LIMITS.registeredIdentityCount.toLocaleString('en-US')}`, 'm'));
+		expect(text).toMatch(new RegExp(`^- Registered users: [\\d,]+ / ${DEFAULT_LIMITS.registeredAccounts.toLocaleString('en-US')}`, 'm'));
 		expect(text).toMatch(/^- Database: /m);
 		// Nor the budget guard's zone and token: a plan that relies on the guard says it can't work.
 		if (ACCOUNT_USAGE_POLICY.monthly) expect(text).toMatch(/^\*\*Edge stop\*\* \(`apron_budget_stop`\): \*\*not working\*\*: `ZONE_ID` or `EDGE_STOP_TOKEN` is not set/m);
@@ -623,7 +623,7 @@ async function registered(userId: string): Promise<void> {
 async function setRoomListMembers(value: number): Promise<void> {
 	await runInDurableObject(stub(), (instance) => {
 		const server = instance as unknown as { config: { limits: Record<string, number> } };
-		server.config = { ...server.config, limits: { ...server.config.limits, roomListMembers: value } };
+		server.config = { ...server.config, limits: { ...server.config.limits, roomListMembersPerRoom: value } };
 	});
 }
 
@@ -653,7 +653,7 @@ it('room_list with user_id lists only that member, also one a truncated listing 
 		const none = (await request(admin, 'none', 'room_list', { room_id: roomId, members: true, user_id: unique('nobody') })).result;
 		expect(none.joined[0].members).toEqual([]);
 		expect(none.users).toEqual([]);
-	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembers); admin.close(); guest.close(); }
+	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembersPerRoom); admin.close(); guest.close(); }
 });
 
 it('room_join and room_leave with a user_id add and remove others: an admin anyone, an owner their bot, and with addmember on anyone adds', async () => {
@@ -934,7 +934,7 @@ it('gives member_count where members leaves registered members out, and keeps th
 			for (const row of rows) expect(row.member_count, row.room_id).toBe(row.stored);
 			expect(rows.find((row) => row.room_id === roomId)?.member_count).toBe(1);
 		});
-	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembers); admin.close(); }
+	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembersPerRoom); admin.close(); }
 });
 
 it('never gives out a ~ user_id, which the protocol reserves for system identities', async () => {

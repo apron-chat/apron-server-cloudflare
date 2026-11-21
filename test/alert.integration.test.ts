@@ -77,9 +77,9 @@ it('posts the alert though registration is closed and the admin user does not ex
 	const stub = env.DEMO.getByName('alert-registration-closed');
 	const warn = vi.spyOn(console, 'warn');
 	await runInDurableObject(stub, async (instance, state) => {
-		const store = (instance as unknown as Runtime).store as unknown as Store & { config: { registeredIdentityCount: number } };
+		const store = (instance as unknown as Runtime).store as unknown as Store & { config: { registeredAccounts: number } };
 		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM identities WHERE user_id = 'admin'").one().count).toBe(0);
-		store.config.registeredIdentityCount = 0;
+		store.config.registeredAccounts = 0;
 		const writeDataPoint = vi.fn();
 		(instance as unknown as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv.METRICS = { writeDataPoint };
 		await (instance as unknown as { notifyAdmins(text: string): Promise<void> }).notifyAdmins('**Budget stop is on.**');
@@ -275,7 +275,7 @@ it('tells the admins once when long room descriptions fill their total, naming t
 		const store = runtime.store;
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
 		// Small limits, so a few rooms fill the total.
-		Object.assign(store.config, { roomMetadataLimit: 1_000, roomMetadataMinLimit: 200, roomMetadataTotalLimit: 1_800 });
+		Object.assign(store.config, { roomMetadataBytes: 1_000, roomMetadataMinBytes: 200, roomMetadataTotalBytes: 1_800 });
 		const now = Date.now();
 		store.createInvitedIdentity({ userId: 'mia', name: 'mia', now, ipKey: 'ip-test' });
 		let request = 0;
@@ -333,9 +333,9 @@ it('tells the admins when a room_set over a WebSocket is refused for the room no
 	let saved: Record<string, number> = {};
 	const token = await runInDurableObject(stub, async (instance) => {
 		const runtime = instance as unknown as Live;
-		const { roomMetadataLimit, roomMetadataMinLimit, roomMetadataTotalLimit } = runtime.store.config;
-		saved = { roomMetadataLimit, roomMetadataMinLimit, roomMetadataTotalLimit };
-		Object.assign(runtime.store.config, { roomMetadataLimit: 1_000, roomMetadataMinLimit: 200, roomMetadataTotalLimit: 300 });
+		const { roomMetadataBytes, roomMetadataMinBytes, roomMetadataTotalBytes } = runtime.store.config;
+		saved = { roomMetadataBytes, roomMetadataMinBytes, roomMetadataTotalBytes };
+		Object.assign(runtime.store.config, { roomMetadataBytes: 1_000, roomMetadataMinBytes: 200, roomMetadataTotalBytes: 300 });
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
 		runtime.store.registerIdentity({
 			userId: 'noter', name: 'Noter', userHandle: 'handle-noter', now: Date.now(), ipKey: 'ip-noter',

@@ -35,7 +35,7 @@ bucket_name = "apron-history-dev"
 
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
 # tiers). Records there stay in history but become read-only: past
-# LIMIT_RETENTION_RECORDS, the oldest move from the object's SQLite to D1,
+# LIMIT_HISTORY_HOT_RECORDS, the oldest move from the object's SQLite to D1,
 # where history pages still read them but their messages can no longer be
 # edited, reacted to or replied to; past LIMIT_HISTORY_D1_RECORDS more, they
 # go on to the cold tier (HISTORY_BLOB, above). Local development and the
@@ -46,36 +46,41 @@ database_name = "apron-archive-dev"
 database_id = "00000000-0000-0000-0000-000000000000"
 
 [vars]
+# Local development (`wrangler dev`) and the tests. Every variable is
+# documented in docs/configuration.md; limits are set as LIMIT_<NAME>.
+
+# ---- Passkeys and origins ----
+# The local web client and this Worker. SIGNAL_UNKNOWN_PASSKEYS is off by
+# default, and here above all: every project on localhost shares that RP ID,
+# so the passkey page must not ask the browser to drop a passkey this server
+# has never seen.
 RP_ID = "localhost"
 RP_ORIGINS = "http://localhost:5173,http://localhost:8787"
 ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:8787"
-# Off by default, and here above all: every project on localhost shares that
-# RP ID, so the passkey page must not ask the browser to drop a passkey this
-# server has never seen.
 SIGNAL_UNKNOWN_PASSKEYS = "false"
-# Room titles and descriptions (docs/configuration.md, Runtime overrides), in
-# serialized bytes: a room's limit; what every room may always hold; and the
-# total of what rooms hold past that minimum, which bounds a listing of every
-# room. A save that would grow the total past it is refused.
-ROOM_METADATA_LIMIT = "8192"
-ROOM_METADATA_MIN_LIMIT = "1024"
-ROOM_METADATA_TOTAL_LIMIT = "262144"
 
-# History (docs/configuration.md, History retention, History tiers, Backups
-# and imports): the plan's own limits written out, as in production.
-LIMIT_RETENTION_RECORDS = "5000"
-LIMIT_RETENTION_SECONDS = "0"
-LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+# ---- History and backups ----
+# The plan's own history limits written out, as in production (History
+# retention, History tiers). Backups on demand only (/history export, no
+# schedule) to the local HISTORY_BLOB bucket, the newest 14 of each kind kept,
+# private rooms included, gzip-compressed (not encrypted).
+LIMIT_HISTORY_HOT_RECORDS = "5000"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_COLD_RECORDS = "0"
-# The room caps count rooms started in the last 30 days, as in production.
-LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
-# Backups on demand only (`/history export`, no schedule) to the local
-# HISTORY_BLOB bucket, the newest 14 of each kind kept, private rooms
-# included, gzip-compressed (not encrypted).
+LIMIT_HISTORY_MAX_AGE_SECONDS = "0"
+LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 BACKUP_EVERY = ""
 BACKUP_KEEP = "14"
 BACKUP_PRIVATE_ROOMS = "true"
+
+# ---- Rooms ----
+# As in production: the room caps count rooms started in the last 30 days,
+# and room titles and descriptions are bounded in serialized bytes (a room's
+# limit, what every room may always hold, and the total past that minimum).
+LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
+LIMIT_ROOM_METADATA_BYTES = "8192"
+LIMIT_ROOM_METADATA_MIN_BYTES = "1024"
+LIMIT_ROOM_METADATA_TOTAL_BYTES = "262144"
 
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.

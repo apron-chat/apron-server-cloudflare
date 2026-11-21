@@ -231,8 +231,8 @@ it("publishes a floor before a failed physical delete and resumes after restart"
 	});
 });
 
-it("keeps the latest retentionRecords records however old, expiring older ones at the next cleanup however young", async () => {
-	const byCount: Partial<StoreConfig> = { retentionRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100 };
+it("keeps the latest historyHotRecords records however old, expiring older ones at the next cleanup however young", async () => {
+	const byCount: Partial<StoreConfig> = { historyHotRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100 };
 	await withStore("retention-count", byCount, (store, clock, state) => {
 		// The seeded general room record and five messages: six records, a
 		// second apart (the count ends at a commit time, and keeps any record
@@ -260,8 +260,8 @@ it("keeps the latest retentionRecords records however old, expiring older ones a
 	});
 });
 
-it("expires records past retentionSeconds whatever the count", async () => {
-	await withStore("retention-ceiling", { retentionRecords: 100, retentionMs: 7 * DAY_MS }, (store, clock) => {
+it("expires records past historyMaxAgeSeconds whatever the count", async () => {
+	await withStore("retention-ceiling", { historyHotRecords: 100, retentionMs: 7 * DAY_MS }, (store, clock) => {
 		const last = ["old", "older"].map((text) => oneLog(store.mutate(messageInput(clock, `ceiling-${text}`, text)))).at(-1)!;
 		clock.value += 8 * DAY_MS;
 		const expired = store.runCleanup(clock.value);
@@ -272,8 +272,8 @@ it("expires records past retentionSeconds whatever the count", async () => {
 
 it("with tiers below, removes records from SQLite only once copied, and keeps the published floor until the chain raises it", async () => {
 	const tiered: Partial<StoreConfig> = {
-		tiered: true, retentionRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100,
-		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
+		tiered: true, historyHotRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100,
+		guestPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	await withStore("history-floors", tiered, async (store, clock, state) => {
 		const general = BigInt(store.getRoomState().log_id);
@@ -369,7 +369,7 @@ it("forgets the chain's floors, queue, tier and link state once tiers are off, s
 });
 
 it("drops SQLite's reaction sets on messages that only a tier below held, for /purge", async () => {
-	await withStore("drop-reactions", { anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000 }, (store, clock, state) => {
+	await withStore("drop-reactions", { guestPostsPerMinute: 1_000, ipPostsPerMinute: 1_000 }, (store, clock, state) => {
 		const posted = store.mutate(messageInput(clock, "reacted", "react to me"));
 		const messageId = String(posted.result.message_id);
 		store.mutate({ ...messageInput(clock, "reaction", ""), method: "reactions", params: { message_id: messageId, emojis: ["👍"] } });
@@ -381,10 +381,10 @@ it("drops SQLite's reaction sets on messages that only a tier below held, for /p
 	});
 });
 
-it("keeps cleanupThresholdPercent of retentionRecords: each daily cleanup trims back to it", async () => {
+it("keeps cleanupThresholdPercent of historyHotRecords: each daily cleanup trims back to it", async () => {
 	const config: Partial<StoreConfig> = {
-		retentionRecords: 10, cleanupThresholdPercent: 50, retentionMs: 0,
-		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
+		historyHotRecords: 10, cleanupThresholdPercent: 50, retentionMs: 0,
+		guestPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	await withStore("threshold", config, (store, clock, state) => {
 		const count = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
@@ -408,8 +408,8 @@ it("keeps cleanupThresholdPercent of retentionRecords: each daily cleanup trims 
 describe("cleanup at the storage watermark", () => {
 	const MIB = 1024 * 1024;
 	const pressed: Partial<StoreConfig> = {
-		retentionRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100,
-		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
+		historyHotRecords: 3, retentionMs: 0, cleanupThresholdPercent: 100,
+		guestPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	/** Puts the database past its high-water mark, as a flood would: every write is refused until it is under the low one. */
 	const overHighWater = (store: Store) => {

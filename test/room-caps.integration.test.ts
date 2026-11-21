@@ -13,15 +13,15 @@ import { messagesOf, withStore, type TestClock } from "./helpers/store";
 const DAY = 24 * 60 * 60 * 1000;
 const CONFIG: Partial<StoreConfig> = {
 	// History far longer than the window, so rooms are old, not expired.
-	retentionRecords: 0,
+	historyHotRecords: 0,
 	retentionMs: 10_000 * DAY,
 	roomCreationWindowMs: 10 * DAY,
 	maxThreads: 2,
 	maxThreadsPerUser: 2,
 	maxPrivateRooms: 2,
 	maxPrivateRoomsPerUser: 2,
-	anonymousPostsPerMinute: 10_000,
-	anonymousPostsPerDay: 10_000,
+	guestPostsPerMinute: 10_000,
+	guestPostsPerDay: 10_000,
 	registeredPostsPerMinute: 10_000,
 	registeredPostsPerDay: 10_000,
 	ipPostsPerMinute: 10_000,

@@ -26,7 +26,7 @@ export interface TerminalOutputRef {
  * escaping would pass it, and one record always fits a history response.
  * Colored output escapes to about 1.4 times its bytes (32 KB of it was 45 KB
  * of JSON), so this cuts only output dense in control characters, and it
- * bounds what history by count (retentionRecords) can hold of terminals.
+ * bounds what history by count (historyHotRecords) can hold of terminals.
  */
 export const MAX_TERMINAL_OUTPUT_JSON_BYTES = 64 * 1024;
 

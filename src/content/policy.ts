@@ -27,7 +27,7 @@ export interface ContentLimits extends BodyLimits, NameLimits {
 	/** Most entries in one user's reaction set (a count limit: denied). */
 	reactionEmojisPerUser: number;
 	/** Most bytes in a room's client fields (title, description, ext) as JSON. */
-	roomMetadataLimit: number;
+	roomMetadataBytes: number;
 }
 
 export interface ContentPolicy {
@@ -40,7 +40,7 @@ export interface ContentPolicy {
 	emojis(value: unknown): Verdict<string[]>;
 	/** Whether a snapshot's client content fits maxSnapshotBytes. */
 	snapshot(snapshot: SnapshotLike): Verdict<void>;
-	/** Whether a room's client fields fit roomMetadataLimit. */
+	/** Whether a room's client fields fit roomMetadataBytes. */
 	roomFields(fields: Record<string, unknown>): Verdict<void>;
 	/** A logged record as a client could have produced it, or why none could: the parts above, per kind. */
 	record(record: ChatRecord): Verdict<ChatRecord>;
@@ -50,7 +50,7 @@ export function contentPolicy(limits: ContentLimits): ContentPolicy {
 	const snapshot = (value: SnapshotLike): Verdict<void> =>
 		contentBytes(value) > limits.maxSnapshotBytes ? refuse("too_large", "message snapshot is too large") : accept(undefined);
 	const roomFields = (fields: Record<string, unknown>): Verdict<void> =>
-		utf8Bytes(JSON.stringify(fields)) > limits.roomMetadataLimit ? refuse("too_large", "room metadata is too large") : accept(undefined);
+		utf8Bytes(JSON.stringify(fields)) > limits.roomMetadataBytes ? refuse("too_large", "room metadata is too large") : accept(undefined);
 
 	/** A message record's value as a post would have made it, in place. */
 	const message = (value: Record<string, unknown>): Verdict<void> => {

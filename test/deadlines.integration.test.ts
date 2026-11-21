@@ -17,7 +17,7 @@ async function open(stub: DurableObjectStub) {
 }
 
 type Runtime = {
-	config: { limits: { unauthenticatedTimeoutSeconds: number } };
+	config: { limits: { authTimeoutSeconds: number } };
 	attackPauseRecord?: { day: string; until: number; count: number; trigger: string; summary: string } | null;
 	rescheduleAlarm(): Promise<void>;
 	runAlarm(): Promise<void>;
@@ -26,7 +26,7 @@ type Runtime = {
 it('closes a connection that never signed in at its next frame past the deadline, with no alarm run', async () => {
 	const stub = env.DEMO.getByName(`deadline-auth-${crypto.randomUUID()}`);
 	const peer = await open(stub);
-	const timeout = await runInDurableObject(stub, (instance) => (instance as unknown as Runtime).config.limits.unauthenticatedTimeoutSeconds);
+	const timeout = await runInDurableObject(stub, (instance) => (instance as unknown as Runtime).config.limits.authTimeoutSeconds);
 	const realNow = Date.now.bind(Date);
 	vi.spyOn(Date, 'now').mockImplementation(() => realNow() + timeout * 1_000 + 1_000);
 	peer.socket.send(JSON.stringify({ id: 'late', method: 'auth', params: { scheme: 'guest' } }));

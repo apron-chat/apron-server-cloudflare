@@ -10,9 +10,9 @@ export interface Limits {
 	 * room changes alike. Older ones leave it at the next cleanup (to the
 	 * tiers below where bound, else they expire), and at once when the
 	 * database reaches its storage watermark. 0 keeps no count, leaving
-	 * `retentionSeconds` alone to expire records.
+	 * `historyMaxAgeSeconds` alone to expire records.
 	 */
-	retentionRecords: number;
+	historyHotRecords: number;
 	/**
 	 * Records past the limits above that the D1 history tier (binding
 	 * HISTORY_D1) keeps, newest first, before they go on to the cold tier or
@@ -37,10 +37,10 @@ export interface Limits {
 	cleanupThresholdPercent: number;
 	/**
 	 * A record older than this expires whatever the count. 0 sets no age
-	 * limit; at least one of it and `retentionRecords` is set.
+	 * limit; at least one of it and `historyHotRecords` is set.
 	 */
-	retentionSeconds: number;
-	cleanupSeconds: number;
+	historyMaxAgeSeconds: number;
+	cleanupIntervalSeconds: number;
 	challengeTtlSeconds: number;
 	/** Lifetime of a passkey session token, renewed on every successful resume. */
 	sessionTtlSeconds: number;
@@ -62,8 +62,8 @@ export interface Limits {
 	maxNameCodePoints: number;
 	maxNameBytes: number;
 	maxEmbeds: number;
-	historyDefaultLimit: number;
-	historyMaxLimit: number;
+	historyPageSize: number;
+	historyMaxPageSize: number;
 	historyMaxResponseBytes: number;
 	/**
 	 * History pages are limited per user and per IP, each with a rate a minute
@@ -86,8 +86,8 @@ export interface Limits {
 	 */
 	guestHistoryDepth: number;
 	concurrentHistoryPerConnection: number;
-	anonymousPostsPerMinute: number;
-	anonymousPostsPerDay: number;
+	guestPostsPerMinute: number;
+	guestPostsPerDay: number;
 	registeredPostsPerMinute: number;
 	registeredPostsPerDay: number;
 	/**
@@ -105,21 +105,21 @@ export interface Limits {
 	globalPostsPerDay: number;
 	registrationsPerIpDay: number;
 	registrationsPerDay: number;
-	registeredIdentityCount: number;
+	registeredAccounts: number;
 	authAttemptsPerIpMinute: number;
 	openConnections: number;
-	anonymousConnectionsPerIp: number;
+	guestConnectionsPerIp: number;
 	registeredConnectionsPerUser: number;
 	connectionsPerIp: number;
 	connectionAdmissionsPerIpMinute: number;
 	connectionAdmissionsPerDay: number;
-	unauthenticatedTimeoutSeconds: number;
+	authTimeoutSeconds: number;
 	pendingFramesPerConnection: number;
 	pendingBytesPerConnection: number;
 	framesPerConnectionMinute: number;
 	framesPerIpMinute: number;
 	processedFramesPerDay: number;
-	repeatedPolicyViolations: number;
+	policyViolationsBeforeClose: number;
 	/**
 	 * Frames the whole server processes in a rolling minute, counted in memory
 	 * before any SQL. Past it, requests get `retry_after` and notifications are
@@ -151,7 +151,7 @@ export interface Limits {
 	 * Connected members, guests included, are always listed besides. Each
 	 * listed registered member costs two indexed reads.
 	 */
-	roomListMembers: number;
+	roomListMembersPerRoom: number;
 	/**
 	 * Seconds between client liveness pings, advertised as `server.ping`
 	 * (protocol §1). The runtime answers the ping without waking the object,
@@ -225,7 +225,7 @@ export interface Limits {
 	threadsPerUser: number;
 	/**
 	 * The window the room caps (`threads`, `threadsPerUser`,
-	 * `privateRoomLimit`, `privateRoomsPerUser`) count rooms started in, by
+	 * `privateRooms`, `privateRoomsPerUser`) count rooms started in, by
 	 * their creation: they limit how fast rooms are started, not how many
 	 * exist, so posting in, joining or leaving an older room never needs a
 	 * slot, and rooms are kept for as long as their history. 0 counts every
@@ -233,23 +233,23 @@ export interface Limits {
 	 */
 	roomCreationWindowSeconds: number;
 	/** One room's serialized client fields (`title`, `description`, `ext`). */
-	roomMetadataLimit: number;
+	roomMetadataBytes: number;
 	/**
-	 * What every room may always hold of roomMetadataLimit, whatever the
+	 * What every room may always hold of roomMetadataBytes, whatever the
 	 * total: enough for a title and a thread's quoted first message. Only
-	 * the bytes past it count against roomMetadataTotalLimit, so a full
+	 * the bytes past it count against roomMetadataTotalBytes, so a full
 	 * total never stops a room from being created or renamed.
 	 */
-	roomMetadataMinLimit: number;
+	roomMetadataMinBytes: number;
 	/**
-	 * Every room's serialized client fields past roomMetadataMinLimit,
+	 * Every room's serialized client fields past roomMetadataMinBytes,
 	 * together, private rooms included: the long room notes a full
 	 * `room_list` or the retention `room_update` can carry. A save that would
 	 * grow the total past it is refused.
 	 */
-	roomMetadataTotalLimit: number;
+	roomMetadataTotalBytes: number;
 	/** Private rooms (§4.2.4) that may be started within roomCreationWindowSeconds; they do not count against `threads`. */
-	privateRoomLimit: number;
+	privateRooms: number;
 	/** Private rooms one registered user may start within roomCreationWindowSeconds. */
 	privateRoomsPerUser: number;
 	/** Private rooms one registered user may be a member of at once, the ones others added them to included. */
@@ -259,7 +259,7 @@ export interface Limits {
 	/** Distinct emoji in one user's reaction set on one message. */
 	reactionEmojisPerUser: number;
 	dedupTtlSeconds: number;
-	limiterRecordCap: number;
+	limiterRecords: number;
 	maxCredentialBytes: number;
 	maxChallengeBytes: number;
 }
@@ -600,8 +600,8 @@ export const MAX_GUEST_HISTORY_DEPTH = 1_000;
 export const MAX_CREDENTIAL_BYTES = 16 * 1024;
 export const MAX_CHALLENGE_BYTES = 16 * 1024;
 export const MAX_OPEN_CONNECTIONS = DEFAULT_LIMITS.openConnections;
-export const MAX_REGISTERED_IDENTITIES = DEFAULT_LIMITS.registeredIdentityCount;
-export const MAX_LIMITER_RECORDS = DEFAULT_LIMITS.limiterRecordCap;
+export const MAX_REGISTERED_IDENTITIES = DEFAULT_LIMITS.registeredAccounts;
+export const MAX_LIMITER_RECORDS = DEFAULT_LIMITS.limiterRecords;
 export const MAX_PROCESSED_FRAMES = DEFAULT_LIMITS.processedFramesPerDay;
 export const MAX_GLOBAL_POSTS_PER_MINUTE = DEFAULT_LIMITS.globalPostsPerMinute;
 export const MAX_GLOBAL_POSTS_PER_DAY = DEFAULT_LIMITS.globalPostsPerDay;
@@ -654,15 +654,15 @@ export const MAX_ROOM_LISTING_BYTES = 1024 * 1024;
 export const ROOM_LISTING_ENTRY_BYTES = 256;
 /**
  * A room listing's worst size: every public room it names (`general`, the
- * created rooms, listedThreads) at roomMetadataMinLimit each, and what they
- * hold past that together (roomMetadataTotalLimit). At the defaults, about
+ * created rooms, listedThreads) at roomMetadataMinBytes each, and what they
+ * hold past that together (roomMetadataTotalBytes). At the defaults, about
  * 530 KiB; with them, `threads` may go up to 298.
  */
-export function roomListingWorstBytes(limits: Pick<Limits, "threads" | "roomMetadataMinLimit" | "roomMetadataTotalLimit">): number {
-	return (1 + MAX_CREATED_ROOMS + listedThreads(limits.threads)) * (limits.roomMetadataMinLimit + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalLimit;
+export function roomListingWorstBytes(limits: Pick<Limits, "threads" | "roomMetadataMinBytes" | "roomMetadataTotalBytes">): number {
+	return (1 + MAX_CREATED_ROOMS + listedThreads(limits.threads)) * (limits.roomMetadataMinBytes + ROOM_LISTING_ENTRY_BYTES) + limits.roomMetadataTotalBytes;
 }
 // A room's client fields must fit one frame (validateLimits). What rooms hold
-// past roomMetadataMinLimit is bounded together by at most one history
+// past roomMetadataMinBytes is bounded together by at most one history
 // response, so a listing of every room is at most the minimum per room plus
 // that (roomListingWorstBytes).
 export const MAX_ROOM_METADATA_LIMIT = 16 * 1024;

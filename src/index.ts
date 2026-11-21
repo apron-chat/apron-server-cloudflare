@@ -585,7 +585,7 @@ const MAX_ATTACHED_ROOMS = MAX_LISTED_USER_ROOMS;
 const MAX_ATTACHED_READS = 64;
 /** How often one connection writes the read cursors it was sent (flushReads): a reader writes about once a minute, however often their client sends. */
 const READ_CURSOR_FLUSH_MS = 60_000;
-/** The close reason of a connection that did not sign in within `unauthenticatedTimeoutSeconds`. */
+/** The close reason of a connection that did not sign in within `authTimeoutSeconds`. */
 const AUTH_TIMEOUT_REASON = "Authentication timed out";
 /** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
 const MAX_HELD_FRAMES = 256;
@@ -1164,13 +1164,13 @@ function nowMs(): number {
 export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	const limits = config.limits;
 	return {
-		retentionMs: limits.retentionSeconds * 1_000,
-		retentionRecords: limits.retentionRecords,
+		retentionMs: limits.historyMaxAgeSeconds * 1_000,
+		historyHotRecords: limits.historyHotRecords,
 		cleanupThresholdPercent: limits.cleanupThresholdPercent,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
-		cleanupIntervalMs: limits.cleanupSeconds * 1_000,
+		cleanupIntervalMs: limits.cleanupIntervalSeconds * 1_000,
 		cleanupBatch: limits.cleanupBatch,
 		maxSnapshotBytes: limits.maxSnapshotBytes,
 		maxTextBytes: limits.maxTextBytes,
@@ -1180,16 +1180,16 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxThreads: limits.threads,
 		maxThreadsPerUser: limits.threadsPerUser,
 		roomCreationWindowMs: limits.roomCreationWindowSeconds * 1_000,
-		roomMetadataLimit: limits.roomMetadataLimit,
-		roomMetadataMinLimit: limits.roomMetadataMinLimit,
-		roomMetadataTotalLimit: limits.roomMetadataTotalLimit,
-		maxPrivateRooms: limits.privateRoomLimit,
+		roomMetadataBytes: limits.roomMetadataBytes,
+		roomMetadataMinBytes: limits.roomMetadataMinBytes,
+		roomMetadataTotalBytes: limits.roomMetadataTotalBytes,
+		maxPrivateRooms: limits.privateRooms,
 		maxPrivateRoomsPerUser: limits.privateRoomsPerUser,
 		maxPrivateMembershipsPerUser: limits.privateMembershipsPerUser,
 		reactionUsersPerMessage: limits.reactionUsersPerMessage,
 		reactionEmojisPerUser: limits.reactionEmojisPerUser,
-		maxHistoryLimit: limits.historyMaxLimit,
-		historyDefaultLimit: limits.historyDefaultLimit,
+		maxHistoryLimit: limits.historyMaxPageSize,
+		historyPageSize: limits.historyPageSize,
 		maxHistoryResponseBytes: limits.historyMaxResponseBytes,
 		historyRequestsPerUserMinute: limits.historyRequestsPerUserMinute,
 		historyRequestsPerIpMinute: limits.historyRequestsPerIpMinute,
@@ -1199,8 +1199,8 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		historyRequestsPerIpDay: limits.historyRequestsPerIpDay,
 		historyRequestsPerDay: limits.historyRequestsPerDay,
 		guestHistoryDepth: limits.guestHistoryDepth,
-		anonymousPostsPerMinute: limits.anonymousPostsPerMinute,
-		anonymousPostsPerDay: limits.anonymousPostsPerDay,
+		guestPostsPerMinute: limits.guestPostsPerMinute,
+		guestPostsPerDay: limits.guestPostsPerDay,
 		registeredPostsPerMinute: limits.registeredPostsPerMinute,
 		registeredPostsPerDay: limits.registeredPostsPerDay,
 		trustedPostsPerMinute: limits.trustedPostsPerMinute,
@@ -1211,9 +1211,9 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		globalPostsPerDay: limits.globalPostsPerDay,
 		registrationsPerIpDay: limits.registrationsPerIpDay,
 		registrationsPerDay: limits.registrationsPerDay,
-		registeredIdentityCount: limits.registeredIdentityCount,
+		registeredAccounts: limits.registeredAccounts,
 		authAttemptsPerIpMinute: limits.authAttemptsPerIpMinute,
-		principalLimitCap: limits.limiterRecordCap,
+		principalLimitCap: limits.limiterRecords,
 		sqlReadsPerDay: limits.sqlReadsPerDay,
 		sqlWritesPerDay: limits.sqlWritesPerDay,
 		foregroundReadsPerDay: limits.foregroundReadsPerDay,
@@ -1223,7 +1223,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		storageHighWaterBytes: limits.databaseHighWaterBytes,
 		storageHardTargetBytes: limits.databaseHardTargetBytes,
 		storageLowWaterBytes: limits.databaseResumeLowWaterBytes,
-		admissionEnabled: !config.admissionOff,
+		admissionEnabled: config.admission,
 		ogMediaHosts: config.ogMediaHosts,
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
@@ -1520,7 +1520,7 @@ const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
 const STORAGE_ALERT_SHARE = 0.5;
 /** The share under which that alert is armed again, so a size hovering at the line tells once. */
 const STORAGE_REARM_SHARE = 0.4;
-/** The share of roomMetadataTotalLimit under which the room notes alert is armed again (maybeAlertRoomNotes). */
+/** The share of roomMetadataTotalBytes under which the room notes alert is armed again (maybeAlertRoomNotes). */
 const ROOM_NOTES_REARM_SHARE = 0.75;
 /** A connection is told of one trigger at most this often (noteTrip). */
 const TRIP_NOTICE_MS = 60 * 60 * 1000;
@@ -2527,7 +2527,7 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		return responseError(503, "Configuration unavailable");
 	}
 	if (!originAllowed(config, request)) return responseError(403, "Origin not allowed");
-	if (config.admissionOff) return responseError(503, "Demo admission is closed");
+	if (!config.admission) return responseError(503, "Demo admission is closed");
 	const key = await hashIpKey(clientIp);
 	const prefixKey = await hashIpv6PrefixKey(clientIp);
 	// The object said it was full or paused moments ago: refuse here, before
@@ -2885,7 +2885,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (request.method !== "GET" || (!isUpgrade(request) && !status)) return responseError(400, "WebSocket upgrade required");
 		const ipKey = trustedIpKey(request);
 		if (!ipKey) return responseError(403, "Trusted client address unavailable");
-		if (this.config.admissionOff) return responseError(503, "Demo admission is closed");
+		if (!this.config.admission) return responseError(503, "Demo admission is closed");
 		this.sweepPresence();
 		this.accountUsage.noteActivity(nowMs());
 		if (this.accountUsage.stops(nowMs())) return responseError(503, "Demo account capacity reached", 300_000);
@@ -2904,7 +2904,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(origin ? { origin } : {}),
 			...(endpoint ? { endpoint } : {}),
 			openedAt: nowMs(),
-			authDeadline: nowMs() + this.config.limits.unauthenticatedTimeoutSeconds * 1_000,
+			authDeadline: nowMs() + this.config.limits.authTimeoutSeconds * 1_000,
 			pendingFrames: 0,
 			pendingBytes: 0,
 			policyViolations: [],
@@ -2948,7 +2948,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (evictedHere) return responseError(429, "Demo capacity reached", fullRetryMs());
 			if (full && !idle) return serverFull();
 			if (peers.length >= this.config.limits.connectionsPerIp ||
-				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
+				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.guestConnectionsPerIp) {
 				return responseError(429, "Demo capacity reached", 60_000);
 			}
 			if (status) {
@@ -5184,7 +5184,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				...(roomId !== undefined ? { roomId } : { roomIds: attachment.rooms ?? [] }),
 				after,
 				before,
-				limit: limit ?? this.config.limits.historyDefaultLimit,
+				limit: limit ?? this.config.limits.historyPageSize,
 				maxBytes: this.config.limits.historyMaxResponseBytes,
 				now: nowMs(),
 				userId: attachment.userId,
@@ -7477,7 +7477,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Tells the admins once a `room_set` is refused because long room
-	 * descriptions filled roomMetadataTotalLimit, naming the public rooms
+	 * descriptions filled roomMetadataTotalBytes, naming the public rooms
 	 * holding the most past the minimum, from what the save's own check read
 	 * (Store.takeRoomNotesCheck), so it costs no query. Told once, as the
 	 * storage alert is: the flag is kept in `_meta`, written only when it
@@ -7492,15 +7492,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!check) return;
 			// The store's limits, which the check applied (asStoreConfig sets them from the plan).
 			const limits = this.store.config;
-			const rearmBytes = Math.floor(limits.roomMetadataTotalLimit * ROOM_NOTES_REARM_SHARE);
+			const rearmBytes = Math.floor(limits.roomMetadataTotalBytes * ROOM_NOTES_REARM_SHARE);
 			this.roomNotesAlerted ??= this.store.roomNotesAlerted();
 			if (check.full && !this.roomNotesAlerted) {
 				this.roomNotesAlerted = true;
 				try { this.store.setRoomNotesAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
-				console.warn(JSON.stringify({ event: "room_notes_alert", bytes: check.total, limit_bytes: limits.roomMetadataTotalLimit }));
+				console.warn(JSON.stringify({ event: "room_notes_alert", bytes: check.total, limit_bytes: limits.roomMetadataTotalBytes }));
 				this.announce({
-					kind: "room_notes", totalBytes: check.total, limitBytes: limits.roomMetadataTotalLimit, ceilingBytes: MAX_ROOM_METADATA_TOTAL_LIMIT,
-					minBytes: limits.roomMetadataMinLimit, rearmBytes, rooms: check.rooms ?? [],
+					kind: "room_notes", totalBytes: check.total, limitBytes: limits.roomMetadataTotalBytes, ceilingBytes: MAX_ROOM_METADATA_TOTAL_LIMIT,
+					minBytes: limits.roomMetadataMinBytes, rearmBytes, rooms: check.rooms ?? [],
 				});
 			} else if (committed && !check.full && this.roomNotesAlerted && check.total < rearmBytes) {
 				this.store.setRoomNotesAlerted(false, now);
@@ -7817,8 +7817,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Keeps a listing near the history response cap: `joined` is never
-	 * truncated, and its rooms' client fields are at most roomMetadataMinLimit
-	 * each plus roomMetadataTotalLimit together, so past the cap `members`,
+	 * truncated, and its rooms' client fields are at most roomMetadataMinBytes
+	 * each plus roomMetadataTotalBytes together, so past the cap `members`,
 	 * `member_count`, and `users` are left out and the rooms are sent whole.
 	 */
 	private boundedListing(result: ListingResult): ListingResult {
@@ -9541,7 +9541,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		lines.push(`- Storage overruns today: ${guard.overruns} (each charged and logged)`);
 		const trips = this.store.throttleTrips(now);
 		lines.push(`- Throttles tripped in the last 24 hours: ${trips.length ? trips.map(([trigger, times]) => `\`${trigger}\` ${times}`).join(", ") : "none"}`);
-		if (this.config.admissionOff) lines.push("- `ADMISSION_OFF` is set: new connections are refused");
+		if (!this.config.admission) lines.push("- `ADMISSION` is false: new connections are refused");
 		lines.push("");
 		const usage = this.accountUsage.snapshot;
 		const daily = ACCOUNT_USAGE_POLICY.daily;
@@ -9615,7 +9615,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Posts: ${share(counts.posts, limits.globalPostsPerDay)}`,
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
-			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
+			`- Registered users: ${share(identities, limits.registeredAccounts)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			...(active ? [await active] : []),
 			...this.roomCountLines(now),
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
@@ -9638,7 +9638,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const older = (n: number) => (n ? `, ${n.toLocaleString("en-US")} older` : "");
 		return [
 			`- Rooms and threads: ${rooms.public.recent.toLocaleString("en-US")} / ${limits.threads.toLocaleString("en-US")}${window}${older(rooms.public.older)}`,
-			...(limits.privateRoomLimit > 0 ? [`- Private rooms: ${rooms.private.recent.toLocaleString("en-US")} / ${limits.privateRoomLimit.toLocaleString("en-US")}${window}${older(rooms.private.older)}`] : []),
+			...(limits.privateRooms > 0 ? [`- Private rooms: ${rooms.private.recent.toLocaleString("en-US")} / ${limits.privateRooms.toLocaleString("en-US")}${window}${older(rooms.private.older)}`] : []),
 		];
 	}
 
@@ -9881,7 +9881,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Each room's members as `room_list` and `room_update` `joined` carry them
 	 * (§4.2.1), in `user_id` order with their current objects: the registered
-	 * members stored with the room, at most `roomListMembers` per room, and
+	 * members stored with the room, at most `roomListMembersPerRoom` per room, and
 	 * every connected user who has joined it, guests included, whose
 	 * memberships live in their connections. `totals` gets each room's
 	 * `member_count` (§4.2.1) where that leaves members out. Where capability
@@ -9892,7 +9892,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private membersOf(roomIds: readonly string[], totals?: Map<string, number>, lister?: WebSocketConnection): Map<string, PublicUser[]> {
 		const counts = new Map<string, number>();
 		const mode = this.presenceMode();
-		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembers, nowMs(), counts, mode);
+		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembersPerRoom, nowMs(), counts, mode);
 		const connected = this.connectedMembers();
 		const members = new Map<string, PublicUser[]>();
 		const statuses = new Map<string, StoredStatus>();
@@ -9904,7 +9904,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			for (const member of connected.get(roomId) ?? []) if (!users.has(member.user_id)) users.set(member.user_id, member);
 			members.set(roomId, sortedUsers(users.values()));
-			// A room past `roomListMembers` registered members lists only some of
+			// A room past `roomListMembersPerRoom` registered members lists only some of
 			// them: the total is every stored member and every connected guest.
 			const registered = counts.get(roomId);
 			if (totals && registered !== undefined) {
@@ -10179,7 +10179,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private noteRoom(roomId: string, exists: boolean): void {
 		this.knownRooms.delete(roomId);
 		// The rooms table is capped; unknown IDs are bounded by the same size.
-		if (this.knownRooms.size >= 2 * (this.config.limits.threads + 1 + this.config.limits.privateRoomLimit)) this.knownRooms.delete(this.knownRooms.keys().next().value!);
+		if (this.knownRooms.size >= 2 * (this.config.limits.threads + 1 + this.config.limits.privateRooms)) this.knownRooms.delete(this.knownRooms.keys().next().value!);
 		this.knownRooms.set(roomId, exists);
 	}
 
@@ -10582,7 +10582,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const state = connectionAttachment(socket);
 		if (!state || state.closing) return;
 		state.policyViolations = [...state.policyViolations.filter(time => time > nowMs() - 60_000), nowMs()];
-		if (state.policyViolations.length >= this.config.limits.repeatedPolicyViolations) this.closePolicy(socket, state, 1008, "Repeated policy violations");
+		if (state.policyViolations.length >= this.config.limits.policyViolationsBeforeClose) this.closePolicy(socket, state, 1008, "Repeated policy violations");
 		else writeAttachment(socket, state);
 	}
 

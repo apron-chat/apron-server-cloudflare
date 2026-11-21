@@ -122,7 +122,7 @@ it('gives users with any role the trusted posting limits, for their IP too, unde
 it('returns the longest applicable retry window and never replenishes on a backward clock', async () => {
 	await runInDurableObject(env.DEMO.getByName('quota-retry-reset'), (_instance, state) => {
 		let now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
-		const store = new Store(state, { anonymousPostsPerMinute: 1, anonymousPostsPerDay: 1 }, { now: () => now });
+		const store = new Store(state, { guestPostsPerMinute: 1, guestPostsPerDay: 1 }, { now: () => now });
 		const post = () => store.mutate({ userId: 'guest', ipKey: 'nat', method: 'message', now,
 			identity: { user_id: 'guest' }, params: { room_id: 'general', body: { text: 'bounded' } } });
 		post();
@@ -137,7 +137,7 @@ it('returns the longest applicable retry window and never replenishes on a backw
 it('names every posting refusal of the write row `write` (ext:limits), memberships and reactions included, and a `me` refusal none', async () => {
 	await runInDurableObject(env.DEMO.getByName('quota-limits-write'), (_instance, state) => {
 		let now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
-		const store = new Store(state, { registeredPostsPerMinute: 2, registeredPostsPerDay: 3, anonymousPostsPerMinute: 1, globalPostsPerDay: 5 }, { now: () => now });
+		const store = new Store(state, { registeredPostsPerMinute: 2, registeredPostsPerDay: 3, guestPostsPerMinute: 1, globalPostsPerDay: 5 }, { now: () => now });
 		const refusal = (fn: () => unknown): StoreError => {
 			try { fn(); } catch (error) { expectRetryAfter(error); return error; }
 			throw new Error('expected a refusal');

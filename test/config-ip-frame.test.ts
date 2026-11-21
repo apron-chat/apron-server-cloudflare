@@ -126,7 +126,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps history by count, by age or both, but not by neither, and only the retention bounds take 0', () => {
-		expect(config().limits).toMatchObject({ retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0 });
+		expect(config().limits).toMatchObject({ historyHotRecords: 5_000, historyMaxAgeSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0 });
 		expect(config({ LIMIT_HISTORY_D1_RECORDS: '0' }).limits.historyD1Records).toBe(0);
 		expect(() => config({ LIMIT_HISTORY_D1_RECORDS: '100001' })).toThrow('historyD1Records exceeds the calibrated bound');
 		expect(config({ LIMIT_HISTORY_COLD_RECORDS: '1000000' }).limits.historyColdRecords).toBe(1_000_000);
@@ -135,17 +135,17 @@ describe('configuration policy boundaries', () => {
 		expect(config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '100' }).limits.cleanupThresholdPercent).toBe(100);
 		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '101' })).toThrow('cleanupThresholdPercent is a share of the limits, at most 100');
 		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '0' })).toThrow(ConfigError);
-		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '604800' }).limits).toMatchObject({ retentionRecords: 0, retentionSeconds: 604_800 });
-		expect(() => config({ LIMIT_RETENTION_RECORDS: '0' })).toThrow('retentionRecords or retentionSeconds must be set');
-		expect(() => config({ LIMIT_RETENTION_RECORDS: '50001' })).toThrow(ConfigError);
+		expect(config({ LIMIT_HISTORY_HOT_RECORDS: '0', LIMIT_HISTORY_MAX_AGE_SECONDS: '604800' }).limits).toMatchObject({ historyHotRecords: 0, historyMaxAgeSeconds: 604_800 });
+		expect(() => config({ LIMIT_HISTORY_HOT_RECORDS: '0' })).toThrow('historyHotRecords or historyMaxAgeSeconds must be set');
+		expect(() => config({ LIMIT_HISTORY_HOT_RECORDS: '50001' })).toThrow(ConfigError);
 		// A count and an age ceiling together: whichever expires a record first.
-		expect(config({ LIMIT_RETENTION_SECONDS: '86400' }).limits).toMatchObject({ retentionRecords: 5_000, retentionSeconds: 86_400 });
-		expect(() => config({ LIMIT_RETENTION_SECONDS: '-1' })).toThrow('retentionSeconds must be a non-negative safe integer');
+		expect(config({ LIMIT_HISTORY_MAX_AGE_SECONDS: '86400' }).limits).toMatchObject({ historyHotRecords: 5_000, historyMaxAgeSeconds: 86_400 });
+		expect(() => config({ LIMIT_HISTORY_MAX_AGE_SECONDS: '-1' })).toThrow('historyMaxAgeSeconds must be a non-negative safe integer');
 		// The count's largest snapshots must fit under the watermark that resumes posting, so cleanup there relieves it.
-		expect(() => config({ LIMIT_RETENTION_RECORDS: '20000' })).toThrow('retentionRecords of the largest snapshots must fit under databaseResumeLowWaterBytes');
-		expect(config({ LIMIT_RETENTION_RECORDS: '13000' }).limits.retentionRecords).toBe(13_000);
-		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600', LIMIT_CLEANUP_SECONDS: '3600' }).limits.retentionSeconds).toBe(3_600);
-		expect(() => config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600' })).toThrow('retentionSeconds must be at least one cleanup interval');
+		expect(() => config({ LIMIT_HISTORY_HOT_RECORDS: '20000' })).toThrow('historyHotRecords of the largest snapshots must fit under databaseResumeLowWaterBytes');
+		expect(config({ LIMIT_HISTORY_HOT_RECORDS: '13000' }).limits.historyHotRecords).toBe(13_000);
+		expect(config({ LIMIT_HISTORY_HOT_RECORDS: '0', LIMIT_HISTORY_MAX_AGE_SECONDS: '3600', LIMIT_CLEANUP_INTERVAL_SECONDS: '3600' }).limits.historyMaxAgeSeconds).toBe(3_600);
+		expect(() => config({ LIMIT_HISTORY_HOT_RECORDS: '0', LIMIT_HISTORY_MAX_AGE_SECONDS: '3600' })).toThrow('historyMaxAgeSeconds must be at least one cleanup interval');
 	});
 
 	it.each([
@@ -171,24 +171,40 @@ describe('configuration policy boundaries', () => {
 		expect(() => config(vars)).toThrow(message);
 	});
 
-	it('accepts the documented aliases in prefixed precedence order', () => {
-		const loaded = config({
-			LIMIT_HISTORY_MAX_LIMIT: '49',
-			HISTORY_MAX_LIMIT: '48',
-			historyMaxLimit: '47',
-		});
-		expect(loaded.limits.historyMaxLimit).toBe(49);
+	it('takes limits only as LIMIT_<NAME>, and refuses old and unprefixed names with the current one', () => {
+		expect(config({ LIMIT_HISTORY_MAX_PAGE_SIZE: '49' }).limits.historyMaxPageSize).toBe(49);
+		// Earlier versions also took a bare or camelCase name: refused, not ignored.
+		expect(() => config({ HISTORY_MAX_PAGE_SIZE: '48' })).toThrow('HISTORY_MAX_PAGE_SIZE must be set as LIMIT_HISTORY_MAX_PAGE_SIZE');
+		expect(() => config({ historyMaxPageSize: '47' })).toThrow('historyMaxPageSize must be set as LIMIT_HISTORY_MAX_PAGE_SIZE');
+		// A renamed limit names its new name, by any spelling it had.
+		for (const [old, renamed] of [
+			['LIMIT_HISTORY_MAX_LIMIT', 'LIMIT_HISTORY_MAX_PAGE_SIZE'],
+			['LIMIT_RETENTION_RECORDS', 'LIMIT_HISTORY_HOT_RECORDS'],
+			['LIMIT_THREAD_LIMIT', 'LIMIT_THREADS'],
+			['LIMIT_PRIVATE_ROOM_LIMIT', 'LIMIT_PRIVATE_ROOMS'],
+			['ROOM_METADATA_LIMIT', 'LIMIT_ROOM_METADATA_BYTES'],
+			['ROOM_METADATA_TOTAL_LIMIT', 'LIMIT_ROOM_METADATA_TOTAL_BYTES'],
+			['LIMIT_ANONYMOUS_POSTS_PER_MINUTE', 'LIMIT_GUEST_POSTS_PER_MINUTE'],
+			['anonymousPostsPerMinute', 'LIMIT_GUEST_POSTS_PER_MINUTE'],
+		]) expect(() => config({ [old]: '10' })).toThrow(`${old} was renamed to ${renamed}`);
+	});
+
+	it('takes ADMISSION as a switch, on by default, and refuses the old ADMISSION_OFF', () => {
+		expect(config().admission).toBe(true);
+		expect(config({ ADMISSION: 'false' }).admission).toBe(false);
+		expect(() => config({ ADMISSION: 'off' })).toThrow('ADMISSION must be true or false');
+		expect(() => config({ ADMISSION_OFF: 'true' } as Record<string, string>)).toThrow('ADMISSION_OFF was renamed to ADMISSION');
 	});
 
 	it('parses an environment object once, and overrides or another object again', () => {
-		const env = { ...base, LIMIT_HISTORY_MAX_LIMIT: '49' } as Parameters<typeof loadConfig>[0];
+		const env = { ...base, LIMIT_HISTORY_MAX_PAGE_SIZE: '49' } as Parameters<typeof loadConfig>[0];
 		const first = loadConfig(env);
 		expect(loadConfig(env)).toBe(first);
 		expect(loadConfig({ ...env })).not.toBe(first);
-		expect(loadConfig({ ...env }).limits.historyMaxLimit).toBe(49);
-		const overridden = loadConfig(env, { historyMaxLimit: 48 });
+		expect(loadConfig({ ...env }).limits.historyMaxPageSize).toBe(49);
+		const overridden = loadConfig(env, { historyMaxPageSize: 48 });
 		expect(overridden).not.toBe(first);
-		expect(overridden.limits.historyMaxLimit).toBe(48);
+		expect(overridden.limits.historyMaxPageSize).toBe(48);
 		expect(loadConfig(env)).toBe(first);
 	});
 
@@ -198,17 +214,17 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('takes room field sizes from the wrangler vars, within one frame and the calibrated total', () => {
-		expect(config().limits).toMatchObject({ roomMetadataLimit: 8 * 1024, roomMetadataMinLimit: 1024, roomMetadataTotalLimit: 256 * 1024 });
-		expect(config({ ROOM_METADATA_LIMIT: '4096', ROOM_METADATA_MIN_LIMIT: '512', ROOM_METADATA_TOTAL_LIMIT: '65536' }).limits)
-			.toMatchObject({ roomMetadataLimit: 4096, roomMetadataMinLimit: 512, roomMetadataTotalLimit: 65536 });
+		expect(config().limits).toMatchObject({ roomMetadataBytes: 8 * 1024, roomMetadataMinBytes: 1024, roomMetadataTotalBytes: 256 * 1024 });
+		expect(config({ LIMIT_ROOM_METADATA_BYTES: '4096', LIMIT_ROOM_METADATA_MIN_BYTES: '512', LIMIT_ROOM_METADATA_TOTAL_BYTES: '65536' }).limits)
+			.toMatchObject({ roomMetadataBytes: 4096, roomMetadataMinBytes: 512, roomMetadataTotalBytes: 65536 });
 		// A room's fields stay within the calibrated 16 KiB and one frame.
-		expect(() => config({ ROOM_METADATA_LIMIT: '16385', ROOM_METADATA_TOTAL_LIMIT: '65536' })).toThrow(/metadata or cleanup/);
-		expect(() => config({ ROOM_METADATA_LIMIT: '16384', MAX_FRAME_BYTES: '16384', MAX_SNAPSHOT_BYTES: '8192', MAX_TEXT_BYTES: '4096' })).toThrow(/fit one frame/);
+		expect(() => config({ LIMIT_ROOM_METADATA_BYTES: '16385', LIMIT_ROOM_METADATA_TOTAL_BYTES: '65536' })).toThrow(/metadata or cleanup/);
+		expect(() => config({ LIMIT_ROOM_METADATA_BYTES: '16384', LIMIT_MAX_FRAME_BYTES: '16384', LIMIT_MAX_SNAPSHOT_BYTES: '8192', LIMIT_MAX_TEXT_BYTES: '4096' })).toThrow(/fit one frame/);
 		// The minimum is at most a room's limit; the total holds one full room past it, and at most 256 KiB.
-		expect(() => config({ ROOM_METADATA_MIN_LIMIT: '8193' })).toThrow(/roomMetadataMinLimit/);
-		expect(config({ ROOM_METADATA_TOTAL_LIMIT: '7168' }).limits.roomMetadataTotalLimit).toBe(7168);
-		expect(() => config({ ROOM_METADATA_TOTAL_LIMIT: '7167' })).toThrow(/roomMetadataTotalLimit/);
-		expect(() => config({ ROOM_METADATA_TOTAL_LIMIT: String(256 * 1024 + 1) })).toThrow(/roomMetadataTotalLimit/);
+		expect(() => config({ LIMIT_ROOM_METADATA_MIN_BYTES: '8193' })).toThrow(/roomMetadataMinBytes/);
+		expect(config({ LIMIT_ROOM_METADATA_TOTAL_BYTES: '7168' }).limits.roomMetadataTotalBytes).toBe(7168);
+		expect(() => config({ LIMIT_ROOM_METADATA_TOTAL_BYTES: '7167' })).toThrow(/roomMetadataTotalBytes/);
+		expect(() => config({ LIMIT_ROOM_METADATA_TOTAL_BYTES: String(256 * 1024 + 1) })).toThrow(/roomMetadataTotalBytes/);
 	});
 
 	it('takes the thread limit (LIMIT_THREADS) from the wrangler vars, bounded by the room listing it sizes rather than a fixed ceiling', () => {
@@ -218,7 +234,7 @@ describe('configuration policy boundaries', () => {
 		expect(config({ LIMIT_THREADS: '298' }).limits.threads).toBe(298);
 		expect(() => config({ LIMIT_THREADS: '299' })).toThrow(/threads \(the thread limit\) is too large for a room listing/);
 		// Smaller room fields leave a listing room for more threads.
-		expect(config({ LIMIT_THREADS: '1000', ROOM_METADATA_LIMIT: '512', ROOM_METADATA_MIN_LIMIT: '128', ROOM_METADATA_TOTAL_LIMIT: '65536' }).limits.threads).toBe(1000);
+		expect(config({ LIMIT_THREADS: '1000', LIMIT_ROOM_METADATA_BYTES: '512', LIMIT_ROOM_METADATA_MIN_BYTES: '128', LIMIT_ROOM_METADATA_TOTAL_BYTES: '65536' }).limits.threads).toBe(1000);
 		expect(() => config({ LIMIT_THREADS_PER_USER: String(DEFAULT_LIMITS.threads + 1) })).toThrow(/threadsPerUser must be between 1 and the thread limit/);
 	});
 
@@ -253,7 +269,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('rejects unsafe payload, queue, history, and maintenance combinations', () => {
-		expect(() => config({}, { historyMaxLimit: 51 })).toThrow(ConfigError);
+		expect(() => config({}, { historyMaxPageSize: 51 })).toThrow(ConfigError);
 		expect(() => config({}, { maxTextBytes: MAX_TEXT_BYTES + 1 })).toThrow(ConfigError);
 		expect(() => config({}, { pendingFramesPerConnection: 9 })).toThrow(ConfigError);
 		expect(() => config({}, { pendingBytesPerConnection: DEFAULT_LIMITS.maxFrameBytes - 1 })).toThrow(ConfigError);
@@ -266,7 +282,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('bounds reaction sets so a moved message fits one history response', () => {
-		expect(config({ REACTION_USERS_PER_MESSAGE: '64', REACTION_EMOJIS_PER_USER: '16' }).limits.reactionUsersPerMessage).toBe(64);
+		expect(config({ LIMIT_REACTION_USERS_PER_MESSAGE: '64', LIMIT_REACTION_EMOJIS_PER_USER: '16' }).limits.reactionUsersPerMessage).toBe(64);
 		expect(() => config({}, { reactionUsersPerMessage: 65 })).toThrow(ConfigError);
 		expect(() => config({}, { reactionEmojisPerUser: 17 })).toThrow(ConfigError);
 		expect(() => config({}, { reactionUsersPerMessage: 64, historyMaxResponseBytes: 64 * 1024 })).toThrow(ConfigError);

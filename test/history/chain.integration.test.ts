@@ -21,7 +21,7 @@ import { expectRetryAfter } from "../helpers/store";
 
 const MIB = 1024 * 1024;
 const DAY_MS = 86_400_000;
-const FAST = { anonymousPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
+const FAST = { guestPostsPerMinute: 100_000, ipPostsPerMinute: 100_000, globalPostsPerMinute: 100_000 };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The runtime's parts these tests drive (private members, reached as the tests reach them elsewhere). */
@@ -43,8 +43,8 @@ async function inObject(name: string, d1Records: number, fn: (object: Awaited<Re
 }
 
 function harness(runtime: Runtime, state: DurableObjectState, name: string, d1Records: number) {
-	runtime.store.config = { ...runtime.store.config, retentionRecords: 3, cleanupThresholdPercent: 100, ...FAST };
-	runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: d1Records, cleanupThresholdPercent: 100 } };
+	runtime.store.config = { ...runtime.store.config, historyHotRecords: 3, cleanupThresholdPercent: 100, ...FAST };
+	runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, historyHotRecords: 3, historyD1Records: d1Records, cleanupThresholdPercent: 100 } };
 	const server = `${name}-${Date.now()}`;
 	const build = (bindings: Record<string, unknown>) => buildHistoryChain({
 		layout: historyLayout(bindings as never, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store,
@@ -151,8 +151,8 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 		const logs = await runInDurableObject(stub(), async (instance, state) => {
 			const runtime = instance as unknown as Runtime;
 			// Three records in SQLite, four more in D1.
-			runtime.store.config = { ...runtime.store.config, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100, ...FAST };
-			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };
+			runtime.store.config = { ...runtime.store.config, historyHotRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100, ...FAST };
+			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, historyHotRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };
 			// The chain takes its tiers' limits when built.
 			runtime.history = buildHistoryChain({ layout: historyLayout(env, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
 			const logs: string[] = [];

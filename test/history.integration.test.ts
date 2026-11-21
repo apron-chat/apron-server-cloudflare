@@ -34,10 +34,10 @@ function logId(result: StoreMutationResult): bigint {
 }
 
 const ROOMY: Partial<StoreConfig> = {
-	anonymousPostsPerMinute: 1_000,
+	guestPostsPerMinute: 1_000,
 	ipPostsPerMinute: 1_000,
 	globalPostsPerMinute: 1_000,
-	anonymousPostsPerDay: 1_000,
+	guestPostsPerDay: 1_000,
 	ipPostsPerDay: 1_000,
 };
 

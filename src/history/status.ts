@@ -41,7 +41,7 @@ export function d1OffReason(off: D1Off): string {
 /** `/status`'s history lines. */
 export async function statusLines(input: StatusInput): Promise<string[]> {
 	const { limits } = input;
-	const hotLimit = limits.retentionRecords > 0 ? limits.retentionRecords : undefined;
+	const hotLimit = limits.historyHotRecords > 0 ? limits.historyHotRecords : undefined;
 	const hot = () => {
 		try {
 			return against(input.hotRecords(), hotLimit, limits.cleanupThresholdPercent);

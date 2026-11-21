@@ -127,7 +127,7 @@ export interface RestorePort {
 	normalize(record: ChatRecord): ChatRecord | null;
 	/** Adds placeholder users, marked unclaimed. */
 	restoreUsers(users: readonly ArchivedUser[]): Promise<void>;
-	/** The accounts here, in use and at most (registeredIdentityCount): each placeholder takes one. */
+	/** The accounts here, in use and at most (registeredAccounts): each placeholder takes one. */
 	accounts(): Promise<{ used: number; limit: number }>;
 	/** Why there is no room here for these new rooms (the caps restoreRoom checks), or undefined: asked before anything is written. */
 	roomCapacity(rooms: readonly RoomListing[]): Promise<string | undefined>;

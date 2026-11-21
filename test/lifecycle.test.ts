@@ -108,10 +108,10 @@ it("enforces the per-IP anonymous connection cap (pending and guest sockets) and
 	// Two browsers on one address, such as a second account in a private
 	// window: each has a guest connection and a sign-in connection beside it,
 	// and one is reloading. All fit under the cap.
-	expect(DEFAULT_LIMITS.anonymousConnectionsPerIp).toBeGreaterThanOrEqual(5);
+	expect(DEFAULT_LIMITS.guestConnectionsPerIp).toBeGreaterThanOrEqual(5);
 	const first = await guestSocket(ip);
 	const others = [await pendingSocket(ip), await guestSocket(ip), await pendingSocket(ip), await pendingSocket(ip)];
-	while (others.length < DEFAULT_LIMITS.anonymousConnectionsPerIp - 1) others.push(await pendingSocket(ip));
+	while (others.length < DEFAULT_LIMITS.guestConnectionsPerIp - 1) others.push(await pendingSocket(ip));
 	try {
 		const rejected = await SELF.fetch("https://lifecycle.test/ws", {
 			headers: {

@@ -105,7 +105,7 @@ it('answers every request about a private room someone is not in exactly as for 
 		const real = probes(roomId, secret);
 		const fake = probes(missingRoom, missingMessage);
 		// Bob, signed in, and a guest. Each pair on a connection of its own: a
-		// third refused request in a minute closes one (repeatedPolicyViolations).
+		// third refused request in a minute closes one (policyViolationsBeforeClose).
 		for (const token of [bob.token, undefined]) {
 			for (let index = 0; index < real.length; index += 1) {
 				const peer = await session(token);

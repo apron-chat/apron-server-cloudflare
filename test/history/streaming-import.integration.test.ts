@@ -12,10 +12,10 @@ import { Store, type StoreConfig } from "../../src/store";
 import { withStore } from "../helpers/store";
 
 const CONFIG: Partial<StoreConfig> = {
-	anonymousPostsPerMinute: 1_000, registeredPostsPerMinute: 1_000, trustedPostsPerMinute: 1_000,
+	guestPostsPerMinute: 1_000, registeredPostsPerMinute: 1_000, trustedPostsPerMinute: 1_000,
 	ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000, registrationsPerIpDay: 1_000, registrationsPerDay: 1_000,
 };
-const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
+const LIMITS = { historyHotRecords: 5_000, historyMaxAgeSeconds: 0, historyD1Records: 0, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 
 /** Two rooms and a thread of `lobby`, the thread's records first in the file (its parent's start later), many records to a line. */
 async function archiveText(base: number): Promise<string> {

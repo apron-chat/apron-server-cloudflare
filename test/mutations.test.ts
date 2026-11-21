@@ -5,8 +5,8 @@ import { BY_AGE, errorCode, expectRetryAfter, messagesOf, RETENTION_MS, withStor
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
 const ROOMY: Partial<StoreConfig> = {
-	anonymousPostsPerMinute: 1_000,
-	anonymousPostsPerDay: 1_000,
+	guestPostsPerMinute: 1_000,
+	guestPostsPerDay: 1_000,
 	ipPostsPerMinute: 1_000,
 	ipPostsPerDay: 1_000,
 	globalPostsPerMinute: 1_000,
@@ -278,7 +278,7 @@ it("merges ext one level deep on message saves and room_set (§4.13)", async () 
 		expect(saved.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
 		const keptRoom = store.mutate(op(clock, "alice", "r3", "room_set", { room_id: roomId, title: "T" }));
 		expect(keptRoom.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
-		const big = "y".repeat(Math.ceil(DEFAULT_LIMITS.roomMetadataLimit * 0.6));
+		const big = "y".repeat(Math.ceil(DEFAULT_LIMITS.roomMetadataBytes * 0.6));
 		store.mutate(op(clock, "alice", "r4", "room_set", { room_id: roomId, title: "T", ext: { big } }));
 		expect(errorCode(() => store.mutate(op(clock, "alice", "r5", "room_set", { room_id: roomId, title: "T", ext: { bigger: big } })))).toBe("too_large");
 		const emptied = store.mutate(op(clock, "alice", "r6", "room_set", { room_id: roomId, title: "T", ext: { demo: {}, more: "", big: "" } }));
@@ -333,7 +333,7 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(errorCode(() => store.mutate(op(clock, "alice", "orphan", "room_set", { parent_room_id: "missing", title: "x" })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-title", "room_set", { parent_room_id: "general", title: 7 })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-description", "room_set", { parent_room_id: "general", description: { text: "x" } })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(DEFAULT_LIMITS.roomMetadataLimit) })))).toBe("too_large");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(DEFAULT_LIMITS.roomMetadataBytes) })))).toBe("too_large");
 		// A private room is never a thread, and only a registered user starts one (§4.2.4).
 		expect(errorCode(() => store.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("denied");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-private", "room_set", { parent_room_id: "general", private: "yes" })))).toBe("invalid_params");
@@ -610,7 +610,7 @@ it("charges reactions and room changes against posting quotas and keeps accepted
 		expect(store.mutate(op(clock, "alice", "react", "reactions", { message_id: target.result.message_id, emojis: ["👍"] })).deduplicated).toBe(true);
 		clock.value += 61_000;
 		expect(store.mutate(op(clock, "alice", "react-3", "reactions", { message_id: target.result.message_id, emojis: [] })).broadcasts).toHaveLength(1);
-	}, { anonymousPostsPerMinute: 3 });
+	}, { guestPostsPerMinute: 3 });
 });
 
 it("rolls back failed writes atomically while keeping their resource reservation spent", async () => {
@@ -640,7 +640,7 @@ it("rolls back failed writes atomically while keeping their resource reservation
 	});
 });
 
-const DEDUP_CONFIG: Partial<StoreConfig> = { anonymousPostsPerMinute: 1 };
+const DEDUP_CONFIG: Partial<StoreConfig> = { guestPostsPerMinute: 1 };
 
 it("deduplicates canonical retries before quotas, survives restart, and expires independently", async () => {
 	await withStore("dedup", (store, clock, state) => {
@@ -680,7 +680,7 @@ it("bounds every room's client fields past the minimum together, refusing only a
 		const note = (length: number) => `"é"\n${"x".repeat(length - 6)}`;
 		const fields = (length: number) => ({ title: "Notes", description: note(length) });
 		const first = String(store.mutate(op(clock, "mia", "first", "room_set", { parent_room_id: "general", ...fields(900) })).result.room_id);
-		const config = (total: number) => ({ ...ROOMY, roomMetadataLimit: per, roomMetadataMinLimit: floor, roomMetadataTotalLimit: total });
+		const config = (total: number) => ({ ...ROOMY, roomMetadataBytes: per, roomMetadataMinBytes: floor, roomMetadataTotalBytes: total });
 		const limited = new Store(state, config(general + excess(fields(900)) + excess(fields(800))), clock.clock);
 		limited.initialize();
 		expect(errorCode(() => limited.mutate(op(clock, "alice", "over", "room_set", { parent_room_id: "general", ...fields(801) })))).toBe("too_large");
@@ -713,7 +713,7 @@ it("answers count limits with denied and size limits with too_large (§1.1)", as
 		expect(errorCode(() => post(store, clock, "alice", "mention", { body: { text: "x", mentions: ["u".repeat(257)] } }))).toBe("too_large");
 		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(DEFAULT_LIMITS.maxTextBytes + 1) } }))).toBe("too_large");
 		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(DEFAULT_LIMITS.maxSnapshotBytes + 1) } }))).toBe("too_large");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(DEFAULT_LIMITS.roomMetadataLimit + 1) } })))).toBe("too_large");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(DEFAULT_LIMITS.roomMetadataBytes + 1) } })))).toBe("too_large");
 	});
 });
 

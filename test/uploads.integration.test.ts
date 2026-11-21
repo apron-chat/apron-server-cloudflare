@@ -244,7 +244,7 @@ describe('store uploads', () => {
 		// History is kept by count, so this bounds only what an age ceiling
 		// keeps: a sign-in anywhere in it, and the day cleanup may lag,
 		// refreshes the avatar.
-		const kept = DEFAULT_LIMITS.retentionSeconds + DEFAULT_LIMITS.cleanupSeconds;
+		const kept = DEFAULT_LIMITS.historyMaxAgeSeconds + DEFAULT_LIMITS.cleanupIntervalSeconds;
 		expect(UPLOADS.avatarRefreshSeconds).toBeGreaterThanOrEqual(kept);
 		expect(UPLOADS.avatarRetentionSeconds).toBeGreaterThan(UPLOADS.avatarRefreshSeconds);
 		await withStore('uploads-avatar-active', { uploads: UPLOADS }, (store, clock) => {

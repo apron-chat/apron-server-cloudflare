@@ -44,7 +44,7 @@ test('a browser opening the server as a page is redirected to the web client wit
 });
 
 test('generation is idempotent and preserves unrelated Wrangler settings', () => {
-	const original = 'name = "example"\n[vars]\nADMISSION_OFF = "true"\n';
+	const original = 'name = "example"\n[vars]\nADMISSION = "false"\n';
 	const initial = replaceBinding(original, renderBinding(namespaces));
 	assert.equal(replaceBinding(initial, renderBinding(namespaces)), initial);
 	const changed = replaceBinding(initial, renderBinding({ attempts: '456', prefix: '457', location: '458', live: '459' }));
@@ -414,7 +414,7 @@ test("production writes out the plan's own history limits, and daily backups", (
 	const { production } = splitPreviews(readFileSync(new URL('../wrangler.production.toml', import.meta.url), 'utf8'));
 	const vars = wranglerVars(production);
 	const config = loadConfig(vars);
-	for (const key of ['retentionRecords', 'retentionSeconds', 'historyD1Records', 'historyColdRecords', 'cleanupThresholdPercent', 'roomCreationWindowSeconds']) {
+	for (const key of ['historyHotRecords', 'historyMaxAgeSeconds', 'historyD1Records', 'historyColdRecords', 'cleanupThresholdPercent', 'roomCreationWindowSeconds']) {
 		const name = `LIMIT_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`;
 		assert.ok(Object.hasOwn(vars, name), `wrangler.production.toml sets ${name}`);
 		assert.equal(config.limits[key], DEFAULT_LIMITS[key], key);

@@ -107,7 +107,7 @@ it('always keeps the keptActiveAccounts most recently active, however idle', asy
 });
 
 it('frees a retired user id once history has expired past its marker, in two steps, a marker without one starting at the log head', async () => {
-	await withStore('retired-ids', { retentionRecords: 0, retentionMs: 7 * day, cleanupIntervalMs: 3_600_000 }, (store, sql, clock) => {
+	await withStore('retired-ids', { historyHotRecords: 0, retentionMs: 7 * day, cleanupIntervalMs: 3_600_000 }, (store, sql, clock) => {
 		const post = (text: string) => store.mutate({
 			userId: 'poster', ipKey: 'poster-ip', requestId: text, method: 'message', now: clock.now,
 			params: { room_id: 'general', body: { format: 'plain', text } }, identity: { user_id: 'poster', name: 'Poster' },

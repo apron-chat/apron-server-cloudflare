@@ -84,9 +84,9 @@ async function configure(update: (config: ServerInternals['config']) => void): P
  */
 async function guestPostsPerMinute(value: number): Promise<number> {
 	return runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => {
-		const store = (instance as unknown as { store: { config: { anonymousPostsPerMinute: number } } }).store;
-		const previous = store.config.anonymousPostsPerMinute;
-		store.config.anonymousPostsPerMinute = value;
+		const store = (instance as unknown as { store: { config: { guestPostsPerMinute: number } } }).store;
+		const previous = store.config.guestPostsPerMinute;
+		store.config.guestPostsPerMinute = value;
 		return previous;
 	});
 }

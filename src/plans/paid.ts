@@ -61,8 +61,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// pushes out become read-only. No age limit: a removed account's
 		// user_id is retired until the log has moved past it, not for a time
 		// (Store.dueRetiredUserIds).
-		retentionRecords: 5_000,
-		retentionSeconds: 0,
+		historyHotRecords: 5_000,
+		historyMaxAgeSeconds: 0,
 		historyD1Records: 100_000,
 		historyColdRecords: 0,
 		// Those are ceilings: each daily cleanup moves what is past 80% of
@@ -88,7 +88,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Registered users' statuses at most 15 s late: at most 5,760 presence
 		// wakes a day, about 52,000 maintenance writes of Paid's 1.5 million.
 		presenceAlarmSeconds: 15,
-		cleanupSeconds: 24 * 60 * 60,
+		cleanupIntervalSeconds: 24 * 60 * 60,
 		// A first visit opens every joined room's newest page at once: room
 		// for 60 in a burst, then 20 a minute. A page is charged one written
 		// row (its budget row), and its two limiter rows every fourth page,
@@ -104,7 +104,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		historyRequestsPerIpDay: 30_000,
 		// A front-page day: about 40,000 visitors, each opening a few pages.
 		historyRequestsPerDay: 400_000,
-		anonymousPostsPerDay: 200,
+		guestPostsPerDay: 200,
 		registeredPostsPerDay: 1_000,
 		// Role holders are people an admin trusts; this guards against a buggy
 		// client more than abuse. A re-thread is one post per message moved,
@@ -115,7 +115,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		trustedPostsPerDay: 4_000,
 		// An office or conference behind one address posts together: several
 		// registered users at their own 20 a minute each. Guests stay at
-		// anonymousPostsPerMinute per address, and sign-ups per address
+		// guestPostsPerMinute per address, and sign-ups per address
 		// (registrationsPerIpDay) bound how many accounts share it.
 		ipPostsPerMinute: 120,
 		ipPostsPerDay: 5_000,
@@ -127,12 +127,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		registrationsPerDay: 5_000,
 		// About 2 KB an identity with its passkey: 100 MB at the cap. Dormant
 		// accounts are pruned (cleanup), so the cap is not spent for good.
-		registeredIdentityCount: 50_000,
+		registeredAccounts: 50_000,
 		// Every slot is room for one limiter's counters. A new address takes
 		// four (admission, frames, auth, history), so this is about 125,000
 		// addresses in a day: past it, a new address cannot connect until
 		// cleanup. About 75 MB at the cap, well under the database watermarks.
-		limiterRecordCap: 500_000,
+		limiterRecords: 500_000,
 		// The memory bound: each open connection may queue
 		// pendingBytesPerConnection of incoming frames, and all of them
 		// together at most MAX_SOCKET_QUEUE_ALLOCATION (32 MiB): 500 at 64 KiB.
@@ -150,7 +150,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// opening a shared link together, each a guest until they sign in.
 		// These are fairness limits; openConnections and the daily admissions
 		// below bound what they can spend.
-		anonymousConnectionsPerIp: 24,
+		guestConnectionsPerIp: 24,
 		connectionsPerIp: 32,
 		// A phone, a desktop and a tab or two, with room for a socket whose
 		// peer vanished (sleep, a network change) and still counts until it
@@ -187,7 +187,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// connections, a few frames each.
 		globalFramesPerMinute: 5_000,
 		// The calibrated ceiling; members cost only reads.
-		roomListMembers: 200,
+		roomListMembersPerRoom: 200,
 		// A guest visit from a new address writes about 30 rows and a repeat
 		// one about 15, so a front-page day's connections alone write about 2
 		// million; these leave room for the day's chat. Early in a month these
