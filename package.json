@@ -19,7 +19,9 @@
 		"test:watch": "vitest",
 		"cf-typegen": "wrangler types",
 		"usage:report": "node scripts/usage-report.mjs",
-		"roundtrip": "node scripts/roundtrip.mjs"
+		"roundtrip": "node scripts/roundtrip.mjs",
+		"cost:profile": "node scripts/cost-profile.mjs --write docs/cost-profile.json",
+		"cost:check": "node scripts/cost-profile.mjs --check docs/cost-profile.json"
 	},
 	"dependencies": {
 		"@apron/archive": "*",
