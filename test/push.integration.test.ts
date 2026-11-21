@@ -615,7 +615,7 @@ describe('push over the socket', () => {
 					credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 				});
 				const browser = await testBrowser();
-				store.push.register({ userId, url: `https://push.example.net/send/${userId}`, p256dh: browser.p256dh, auth: browser.auth });
+				store.push!.register({ userId, url: `https://push.example.net/send/${userId}`, p256dh: browser.p256dh, auth: browser.auth });
 			}
 		});
 		try {
@@ -744,7 +744,7 @@ describe('wake scopes', () => {
 		} finally {
 			sender.close();
 			// Every other test here posts in general: this moderator must wake for none of it.
-			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.push.clearSubscriptions(moderatorId); });
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.push!.clearSubscriptions(moderatorId); });
 		}
 	});
 });
@@ -1486,7 +1486,7 @@ describe('held wakes', () => {
 			expect(JSON.parse((await decryptPush(pushes[0].body, modSub.browser)).plaintext).message.message_id).toBe(mention.result.message_id);
 		} finally {
 			alice.close(); mod.close();
-			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.push.clearSubscriptions(modId); });
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.push!.clearSubscriptions(modId); });
 		}
 	});
 
@@ -1665,15 +1665,15 @@ describe('security review fixes', () => {
 					credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 				});
 			}
-			store.push.register({ userId: 'old', url: 'https://push.retired.example/x', ...keys, now: clock.value });
-			store.push.register({ userId: 'new', url: 'https://push.example.net/y', ...keys, now: clock.value });
-			const claimed = store.push.claim({
+			store.push!.register({ userId: 'old', url: 'https://push.retired.example/x', ...keys, now: clock.value });
+			store.push!.register({ userId: 'new', url: 'https://push.example.net/y', ...keys, now: clock.value });
+			const claimed = store.push!.claim({
 				senderId: 'sender', roomId: 'general', now: clock.value,
 				candidates: [{ userId: 'old', reasons: WAKE_SCOPES.mentions }, { userId: 'new', reasons: WAKE_SCOPES.mentions }],
 				allowed: (url) => url.startsWith('https://push.example.net/'),
 			});
 			expect(claimed.subscriptions.map((row) => row.userId)).toEqual(['new']);
-			expect(store.push.sentToday(clock.value)).toBe(1);
+			expect(store.push!.sentToday(clock.value)).toBe(1);
 		});
 	});
 
@@ -1694,7 +1694,7 @@ describe('security review fixes', () => {
 			// The bot's token is replaced: its registrations go with the old one.
 			const botId = `bot_${userId}`;
 			expect((await request(peer, 'bot', 'command', { body: { text: '/invite-bot' } })).result).toEqual({});
-			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.push.register({
+			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.push!.register({
 				userId: botId, url: 'https://push.example.net/bot', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22),
 			}));
 			expect(await subscriptionsOf(botId)).toHaveLength(1);
@@ -1758,7 +1758,7 @@ describe('push subscriptions in the store', () => {
 		});
 	}
 	const claim = (store: Store, clock: TestClock, candidates: string[], roomId = 'general', senderId = 'sender') =>
-		store.push.claim({ senderId, roomId, candidates: candidates.map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.value });
+		store.push!.claim({ senderId, roomId, candidates: candidates.map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.value });
 
 	it('keeps subscriptionsPerUser per user, replacing the least recently registered; registrations are per user', async () => {
 		const keys = await browserKeys();
@@ -1767,35 +1767,35 @@ describe('push subscriptions in the store', () => {
 			registerUser(store, clock, 'ben');
 			const url = (n: number) => `https://push.example.net/${n}`;
 			for (let n = 0; n < POLICY.subscriptionsPerUser; n++) {
-				store.push.register({ userId: 'ann', url: url(n), ...keys, now: clock.value });
+				store.push!.register({ userId: 'ann', url: url(n), ...keys, now: clock.value });
 				clock.value += 1_000;
 			}
 			// Registering the oldest again, unchanged within a day, writes nothing: it stays the oldest.
-			store.push.register({ userId: 'ann', url: url(0), ...keys, now: clock.value });
-			store.push.register({ userId: 'ann', url: url(99), ...keys, now: clock.value });
+			store.push!.register({ userId: 'ann', url: url(0), ...keys, now: clock.value });
+			store.push!.register({ userId: 'ann', url: url(99), ...keys, now: clock.value });
 			const urls = pushSubscriptionsOf(state, 'ann').map((row) => row.url);
 			expect(urls).toHaveLength(POLICY.subscriptionsPerUser);
 			expect(urls[0]).toBe(url(99));
 			expect(urls).not.toContain(url(0));
 			// A changed push_id is a change, even within a day; an absent one removes it.
 			const of = (userId: string, n: number) => pushSubscriptionsOf(state, userId).find((row) => row.url === url(n));
-			store.push.register({ userId: 'ann', url: url(1), ...keys, pushId: 'one', now: clock.value });
+			store.push!.register({ userId: 'ann', url: url(1), ...keys, pushId: 'one', now: clock.value });
 			expect(of('ann', 1)?.pushId).toBe('one');
-			store.push.register({ userId: 'ann', url: url(1), ...keys, pushId: 'two', now: clock.value });
+			store.push!.register({ userId: 'ann', url: url(1), ...keys, pushId: 'two', now: clock.value });
 			expect(of('ann', 1)?.pushId).toBe('two');
-			store.push.register({ userId: 'ann', url: url(1), ...keys, now: clock.value });
+			store.push!.register({ userId: 'ann', url: url(1), ...keys, now: clock.value });
 			expect(of('ann', 1)).not.toHaveProperty('pushId');
-			expect(() => store.push.register({ userId: 'ann', url: url(1), ...keys, pushId: 'not ok' })).toThrow(/push_id/);
+			expect(() => store.push!.register({ userId: 'ann', url: url(1), ...keys, pushId: 'not ok' })).toThrow(/push_id/);
 			// Ben registers the same endpoint: both hold it, each their own.
-			store.push.register({ userId: 'ben', url: url(99), ...keys, pushId: 'ben', now: clock.value });
+			store.push!.register({ userId: 'ben', url: url(99), ...keys, pushId: 'ben', now: clock.value });
 			expect(pushSubscriptionsOf(state, 'ben').map((row) => row.url)).toEqual([url(99)]);
 			expect(of('ann', 99)).toBeDefined();
 			// Unregistering takes only the caller's own.
-			store.push.remove({ userId: 'ann', url: url(99) });
+			store.push!.remove({ userId: 'ann', url: url(99) });
 			expect(of('ann', 99)).toBeUndefined();
 			expect(pushSubscriptionsOf(state, 'ben')).toHaveLength(1);
 			// No identity, no subscription.
-			expect(() => store.push.register({ userId: 'guest_7', url: url(7), ...keys })).toThrow(/Sign in/);
+			expect(() => store.push!.register({ userId: 'guest_7', url: url(7), ...keys })).toThrow(/Sign in/);
 		});
 	});
 
@@ -1804,7 +1804,7 @@ describe('push subscriptions in the store', () => {
 		await withStore('push-slots', { push: { ...POLICY, wakesPerMessage: 2 } }, (store, clock, state) => {
 			for (const userId of ['fay', 'gus', 'hal']) {
 				registerUser(store, clock, userId);
-				store.push.register({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
+				store.push!.register({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
 			}
 			const nobody = Array.from({ length: 10 }, (_, index) => `nobody_${index}`);
 			const first = claim(store, clock, [...nobody, 'fay', 'gus', 'hal']);
@@ -1824,18 +1824,18 @@ describe('push subscriptions in the store', () => {
 			atMidday(clock);
 			for (const userId of ['cy', 'di', 'ed']) {
 				registerUser(store, clock, userId);
-				for (const n of [1, 2]) store.push.register({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+				for (const n of [1, 2]) store.push!.register({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
 			}
 			expect(claim(store, clock, [])).toEqual({ subscriptions: [], skipped: 0 });
 			const first = claim(store, clock, ['cy', 'di', 'nobody']);
 			expect(first.subscriptions).toHaveLength(3);
 			expect(first.skipped).toBe(1);
-			expect(store.push.sentToday(clock.value)).toBe(3);
+			expect(store.push!.sentToday(clock.value)).toBe(3);
 			clock.value += 1_000;
 			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], skipped: 2 });
 			clock.value += DAY;
 			expect(claim(store, clock, ['cy'], 'general', 'sal').subscriptions).toHaveLength(2);
-			expect(store.push.sentToday(clock.value)).toBe(2);
+			expect(store.push!.sentToday(clock.value)).toBe(2);
 		});
 	});
 
@@ -1845,7 +1845,7 @@ describe('push subscriptions in the store', () => {
 			atMidday(clock);
 			for (const userId of ['fi', 'gil', 'hu']) {
 				registerUser(store, clock, userId);
-				for (const n of [1, 2]) store.push.register({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+				for (const n of [1, 2]) store.push!.register({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
 			}
 			// Claims are charged whether or not they are ever delivered, so
 			// registrations that always fail cannot spend the server's day for a
@@ -1875,15 +1875,15 @@ describe('push subscriptions in the store', () => {
 			registerUser(store, clock, 'ida');
 			registerUser(store, clock, 'jon');
 			const url = 'https://push.example.net/shared';
-			store.push.register({ userId: 'ida', url, ...old, now: clock.value });
-			store.push.register({ userId: 'jon', url, ...old, now: clock.value });
+			store.push!.register({ userId: 'ida', url, ...old, now: clock.value });
+			store.push!.register({ userId: 'jon', url, ...old, now: clock.value });
 			// Ida's push came back gone: only her registration goes.
-			store.push.forgetSubscriptions([{ userId: 'ida', url, p256dh: old.p256dh }], clock.value);
+			store.push!.forgetSubscriptions([{ userId: 'ida', url, p256dh: old.p256dh }], clock.value);
 			expect(pushSubscriptionsOf(state, 'ida')).toEqual([]);
 			expect(pushSubscriptionsOf(state, 'jon')).toHaveLength(1);
 			// Jon registered again with new keys before his gone push came back: the fresh one stays.
-			store.push.register({ userId: 'jon', url, ...fresh, now: clock.value });
-			store.push.forgetSubscriptions([{ userId: 'jon', url, p256dh: old.p256dh }], clock.value);
+			store.push!.register({ userId: 'jon', url, ...fresh, now: clock.value });
+			store.push!.forgetSubscriptions([{ userId: 'jon', url, p256dh: old.p256dh }], clock.value);
 			expect(pushSubscriptionsOf(state, 'jon').map((row) => row.p256dh)).toEqual([fresh.p256dh]);
 		});
 	});
@@ -1895,17 +1895,17 @@ describe('push subscriptions in the store', () => {
 			const users = Array.from({ length: 50 }, (_, index) => `many_${index}`);
 			for (const userId of users) {
 				registerUser(store, clock, userId);
-				store.push.register({ userId, url, ...keys, now: clock.value });
+				store.push!.register({ userId, url, ...keys, now: clock.value });
 			}
 			// Every user's 410 forgets that user's row alone, within its reservation.
 			const claimed = claim(store, clock, users.slice(0, 32));
 			expect(claimed.subscriptions).toHaveLength(POLICY.wakesPerMessage);
-			store.push.forgetSubscriptions(claimed.subscriptions, clock.value);
-			store.push.forgetSubscriptions([{ userId: users[49], url, p256dh: keys.p256dh }], clock.value);
+			store.push!.forgetSubscriptions(claimed.subscriptions, clock.value);
+			store.push!.forgetSubscriptions([{ userId: users[49], url, p256dh: keys.p256dh }], clock.value);
 			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			expect(users.filter((userId) => pushSubscriptionsOf(state, userId).length)).toHaveLength(50 - POLICY.wakesPerMessage - 1);
 			// The store still takes work.
-			expect(() => store.push.register({ userId: users[0], url, ...keys, now: clock.value })).not.toThrow();
+			expect(() => store.push!.register({ userId: users[0], url, ...keys, now: clock.value })).not.toThrow();
 		});
 	});
 
@@ -1914,11 +1914,11 @@ describe('push subscriptions in the store', () => {
 		await withStore('push-expiry', config, (store, clock, state) => {
 			registerUser(store, clock, 'kit');
 			registerUser(store, clock, 'lou');
-			store.push.register({ userId: 'kit', url: 'https://push.example.net/kit', ...keys, now: clock.value });
-			store.push.register({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
+			store.push!.register({ userId: 'kit', url: 'https://push.example.net/kit', ...keys, now: clock.value });
+			store.push!.register({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
 			clock.value += (POLICY.pushExpiryDays - 1) * DAY;
 			// Lou's browser connects again: more than a day on, the registration is refreshed.
-			store.push.register({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
+			store.push!.register({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
 			clock.value += DAY + 1_000;
 			expect(claim(store, clock, ['kit', 'lou']).subscriptions.map((row) => row.userId)).toEqual(['lou']);
 			expect(pushSubscriptionsOf(state, 'kit')).toHaveLength(1);
@@ -1936,7 +1936,7 @@ describe('push subscriptions in the store', () => {
 		await withStore('push-mute', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock, state) => {
 			for (const userId of ['mo', 'ned', 'dee']) {
 				registerUser(store, clock, userId);
-				store.push.register({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
+				store.push!.register({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
 			}
 			const muteOf = (userId: string) => store.reads.statusInputs(userId, clock.value).muteUntil;
 			expect(store.accounts.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toEqual({ changed: true, untilMs: clock.value + 90_500 });
@@ -1977,16 +1977,16 @@ describe('push subscriptions in the store', () => {
 		const keys = await browserKeys();
 		await withStore('push-room-mute', { push: { ...POLICY } }, (store, clock, state) => {
 			registerUser(store, clock, 'rho');
-			store.push.register({ userId: 'rho', url: 'https://push.example.net/rho', ...keys, now: clock.value });
+			store.push!.register({ userId: 'rho', url: 'https://push.example.net/rho', ...keys, now: clock.value });
 			const thread = store.messages.mutate({
 				userId: 'rho', ipKey: 'ip-rho', requestId: 'thread', method: 'room_set', now: clock.value,
 				identity: { user_id: 'rho' }, params: { parent_room_id: 'general', title: 'A thread' },
 			}).result.room_id as string;
 			expect(store.reads.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: clock.value + 10_000, now: clock.value })).toEqual({ changed: true, untilMs: clock.value + 10_000 });
 			// The parent's mute silences the thread, but for a mention, which gets through with only `mentions`.
-			const reply = () => store.push.claim({ senderId: 'sender', roomId: thread, candidates: [{ userId: 'rho', reasons: WAKE_SCOPES.replies }], now: clock.value });
+			const reply = () => store.push!.claim({ senderId: 'sender', roomId: thread, candidates: [{ userId: 'rho', reasons: WAKE_SCOPES.replies }], now: clock.value });
 			expect(reply()).toEqual({ subscriptions: [], skipped: 0 });
-			const mentioned = store.push.claim({ senderId: 'sender', roomId: thread, candidates: [{ userId: 'rho', reasons: WAKE_SCOPES.mentions | WAKE_SCOPES.replies }], now: clock.value });
+			const mentioned = store.push!.claim({ senderId: 'sender', roomId: thread, candidates: [{ userId: 'rho', reasons: WAKE_SCOPES.mentions | WAKE_SCOPES.replies }], now: clock.value });
 			expect(mentioned.subscriptions.map((subscription) => subscription.reasons)).toEqual([WAKE_SCOPES.mentions]);
 			expect(store.reads.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: true });
 			expect(store.reads.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: false });
@@ -2021,16 +2021,16 @@ describe('push subscriptions in the store', () => {
 			for (const [userId, role] of Object.entries(roles)) {
 				registerUser(store, clock, userId);
 				if (role) store.accounts.setRole({ userId, role, on: true, now: clock.value });
-				store.push.register({ userId, url: `https://push.example.net/${userId}`, ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+				store.push!.register({ userId, url: `https://push.example.net/${userId}`, ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
 			}
 			const wakeOf = (userId: string) => pushSubscriptionsOf(state, userId).map((row) => row.wake);
 			expect(wakeOf('mia')).toEqual([['mentions', 'joined']]);
 			expect(wakeOf('rob')).toEqual([['mentions']]);
 			expect(wakeOf('uma')).toEqual([['mentions']]);
-			expect(store.push.joinedWakers(clock.value).sort()).toEqual(['ada', 'lea', 'mia']);
+			expect(store.push!.joinedWakers(clock.value).sort()).toEqual(['ada', 'lea', 'mia']);
 			store.rooms.changeMembership({ userId: 'lea', ipKey: 'ip-lea', roomId: 'general', join: false, now: clock.value });
 			const joined = (roomId: string, userIds: string[], reasons: number = WAKE_SCOPES.joined) =>
-				store.push.claim({ senderId: 'sender', roomId, candidates: userIds.map((userId) => ({ userId, reasons })), now: clock.value }).subscriptions
+				store.push!.claim({ senderId: 'sender', roomId, candidates: userIds.map((userId) => ({ userId, reasons })), now: clock.value }).subscriptions
 					.map((row) => [row.userId, row.reasons]);
 			// Lea left general; Rob and Uma never kept `joined`.
 			expect(joined('general', ['ada', 'lea', 'mia', 'rob', 'uma'])).toEqual([['ada', WAKE_SCOPES.joined], ['mia', WAKE_SCOPES.joined]]);
@@ -2056,12 +2056,12 @@ describe('push subscriptions in the store', () => {
 			// Qualifying otherwise as well, she is pushed for that alone.
 			expect(joined('general', ['mia'], WAKE_SCOPES.joined | WAKE_SCOPES.mentions)).toEqual([['mia', WAKE_SCOPES.mentions]]);
 			// Her next registration drops it.
-			store.push.register({ userId: 'mia', url: 'https://push.example.net/mia', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+			store.push!.register({ userId: 'mia', url: 'https://push.example.net/mia', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
 			expect(wakeOf('mia')).toEqual([['mentions']]);
-			expect(store.push.joinedWakers(clock.value).sort()).toEqual(['ada', 'lea']);
+			expect(store.push!.joinedWakers(clock.value).sort()).toEqual(['ada', 'lea']);
 			// Expired registrations are not read.
 			clock.value += POLICY.pushExpiryDays * DAY + 1;
-			expect(store.push.joinedWakers(clock.value)).toEqual([]);
+			expect(store.push!.joinedWakers(clock.value)).toEqual([]);
 			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
@@ -2073,8 +2073,8 @@ describe('push subscriptions in the store', () => {
 			atMidday(clock);
 			registerUser(store, clock, 'mo');
 			store.accounts.setRole({ userId: 'mo', role: 'mod', on: true, now: clock.value });
-			store.push.register({ userId: 'mo', url: 'https://push.example.net/mo', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
-			const push = (reasons: number, sender = 'sam') => store.push.claim({ senderId: sender, roomId: 'general', candidates: [{ userId: 'mo', reasons }], now: clock.value });
+			store.push!.register({ userId: 'mo', url: 'https://push.example.net/mo', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+			const push = (reasons: number, sender = 'sam') => store.push!.claim({ senderId: sender, roomId: 'general', candidates: [{ userId: 'mo', reasons }], now: clock.value });
 			const counter = (scope: string, key: string) =>
 				integer(state.storage.sql.exec("SELECT posts_day FROM principal_limits WHERE scope = ? AND principal_key = ?", scope, key).toArray()[0]?.posts_day ?? 0);
 			expect(push(WAKE_SCOPES.joined).subscriptions.map((row) => row.reasons)).toEqual([WAKE_SCOPES.joined]);
@@ -2118,8 +2118,8 @@ describe('push subscriptions in the store', () => {
 		await withStore('push-unread', { push: { ...POLICY, coalesceSeconds: 1 } }, (store, clock) => {
 			atMidday(clock);
 			registerUser(store, clock, 'uma');
-			store.push.register({ userId: 'uma', url: 'https://push.example.net/uma-1', ...keys, now: clock.value });
-			store.push.register({ userId: 'uma', url: 'https://push.example.net/uma-2', ...keys, now: clock.value });
+			store.push!.register({ userId: 'uma', url: 'https://push.example.net/uma-1', ...keys, now: clock.value });
+			store.push!.register({ userId: 'uma', url: 'https://push.example.net/uma-2', ...keys, now: clock.value });
 			const unread = (userId = 'uma') => {
 				clock.value += 2_000;
 				return claim(store, clock, [userId]).subscriptions.map((row) => row.unread);
@@ -2127,11 +2127,11 @@ describe('push subscriptions in the store', () => {
 			// One a push, whatever the registrations: each carries the same count.
 			expect(unread()).toEqual([1, 1]);
 			expect(unread()).toEqual([2, 2]);
-			store.push.clearUnread('uma', clock.value);
+			store.push!.clearUnread('uma', clock.value);
 			expect(unread()).toEqual([1, 1]);
 			// Zeroing a count of none changes nothing.
-			store.push.clearUnread('uma', clock.value);
-			store.push.clearUnread('uma', clock.value);
+			store.push!.clearUnread('uma', clock.value);
+			store.push!.clearUnread('uma', clock.value);
 			expect(unread()).toEqual([1, 1]);
 			// Only the day's count stands.
 			atMidday(clock);
@@ -2146,7 +2146,7 @@ describe('push subscriptions in the store', () => {
 		const keys = await browserKeys();
 		await withStore('push-rename', config, (store, clock, state) => {
 			registerUser(store, clock, 'eve');
-			store.push.register({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, pushId: 'eve-laptop', now: clock.value });
+			store.push!.register({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, pushId: 'eve-laptop', now: clock.value });
 			expect(claim(store, clock, ['eve']).subscriptions).toHaveLength(1);
 			store.accounts.rename({ from: 'eve', to: 'eva', now: clock.value });
 			expect(pushSubscriptionsOf(state, 'eve')).toEqual([]);

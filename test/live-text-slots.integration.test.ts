@@ -24,11 +24,11 @@ it('frees a live text\'s slots once its write_url expires, before the alarm ends
 		expect(() => post('other')).toThrow(/busy on this server/);
 		// Past it, nothing can claim the write: the slots are free, though no alarm has run.
 		clock.value += LIVE.writeWindowSeconds * 1_000 + 1;
-		expect(store.liveText.open(clock.value)).toHaveLength(1);
+		expect(store.liveText!.open(clock.value)).toHaveLength(1);
 		post('owner');
-		expect(store.liveText.open(clock.value)).toHaveLength(2);
+		expect(store.liveText!.open(clock.value)).toHaveLength(2);
 		// The alarm still ends the expired one's message.
-		const expired = store.liveText.expire(new Set(), clock.value);
+		const expired = store.liveText!.expire(new Set(), clock.value);
 		expect(expired.ended).toHaveLength(1);
 	});
 });
@@ -50,7 +50,7 @@ it('rewrites no message below the retention floor that cleanup has not yet delet
 		state.storage.sql.exec('UPDATE log_state SET history_floor = ? WHERE id = 1', before + 1);
 		const fresh = openStore(state, { liveText: LIVE }, clock.clock);
 		fresh.lifecycle.initialize();
-		const claimed = fresh.liveText.claim(key, clock.value);
+		const claimed = fresh.liveText!.claim(key, clock.value);
 		expect(claimed?.broadcasts ?? []).toEqual([]);
 		expect(latest()).toBe(before);
 	});

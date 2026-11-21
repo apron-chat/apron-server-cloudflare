@@ -57,8 +57,8 @@ describe('store uploads', () => {
 			expect(early.deduplicated).toBe(true);
 			expect(early.broadcasts).toEqual([]);
 			expect(early.result).toEqual(first.result);
-			expect(store.uploads.claim(write.write.key, clock.value)).toBe(true);
-			store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			expect(store.uploads!.claim(write.write.key, clock.value)).toBe(true);
+			store.uploads!.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
 			// Once the write is done, the retry names the message and embed, without a grant.
 			const late = send();
 			expect(late.deduplicated).toBe(true);
@@ -80,14 +80,14 @@ describe('store uploads', () => {
 			expect(created.uploads).toHaveLength(1);
 
 			// The write finishes: a server snapshot completes the embed.
-			expect(store.uploads.claim(write.write.key, clock.value)).toBe(true);
-			expect(store.uploads.claim(write.write.key, clock.value)).toBe(false);
-			const finished = store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png', width: 1, height: 1 }, clock.value);
+			expect(store.uploads!.claim(write.write.key, clock.value)).toBe(true);
+			expect(store.uploads!.claim(write.write.key, clock.value)).toBe(false);
+			const finished = store.uploads!.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png', width: 1, height: 1 }, clock.value);
 			expect(finished.accepted).toBe(true);
 			const completed = (finished.broadcasts[0].params.body as { embeds: Array<Record<string, unknown>> }).embeds[1];
 			const url = `${MEDIA}/${write.write.key}`;
 			expect(completed).toEqual({ embed_id: embeds[1].embed_id, kind: 'upload', title: 'dot.png', url, og: { title: 'dot.png', image: { url, type: 'image/png', width: 1, height: 1 } } });
-			expect(store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value).accepted).toBe(false);
+			expect(store.uploads!.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value).accepted).toBe(false);
 
 			// A save sends embeds back by id; the server restores the upload's url and og.
 			clock.value += 1_000;
@@ -109,15 +109,15 @@ describe('store uploads', () => {
 			register(store, clock, 'vera');
 			const created = post(store, clock, 'vera', { body: { embeds: [{ kind: 'upload', title: 'voice-message.webm' }] } });
 			const write = writeOf(created.result);
-			expect(store.uploads.claim(write.write.key, clock.value)).toBe(true);
-			const finished = store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
+			expect(store.uploads!.claim(write.write.key, clock.value)).toBe(true);
+			const finished = store.uploads!.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
 			expect(finished.accepted).toBe(true);
 			const url = `${MEDIA}/${write.write.key}`;
 			expect((finished.broadcasts[0].params.body as { embeds: unknown[] }).embeds[0]).toEqual({ embed_id: write.embed_id, kind: 'upload', title: 'voice-message.webm', url, og: { title: 'voice-message.webm', audio: { url, type: 'audio/webm' } } });
 
-			const avatar = store.uploads.startAvatar({ userId: 'vera', now: clock.value });
-			expect(store.uploads.claim(avatar.key, clock.value)).toBe(true);
-			const refused = store.uploads.finish({ key: avatar.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
+			const avatar = store.uploads!.startAvatar({ userId: 'vera', now: clock.value });
+			expect(store.uploads!.claim(avatar.key, clock.value)).toBe(true);
+			const refused = store.uploads!.finish({ key: avatar.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
 			expect(refused).toMatchObject({ accepted: false, deletedUploads: [avatar.key] });
 		});
 	});
@@ -129,31 +129,31 @@ describe('store uploads', () => {
 			const alone = post(store, clock, 'bob', { body: { embeds: [{ kind: 'upload' }] } });
 			// A failed write publishes the message without the embed (§4.8.3).
 			const failedKey = writeOf(withText.result).write.key;
-			expect(store.uploads.claim(failedKey, clock.value)).toBe(true);
-			const failed = store.uploads.finish({ key: failedKey, ok: false }, clock.value);
+			expect(store.uploads!.claim(failedKey, clock.value)).toBe(true);
+			const failed = store.uploads!.finish({ key: failedKey, ok: false }, clock.value);
 			expect(failed.accepted).toBe(false);
 			expect(failed.deletedUploads).toEqual([failedKey]);
 			expect(failed.broadcasts[0].params).toMatchObject({ message_id: withText.result.message_id, body: { text: 'caption', embeds: [] } });
 			// Past its window and grace, a write never started is failed by the sweep;
 			// a message left with nothing is a tombstone.
-			expect(store.uploads.expirePending(clock.value)).toMatchObject({ broadcasts: [], next: writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS });
+			expect(store.uploads!.expirePending(clock.value)).toMatchObject({ broadcasts: [], next: writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS });
 			// An alarm after a wake reads the same deadline from storage.
-			expect(store.uploads.nextDeadline(clock.value)).toBe(writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS);
+			expect(store.uploads!.nextDeadline(clock.value)).toBe(writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS);
 			clock.value += UPLOADS.writeWindowSeconds * 1_000 + UPLOAD_WRITE_GRACE_MS + 1;
-			expect(store.uploads.claim(writeOf(alone.result).write.key, clock.value)).toBe(false);
-			const expired = store.uploads.expirePending(clock.value);
+			expect(store.uploads!.claim(writeOf(alone.result).write.key, clock.value)).toBe(false);
+			const expired = store.uploads!.expirePending(clock.value);
 			expect(expired.broadcasts).toHaveLength(1);
 			expect(expired.broadcasts[0].params).toMatchObject({ message_id: alone.result.message_id, deleted: true });
 			expect(expired.broadcasts[0].params.body).toBeUndefined();
 			expect(expired.next).toBeUndefined();
-			expect(store.uploads.nextDeadline(clock.value)).toBeUndefined();
+			expect(store.uploads!.nextDeadline(clock.value)).toBeUndefined();
 			// A message deleted while its write was in flight does not take the object.
 			clock.value += 1_000;
 			const deleted = post(store, clock, 'bob', { body: { text: 'soon gone', embeds: [{ kind: 'upload' }] } });
 			const key = writeOf(deleted.result).write.key;
-			expect(store.uploads.claim(key, clock.value)).toBe(true);
+			expect(store.uploads!.claim(key, clock.value)).toBe(true);
 			expect(post(store, clock, 'bob', { message_id: deleted.result.message_id, deleted: true }).deletedUploads).toEqual([key]);
-			expect(store.uploads.finish({ key, ok: true, bytes: 10, contentType: 'image/png' }, clock.value).accepted).toBe(false);
+			expect(store.uploads!.finish({ key, ok: true, bytes: 10, contentType: 'image/png' }, clock.value).accepted).toBe(false);
 		});
 	});
 
@@ -173,9 +173,9 @@ describe('store uploads', () => {
 			// The server's count is charged by writes claimed, not uploads started:
 			// Carol's two and Dave's two started, none written, leave it open.
 			const daves = keys(post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } }).result);
-			for (const key of [...carols, daves[0]]) expect(store.uploads.claim(key, clock.value)).toBe(true);
+			for (const key of [...carols, daves[0]]) expect(store.uploads!.claim(key, clock.value)).toBe(true);
 			// Three claimed: Dave's other write is refused until the reset, and no upload starts.
-			expect(store.uploads.claim(daves[1], clock.value)).toBe('closed');
+			expect(store.uploads!.claim(daves[1], clock.value)).toBe('closed');
 			try { post(store, clock, 'erin', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Daily upload limit reached for the server');
 			expect((error as StoreError).data).toEqual({ ext: { limits: 'upload' } });
@@ -184,7 +184,7 @@ describe('store uploads', () => {
 			try { post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Upload storage is full');
 			expect((error as StoreError).data).toEqual({ ext: { limits: 'upload' } });
-			store.uploads.startAvatar({ userId: 'dave', now: clock.value });
+			store.uploads!.startAvatar({ userId: 'dave', now: clock.value });
 		});
 	});
 
@@ -195,7 +195,7 @@ describe('store uploads', () => {
 			store.server.setToggle('uploads', false, clock.value);
 			expect(store.server.toggle('uploads', clock.value)).toBe(false);
 			expect(errorCode(() => post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } }))).toBe('denied');
-			expect(errorCode(() => store.uploads.startAvatar({ userId: 'frank', now: clock.value }))).toBe('denied');
+			expect(errorCode(() => store.uploads!.startAvatar({ userId: 'frank', now: clock.value }))).toBe('denied');
 			// Other embeds still post.
 			post(store, clock, 'frank', { body: { embeds: [{ kind: 'link', url: 'https://example.com' }] } });
 			store.server.setToggle('uploads', undefined, clock.value);
@@ -212,8 +212,8 @@ describe('store uploads', () => {
 				return { key: writeOf(result).write.key, messageId: result.message_id as string };
 			};
 			const write = (key: string) => {
-				expect(store.uploads.claim(key, clock.value)).toBe(true);
-				store.uploads.finish({ key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+				expect(store.uploads!.claim(key, clock.value)).toBe(true);
+				store.uploads!.finish({ key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
 			};
 			const written = upload('written').key;
 			write(written);
@@ -227,16 +227,16 @@ describe('store uploads', () => {
 			state.storage.sql.exec('UPDATE uploads SET expires_ms = created_ms + ?', week);
 			clock.value += week + UPLOADS.lifecycleLagSeconds * 1_000 + 1;
 			// The written file is kept on, to its expiry under the current setting; the unwritten one and the orphan go.
-			const swept = store.uploads.cleanup(clock.value);
+			const swept = store.uploads!.cleanup(clock.value);
 			expect(swept.count).toBe(3);
 			expect([...swept.deleted].sort()).toEqual([unwritten, orphan.key].sort());
 			const expires = (key: string) => state.storage.sql.exec<{ expires_ms: number }>('SELECT expires_ms FROM uploads WHERE upload_key = ?', key).toArray()[0]?.expires_ms;
 			const created = state.storage.sql.exec<{ created_ms: number }>('SELECT created_ms FROM uploads WHERE upload_key = ?', written).one().created_ms;
 			expect(expires(written)).toBe(created + UPLOADS.fileRetentionSeconds * 1_000);
-			expect(store.uploads.cleanup(clock.value)).toEqual({ count: 0, deleted: [] });
+			expect(store.uploads!.cleanup(clock.value)).toEqual({ count: 0, deleted: [] });
 			// Past that expiry and the lifecycle lag, it goes as usual.
 			clock.value = created + (UPLOADS.fileRetentionSeconds + UPLOADS.lifecycleLagSeconds) * 1_000 + 1;
-			expect(store.uploads.cleanup(clock.value)).toEqual({ count: 1, deleted: [written] });
+			expect(store.uploads!.cleanup(clock.value)).toEqual({ count: 1, deleted: [written] });
 			expect(expires(written)).toBeUndefined();
 		});
 	});
@@ -250,13 +250,13 @@ describe('store uploads', () => {
 		expect(UPLOADS.avatarRetentionSeconds).toBeGreaterThan(UPLOADS.avatarRefreshSeconds);
 		await withStore('uploads-avatar-active', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'ivy');
-			const upload = store.uploads.startAvatar({ userId: 'ivy', now: clock.value });
-			store.uploads.claim(upload.key, clock.value);
-			store.uploads.finish({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value);
+			const upload = store.uploads!.startAvatar({ userId: 'ivy', now: clock.value });
+			store.uploads!.claim(upload.key, clock.value);
+			store.uploads!.finish({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value);
 			// A sign-in with no more than the message retention and cleanup's day left refreshes it.
 			clock.value += (UPLOADS.avatarRetentionSeconds - kept) * 1_000 + 1;
-			expect(store.uploads.avatarRefreshDue('ivy', clock.value)).toBe(upload.key);
-			store.uploads.renewAvatar({ userId: 'ivy', key: upload.key, now: clock.value });
+			expect(store.uploads!.avatarRefreshDue('ivy', clock.value)).toBe(upload.key);
+			store.uploads!.renewAvatar({ userId: 'ivy', key: upload.key, now: clock.value });
 			const signedIn = clock.value;
 			// Nobody signs in again: it is still shown as long as anything posted then is kept.
 			clock.value = signedIn + kept * 1_000;
@@ -271,11 +271,11 @@ describe('store uploads', () => {
 		await withStore('uploads-avatar', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'erin');
 			const setAvatar = () => {
-				const upload = store.uploads.startAvatar({ userId: 'erin', now: clock.value });
+				const upload = store.uploads!.startAvatar({ userId: 'erin', now: clock.value });
 				expect(upload.key).toMatch(/^a\//);
 				expect(upload.maxBytes).toBe(UPLOADS.maxAvatarBytes);
-				store.uploads.claim(upload.key, clock.value);
-				return { upload, finished: store.uploads.finish({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value) };
+				store.uploads!.claim(upload.key, clock.value);
+				return { upload, finished: store.uploads!.finish({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value) };
 			};
 			const first = setAvatar();
 			expect(first.finished).toMatchObject({ accepted: true, broadcasts: [], avatar: { userId: 'erin', url: `${MEDIA}/${first.upload.key}` }, deletedUploads: [] });
@@ -285,22 +285,22 @@ describe('store uploads', () => {
 			const second = setAvatar();
 			expect(second.finished.deletedUploads).toEqual([first.upload.key]);
 			// Not due for a refresh until avatarRefreshSeconds before it expires.
-			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBeNull();
+			expect(store.uploads!.avatarRefreshDue('erin', clock.value)).toBeNull();
 			clock.value += (UPLOADS.avatarRetentionSeconds - UPLOADS.avatarRefreshSeconds) * 1_000 + 1;
-			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBe(second.upload.key);
-			store.uploads.renewAvatar({ userId: 'erin', key: second.upload.key, now: clock.value });
-			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBeNull();
+			expect(store.uploads!.avatarRefreshDue('erin', clock.value)).toBe(second.upload.key);
+			store.uploads!.renewAvatar({ userId: 'erin', key: second.upload.key, now: clock.value });
+			expect(store.uploads!.avatarRefreshDue('erin', clock.value)).toBeNull();
 			// Past its expiry it is no longer shown, and past the lifecycle lag cleanup forgets it.
 			clock.value += UPLOADS.avatarRetentionSeconds * 1_000 + 1;
 			expect(store.accounts.get('erin')!.avatar).toBeUndefined();
-			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBeNull();
+			expect(store.uploads!.avatarRefreshDue('erin', clock.value)).toBeNull();
 			clock.value += UPLOADS.lifecycleLagSeconds * 1_000;
 			// Its key comes back for the caller to delete from R2.
-			expect(store.uploads.cleanup(clock.value)).toEqual({ count: 1, deleted: [second.upload.key] });
+			expect(store.uploads!.cleanup(clock.value)).toEqual({ count: 1, deleted: [second.upload.key] });
 			// Clearing removes a live one.
 			setAvatar();
-			expect(store.uploads.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
-			expect(store.uploads.clearAvatar({ userId: 'erin', now: clock.value })).toEqual({ changed: false, deletedUploads: [] });
+			expect(store.uploads!.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
+			expect(store.uploads!.clearAvatar({ userId: 'erin', now: clock.value })).toEqual({ changed: false, deletedUploads: [] });
 			// A new user_id is a user clients keep nothing for: /rename gets every
 			// profile field to announce (§3.3), the live avatar included.
 			const third = setAvatar();
@@ -315,9 +315,9 @@ describe('store uploads', () => {
 		await withStore('uploads-emoji', config, (store, clock, state) => {
 			register(store, clock, 'ada');
 			const add = (key: string, side = 1) => {
-				const upload = store.uploads.startEmoji({ userId: 'ada', key, now: clock.value });
+				const upload = store.uploads!.startEmoji({ userId: 'ada', key, now: clock.value });
 				expect(upload).toMatchObject({ key: expect.stringMatching(/^e\/[A-Za-z0-9_-]{22}$/), maxBytes: UPLOADS.maxEmojiBytes });
-				expect(store.uploads.claim(upload.key, clock.value)).toBe(true);
+				expect(store.uploads!.claim(upload.key, clock.value)).toBe(true);
 				const draft = store.server.emojiDraft({ add: { key: upload.key, ok: true, bytes: 64, contentType: 'image/png', width: side, height: side } }, clock.value)!;
 				const committed = store.server.commitEmoji(draft, clock.value);
 				expect(committed.applied).toBe(true);
@@ -335,7 +335,7 @@ describe('store uploads', () => {
 			// At the cap a new key is denied; a known one may still be replaced,
 			// releasing the catalog two back. Its old image stays with the
 			// previous catalog, which refers to it.
-			expect(errorCode(() => store.uploads.startEmoji({ userId: 'ada', key: ':c:', now: clock.value }))).toBe('denied');
+			expect(errorCode(() => store.uploads!.startEmoji({ userId: 'ada', key: ':c:', now: clock.value }))).toBe('denied');
 			const replaced = add(':a:', 2);
 			expect(replaced.committed.deletedUploads).toEqual([a.draft.key]);
 			expect(JSON.parse(stored()!)).toEqual({ ':a:': { url: `${MEDIA}/${replaced.upload.key}`, width: 2, height: 2 }, ':b:': { url: `${MEDIA}/${b.upload.key}`, width: 1, height: 1 } });
@@ -346,7 +346,7 @@ describe('store uploads', () => {
 			expect(store.server.emojiDraft({ remove: ':a:' }, clock.value)).toBeNull();
 			// Emoji never expire, and purging the admin who added them leaves them.
 			clock.value += 400 * 86_400_000;
-			store.uploads.cleanup(clock.value);
+			store.uploads!.cleanup(clock.value);
 			expect(store.accounts.purge({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
 			expect(store.server.emojiCatalog(clock.value)?.keys).toEqual(new Set([':b:']));
 			// After a wake, the catalog is read again from its row.
@@ -371,29 +371,29 @@ describe('store uploads', () => {
 
 			// An avatar is an avatar in size, kept under e/ as the server's.
 			const start = () => {
-				const upload = store.uploads.startServerAvatar({ userId: 'ada', now: clock.value });
+				const upload = store.server.startAvatarUpload({ userId: 'ada', now: clock.value });
 				expect(upload).toMatchObject({ key: expect.stringMatching(/^e\/[A-Za-z0-9_-]{22}$/), maxBytes: UPLOADS.maxAvatarBytes });
-				expect(store.uploads.claim(upload.key, clock.value)).toBe(true);
+				expect(store.uploads!.claim(upload.key, clock.value)).toBe(true);
 				return upload;
 			};
 			const first = start();
 			expect(storedBytes()).toBe(UPLOADS.maxAvatarBytes);
 			// It is no custom emoji, and only an image becomes the avatar.
 			expect(store.server.emojiDraft({ add: { key: first.key, ok: true, bytes: 64, contentType: 'image/png' } }, clock.value)).toBeNull();
-			const finished = store.uploads.finish({ key: first.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			const finished = store.uploads!.finish({ key: first.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
 			expect(finished).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${first.key}`, deletedUploads: [] });
 			expect(storedBytes()).toBe(64);
 			expect(sql.exec<{ owner_id: string; expires_ms: number }>('SELECT owner_id, expires_ms FROM uploads WHERE upload_key = ?', first.key).one()).toEqual({ owner_id: '~server', expires_ms: Number.MAX_SAFE_INTEGER });
 			const audio = start();
-			expect(store.uploads.finish({ key: audio.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value)).toMatchObject({ accepted: false, deletedUploads: [audio.key] });
+			expect(store.uploads!.finish({ key: audio.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value)).toMatchObject({ accepted: false, deletedUploads: [audio.key] });
 			// A new one replaces the old, whose object goes at once.
 			const second = start();
-			expect(store.uploads.finish({ key: second.key, ok: true, bytes: 32, contentType: 'image/png' }, clock.value)).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${second.key}`, deletedUploads: [first.key] });
+			expect(store.uploads!.finish({ key: second.key, ok: true, bytes: 32, contentType: 'image/png' }, clock.value)).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${second.key}`, deletedUploads: [first.key] });
 			expect(storedBytes()).toBe(32);
 
 			// It never expires, and renaming or purging the admin who set it leaves it.
 			clock.value += 400 * 86_400_000;
-			store.uploads.cleanup(clock.value);
+			store.uploads!.cleanup(clock.value);
 			store.accounts.rename({ from: 'ada', to: 'ada_2', now: clock.value });
 			expect(store.accounts.purge({ userIds: ['ada_2'], now: clock.value }).deletedUploads).toEqual([]);
 			expect(store.server.metadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
@@ -416,8 +416,8 @@ describe('store uploads', () => {
 		await withStore('uploads-emoji-superseded', config, (store, clock, state) => {
 			register(store, clock, 'ada');
 			const add = (key: string, bytes: number) => {
-				const upload = store.uploads.startEmoji({ userId: 'ada', key, now: clock.value });
-				expect(store.uploads.claim(upload.key, clock.value)).toBe(true);
+				const upload = store.uploads!.startEmoji({ userId: 'ada', key, now: clock.value });
+				expect(store.uploads!.claim(upload.key, clock.value)).toBe(true);
 				return commit(store.server.emojiDraft({ add: { key: upload.key, ok: true, bytes, contentType: 'image/png' } }, clock.value)!, upload.key);
 			};
 			const remove = (key: string) => commit(store.server.emojiDraft({ remove: key }, clock.value)!);
@@ -470,7 +470,7 @@ describe('store uploads', () => {
 			// A superseded image counts against the stored-bytes cap, and not
 			// against maxEmoji; it is the server's, so purges and expiry leave it.
 			clock.value += 400 * 86_400_000;
-			store.uploads.cleanup(clock.value);
+			store.uploads!.cleanup(clock.value);
 			expect(store.accounts.purge({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
 			expect(states()).toEqual({ [z2.image!]: 'superseded', [z3.image!]: 'done' });
 			// It survives a wake, and the next change after it releases it.

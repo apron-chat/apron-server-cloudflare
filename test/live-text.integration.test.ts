@@ -511,7 +511,7 @@ describe('live text end to end', () => {
 				const runtime = instance as unknown as { store: Store; refreshLiveDeadline(): Promise<void>; stopLiveText(key: string, reason: string): void };
 				const refresh = runtime.refreshLiveDeadline.bind(runtime);
 				vi.spyOn(runtime, 'refreshLiveDeadline').mockImplementationOnce(async () => {
-					const live = runtime.store.liveText.open(Date.now()).find((entry) => entry.owner === userId)!;
+					const live = runtime.store.liveText!.open(Date.now()).find((entry) => entry.owner === userId)!;
 					runtime.stopLiveText(live.key, 'removed');
 					await refresh();
 				});

@@ -231,7 +231,7 @@ it('degrades at 70% of a daily ceiling: live text, uploads and older history are
 		busy.lifecycle.initialize();
 		sqliteOf(busy).getRoomState();
 		expect(busy.ops.budgetShares(now)?.writes).toBeGreaterThanOrEqual(0.7);
-		const upload = refusal(() => busy.uploads.startAvatar({ userId: 'degrade_user', now }));
+		const upload = refusal(() => busy.uploads!.startAvatar({ userId: 'degrade_user', now }));
 		expect(upload.data?.reason).toBe(DEGRADED);
 		// A page more than a page back from the head is older history.
 		const older = refusal(() => sqliteOf(busy).history({ roomId: 'general', before: '1', limit: 1, now, userId: 'degrade_user', ipKey: 'ip-degrade' }));

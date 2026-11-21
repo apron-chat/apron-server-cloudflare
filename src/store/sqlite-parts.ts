@@ -107,6 +107,7 @@ export function sqliteServer(sqlite: SqliteStore): Server {
     commitEmoji: (draft, now) => sqlite.commitEmoji(draft, now),
     toggle: (feature, now) => sqlite.toggle(feature, now),
     setToggle: (feature, on, now, since) => sqlite.setToggle(feature, on, now, since),
+    startAvatarUpload: (input) => sqlite.startServerAvatarUpload(input),
   };
 }
 
@@ -212,7 +213,6 @@ export function sqliteUploads(sqlite: SqliteStore): Uploads {
     terminalOutputKey: () => newTerminalOutputKey(),
     startAvatar: (input) => sqlite.startAvatarUpload(input),
     startEmoji: (input) => sqlite.startEmojiUpload(input),
-    startServerAvatar: (input) => sqlite.startServerAvatarUpload(input),
     owner: (key, now) => sqlite.uploadOwner(key, now),
     finish: (write, now) => sqlite.finishUpload(write, now),
     claim: (key, now) => sqlite.claimUpload(key, now),

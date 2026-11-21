@@ -331,7 +331,7 @@ it('builds the joined wake index for a schema 9 store from code before it, with 
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_joined_idx'").one().sql).toMatch(/WHERE \(wake & 8\) != 0$/);
 		// The registration made before is in it.
-		expect(store.push.joinedWakers(now)).toEqual(['kept_mod']);
+		expect(store.push!.joinedWakers(now)).toEqual(['kept_mod']);
 		return { writes: writesReserved(sql) };
 	});
 

@@ -964,11 +964,11 @@ describe('measured storage accounting', () => {
 				upload('a/old', 'avatar', 'done');
 				upload('a/new', 'avatar', 'writing');
 			});
-			const replaced = store.uploads.finish({ key: 'a/new', ok: true, bytes: 512, contentType: 'image/png' }, clock.now());
+			const replaced = store.uploads!.finish({ key: 'a/new', ok: true, bytes: 512, contentType: 'image/png' }, clock.now());
 			expect(replaced.accepted).toBe(true);
 			expect(replaced.deletedUploads).toEqual(['a/old']);
 			expect(store.ops.accountingStatus().unsafe).toBe(false);
-			expect(store.uploads.clearAvatar({ userId: 'heavy', now: clock.now() })).toEqual({ changed: true, deletedUploads: ['a/new'] });
+			expect(store.uploads!.clearAvatar({ userId: 'heavy', now: clock.now() })).toEqual({ changed: true, deletedUploads: ['a/new'] });
 			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
@@ -990,7 +990,7 @@ describe('measured storage accounting', () => {
 				for (let index = 0; index < 3 * UPLOAD_POLICY!.uploadsPerUserDay; index += 1) upload(`a/pending-${index}`, 'writing');
 				upload('a/server-old', 'done');
 			});
-			expect(store.uploads.finish({ key: 'a/pending-0', ok: true, bytes: 512, contentType: 'image/png' }, clock.now()).deletedUploads).toEqual(['a/server-old']);
+			expect(store.uploads!.finish({ key: 'a/pending-0', ok: true, bytes: 512, contentType: 'image/png' }, clock.now()).deletedUploads).toEqual(['a/server-old']);
 			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			expect(store.server.clearAvatar(clock.now()).deletedUploads).toEqual(['a/pending-0']);
 			expect(store.ops.accountingStatus().unsafe).toBe(false);
@@ -1049,13 +1049,13 @@ describe('measured storage accounting', () => {
 			measure('credential IDs lookup', () => store.credentials.idsForUser('matrix-user'));
 			measure('credential counter update', () => store.credentials.updateCounter('matrix-credential', 1));
 			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), pushId: 'p'.repeat(64) };
-			measure('push subscription register', () => store.push.register({ ...subscription, now: clock.now() }));
-			measure('push subscription register again, unchanged', () => store.push.register({ ...subscription, now: clock.now() }));
-			expect(measure('push wake claim', () => store.push.claim({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('push subscription register', () => store.push!.register({ ...subscription, now: clock.now() }));
+			measure('push subscription register again, unchanged', () => store.push!.register({ ...subscription, now: clock.now() }));
+			expect(measure('push wake claim', () => store.push!.claim({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
 			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
-			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.push.claim({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
-			measure('push registrations clear', () => store.push.clearSubscriptions('matrix-other', clock.now()));
-			measure('gone push subscription forget', () => store.push.forgetSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
+			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.push!.claim({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('push registrations clear', () => store.push!.clearSubscriptions('matrix-other', clock.now()));
+			measure('gone push subscription forget', () => store.push!.forgetSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
 			const create = measure('message create', () => store.messages.commit({
@@ -1068,13 +1068,13 @@ describe('measured storage accounting', () => {
 			}));
 			const messageId = create.result.message_id as string;
 			expect(measure('push reply author lookup', () => store.messages.author(messageId, clock.now()))).toBe('matrix-user');
-			store.push.register({ ...subscription, now: clock.now() });
-			expect(measure('push wake claim for a reply', () => store.push.claim({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
+			store.push!.register({ ...subscription, now: clock.now() });
+			expect(measure('push wake claim for a reply', () => store.push!.claim({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
 			// The unread count the claims kept on the recipient counter, zeroed as the user comes back: written once, then nothing.
-			measure('push unread clear', () => store.push.clearUnread('matrix-user', clock.now()));
-			measure('push unread clear, already zero', () => store.push.clearUnread('matrix-user', clock.now()));
+			measure('push unread clear', () => store.push!.clearUnread('matrix-user', clock.now()));
+			measure('push unread clear, already zero', () => store.push!.clearUnread('matrix-user', clock.now()));
 			// A sign-in zeroes it in the reservation that reads the user's status and mutes.
-			store.push.claim({ senderId: 'matrix-replier', roomId: 'matrix-unread-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() });
+			store.push!.claim({ senderId: 'matrix-replier', roomId: 'matrix-unread-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() });
 			expect(measure('status inputs at sign-in, zeroing unread', () => store.reads.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
 			expect(state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = 'user:matrix-user'").one().uploads_day).toBe(0);
 			// A moderator who kept `joined`: the read each message makes for them, and their claim (role and membership checked).
@@ -1083,9 +1083,9 @@ describe('measured storage accounting', () => {
 				credential: { credentialId: 'matrix-mod-credential', userId: 'matrix-mod', publicKey: 'matrix-public-key', counter: 0 },
 			});
 			store.accounts.setRole({ userId: 'matrix-mod', role: 'mod', on: true, now: clock.now() });
-			measure('push subscription register, keeping joined', () => store.push.register({ ...subscription, userId: 'matrix-mod', wake: WAKE_SCOPES.joined, now: clock.now() }));
-			expect(measure('push joined wakers', () => store.push.joinedWakers(clock.now()))).toEqual(['matrix-mod']);
-			expect(measure('push wake claim for joined', () => store.push.claim({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-mod', reasons: WAKE_SCOPES.joined }], now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('push subscription register, keeping joined', () => store.push!.register({ ...subscription, userId: 'matrix-mod', wake: WAKE_SCOPES.joined, now: clock.now() }));
+			expect(measure('push joined wakers', () => store.push!.joinedWakers(clock.now()))).toEqual(['matrix-mod']);
+			expect(measure('push wake claim for joined', () => store.push!.claim({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-mod', reasons: WAKE_SCOPES.joined }], now: clock.now() })).subscriptions).toHaveLength(1);
 			measure('reaction set', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-react-ip', requestId: 'matrix-react', method: 'reactions', now: clock.now(),
 				params: { message_id: messageId, emojis: ['👍', '🎉'] }, identity,
@@ -1133,7 +1133,7 @@ describe('measured storage accounting', () => {
 			// A close's seen, settled by the store: written when none (or an old one) is stored, else the stored one standing.
 			expect(measure('seen settled, written', () => store.reads.settleSeen({ userId: 'matrix-user', at: clock.now(), now: clock.now() }))).toBe(clock.now());
 			expect(measure('seen settled, the stored one standing', () => store.reads.settleSeen({ userId: 'matrix-user', at: clock.now() + 60_000, now: clock.now() }))).toBe(clock.now());
-			expect(measure('push wake claim, dnd and muted', () => store.push.claim({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			expect(measure('push wake claim, dnd and muted', () => store.push!.claim({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			measure('room mute set', () => store.reads.setRoomMute({ userId: 'matrix-user', roomId: 'general', untilMs: clock.now() + 60_000, now: clock.now() }));
 			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.reads.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
 			store.accounts.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
@@ -1156,7 +1156,7 @@ describe('measured storage accounting', () => {
 			expect(store.accounts.get('matrix-user')?.seen).toBe(later);
 			store.accounts.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			// The thread's parent is muted: a wake for the thread is silenced by it, but for a mention.
-			expect(measure('push wake claim, the thread\'s parent muted', () => store.push.claim({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			expect(measure('push wake claim, the thread\'s parent muted', () => store.push!.claim({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			// The most room mutes a user may hold: the sign-in reads them all.
 			state.storage.transactionSync(() => {
 				for (let index = 1; index < MAX_ROOM_MUTES_PER_USER; index += 1) {

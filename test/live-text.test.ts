@@ -10,6 +10,7 @@ import { type LiveEntry, type Store, openStore } from '../src/store';
 import { type StoreLiveTextConfig } from '../src/store/config';
 import { liveInputLimit, liveResultEmbed, terminalOg } from '../src/content/embeds';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
+import { sqliteOf } from "../src/store/open";
 
 const encode = (text: string) => new TextEncoder().encode(text);
 const bytes = (...values: number[]) => new Uint8Array(values);
@@ -296,16 +297,16 @@ describe('store live text', () => {
 			expect(embed).toEqual({ embed_id: expect.stringMatching(/^embed_/), kind: 'terminal', title: 'make test', og: terminalOg('make test') });
 			const write = writeOf(created.result);
 			expect(write).toEqual({ embed_id: embed.embed_id, kind: 'terminal', write: { key: expect.stringMatching(/^l\/[A-Za-z0-9_-]{22}$/), max_bytes: LIVE.maxInputBytes, expires_ms: clock.value + LIVE.writeWindowSeconds * 1_000 } });
-			const claimed = store.liveText.claim(write.write.key, clock.value);
+			const claimed = store.liveText!.claim(write.write.key, clock.value);
 			expect(claimed?.entry).toMatchObject({ state: 'live', startedMs: clock.value, maxMs: 120_000, messageId: created.result.message_id });
 			// The write's start republishes the message with the embed's url.
 			expect(claimed?.broadcasts).toHaveLength(1);
 			expect(bodyOf(claimed!).body!.embeds).toEqual([{ ...embed, url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/), og: terminalOg('make test') }]);
-			expect(store.liveText.claim(write.write.key, clock.value)).toBeNull();
-			const finished = store.liveText.finish(write.write.key, encode('ignored\x1b[1mbold'), clock.value);
+			expect(store.liveText!.claim(write.write.key, clock.value)).toBeNull();
+			const finished = store.liveText!.finish(write.write.key, encode('ignored\x1b[1mbold'), clock.value);
 			// The store keeps the last 8 bytes itself, whatever it is given: they start at ESC.
 			expect(bodyOf(finished).body!.embeds).toEqual([{ embed_id: embed.embed_id, kind: 'terminal', title: 'make test', output: '\x1b[1mbold', og: terminalOg('make test') }]);
-			expect(store.liveText.finish(write.write.key, encode('again'), clock.value).broadcasts).toEqual([]);
+			expect(store.liveText!.finish(write.write.key, encode('again'), clock.value).broadcasts).toEqual([]);
 			// A save keeps the output from the server's record, whatever it sends.
 			const saved = post(store, clock, 'tess', { message_id: created.result.message_id, body: { text: 'done', embeds: [{ embed_id: embed.embed_id, kind: 'terminal', title: 'renamed', output: 'forged' }] } });
 			// Its og is the server's too, titled as the save renames it, and finished.
@@ -319,10 +320,10 @@ describe('store live text', () => {
 			register(store, clock, 'bob');
 			const created = post(store, clock, 'ada', { body: { text: 'Plan: ', format: 'markdown', mentions: ['bob'], embeds: [{ kind: 'append' }] } });
 			const write = writeOf(created.result);
-			const claimed = store.liveText.claim(write.write.key, clock.value)!;
+			const claimed = store.liveText!.claim(write.write.key, clock.value)!;
 			// The append may add what the text limit leaves.
 			expect(claimed.entry.limit).toBe(14);
-			const finished = store.liveText.finish(write.write.key, encode('roll back @carol'), clock.value);
+			const finished = store.liveText!.finish(write.write.key, encode('roll back @carol'), clock.value);
 			const params = finished.broadcasts[0].params as { body: Record<string, unknown>; prev_log_id: string };
 			// The appended text does not change mentions. It follows the snapshot that added the url.
 			expect(params.body).toEqual({ text: 'Plan: roll back @car', format: 'markdown', mentions: ['bob'] });
@@ -343,15 +344,15 @@ describe('store live text', () => {
 			register(store, clock, 'ed');
 			const created = post(store, clock, 'ed', { body: { text: 'Plan:', format: 'markdown', embeds: [{ kind: 'append' }] } });
 			const key = writeOf(created.result).write.key;
-			store.liveText.claim(key, clock.value);
+			store.liveText!.claim(key, clock.value);
 			// The store edits whatever it is given: backspaces before the live text do nothing.
-			const finished = store.liveText.finish(key, encode('\b\b\b\bfirst draft\f\b ok caf\u00e9\be \u{1F680}\b!'), clock.value);
+			const finished = store.liveText!.finish(key, encode('\b\b\b\bfirst draft\f\b ok caf\u00e9\be \u{1F680}\b!'), clock.value);
 			expect(bodyOf(finished).body).toEqual({ text: 'Plan: ok cafe !', format: 'markdown' });
 			// The limit counts the edited text: 23 bytes of room, of which an erased draft takes none.
 			const next = post(store, clock, 'ed', { body: { text: 'x', embeds: [{ kind: 'append' }] } });
 			const nextKey = writeOf(next.result).write.key;
-			store.liveText.claim(nextKey, clock.value);
-			const long = store.liveText.finish(nextKey, encode(`${'draft '.repeat(3)}\f${'0123456789'.repeat(3)}`), clock.value);
+			store.liveText!.claim(nextKey, clock.value);
+			const long = store.liveText!.finish(nextKey, encode(`${'draft '.repeat(3)}\f${'0123456789'.repeat(3)}`), clock.value);
 			expect(bodyOf(long).body!.text).toBe('x01234567890123456789012');
 		});
 	});
@@ -361,11 +362,11 @@ describe('store live text', () => {
 			register(store, clock, 'eve');
 			const first = post(store, clock, 'eve', { body: { text: 'x', embeds: [{ kind: 'terminal' }] } });
 			const key = writeOf(first.result).write.key;
-			store.liveText.claim(key, clock.value);
+			store.liveText!.claim(key, clock.value);
 			const saved = post(store, clock, 'eve', { message_id: first.result.message_id, body: { text: 'no output after all' } });
 			expect(saved.liveEnded).toEqual([key]);
-			expect(store.liveText.open(clock.value)).toEqual([]);
-			expect(store.liveText.finish(key, encode('late'), clock.value).broadcasts).toEqual([]);
+			expect(store.liveText!.open(clock.value)).toEqual([]);
+			expect(store.liveText!.finish(key, encode('late'), clock.value).broadcasts).toEqual([]);
 			const second = post(store, clock, 'eve', { body: { text: 'y', embeds: [{ kind: 'append' }] } });
 			const deleted = post(store, clock, 'eve', { message_id: second.result.message_id, deleted: true });
 			expect(deleted.liveEnded).toEqual([writeOf(second.result).write.key]);
@@ -378,8 +379,8 @@ describe('store live text', () => {
 			for (const [userId, roles, maxMs] of cases) {
 				register(store, clock, userId, roles);
 				const created = post(store, clock, userId, { body: { embeds: [{ kind: 'terminal' }] } });
-				expect(store.liveText.open(clock.value).find((entry) => entry.owner === userId)!.maxMs).toBe(maxMs);
-				store.liveText.finish(writeOf(created.result).write.key, null, clock.value);
+				expect(store.liveText!.open(clock.value).find((entry) => entry.owner === userId)!.maxMs).toBe(maxMs);
+				store.liveText!.finish(writeOf(created.result).write.key, null, clock.value);
 			}
 		});
 	});
@@ -387,9 +388,9 @@ describe('store live text', () => {
 	it('allows one open text per user, pending writes included, and refuses past the server\'s concurrent texts', async () => {
 		await withStore('live-concurrent', { liveText: { ...LIVE, concurrent: 2 } }, (store, clock) => {
 			for (const userId of ['u1', 'u2', 'u3']) register(store, clock, userId);
-			const pending = store.liveText.start({ userId: 'u1', ipKey: 'ip-1', identity: { user_id: 'u1' }, kind: 'terminal', roomId: 'general', now: clock.value });
+			const pending = store.liveText!.start({ userId: 'u1', ipKey: 'ip-1', identity: { user_id: 'u1' }, kind: 'terminal', roomId: 'general', now: clock.value });
 			let error: unknown;
-			try { store.liveText.start({ userId: 'u1', ipKey: 'ip-1', identity: { user_id: 'u1' }, kind: 'append', roomId: 'general', now: clock.value }); }
+			try { store.liveText!.start({ userId: 'u1', ipKey: 'ip-1', identity: { user_id: 'u1' }, kind: 'append', roomId: 'general', now: clock.value }); }
 			catch (caught) { error = caught; }
 			expect(error).toMatchObject({ code: 'denied', message: expect.stringContaining('already have a live text open') });
 			expect(errorCode(() => post(store, clock, 'u1', { body: { embeds: [{ kind: 'terminal' }] } }))).toBe('denied');
@@ -400,9 +401,9 @@ describe('store live text', () => {
 			expect(error.message).toBe('Live text is busy on this server; try again shortly');
 			// A command's write that expires frees its owner, with nothing to publish.
 			clock.value = pending.writeExpiresMs + 1;
-			expect(store.liveText.start({ userId: 'u1', ipKey: 'ip-1', identity: { user_id: 'u1' }, kind: 'append', roomId: 'general', now: clock.value }).owner).toBe('u1');
+			expect(store.liveText!.start({ userId: 'u1', ipKey: 'ip-1', identity: { user_id: 'u1' }, kind: 'append', roomId: 'general', now: clock.value }).owner).toBe('u1');
 			// A message's expired write is ended by the alarm, which publishes it without the embed.
-			const expired = store.liveText.expire(new Set(), clock.value);
+			const expired = store.liveText!.expire(new Set(), clock.value);
 			expect(expired.ended.map((entry) => entry.owner)).toEqual(['u2']);
 			expect(expired.broadcasts).toHaveLength(1);
 		});
@@ -412,9 +413,9 @@ describe('store live text', () => {
 		await withStore('live-rates', { liveText: { ...LIVE, startsPerDay: 7 } }, (store, clock) => {
 			register(store, clock, 'spammer');
 			const start = (userId: string, ipKey: string) => {
-				const entry = store.liveText.start({ userId, ipKey, identity: { user_id: userId }, kind: 'terminal', roomId: 'general', now: clock.value });
-				store.liveText.claim(entry.key, clock.value);
-				store.liveText.finish(entry.key, null, clock.value);
+				const entry = store.liveText!.start({ userId, ipKey, identity: { user_id: userId }, kind: 'terminal', roomId: 'general', now: clock.value });
+				store.liveText!.claim(entry.key, clock.value);
+				store.liveText!.finish(entry.key, null, clock.value);
 			};
 			for (let index = 0; index < LIVE.startsPerUser; index++) start('spammer', 'ip-a');
 			let error: unknown;
@@ -447,20 +448,20 @@ describe('store live text', () => {
 			const waiting = post(store, clock, 'gil', { body: { text: '', embeds: [{ kind: 'terminal' }] } });
 			const lost = post(store, clock, 'hal', { body: { text: 'keep me', embeds: [{ kind: 'append' }] } });
 			const lostKey = writeOf(lost.result).write.key;
-			store.liveText.claim(lostKey, clock.value);
+			store.liveText!.claim(lostKey, clock.value);
 			// Streaming in this instance: nothing is due yet.
-			const quiet = store.liveText.expire(new Set([lostKey]), clock.value);
+			const quiet = store.liveText!.expire(new Set([lostKey]), clock.value);
 			expect(quiet.broadcasts).toEqual([]);
 			expect(quiet.next).toBe(clock.value + LIVE.writeWindowSeconds * 1_000);
 			clock.value += LIVE.writeWindowSeconds * 1_000 + 1;
 			// Not streaming here (an evicted instance had it): ended with nothing kept.
-			const expired = store.liveText.expire(new Set(), clock.value);
+			const expired = store.liveText!.expire(new Set(), clock.value);
 			const byId = new Map(expired.broadcasts.map((record) => [record.params.message_id, record.params as Record<string, unknown>]));
 			// A terminal with no text left is a tombstone; the append keeps its text, without the embed.
 			expect(byId.get(waiting.result.message_id)).toMatchObject({ deleted: true });
 			expect(byId.get(lost.result.message_id)!.body).toEqual({ text: 'keep me', format: 'plain' });
-			expect(store.liveText.claim(writeOf(waiting.result).write.key, clock.value)).toBeNull();
-			expect(store.liveText.open(clock.value)).toEqual([]);
+			expect(store.liveText!.claim(writeOf(waiting.result).write.key, clock.value)).toBeNull();
+			expect(store.liveText!.open(clock.value)).toEqual([]);
 			expect(LIVE_ORPHAN_GRACE_MS).toBeGreaterThan(0);
 		});
 	});
@@ -471,7 +472,7 @@ describe('store live text', () => {
 			const send = () => store.messages.commit({ userId: 'rita', ipKey: 'ip-rita', requestId: 'retry-1', method: 'message', now: clock.value, params: { body: { embeds: [{ kind: 'terminal' }] } }, identity: { user_id: 'rita' } });
 			const first = send();
 			expect(send().result).toEqual(first.result);
-			store.liveText.claim(writeOf(first.result).write.key, clock.value);
+			store.liveText!.claim(writeOf(first.result).write.key, clock.value);
 			expect(send().result).toEqual({ message_id: first.result.message_id, embeds: [{ embed_id: writeOf(first.result).embed_id, kind: 'terminal' }] });
 		});
 	});
@@ -480,17 +481,17 @@ describe('store live text', () => {
 		await withStore('live-command', { liveText: LIVE }, (store, clock) => {
 			register(store, clock, 'cy');
 			const parent = post(store, clock, 'cy', { body: { text: 'question' } });
-			const entry = store.liveText.start({ userId: 'cy', ipKey: 'ip-cy', identity: { user_id: 'cy', name: 'Cy' }, kind: 'append', roomId: 'general', text: '**Answer:** ', replyTo: parent.result.message_id as string, now: clock.value });
-			const claimed = store.liveText.claim(entry.key, clock.value)!;
+			const entry = store.liveText!.start({ userId: 'cy', ipKey: 'ip-cy', identity: { user_id: 'cy', name: 'Cy' }, kind: 'append', roomId: 'general', text: '**Answer:** ', replyTo: parent.result.message_id as string, now: clock.value });
+			const claimed = store.liveText!.claim(entry.key, clock.value)!;
 			expect(claimed.message).toMatchObject({
 				room_id: 'general', from: { user_id: 'cy', name: 'Cy' }, reply_to: { message_id: parent.result.message_id },
 				body: { text: '**Answer:** ', format: 'markdown', embeds: [{ embed_id: entry.embedId, kind: 'append', url: `https://demo.test/live/${entry.id}` }] },
 			});
 			expect(claimed.broadcasts).toHaveLength(1);
-			store.liveText.finish(entry.key, encode('42'), clock.value);
+			store.liveText!.finish(entry.key, encode('42'), clock.value);
 			// An unknown room or reply is refused at the command.
-			expect(errorCode(() => store.liveText.start({ userId: 'cy', ipKey: 'ip-cy', identity: { user_id: 'cy' }, kind: 'terminal', roomId: 'nowhere', now: clock.value }))).toBe('invalid_params');
-			expect(errorCode(() => store.liveText.start({ userId: 'cy', ipKey: 'ip-cy', identity: { user_id: 'cy' }, kind: 'terminal', roomId: 'general', replyTo: '1', now: clock.value }))).toBe('invalid_params');
+			expect(errorCode(() => store.liveText!.start({ userId: 'cy', ipKey: 'ip-cy', identity: { user_id: 'cy' }, kind: 'terminal', roomId: 'nowhere', now: clock.value }))).toBe('invalid_params');
+			expect(errorCode(() => store.liveText!.start({ userId: 'cy', ipKey: 'ip-cy', identity: { user_id: 'cy' }, kind: 'terminal', roomId: 'general', replyTo: '1', now: clock.value }))).toBe('invalid_params');
 		});
 	});
 
@@ -499,9 +500,9 @@ describe('store live text', () => {
 			register(store, clock, 'jo');
 			const created = post(store, clock, 'jo', { body: { embeds: [{ kind: 'terminal' }] } });
 			const key = writeOf(created.result).write.key;
-			store.liveText.claim(key, clock.value);
+			store.liveText!.claim(key, clock.value);
 			// 32 KB of escape characters is 192 KB of JSON.
-			const finished = store.liveText.finish(key, new Uint8Array(LIVE.terminalKeepBytes).fill(0x1b), clock.value);
+			const finished = store.liveText!.finish(key, new Uint8Array(LIVE.terminalKeepBytes).fill(0x1b), clock.value);
 			const output = (bodyOf(finished).body!.embeds![0] as { output: string }).output;
 			expect(new TextEncoder().encode(JSON.stringify(output)).length).toBeLessThanOrEqual(MAX_TERMINAL_OUTPUT_JSON_BYTES);
 			expect(output.length).toBeGreaterThan(MAX_TERMINAL_OUTPUT_JSON_BYTES / 8);
@@ -522,7 +523,7 @@ describe('store live text', () => {
 			const fresh = openStore(state, { liveText: LIVE }, clock.clock);
 			fresh.lifecycle.initialize();
 			let error: unknown;
-			try { fresh.liveText.start({ userId: 'broke', ipKey: 'ip-broke', identity: { user_id: 'broke' }, kind: 'terminal', roomId: 'general', now: clock.value }); }
+			try { fresh.liveText!.start({ userId: 'broke', ipKey: 'ip-broke', identity: { user_id: 'broke' }, kind: 'terminal', roomId: 'general', now: clock.value }); }
 			catch (caught) { error = caught; }
 			expectRetryAfter(error);
 			expect(error.data).toMatchObject({ reason: 'daily_budget' });
@@ -538,7 +539,8 @@ describe('store live text', () => {
 			const created = post(store, clock, 'old', { body: { embeds: [{ kind: 'terminal', url: 'https://example.com/t' }] } });
 			expect(created.result.embeds).toBeUndefined();
 			expect((created.message!.body!.embeds as Array<Record<string, unknown>>)[0]).toMatchObject({ kind: 'terminal', url: 'https://example.com/t' });
-			expect(store.liveText.open(clock.value)).toEqual([] as LiveEntry[]);
+			expect(store.liveText).toBeUndefined();
+			expect(sqliteOf(store).openLiveTexts(clock.value)).toEqual([] as LiveEntry[]);
 		});
 	});
 });

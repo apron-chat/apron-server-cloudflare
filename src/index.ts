@@ -62,6 +62,7 @@ import {
 	type Lifecycle,
 	type LiveText,
 	type Push,
+	type Uploads,
 	type Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
@@ -3273,10 +3274,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// Committed removals need no store access; tell their members before any
 		// listing that could fail on an exhausted budget.
-		if (this.config.uploads) {
+		const uploads = this.store.uploads;
+		if (uploads) {
 			try {
 				await this.runMutation(async () => {
-					const expired = this.store.uploads.expirePending(now);
+					const expired = uploads.expirePending(now);
 					await this.broadcastRecords(expired.broadcasts);
 					this.deleteMedia(expired.deletedUploads);
 					this.deadlines.uploads.set(expired.next);
@@ -3284,7 +3286,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				});
 				// A full batch may have left more behind: sweep again shortly rather
 				// than a cleanup interval later, so released bytes do not pile up.
-				const swept = this.store.uploads.cleanup(now);
+				const swept = uploads.cleanup(now);
 				// Expired files and avatars go from R2 too, not only by its lifecycle rules.
 				this.deleteMedia(swept.deleted);
 				if (swept.count >= UPLOAD_SWEEP_BATCH) {
@@ -3292,7 +3294,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
-		if (this.config.liveText) {
+		if (this.store.liveText) {
 			// Recovered only once the expiry ran: a failure (the maintenance budget
 			// run out) leaves the lost texts to the next alarm or live request.
 			try {
@@ -3358,9 +3360,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// History upkeep: a cycle that asked to go on, or a `/purge` or
 		// `/rename` the tiers below have yet to apply, read once a wake.
 		if (this.history && this.historySchedule.workDue(now, () => this.store.history.rewrites(now).length > 0)) return true;
-		if (this.config.uploads && !this.uploadDeadlineRead) {
+		const uploads = this.store.uploads;
+		if (uploads && !this.uploadDeadlineRead) {
 			try {
-				const stored = this.store.uploads.nextDeadline(now);
+				const stored = uploads.nextDeadline(now);
 				if (stored !== undefined) this.deadlines.uploads.soonest(stored);
 				this.uploadDeadlineRead = true;
 			} catch {
@@ -3369,9 +3372,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (this.deadlines.uploads.passed(now)) return true;
 		// Live texts that a lost instance left open, read once (recoverLiveTexts), or one past its deadline.
-		if (this.config.liveText && !this.liveRecovered) {
+		const liveText = this.store.liveText;
+		if (liveText && !this.liveRecovered) {
 			try {
-				if (this.store.liveText.open(now).length > 0) return true;
+				if (liveText.open(now).length > 0) return true;
 				this.liveRecovered = true;
 			} catch {
 				return true;
@@ -3850,14 +3854,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!this.config.push) break;
 				this.handleStatus(socket, request);
 				return;
-			case "push_register":
-				if (!this.config.push) break;
-				await this.handlePushRegister(socket, attachment, request);
+			case "push_register": {
+				const push = this.store.push;
+				if (!push) break;
+				await this.handlePushRegister(push, socket, attachment, request);
 				return;
-			case "push_unregister":
-				if (!this.config.push) break;
-				this.handlePushUnregister(socket, attachment, request);
+			}
+			case "push_unregister": {
+				const push = this.store.push;
+				if (!push) break;
+				this.handlePushUnregister(push, socket, attachment, request);
 				return;
+			}
 			case "room_list":
 				await this.handleRoomList(socket, attachment, request);
 				return;
@@ -5371,9 +5379,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// changeChoice checks the rate before it changes anything.
 		if (status !== undefined && this.config.push) this.changeChoice(socket, attachment, statusChoice(status));
-		const removeAvatar = avatar === "" && attachment.tier === "registered" && !!this.config.uploads;
+		const uploads = this.store.uploads;
+		const removeAvatar = avatar === "" && attachment.tier === "registered" && !!uploads;
 		if (removeAvatar) {
-			const cleared = this.store.uploads.clearAvatar({ userId: identity.user_id, now: nowMs() });
+			const cleared = uploads.clearAvatar({ userId: identity.user_id, now: nowMs() });
 			this.deleteMedia(cleared.deletedUploads);
 			// Announced as its empty value (§3.3), before the result.
 			if (cleared.changed) this.announceAvatar(identity.user_id, "");
@@ -6975,7 +6984,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * registering a `url` again replaces their own registration of it
 	 * (Store.registerPushSubscription).
 	 */
-	private async handlePushRegister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+	private async handlePushRegister(push: Push, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const now = nowMs();
@@ -7008,7 +7017,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
-		this.store.push.register({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
+		push.register({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -7017,7 +7026,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * an unknown one is already gone, as is one too long to have been
 	 * registered, which is answered without SQL.
 	 */
-	private handlePushUnregister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+	private handlePushUnregister(push: Push, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const sent = requiredString(request.params, "url");
@@ -7029,7 +7038,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// As registration stores it; an unparsable url was never registered.
 		let url = sent;
 		try { url = new URL(sent).href; } catch { /* removes nothing */ }
-		this.store.push.remove({ userId: attachment.userId!, url, now: nowMs() });
+		push.remove({ userId: attachment.userId!, url, now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -7057,7 +7066,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * is never pushed (§4.9), and never reaches here.
 	 */
 	private wakeFor(message: MessageSnapshot): void {
-		if (!this.config.push || !PUSH_POLICY || !message.message_id || !message.log_id) return;
+		const push = this.store.push;
+		if (!push || !PUSH_POLICY || !message.message_id || !message.log_id) return;
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const reasons = new Map<string, number>();
@@ -7095,7 +7105,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Moderators may wake for every message in a room they joined (`joined`, §4.9.4,
 		// JOINED_WAKE_ROLES); claimPushes checks the role and the membership.
 		try {
-			for (const userId of this.store.push.joinedWakers(now)) consider(userId, WAKE_SCOPES.joined);
+			for (const userId of push.joinedWakers(now)) consider(userId, WAKE_SCOPES.joined);
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_joined_lookup_failed", reason: errorToProtocol(error).message }));
 		}
@@ -7248,10 +7258,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private clearUnread(state: ConnectionAttachment): void {
 		const userId = state.userId;
-		if (!this.config.push || state.tier !== "registered" || !userId) return;
+		const push = this.store.push;
+		if (!push || state.tier !== "registered" || !userId) return;
 		if (!state.unreadOwed && !this.connectionsOf(userId).some((peer) => connectionAttachment(peer)?.unreadOwed)) return;
 		try {
-			this.store.push.clearUnread(userId, nowMs());
+			push.clearUnread(userId, nowMs());
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_unread_clear_failed", reason: errorToProtocol(error).message }));
 			return;
@@ -7320,8 +7331,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** A held wake's message as it is now (one metered lookup), or null when gone, deleted, or unreadable. */
 	private heldMessage(messageId: string, now: number): MessageSnapshot | null {
+		const push = this.store.push;
+		if (!push) return null;
 		try {
-			const message = this.store.push.message(messageId, now);
+			const message = push.message(messageId, now);
 			return message && !message.deleted ? message : null;
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_held_lookup_failed", reason: errorToProtocol(error).message }));
@@ -7652,8 +7665,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>, alert = false): boolean {
 		const vapid = this.config.push;
+		const push = this.store.push;
 		const policy = PUSH_POLICY;
-		if (!vapid || !policy) return true;
+		if (!vapid || !push || !policy) return true;
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
@@ -7662,7 +7676,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// PUSH_HOSTS as configured now: a registration made under a wider list
 			// is passed over before it takes a wake or a push.
 			const hosts = this.config.pushHosts;
-			claimed = this.store.push.claim({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now, alert });
+			claimed = push.claim({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now, alert });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return true;
@@ -7672,7 +7686,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const counted = new Set(claimed.subscriptions.filter((subscription) => subscription.unread !== undefined).map((subscription) => subscription.userId));
 		for (const userId of counted) this.markUnreadOwed(userId, true);
 		this.unreadClaims += counted.size;
-		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
+		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(push, claimed.subscriptions, message, vapid, policy.ttlSeconds));
 		return claimed.subscriptions.length > 0 || claimed.skipped > 0;
 	}
 
@@ -7683,7 +7697,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (404 or 410) or refuses this server's key (403). Other failures are only logged: the
 	 * push is lost, not retried.
 	 */
-	private async deliverPushes(subscriptions: readonly ClaimedPush[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
+	private async deliverPushes(push: Push, subscriptions: readonly ClaimedPush[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
 		const payloads = new Map<string, string>();
 		const payloadFor = (pushId: string | undefined, unread: number | undefined): string => {
 			const key = JSON.stringify([pushId ?? null, unread ?? null]);
@@ -7715,7 +7729,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (count) recordMetric(this.runtimeEnv.METRICS, "push", [outcome], count);
 		}
 		try {
-			if (gone.length) this.store.push.forgetSubscriptions(gone, nowMs());
+			if (gone.length) push.forgetSubscriptions(gone, nowMs());
 		} catch { /* a failed delete is retried by nothing: the next push tries again */ }
 	}
 
@@ -8211,7 +8225,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.
-		if (this.config.push) this.store.push.clearSubscriptions(userId, nowMs());
+		this.store.push?.clearSubscriptions(userId, nowMs());
 		const text = `Removed the passkey \`${chosen.credentialId.slice(0, 8)}…\` from your account.`;
 		for (const peer of this.connectionsOf(userId, socket)) {
 			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
@@ -8247,7 +8261,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.recoverLiveTexts();
 		let entry: LiveEntry | undefined;
 		await this.runMutation(async () => {
-			entry = this.store.liveText.start({
+			entry = this.store.liveText!.start({
 				userId: identity.user_id, ipKey: attachment.ipKey, identity: { user_id: identity.user_id, ...(attachment.name ? { name: attachment.name } : {}) },
 				kind, roomId, now: nowMs(),
 				// A non-empty opening ends in a paragraph break, so the streamed text starts a new paragraph.
@@ -8269,7 +8283,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * started streaming leaves no alarm for a deadline it no longer has.
 	 */
 	private async refreshLiveDeadline(): Promise<void> {
-		const entries = this.store.liveText.open(nowMs());
+		const liveText = this.store.liveText;
+		if (!liveText) return;
+		const entries = liveText.open(nowMs());
 		const next = entries.length ? Math.min(...entries.map(liveDeadline)) : undefined;
 		if (!this.deadlines.live.set(next)) return;
 		await this.rescheduleAlarm();
@@ -8287,7 +8303,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * when the next one falls due. One `_meta` read when there are none.
 	 */
 	private async recoverLiveTexts(): Promise<void> {
-		if (!this.config.liveText) return;
+		if (!this.store.liveText) return;
 		if (this.liveRecovered && !this.deadlines.live.passed(nowMs())) return;
 		await this.expireLive(nowMs());
 		this.liveRecovered = true;
@@ -8300,7 +8316,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Read inside the mutation: a write claimed before it is streaming by now (liveWrite).
 			const streaming = new Set<string>();
 			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
-			const expired = this.store.liveText.expire(streaming, now);
+			const expired = this.store.liveText!.expire(streaming, now);
 			await this.broadcastRecords(expired.broadcasts);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
@@ -8323,7 +8339,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private forgetEndedLive(key: string): void {
 		let open: ReadonlySet<string>;
 		try {
-			open = new Set(this.store.liveText.open(nowMs()).map((entry) => entry.key));
+			open = new Set(this.store.liveText!.open(nowMs()).map((entry) => entry.key));
 		} catch {
 			return; // Unknown: the alarm's expiry ends them if their text went.
 		}
@@ -8340,13 +8356,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Ends the live texts of purged users: their messages are gone, so nothing is published. */
 	private async endLiveOf(userIds: readonly string[]): Promise<void> {
-		if (!this.config.liveText) return;
-		const entries = this.store.liveText.open(nowMs()).filter((entry) => userIds.includes(entry.owner));
+		const liveText = this.store.liveText;
+		if (!liveText) return;
+		const entries = liveText.open(nowMs()).filter((entry) => userIds.includes(entry.owner));
 		for (const entry of entries) {
 			const session = this.liveSessions.get(entry.id);
 			if (session?.phase === "streaming") session.stop.abort("removed");
 			else {
-				await this.runMutation(async () => { this.store.liveText.finish(entry.key, null, nowMs()); });
+				await this.runMutation(async () => { liveText.finish(entry.key, null, nowMs()); });
 				this.stopLiveText(entry.key, "removed");
 			}
 		}
@@ -8406,7 +8423,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const { policy, viewerUrl, publicOrigin } = this.config.liveText!;
 		let session = this.liveSessions.get(id);
 		if (!session) {
-			const entry = this.store.liveText.open(nowMs()).find((candidate) => candidate.id === id);
+			const entry = this.store.liveText!.open(nowMs()).find((candidate) => candidate.id === id);
 			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveRefused(liveAnswer(404, "This live text has ended, or never existed"), "ended");
 			session = { phase: "waiting", entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
@@ -8446,7 +8463,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let streaming: Extract<LiveSession, { phase: "streaming" }> | undefined;
 		await this.runMutation(async () => {
 			try {
-				claimed = this.store.liveText.claim(key, nowMs());
+				claimed = this.store.liveText!.claim(key, nowMs());
 			} catch (error) {
 				// A refused claim may end the text (Store.claimLiveText): its waiting readers go with it.
 				this.forgetEndedLive(key);
@@ -8528,7 +8545,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let used = false;
 		try {
 			await this.runMutation(async () => {
-				const finished = this.store.liveText.finish(entry.key, kept, nowMs(), stored);
+				const finished = this.store.liveText!.finish(entry.key, kept, nowMs(), stored);
 				used = !!finished.stored;
 				await this.broadcastRecords(finished.broadcasts);
 				published = !!finished.entry;
@@ -8569,10 +8586,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async storeTerminalOutput(kept: Uint8Array, limit: number): Promise<TerminalStored | undefined> {
 		const media = this.runtimeEnv.MEDIA;
-		if (!this.config.uploads || !media) return undefined;
+		const uploads = this.store.uploads;
+		if (!uploads || !media) return undefined;
 		const output = terminalOutput(keepLast(kept, limit));
 		if (!output) return undefined;
-		const key = this.store.uploads.terminalOutputKey();
+		const key = uploads.terminalOutputKey();
 		try {
 			await this.stalls.track("r2", "put", media.put(key, output, {
 				httpMetadata: { contentType: "text/plain; charset=utf-8", cacheControl: "public, max-age=604800, immutable" },
@@ -8587,7 +8605,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		let started = false;
 		await this.runMutation(async () => {
-			const upload = this.store.uploads.startAvatar({ userId: attachment.userId!, now: nowMs() });
+			const upload = this.store.uploads!.startAvatar({ userId: attachment.userId!, now: nowMs() });
 			this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 			started = this.afterUploads({ uploads: [upload] });
 		});
@@ -8608,7 +8626,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (action === "add") {
 			let started = false;
 			await this.runMutation(async () => {
-				const upload = this.store.uploads.startEmoji({ userId: attachment.userId!, key, now: nowMs() });
+				const upload = this.store.uploads!.startEmoji({ userId: attachment.userId!, key, now: nowMs() });
 				this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 				started = this.afterUploads({ uploads: [upload] });
 			});
@@ -8650,7 +8668,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (args.upload) {
 				let started = false;
 				await this.runMutation(async () => {
-					const upload = this.store.uploads.startServerAvatar({ userId: attachment.userId!, now: nowMs() });
+					const upload = this.store.server.startAvatarUpload({ userId: attachment.userId!, now: nowMs() });
 					this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 					started = this.afterUploads({ uploads: [upload] });
 				});
@@ -9051,7 +9069,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (state) this.closePolicy(peer, state, 1008, "Signed out by an admin");
 			}
 		}
-		if (this.config.push) this.store.push.clearSubscriptions(userId, nowMs());
+		this.store.push?.clearSubscriptions(userId, nowMs());
 		this.sendNotice(socket, roomId, [
 			`Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had. This new token signs in as them; it does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately.`,
 			"```\n" + token + "\n```",
@@ -9615,7 +9633,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Connection admissions: ${share(counts.admissions, limits.connectionAdmissionsPerDay)}`,
 			`- Posts: ${share(counts.posts, limits.globalPostsPerDay)}`,
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
-			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.push.sentToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
+			...(this.store.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.push.sentToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredAccounts)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			...(active ? [await active] : []),
 			...this.roomCountLines(now),
@@ -9820,7 +9838,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			if (state?.credential && keys.includes(state.credential)) this.closePolicy(peer, state, 1008, reason);
 		}
-		if (this.config.push) this.store.push.clearSubscriptions(userId, nowMs());
+		this.store.push?.clearSubscriptions(userId, nowMs());
 	}
 
 	/**
@@ -9848,7 +9866,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");
 		}
-		if (this.config.push) this.store.push.clearSubscriptions(botId, nowMs());
+		this.store.push?.clearSubscriptions(botId, nowMs());
 		// Those who share a room with the bot see its new name (§3.3).
 		if (bot.renamed) {
 			const stored = this.store.accounts.get(botId);
@@ -10319,13 +10337,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private refreshAvatar(userId: string): void {
 		const media = this.runtimeEnv.MEDIA;
-		if (!this.config.uploads || !media) return;
+		const uploads = this.store.uploads;
+		if (!uploads || !media) return;
 		this.ctx.waitUntil((async () => {
-			const key = this.store.uploads.avatarRefreshDue(userId, nowMs());
+			const key = uploads.avatarRefreshDue(userId, nowMs());
 			if (!key) return;
 			const object = await this.stalls.track("r2", "get", media.get(key));
 			if (!object) {
-				const cleared = this.store.uploads.clearAvatar({ userId, now: nowMs() });
+				const cleared = uploads.clearAvatar({ userId, now: nowMs() });
 				// This runs at sign-in: telling others of an invisible user's
 				// avatar would tell them the user just connected (§4.5). Their
 				// own connections still get `you`; others see the removal in
@@ -10335,7 +10354,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			}
 			await this.stalls.track("r2", "put", (async () => media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata }))());
-			this.store.uploads.renewAvatar({ userId, key, now: nowMs() });
+			uploads.renewAvatar({ userId, key, now: nowMs() });
 		})().catch(() => undefined));
 	}
 
@@ -10374,7 +10393,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
 		this.stalls.event(() => this.awakeSnapshot());
-		return !!this.config.uploads && this.asUploadOwner(key, () => this.store.uploads.claim(key, nowMs()));
+		const uploads = this.store.uploads;
+		return !!uploads && this.asUploadOwner(uploads, key, () => uploads.claim(key, nowMs()));
 	}
 
 	/**
@@ -10382,9 +10402,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * so an overrun there pauses them rather than the server. The server's
 	 * own uploads (its avatar, custom emoji) have no user and run as the server.
 	 */
-	private asUploadOwner<T>(key: string, fn: () => T): T {
+	private asUploadOwner<T>(uploads: Uploads, key: string, fn: () => T): T {
 		let owner: string | undefined;
-		try { owner = this.store.uploads.owner(key, nowMs()); } catch { /* fn meets the same refusal */ }
+		try { owner = uploads.owner(key, nowMs()); } catch { /* fn meets the same refusal */ }
 		return ACTOR.run(() => (owner && !owner.startsWith("~") ? [`user:${owner}`] : []), fn);
 	}
 
@@ -10400,11 +10420,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private async uploadFinished(write: UploadWrite): Promise<boolean> {
-		if (!this.config.uploads) return false;
-		if (write.key.startsWith("e/")) return this.finishEmoji(write);
+		const uploads = this.store.uploads;
+		if (!uploads) return false;
+		if (write.key.startsWith("e/")) return this.finishEmoji(uploads, write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
-		await this.asUploadOwner(write.key, () => this.runMutation(async () => {
-			finished = this.store.uploads.finish(write, nowMs());
+		await this.asUploadOwner(uploads, write.key, () => this.runMutation(async () => {
+			finished = uploads.finish(write, nowMs());
 			await this.broadcastRecords(finished.broadcasts);
 		}));
 		this.deleteMedia(finished.deletedUploads);
@@ -10421,7 +10442,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * emoji (emojiDraft): it finishes as any other upload, and becomes the
 	 * server's `avatar` in a new `server` frame for every connection.
 	 */
-	private async finishEmoji(write: UploadWrite): Promise<boolean> {
+	private async finishEmoji(uploads: Uploads, write: UploadWrite): Promise<boolean> {
 		let accepted = false;
 		let released: string[] = [];
 		let serverAvatar: string | undefined;
@@ -10431,7 +10452,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (accepted) return;
 			// Without a draft, the write may be the server's avatar's: the store
 			// finishes that one, and fails a custom emoji's as above.
-			const finished = this.store.uploads.finish(draft ? { key: write.key, ok: false } : write, nowMs());
+			const finished = uploads.finish(draft ? { key: write.key, ok: false } : write, nowMs());
 			accepted = finished.accepted;
 			serverAvatar = finished.serverAvatar;
 			released = finished.deletedUploads;

@@ -919,8 +919,8 @@ it("lets every moderator role, the built-in admin included, move anyone's messag
 			ext: { irc: { nick: "rita_" } },
 		});
 		const key = (created.result.embeds as Array<{ write: { key: string } }>)[0].write.key;
-		expect(store.uploads.claim(key, clock.value)).toBe(true);
-		const finished = store.uploads.finish({ key, ok: true, bytes: 64, contentType: "image/png", width: 1, height: 1 }, clock.value);
+		expect(store.uploads!.claim(key, clock.value)).toBe(true);
+		const finished = store.uploads!.finish({ key, ok: true, bytes: 64, contentType: "image/png", width: 1, height: 1 }, clock.value);
 		const guest = post(store, clock, "guest_7", "guest", { body: { text: "a guest's" } });
 		const first = thread(store, clock, "first");
 		const second = thread(store, clock, "second");

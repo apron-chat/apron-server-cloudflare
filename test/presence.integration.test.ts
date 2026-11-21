@@ -288,7 +288,7 @@ describe('the status a user chooses (§4.5)', () => {
 			store.accounts.setStatus({ userId: ids.none, choice: '', now });
 			store.accounts.setMute({ userId: ids.muted, untilMs: now + 3_600_000, now });
 			// A registration that wakes for messages never makes anyone idle.
-			store.push.register({ userId: ids.pushed, url: `https://push.example.net/${ids.pushed}`, p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+			store.push!.register({ userId: ids.pushed, url: `https://push.example.net/${ids.pushed}`, p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		});
 		const observer = await signedIn(observerId);
 		try {

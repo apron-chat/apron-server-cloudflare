@@ -38,9 +38,12 @@ export function storeOver(sqlite: SqliteStore): Store {
     ops: sqliteOps(sqlite),
     lifecycle: sqliteLifecycle(sqlite),
     history: sqliteHistory(sqlite),
-    push: sqlitePush(sqlite),
-    uploads: sqliteUploads(sqlite),
-    liveText: sqliteLiveText(sqlite),
+    // The optional parts, decided once from the configuration that gates the
+    // features (asStoreConfig). A runtime toggle (`/toggle uploads`) leaves
+    // them be; the store's own cleanup prunes their tables either way.
+    ...(sqlite.config.push ? { push: sqlitePush(sqlite) } : {}),
+    ...(sqlite.config.uploads ? { uploads: sqliteUploads(sqlite) } : {}),
+    ...(sqlite.config.liveText ? { liveText: sqliteLiveText(sqlite) } : {}),
   });
   UNDER.set(store, sqlite);
   return store;

@@ -224,10 +224,10 @@ it("wakes only a private room's members for its messages, and each of them for `
 		const roomId = create(store, clock, "ada");
 		add(store, clock, "ada", roomId, "bob");
 		const keys = { p256dh: "p".repeat(87), auth: "a".repeat(22) };
-		store.push.register({ userId: "bob", url: "https://push.example.net/bob", ...keys, wake: WAKE_SCOPES.private, now: clock.value });
-		store.push.register({ userId: "cy", url: "https://push.example.net/cy", ...keys, now: clock.value });
+		store.push!.register({ userId: "bob", url: "https://push.example.net/bob", ...keys, wake: WAKE_SCOPES.private, now: clock.value });
+		store.push!.register({ userId: "cy", url: "https://push.example.net/cy", ...keys, now: clock.value });
 		// Cy is mentioned but not a member: no push. Bob wakes for `private`.
-		const claim = store.push.claim({
+		const claim = store.push!.claim({
 			senderId: "ada", roomId,
 			candidates: [{ userId: "cy", reasons: WAKE_SCOPES.mentions }, { userId: "bob", reasons: WAKE_SCOPES.private }],
 			now: clock.value,

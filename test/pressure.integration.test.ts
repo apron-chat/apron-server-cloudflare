@@ -179,7 +179,7 @@ it('keeps the storage-pressure latch set by a refusal inside a transaction, whic
 		Object.assign(store.ops.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
 		let error: unknown;
 		try {
-			store.push.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+			store.push!.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		} catch (candidate) {
 			error = candidate;
 		}
@@ -189,14 +189,14 @@ it('keeps the storage-pressure latch set by a refusal inside a transaction, whic
 		Object.assign(store.ops.config, { storageLowWaterBytes: 1, storageHighWaterBytes: size * 2 });
 		error = undefined;
 		try {
-			store.push.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+			store.push!.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		} catch (candidate) {
 			error = candidate;
 		}
 		expectRetryAfter(error);
 		// Below the low-water mark it clears, and the registration goes through.
 		Object.assign(store.ops.config, { storageLowWaterBytes: size * 2 });
-		store.push.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+		store.push!.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		expect(latch()).toBe('0');
 	});
 });

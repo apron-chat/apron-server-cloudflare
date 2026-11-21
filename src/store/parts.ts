@@ -531,6 +531,17 @@ export interface Server {
    * then: it is kept too (META_PRESENCE_ON), in the same reservation.
    */
   setToggle(feature: string, on: boolean | undefined, now?: number, since?: number): void;
+  /**
+   * Starts the server's avatar upload (§3.1, §4.8.7): `/server avatar` with
+   * one `upload` embed, by an admin. Kept like a custom emoji: the server's
+   * (SERVER_OWNER), never expiring, an avatar in size, and counted against
+   * the admin's and the server's daily uploads and the stored-bytes cap.
+   * The avatar is set when the write finishes (finishUpload). A server
+   * part, not an uploads one, as `/server avatar` is offered whether or not
+   * uploads are configured: without them it is refused (`unsupported`),
+   * once reserved, as any upload start is.
+   */
+  startAvatarUpload(input: { userId: string; now?: number }): PendingUpload;
 }
 
 /** Admission control: the per-IP and daily limits on sign-ins, guests, frames and connections, throttle trips and the attack pause. */
@@ -892,14 +903,6 @@ export interface Uploads {
    * (emojiDraft, commitEmoji). A new key past `maxEmoji` is `denied`.
    */
   startEmoji(input: { userId: string; key: string; now?: number }): PendingUpload;
-  /**
-   * Starts the server's avatar upload (§3.1, §4.8.7): `/server avatar` with
-   * one `upload` embed, by an admin. Kept like a custom emoji: the server's
-   * (SERVER_OWNER), never expiring, an avatar in size, and counted against
-   * the admin's and the server's daily uploads and the stored-bytes cap.
-   * The avatar is set when the write finishes (finishUpload).
-   */
-  startServerAvatar(input: { userId: string; now?: number }): PendingUpload;
   /** Who owns an upload (`owner_id`: a user, or SERVER_OWNER or EMOJI_OWNER), or undefined for an unknown key: one row by primary key. */
   owner(key: string, now?: number): string | undefined;
   /** Records a finished (or failed) R2 write of a pending upload, and what it publishes. */
@@ -1013,7 +1016,10 @@ export interface Store {
   readonly ops: Ops;
   readonly lifecycle: Lifecycle;
   readonly history: History;
-  readonly push: Push;
-  readonly uploads: Uploads;
-  readonly liveText: LiveText;
+  /** Present where push is configured (VAPID keys and the plan's PUSH_POLICY). */
+  readonly push?: Push;
+  /** Present where uploads are configured (MEDIA, its origins, the signing key and the plan's UPLOAD_POLICY). */
+  readonly uploads?: Uploads;
+  /** Present where live text is configured (the plan's LIVE_TEXT_POLICY and the deployment's origin and key). */
+  readonly liveText?: LiveText;
 }
