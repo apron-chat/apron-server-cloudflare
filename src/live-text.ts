@@ -10,6 +10,9 @@
  * connects gets what is kept, then every chunk as it arrives.
  */
 
+import { MAX_TERMINAL_OUTPUT_JSON_BYTES } from "./content/output-ref";
+import { utf8Bytes } from "./content/verdict";
+
 export type LiveKind = "terminal" | "append";
 
 /** Why a text ended, as the writer is told in the `PUT` response. */
@@ -284,4 +287,50 @@ export function liveTextHeaders(): Headers {
 		"Access-Control-Allow-Origin": "*",
 		"Content-Security-Policy": "default-src 'none'",
 	});
+}
+
+/**
+ * How long past its time limit a text marked `live` may stay open before the
+ * alarm ends it as lost: the object that streamed it was evicted or
+ * redeployed, so its bytes are gone (finishLiveText with nothing kept).
+ */
+export const LIVE_ORPHAN_GRACE_MS = 30_000;
+
+/** What liveDeadline reads of an open live text (the store's LiveEntry). */
+export interface LiveSlot {
+	state: "pending" | "live";
+	writeExpiresMs: number;
+	startedMs?: number;
+	maxMs: number;
+}
+
+/**
+ * When an open live text falls due: its `write_url`'s expiry while it
+ * waits, and its time limit plus LIVE_ORPHAN_GRACE_MS while it streams.
+ */
+export function liveDeadline(entry: LiveSlot): number {
+	return entry.state === "pending" ? entry.writeExpiresMs : (entry.startedMs ?? 0) + entry.maxMs + LIVE_ORPHAN_GRACE_MS;
+}
+
+/**
+ * Whether a live text still holds its slot at `now`: its write can still be
+ * claimed (Store.claimLiveText's window), or it streams within its time and
+ * the orphan grace. Past that it only awaits the alarm that ends it.
+ */
+export function liveHolds(entry: LiveSlot, now: number): boolean {
+	return now <= liveDeadline(entry);
+}
+
+/**
+ * A finished terminal's `output` (§4.8.6): the kept bytes as text, cut
+ * further with keep_last while their JSON passes
+ * MAX_TERMINAL_OUTPUT_JSON_BYTES.
+ */
+export function terminalOutput(bytes: Uint8Array): string {
+	let kept = bytes;
+	for (;;) {
+		const text = liveTextString(kept);
+		if (utf8Bytes(JSON.stringify(text)) <= MAX_TERMINAL_OUTPUT_JSON_BYTES) return text;
+		kept = keepLast(kept, Math.floor(kept.length * 3 / 4));
+	}
 }

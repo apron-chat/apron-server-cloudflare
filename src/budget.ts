@@ -771,3 +771,16 @@ export const ACCOUNT_USAGE_POLICY = Object.freeze({
 	stopRatio: 0.90,
 	...PLAN.account,
 });
+
+/**
+ * The share of a daily ceiling (foreground SQL reads or writes, frames) at
+ * which the server degrades: live text, uploads and older history are
+ * refused until UTC midnight, so what is left goes to chat (assertNotDegraded).
+ */
+export const DEGRADE_SHARE = 0.7;
+/**
+ * The share at which the server counts a ceiling as spent (the exhausted
+ * tier): the ledger refuses a reservation that would pass the ceiling, so a
+ * share stops short of 1 while work is already refused.
+ */
+export const EXHAUSTED_SHARE = 0.99;

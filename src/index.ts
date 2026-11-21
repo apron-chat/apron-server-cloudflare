@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords, DEGRADE_SHARE, EXHAUSTED_SHARE } from "./budget";
 import { MAX_LISTING_MEMBERS } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
@@ -13,7 +13,7 @@ import { type BackupKind, BackupStore, MAX_IMPORT_BYTES, MAX_IMPORT_RECORDS, imp
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryChain } from "./history/chain";
 import { type ChatRecord, type PublicRecord, asPublic } from "./history/records";
-import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
+import { keepLast, LiveBuffer, LiveReaders, liveDeadline, liveTextHeaders, terminalOutput, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
 import { PRICED_LABEL, PRICES, usd } from "./pricing";
@@ -29,8 +29,9 @@ import { IMAGE_TYPES, sniffImage } from "./content/media/image";
 import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./content/media/text";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./content/emoji";
 import { liveInputLimit, liveResultEmbed, uploadResultEmbed } from "./content/embeds";
-import { MAX_USER_EXT_BYTES, clientUserExt, userExtFits } from "./content/user";
+import { MAX_USER_EXT_BYTES, clientUserExt, mergeExt, userExtFits } from "./content/user";
 import { limitData } from "./store-error";
+import { ADMIN_USER_ID } from "./user-ids";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
@@ -56,41 +57,13 @@ import {
 	type RequestFrame,
 } from "./protocol";
 import {
-	ADMIN_USER_ID,
-	DEGRADE_SHARE,
-	EXHAUSTED_SHARE,
-	DEFAULT_JOINED_ROOMS,
-	MAX_PASSKEYS_PER_USER,
 	RETIRED_SWEEP_BATCH,
-	MAX_PUSH_URL_BYTES,
-	MAX_ROLES_PER_USER,
-	MAX_MUTE_SECONDS,
-	MUTE_FOREVER,
-	muteValue,
-	nextRoomMuteEnd,
-	PUSH_ID_PATTERN,
-	ROLE_PATTERN,
-	WAKE_SCOPES,
-	MAX_ROOM_MUTES_PER_USER,
-	ROOM_ID,
-	JOINED_WAKE_ROLES,
-	EMOJI_ROLES,
-	MODERATOR_ROLES,
-	BOT_MODERATOR_ROLES,
-	BOT_NAME_PATTERN,
-	BOT_NAME_RULE,
-	mergeExt,
 	Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
-	liveDeadline,
-	isPrivateRoomId,
-	MAX_READ_RECEIPT_MEMBERS,
-	seenStands,
 	isPendingHistory,
 	newTerminalOutputKey,
-	terminalOutput,
 	type Broadcast,
 	type TerminalStored,
 	type ClaimedPush,
@@ -107,10 +80,35 @@ import {
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
-	MAX_LISTED_USER_ROOMS,
 	STORAGE_UNAVAILABLE,
 } from "./store";
-import { isProtocolId, type StoredCredential } from "./domain";
+import {
+	BOT_MODERATOR_ROLES,
+	BOT_NAME_PATTERN,
+	BOT_NAME_RULE,
+	DEFAULT_JOINED_ROOMS,
+	EMOJI_ROLES,
+	isPrivateRoomId,
+	isProtocolId,
+	JOINED_WAKE_ROLES,
+	MAX_LISTED_USER_ROOMS,
+	MAX_MUTE_SECONDS,
+	MAX_PASSKEYS_PER_USER,
+	MAX_PUSH_URL_BYTES,
+	MAX_READ_RECEIPT_MEMBERS,
+	MAX_ROLES_PER_USER,
+	MAX_ROOM_MUTES_PER_USER,
+	MODERATOR_ROLES,
+	MUTE_FOREVER,
+	muteValue,
+	nextRoomMuteEnd,
+	PUSH_ID_PATTERN,
+	ROLE_PATTERN,
+	ROOM_ID,
+	seenStands,
+	type StoredCredential,
+	WAKE_SCOPES,
+} from "./domain";
 import { arity, inviteUses, issuableUserId, oneOf, passkeyNumber, requiredArg, requiredUserId, roomIdArgs, stripMention, userIdArg, usageError, type InviteUses, type IssuableUserId, type PasskeyNumber, type RoomIdArg, type UserIdArg } from "./commands/args";
 import { noAuditSink, type AuditSink } from "./commands/audit";
 import { type AdminCapability, assertAdmin, assertRoles, type RoleCapability } from "./commands/capability";
