@@ -1,0 +1,1 @@
+- Keep the storage cost profile (`docs/cost-profile.json`, checked by `test/cost-profile.integration.test.ts`) current, and justify in the pull request any change that raises a cost before regenerating it with `npm run cost:profile`.
