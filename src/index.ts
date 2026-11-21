@@ -2,8 +2,18 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
-import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
+import { MAX_LISTING_MEMBERS } from "@apron/archive";
+import { type ImportReport, importArchive } from "./history/archive/import";
+import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
+import { type D1Off, detailLines, statusLines } from "./history/status";
+import { storeExport, storeRestore } from "./history/store-head";
+import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./content/output-ref";
+import { type BackupKind, BackupStore, MAX_IMPORT_BYTES, MAX_IMPORT_RECORDS, importableWarning, writeBackup } from "./history/exports";
+import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
+import type { HistoryChain } from "./history/chain";
+import { type ChatRecord, type PublicRecord, asPublic } from "./history/records";
+import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
 import { PRICED_LABEL, PRICES, usd } from "./pricing";
@@ -14,10 +24,12 @@ import { recordMetric } from "./metrics";
 import { StallMeter, type AwakeSnapshot } from "./stalls";
 import { RefusalMeter } from "./refusals";
 import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
-import { AUDIO_TYPES, sniffAudio } from "./audio";
-import { IMAGE_TYPES, sniffImage } from "./image";
-import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./text";
-import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
+import { AUDIO_TYPES, sniffAudio } from "./content/media/audio";
+import { IMAGE_TYPES, sniffImage } from "./content/media/image";
+import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./content/media/text";
+import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./content/emoji";
+import { liveInputLimit, liveResultEmbed, uploadResultEmbed } from "./content/embeds";
+import { MAX_USER_EXT_BYTES, clientUserExt, userExtFits } from "./content/user";
 import { limitData } from "./store-error";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -61,28 +73,26 @@ import {
 	WAKE_SCOPES,
 	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
-	MAX_USER_EXT_BYTES,
 	JOINED_WAKE_ROLES,
 	EMOJI_ROLES,
 	MODERATOR_ROLES,
 	BOT_MODERATOR_ROLES,
 	BOT_NAME_PATTERN,
 	BOT_NAME_RULE,
-	clientUserExt,
 	mergeExt,
-	userExtFits,
 	Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
-	uploadResultEmbed,
 	liveDeadline,
-	liveInputLimit,
-	liveResultEmbed,
 	isPrivateRoomId,
 	MAX_READ_RECEIPT_MEMBERS,
 	seenStands,
+	isPendingHistory,
+	newTerminalOutputKey,
+	terminalOutput,
 	type Broadcast,
+	type TerminalStored,
 	type ClaimedPush,
 	type EmojiDraft,
 	type LiveEntry,
@@ -93,12 +103,18 @@ import {
 	type StoreConfig,
 	type StoreMutationInput,
 	type StoreMutationResult,
+	type StoreHistoryResult,
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
+	MAX_LISTED_USER_ROOMS,
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import { isProtocolId, type StoredCredential } from "./domain";
+import { arity, inviteUses, issuableUserId, oneOf, passkeyNumber, requiredArg, requiredUserId, roomIdArgs, stripMention, userIdArg, usageError, type InviteUses, type IssuableUserId, type PasskeyNumber, type RoomIdArg, type UserIdArg } from "./commands/args";
+import { noAuditSink, type AuditSink } from "./commands/audit";
+import { type AdminCapability, assertAdmin, assertRoles, type RoleCapability } from "./commands/capability";
+import { defineCommands, dispatchCommand, helpText } from "./commands/registry";
 import {
 	authorizationServerMetadata,
 	AUTHORIZE_PATH,
@@ -128,6 +144,16 @@ import { pageHeaders, renderErrorPage, renderSignInPage, type SignInPageView } f
 import { Deadline } from "./deadline";
 
 const OBJECT_NAME = "public-demo-v1";
+/** Characters of finished terminals' outputs the object keeps in memory (Store.finishLiveText, withOutputs): about 8 MB. */
+const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
+/** How long the history chain waits after a failed step (runHistory), and cleanup between copies meanwhile; a second otherwise. */
+const HISTORY_RETRY_MS = 5 * 60_000;
+/** Steps one history cycle takes at most (HistoryChain.cycle): each a copy, a trim or less. */
+const HISTORY_CYCLE_STEPS = 24;
+/** How long a copy to a tier below fails (or waits for an unbound D1 tier) before the admins are told. */
+const HISTORY_STALL_ALERT_MS = 6 * 3_600_000;
+/** When the scheduled backup last ran (Store.historyMetaNumber). */
+const META_SCHEDULED_BACKUP = "history:export:scheduled";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
 /**
  * The paths the entry Worker forwards live text to the object on (§4.8.3):
@@ -542,8 +568,21 @@ const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } 
  */
 const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
-/** Joined room IDs a connection attachment may carry: every public room and the user's private ones, with slack for removals in flight. */
-const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER);
+/**
+ * Joined room IDs a connection attachment may carry: every room the user's
+ * listing names (MAX_LISTED_USER_ROOMS), so each is delivered to. Room IDs
+ * are log IDs (16 digits at most) or private ones, so that list stays near
+ * 8 KB, within ATTACHMENT_SAFETY_BYTES beside the read cursors below.
+ */
+const MAX_ATTACHED_ROOMS = MAX_LISTED_USER_ROOMS;
+/**
+ * Unwritten read cursors a connection holds before writing them: past this
+ * many rooms read within READ_CURSOR_FLUSH_MS they are written at once, so
+ * cursors and rooms together stay within ATTACHMENT_SAFETY_BYTES. A stored
+ * attachment is still read with up to MAX_ATTACHED_ROOMS of them, so none
+ * held by a connection from before is dropped.
+ */
+const MAX_ATTACHED_READS = 64;
 /** How often one connection writes the read cursors it was sent (flushReads): a reader writes about once a minute, however often their client sends. */
 const READ_CURSOR_FLUSH_MS = 60_000;
 /** The close reason of a connection that did not sign in within `unauthenticatedTimeoutSeconds`. */
@@ -577,36 +616,151 @@ function roomServerDescription(description: string | undefined): string | undefi
 }
 
 /**
- * The commands this server provides (§4.1), as `/help` lists them to those
- * who may run them: `everyone`, `registered` (registered users, bots
- * included), `owners` (registered users other than bots, so a bot neither
- * invites nor manages sign-ins), or `admins` (the `APRON_ADMIN_TOKEN` user
- * and those given the `admin` role).
- * An `owners` command with `roles` is for owners who hold one of them.
- * Kept in alphabetical order, the order `/help` lists them in, admins'
- * marked "(admin-only)".
+ * What a command's handler gets (src/commands/registry.ts): the
+ * connection and request it came on, the room it was sent in, and the
+ * runtime; an admin command's handler also gets its AdminCapability.
  */
-const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "registered" | "owners" | "admins"; roles?: readonly string[] }> = [
-	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "registered" },
-	{ name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", audience: "everyone" },
-	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
-	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
-	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
-	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
-	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
-	{ name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", audience: "owners" },
-	{ name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", audience: "admins" },
-	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
-	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
-	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
-	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
-	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
-	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
-	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
-	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
-	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember|livetext>", help: "turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone", audience: "admins" },
-];
+interface CommandScope {
+	readonly socket: WebSocketConnection;
+	readonly attachment: ConnectionAttachment;
+	readonly request: RequestFrame;
+	readonly roomId: string;
+	readonly runtime: ApronDemoServer;
+}
+
+/** A command that takes no arguments: words after its name are ignored, as they always were. */
+function noArgs(): Record<string, never> {
+	return {};
+}
+
+/** Whether `embeds` is exactly one `upload` embed: what `/avatar`, `/emoji add` and `/server avatar` take. */
+function oneUploadEmbed(embeds: unknown): boolean {
+	return Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+}
+
+/** `/embed-terminal`'s title or `/embed-append`'s opening markdown: the command's text after its first word, newlines and all. */
+function liveOpening(text: string): string {
+	return text.replace(/^\s*\/\S+[ \t]*(?:\r?\n)?/, "");
+}
+
+/** `/invite-device`'s arguments: list the sender's device tokens, mint one (under `id`, or the first free one), or revoke one. */
+type DeviceArgs = { action: "list" } | { action: "add"; id?: string } | { action: "remove"; id: string };
+
+function deviceArgs(words: readonly string[], usage: string): DeviceArgs {
+	const action = words[1];
+	const length = action === "list" ? [2] : action === "add" ? [2, 3] : action === "remove" ? [3] : [];
+	if (!length.includes(words.length)) throw usageError(`Usage: ${usage}`);
+	if (action === "list") return { action };
+	if (action === "add") return words.length === 3 ? { action, id: words[2] } : { action };
+	return { action: "remove", id: words[2] };
+}
+
+/** `/passkeys`' arguments: list the sender's passkeys, or remove the one numbered `remove`. */
+type PasskeysArgs = { remove?: PasskeyNumber };
+
+/** `/passkeys`' usage error, which names its two forms rather than its usage line. */
+function passkeysUsage(): ProtocolError {
+	return usageError("Usage: /passkeys, or /passkeys remove <n>");
+}
+
+function passkeysArgs(words: readonly string[]): PasskeysArgs {
+	const args = words.slice(1);
+	if (args.length === 0) return {};
+	if (args.length !== 2 || args[0] !== "remove") throw passkeysUsage();
+	return { remove: passkeyNumber(args[1], passkeysUsage()) };
+}
+
+/** `/emoji`'s arguments: add (with its image attached) or remove the custom emoji `key`, written `:name:`. */
+type EmojiArgs = { action: "add" | "remove"; key: string };
+
+function emojiArgs(words: readonly string[], body: Readonly<Record<string, unknown>>): EmojiArgs {
+	const args = words.slice(1);
+	const action = args[0];
+	if (args.length !== 2 || (action !== "add" && action !== "remove")) {
+		throw usageError("Usage: /emoji add :name: with one image attached, or /emoji remove :name:");
+	}
+	const key = args[1];
+	if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
+		throw usageError(`A custom emoji is written :name:, with a name of 1 to ${MAX_EMOJI_NAME_CHARS} letters, digits, _, + or -`);
+	}
+	if (action === "add" && !oneUploadEmbed(body.embeds)) throw usageError(`Attach one image to /emoji add ${key} as an upload embed`);
+	return { action, key };
+}
+
+/**
+ * `/server`'s arguments: show the server's metadata; set its avatar from
+ * the one image attached (`upload`) or clear it; or set the title or
+ * description to `value`, or clear it (no `value`).
+ */
+type ServerArgs = { field: "show" } | { field: "avatar"; upload: boolean } | { field: "title" | "description"; value?: string };
+
+function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limits: RuntimeConfig["limits"]): ServerArgs {
+	// The text after the field is taken as typed, line breaks included.
+	const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
+	const value = rest.trim();
+	const chosen = field.toLowerCase();
+	const embeds = Array.isArray(body.embeds) ? body.embeds : [];
+	if (chosen !== "avatar" && embeds.length) throw usageError("Only /server avatar takes an attachment");
+	if (!chosen) return { field: "show" };
+	if (chosen === "avatar") {
+		if (value) throw usageError("Usage: /server avatar with one image attached, or alone to clear it");
+		if (embeds.length && !oneUploadEmbed(embeds)) throw usageError("Attach one image to /server avatar as an upload embed");
+		return { field: "avatar", upload: embeds.length > 0 };
+	}
+	if (chosen !== "title" && chosen !== "description") throw usageError("Usage: /server, /server title|description [<text>], or /server avatar");
+	if (chosen === "title" && !validServerTitle(value, limits)) throw usageError(`A server title is one line of at most ${limits.maxNameCodePoints} characters`);
+	if (chosen === "description" && !validServerDescription(value)) throw usageError(`A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes`);
+	return value ? { field: chosen, value } : { field: chosen };
+}
+
+/** `/history`'s arguments, one form each (historyCommand). */
+type HistoryArgs =
+	| { action: "status" }
+	| { action: "export"; roomIds: RoomIdArg[] }
+	| { action: "import"; key: string; dryRun: boolean; users?: "match" | "new"; renumber: boolean; restart: boolean };
+
+/** What may follow `/history import <key>`. */
+const HISTORY_IMPORT_FLAGS: readonly string[] = ["dry-run", "match", "new", "renumber", "restart"];
+
+/** `/history`'s arguments; `busy` while an export or import runs, which refuses another before its arguments are read. */
+/** `/history import`'s notice: what it added, or would, and what it left out. */
+function importNotice(report: ImportReport): string {
+	const users = Object.entries(report.users).map(([from, to]) => "matched" in to ? `${from} → ${to.matched}` : `${from} → ${to.placeholder} (unclaimed)`);
+	return [
+		report.abandoned ? `Abandoned an unfinished import of another archive${report.abandoned.length ? `; these rooms it began stay as far as it got: ${report.abandoned.map((id) => `\`${id}\``).join(", ")}` : ""}.` : "",
+		report.resumed ? "Finished the import an earlier run began." : "",
+		report.refused ? `**Would be refused:** ${report.refused}.` : "",
+		`${report.dryRun ? "Would import" : "Imported"} ${report.records} records into ${report.roomsAdded.length} new rooms${report.roomsAdded.length ? ` (${report.roomsAdded.map((id) => `\`${id}\``).join(", ")})` : ""}.`,
+		report.logIdRange ? `Log IDs ${report.logIdRange.first} to ${report.logIdRange.last}.` : "",
+		report.roomsSkipped.length ? `Skipped ${report.roomsSkipped.length} rooms that exist here.` : "",
+		report.duplicates ? `Skipped ${report.duplicates} records held here already.` : "",
+		report.expired ? `Dropped ${report.expired} records older than history here.` : "",
+		report.rejected ? `Dropped ${report.rejected} records no client could have sent.` : "",
+		report.collisions ? `Left ${report.collisions} messages as they are here: another message holds their ID.` : "",
+		Object.keys(report.remapped.logIds).length ? `Moved ${Object.keys(report.remapped.logIds).length} log IDs that other records hold.` : "",
+		report.placeholders ? `${report.dryRun ? "Would make" : "Made"} ${report.placeholders} placeholder accounts${report.accounts ? ` (${report.accounts.used} of ${report.accounts.limit} accounts were in use)` : ""}.` : "",
+		report.membersJoined ? `Joined ${report.membersJoined} members the rooms' listings name.` : "",
+		report.membersSkipped ? `Left out ${report.membersSkipped} listed members: no account here, or past a cap.` : "",
+		users.length ? `Users: ${users.join(", ")}.` : "",
+	].filter(Boolean).join("\n");
+}
+
+/** The lease `/purge` and `/rename` hold (HistorySchedule): no import runs beside them. */
+type RewriteLease = HistoryLease<{ kind: "rewrite" }>;
+
+function historyArgs(words: readonly string[], usage: string): HistoryArgs {
+	const action = words[1];
+	if (action === "export" || action === "import") {
+		if (action === "export") return { action, roomIds: roomIdArgs(words.slice(2)) };
+		const key = words[2];
+		const flags = new Set(words.slice(3));
+		if (!key || [...flags].some((flag) => !HISTORY_IMPORT_FLAGS.includes(flag)) || (flags.has("match") && flags.has("new"))) throw usageError(`Usage: ${usage}`);
+		const users = flags.has("match") ? "match" : flags.has("new") ? "new" : undefined;
+		return { action, key, dryRun: flags.has("dry-run"), ...(users ? { users } : {}), renumber: flags.has("renumber"), restart: flags.has("restart") };
+	}
+	if (action === "status" && words.length === 2) return { action };
+	throw usageError(`Usage: ${usage}`);
+}
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
 const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to post or join rooms";
 /**
@@ -935,18 +1089,6 @@ function endpointOf(request: Request): string | undefined {
 	return endpoint.length <= MAX_ENDPOINT_CHARS ? endpoint : undefined;
 }
 
-/**
- * Throws unless `userId` may be issued by an admin (`/rename`, `/invite-token`):
- * 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit and
- * ending with a letter, digit or `_`, so that `@` and the whole ID make a
- * mention in text (Appendix A.3), and not a guest's or bot's.
- */
-function assertIssuableUserId(userId: string): void {
-	if (!/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) || /^(guest|bot)(_|$)/i.test(userId)) {
-		throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, ending with a letter, digit or _, and not guest_ or bot_" } satisfies ProtocolError;
-	}
-}
-
 /** Whether a `user_id` is an owner's bot's (`bot_<owner>`); a user may also be a bot by role (`isBot`). */
 function isBotId(userId: string | undefined): boolean {
 	return userId?.startsWith(BOT_ID_PREFIX) === true;
@@ -1023,9 +1165,10 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	const limits = config.limits;
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,
+		retentionRecords: limits.retentionRecords,
+		cleanupThresholdPercent: limits.cleanupThresholdPercent,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
-		retiredUserIdMs: limits.retiredUserIdSeconds * 1_000,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
 		cleanupIntervalMs: limits.cleanupSeconds * 1_000,
 		cleanupBatch: limits.cleanupBatch,
@@ -1036,6 +1179,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxEmbeds: limits.maxEmbeds,
 		maxThreads: limits.threadLimit,
 		maxThreadsPerUser: limits.threadsPerUser,
+		roomCreationWindowMs: limits.roomCreationWindowSeconds * 1_000,
 		roomMetadataLimit: limits.roomMetadataLimit,
 		roomMetadataMinLimit: limits.roomMetadataMinLimit,
 		roomMetadataTotalLimit: limits.roomMetadataTotalLimit,
@@ -2467,6 +2611,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly store: Store;
 	private readonly webAuthn: WebAuthnService;
 	private mutationTail: Promise<void> = Promise.resolve();
+	/** Where admin commands' `admin_action` audit events go (src/commands/audit.ts): nowhere yet, unless a test captures them. */
+	private audit: AuditSink = noAuditSink;
 	/** The tier and open breakers last announced (Store.announcedTier), read once per instance. */
 	private announcedTier?: { tier: ServerTier; breakers: string[] };
 	/** When the tier was last evaluated (maybeEvaluateTier). */
@@ -2528,6 +2674,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * ends them (recoverLiveTexts). Bounded by the policy's `concurrent`.
 	 */
 	private readonly liveSessions = new Map<string, LiveSession>();
+	/**
+	 * Finished terminals' outputs kept in R2 (Store.finishLiveText), by key,
+	 * most recently used last, up to TERMINAL_OUTPUT_CACHE_BYTES: what a
+	 * broadcast or a history page puts back (withOutputs) without reading R2
+	 * again for the terminals people are looking at.
+	 */
+	private readonly terminalOutputs = new Map<string, string>();
+	/**
+	 * The history tiers below this object's SQLite (src/history/config.ts:
+	 * D1, then the cold tier, each where it is bound), where records past its
+	 * limits go first (runHistory); none without one.
+	 */
+	private readonly history?: HistoryChain;
+	/**
+	 * History upkeep's lock and schedule (src/history/schedule.ts): what runs
+	 * (a cycle, a job, rewrites), each under a lease, and whether a cycle is
+	 * wanted, backing off after failures.
+	 */
+	private readonly historySchedule = new HistorySchedule();
+	/** Whether the D1 tier has held history here (d1Missing), once read; undefined until then. */
+	private d1Held: boolean | undefined;
+	/** Whether this wake has warned that the scheduled backup has no store (runScheduledBackup). */
+	private backupUnboundWarned = false;
+	private terminalOutputCacheBytes = 0;
 	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
 	private liveRecovered = false;
 	/**
@@ -2627,7 +2797,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 		super(ctx, env);
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
-		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
+		// Records past this SQLite's limits go to the tiers below where they are
+		// bound: D1 (HISTORY_D1), then the cold tier (HISTORY_BLOB).
+		// The layout first: the Store is tiered exactly when the chain has tiers below it.
+		const layout = historyLayout(env, this.config.limits);
+		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered: layoutTiered(layout) });
+		this.history = buildHistoryChain({
+			layout, limits: this.config.limits, store: this.store, clock: { now: nowMs },
+			track: (kind, method, call) => this.stalls.track(kind, method, call()),
+			chunkIndex: (tier) => this.store.chunkIndex(tier),
+			server: this.config.rpId,
+			serverUrl: this.archiveHeader().server,
+		});
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
@@ -3078,9 +3259,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
 		if (this.deadlines.maintenance.passed(now)) this.deadlines.maintenance.clear();
 		if (now >= this.idlePruneAt) await this.pruneIdle(now);
+		// Records about to leave this SQLite are copied to the tier below first.
+		if (this.history) await this.runHistory(now);
+		await this.runScheduledBackup(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
-			result = this.store.runCleanup(now);
+			result = this.store.runCleanup(now, { copyWaitMs: this.copyWaitMs() });
 		} catch {
 			// A metered maintenance failure is deferred. Do not spin an alarm loop.
 			// The floor may already be durable even if a physical deletion failed,
@@ -3092,7 +3276,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			try {
 				await this.runMutation(async () => {
 					const expired = this.store.expirePendingUploads(now);
-					for (const record of expired.broadcasts) this.broadcastRecord(record);
+					await this.broadcastRecords(expired.broadcasts);
 					this.deleteMedia(expired.deletedUploads);
 					this.deadlines.uploads.set(expired.next);
 					this.uploadDeadlineRead = true;
@@ -3115,6 +3299,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.liveRecovered = true;
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
+		// Records left this SQLite: the tiers below may now let theirs go.
+		if (this.history && result?.deleted_records) await this.runHistory(now);
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
 		if (removed.length) this.removeRooms(removed);
@@ -3168,6 +3354,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (Store.cleanupDue).
 	 */
 	private alarmWorkDue(now: number): boolean {
+		// History upkeep: a cycle that asked to go on, or a `/purge` or
+		// `/rename` the tiers below have yet to apply, read once a wake.
+		if (this.history && this.historySchedule.workDue(now, () => this.store.historyRewrites(now).length > 0)) return true;
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
@@ -3377,14 +3566,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null, endpoint: string | undefined): string {
-		const days = Math.max(1, Math.round(this.config.limits.retentionSeconds / 86_400));
-		const history = `Messages are kept for ${days === 1 ? "a day" : `${days} days`}.`;
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
 		const signIn = this.passkeysOfferedTo(origin, endpoint)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
 		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
-		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
+		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`.`;
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
@@ -3566,7 +3753,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// A sign-in that failed after holding deliveries sends them after its error.
 		this.releaseDeliveries(socket);
-		if (!this.alarmKnown) await this.rescheduleAlarm();
+		// A refusal at the storage watermark starts cleanup at once: its alarm may be sooner than the one set.
+		if (!this.alarmKnown || this.store.takeAlarmChange()) await this.rescheduleAlarm();
 	}
 
 	/** Counts one frame against the server-wide minute; the seconds to wait when it is full. */
@@ -4828,14 +5016,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/invite-code <uses>`: mints the sign-up invite (protocol Appendix B), a
 	 * token that signs up to `uses` new users within a week, and revokes the
-	 * last one; `/invite-code 0` only revokes. The token goes to this connection
+	 * last one; `/invite-code 0` only revokes. More uses than the server
+	 * allows is a count limit, `denied` (§1.1), when the count is parsed
+	 * (inviteUses). The token goes to this connection
 	 * only, in a `~private` notice, before the result (§1).
 	 */
-	private async invite(socket: WebSocketConnection, request: RequestFrame, roomId: string, count: string): Promise<void> {
-		const uses = /^\d{1,3}$/.test(count) ? Number(count) : -1;
-		if (uses < 0) throw { name: "invalid_params", message: `Usage: /invite-code <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
-		// More uses than the server allows is a count limit: denied (§1.1).
-		if (uses > MAX_JOIN_USES) throw { name: "denied", message: `An invite signs up at most ${MAX_JOIN_USES} users` } satisfies ProtocolError;
+	private async invite(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, uses: InviteUses): Promise<void> {
+		assertAdmin(cap);
 		const token = JOIN_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const expiresMs = nowMs() + JOIN_INVITE_TTL_MS;
@@ -4993,7 +5180,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.historyInFlight += 1;
 		writeAttachment(socket, attachment);
 		try {
-			const page = this.store.history({
+			const found = this.store.historyAcrossTiers({
 				...(roomId !== undefined ? { roomId } : { roomIds: attachment.rooms ?? [] }),
 				after,
 				before,
@@ -5004,7 +5191,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 				ipKey: attachment.ipKey,
 				guest,
 			});
-			this.reply(socket, request, page);
+			// A page below the hot floor reads the tiers below; without them, no
+			// page. They apply a `/purge` or `/rename` they have yet to, or that
+			// came while this page waited (HistoryChain.read).
+			let page: StoreHistoryResult;
+			if (!isPendingHistory(found)) page = found;
+			else {
+				let rows: ChatRecord[];
+				try {
+					// What the unbound D1 tier holds is nowhere else to read.
+					if (await this.d1Missing()) throw new Error("the D1 tier is off");
+					rows = await this.history!.read(found.below, { skipHead: true });
+				}
+				catch { throw { name: "retry_after", message: "Older history is unavailable for now", data: { retry_after: 60, ...limitData("read") } } satisfies ProtocolError; }
+				page = found.assemble(rows);
+			}
+			this.reply(socket, request, await this.withPageOutputs(page));
 		} finally {
 			const latest = connectionAttachment(socket);
 			if (latest) {
@@ -5012,6 +5214,110 @@ export class ApronDemoServer extends DurableObject<Env> {
 				writeAttachment(socket, latest);
 			}
 		}
+	}
+
+	/**
+	 * Whether the D1 tier is off in this deploy (HISTORY_D1 unbound, or
+	 * LIMIT_HISTORY_D1_RECORDS 0) while it holds history: the Store has its
+	 * state, and a tier below (the cold tier) is still bound. Then nothing
+	 * moves below SQLite, nor is exported or imported: the cold tier in its
+	 * place would skip what D1 holds (the copy marker describes D1), so SQLite
+	 * keeps what it holds until HISTORY_D1 is bound again. Read once; an
+	 * unreadable state counts as unbound for now.
+	 */
+	private async d1Missing(): Promise<D1Off | undefined> {
+		const off = d1Off(this.runtimeEnv, this.config.limits);
+		if (!this.history || !off) return undefined;
+		if (this.d1Held === undefined) {
+			try {
+				this.d1Held = await this.history.hasTierState(D1_TIER);
+			} catch {
+				return off;
+			}
+			if (this.d1Held) console.warn(JSON.stringify({ event: "history_tier_unbound", tier: D1_TIER, missing: off === "unbound" ? "HISTORY_D1" : "LIMIT_HISTORY_D1_RECORDS" }));
+		}
+		return this.d1Held ? off : undefined;
+	}
+
+	/**
+	 * How long a cleanup job waiting on a copy below waits before it looks
+	 * again: a second only while a cycle is due and nothing holds the lock,
+	 * so the copy it waits for can come next wake. Otherwise nothing will
+	 * have moved by then (the D1 tier off, upkeep backing off or settled with
+	 * the link waiting for a whole batch, a job running: its release asks
+	 * for a cycle), so it waits HISTORY_RETRY_MS: no alarm a second.
+	 */
+	private copyWaitMs(): number {
+		const schedule = this.historySchedule;
+		return schedule.want.kind === "due" && schedule.holder === undefined ? 1_000 : HISTORY_RETRY_MS;
+	}
+
+	/**
+	 * The D1 tier is off while it holds history (d1Missing): the copy into it
+	 * counts as failing from the first wake that sees it, and once that has
+	 * lasted HISTORY_STALL_ALERT_MS, admins get the history_stall alert, once,
+	 * as for any stalled copy (src/history/stall.ts). On again, the chain's
+	 * first good copy clears it.
+	 */
+	private async noteD1Missing(now: number): Promise<void> {
+		try {
+			const alert = await this.history!.noteHeadBlocked(now, HISTORY_STALL_ALERT_MS);
+			if (alert) this.announce({ kind: "history_stall", from: HEAD_TIER, to: D1_TIER, hours: (now - alert.since) / 3_600_000 });
+		} catch {
+			// The maintenance budget: noted on a later wake.
+		}
+	}
+
+	/**
+	 * History upkeep on a full alarm, before and after cleanup
+	 * (Store.runCleanup): a bounded cycle of the chain (HistoryChain.cycle)
+	 * that applies queued `/purge` and `/rename` below, copies the records the
+	 * running cleanup job will remove to the tier below, and lets each tier
+	 * below go of what its retention no longer keeps. A failure waits
+	 * HISTORY_RETRY_MS, and cleanup waits that long for the copy meanwhile; a
+	 * copy failing for HISTORY_STALL_ALERT_MS tells the admins once.
+	 */
+	private async runHistory(now: number): Promise<void> {
+		const history = this.history!;
+		const schedule = this.historySchedule;
+		if (!schedule.mayRun(now)) return;
+		if (await this.d1Missing()) {
+			// Nothing runs until D1 is on: no cycle or queued rewrite is due meanwhile.
+			schedule.idle();
+			await this.noteD1Missing(now);
+			return;
+		}
+		// Held by a job: the cycle is left due, and the job's release asks for it.
+		const lease = schedule.acquire({ kind: "cycle" });
+		if (isRefusal(lease)) return;
+		try {
+			const { more, report } = await history.cycle({ steps: HISTORY_CYCLE_STEPS });
+			if (report.failure) {
+				schedule.failed(now, HISTORY_RETRY_MS, true);
+				this.deadlines.maintenance.soonest(now + HISTORY_RETRY_MS);
+				console.warn(JSON.stringify({ event: "history_step_failed", step: report.failure.step.kind, message: report.failure.error instanceof Error ? report.failure.error.message : String(report.failure.error) }));
+			} else {
+				// A finished round applied every op it found.
+				schedule.succeeded(more);
+				if (more) this.maintenanceSoon(now);
+			}
+			for (const stall of await history.stallsToAlert(HISTORY_STALL_ALERT_MS)) {
+				this.announce({ kind: "history_stall", from: stall.from, to: stall.to, hours: (now - stall.since) / 3_600_000 });
+			}
+		} catch {
+			// The state could not be read or saved (the maintenance budget): tried again later.
+			schedule.failed(now, HISTORY_RETRY_MS, false);
+			this.deadlines.maintenance.soonest(now + HISTORY_RETRY_MS);
+		} finally {
+			lease.release();
+		}
+	}
+
+	/** A history page with its stored terminal outputs put back (loadTerminalOutputs). */
+	private async withPageOutputs<T extends { messages?: MessageSnapshot[] }>(page: T): Promise<T> {
+		if (!page.messages?.some((message) => hasOutputRef(message))) return page;
+		await this.loadTerminalOutputs(page.messages);
+		return { ...page, messages: page.messages.map((message) => withTerminalOutputs(message, (key) => this.cachedOutput(key))) };
 	}
 
 	/**
@@ -5141,7 +5447,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const result = this.store.mutate(input);
 			// A deduplicated retry carries no records and is never rebroadcast.
 			// The broadcast comes before the result on the sender's connection (§1).
-			for (const record of result.broadcasts) this.broadcastRecord(record);
+			await this.broadcastRecords(result.broadcasts);
 			this.reply(socket, request, await this.withWriteUrls(result.result));
 			started = this.afterUploads(result);
 			// A save that removed a live text's embed ended it (§4.8.3): its write stops.
@@ -5493,7 +5799,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!latest.rooms?.includes(roomId)) return;
 		const holding = !latest.reads;
 		latest.reads = { ...latest.reads, [roomId]: read };
-		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
+		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_READS) this.flushReads(latest, now, socket);
 		else {
 			writeAttachment(socket, latest);
 			// A connection that starts holding cursors has a new deadline (connectionDeadlines): schedule it.
@@ -7528,11 +7834,188 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * The commands this server provides (§4.1), each with who may run it
+	 * and its handler: `everyone` (publicCommand), `registered` (registered
+	 * users, bots included), `owners` (registered users other than bots, so
+	 * a bot neither invites nor manages sign-ins; with `roles`, those holding
+	 * one of them), or `admins` (the `APRON_ADMIN_TOKEN` user and those given
+	 * the `admin` role). Kept in alphabetical order, the order `/help` lists
+	 * them in, admins' marked "(admin-only)". Each parses its words before
+	 * it runs, and the dispatcher (dispatchCommand) checks who may run it, so
+	 * no handler does; an admin command's handler gets the AdminCapability
+	 * the privileged methods demand, and says what it acted on for the audit
+	 * trail. A command's `user_id` may be written `@user_id`, as a client's
+	 * mention sends it (Appendix A.3), and so may an admin command's one
+	 * argument; a mistyped or wrong one is an error to show (`usageErrors:
+	 * "reply"`), like an unknown command, not a policy violation.
+	 */
+	private static readonly commandTable = defineCommands<CommandScope>(({ adminCommand, ownerCommand, registeredCommand, publicCommand }) => [
+		adminCommand({
+			name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
+				const remove = words[1] === "remove";
+				arity(words, remove ? 2 : 1, usage);
+				return { remove, userId: requiredUserId(words[remove ? 2 : 1], usage) };
+			},
+			audit: ({ remove, userId }) => ({ target: userId, action: remove ? "remove" : "grant" }),
+			run: ({ cap, runtime, socket, request, roomId }, { remove, userId }) => runtime.grantAdmin(cap, socket, request, roomId, userId, remove),
+		}),
+		registeredCommand({
+			name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", usageErrors: "violation",
+			available: (runtime) => runtime.uploadsOn(),
+			parse: ({ body }) => {
+				if (!oneUploadEmbed(body.embeds)) throw usageError("Attach one image to /avatar as an upload embed");
+				return {};
+			},
+			run: ({ runtime, socket, attachment, request }) => runtime.startAvatar(socket, attachment, request),
+		}),
+		publicCommand({
+			name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", usageErrors: "violation", posting: true,
+			available: (runtime) => runtime.liveTextOn(),
+			parse: ({ text }) => liveOpening(text),
+			run: ({ runtime, socket, attachment, request, roomId }, opening) => runtime.liveCommand(socket, attachment, request, roomId, "append", opening),
+		}),
+		publicCommand({
+			name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", usageErrors: "violation", posting: true,
+			available: (runtime) => runtime.liveTextOn(),
+			parse: ({ text }) => liveOpening(text),
+			run: ({ runtime, socket, attachment, request, roomId }, title) => runtime.liveCommand(socket, attachment, request, roomId, "terminal", title),
+		}),
+		ownerCommand({
+			name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", usageErrors: "reply",
+			roles: EMOJI_ROLES,
+			available: (runtime) => !!runtime.config.uploads,
+			parse: ({ words, body }) => emojiArgs(words, body),
+			run: ({ grant, runtime, socket, attachment, request, roomId }, args) => runtime.emojiCommand(grant, socket, attachment, request, roomId, args),
+		}),
+		publicCommand({
+			name: "help", usage: "/help", help: "list the commands you can use here", usageErrors: "violation",
+			parse: noArgs,
+			run: (scope) => scope.runtime.sendHelp(scope),
+		}),
+		adminCommand({
+			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart]", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, as written or through the codecs its name or metadata gives) from it (running a failed import again finishes it; restart abandons another file's)", usageErrors: "reply",
+			parse: ({ words, usage }) => historyArgs(words, usage),
+			audit: (args) => ({ action: args.action, target: args.action === "import" ? args.key : args.action === "export" ? args.roomIds.join(" ") : undefined }),
+			run: ({ cap, runtime, socket, request, roomId }, args) => runtime.historyCommand(cap, socket, request, roomId, args),
+		}),
+		ownerCommand({
+			name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", usageErrors: "violation",
+			parse: noArgs,
+			run: ({ runtime, socket, attachment, request, roomId }) => runtime.inviteBot(socket, attachment, request, roomId),
+		}),
+		adminCommand({
+			name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return inviteUses(requiredArg(words[1], usage), MAX_JOIN_USES);
+			},
+			audit: (uses) => ({ action: uses === 0 ? "revoke" : `mint ${uses}` }),
+			run: ({ cap, runtime, socket, request, roomId }, uses) => runtime.invite(cap, socket, request, roomId, uses),
+		}),
+		ownerCommand({
+			name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", usageErrors: "reply",
+			parse: ({ words, usage }) => deviceArgs(words, usage),
+			run: ({ runtime, socket, attachment, request, roomId }, args) => args.action === "list" ? runtime.listDevices(socket, attachment, request, roomId)
+				: args.action === "add" ? runtime.inviteDevice(socket, attachment, request, roomId, args.id)
+				: runtime.removeDevice(socket, attachment, request, roomId, args.id),
+		}),
+		adminCommand({
+			name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", usageErrors: "reply",
+			// A second leading `@` is taken off too, as this command always has.
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return userIdArg(requiredArg(words[1], usage));
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.invitePurge(cap, socket, attachment, request, roomId, userId),
+		}),
+		adminCommand({
+			name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", usageErrors: "reply",
+			// A second leading `@` is taken off too, as this command always has.
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return issuableUserId(stripMention(requiredArg(words[1], usage)));
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.inviteToken(cap, socket, attachment, request, roomId, userId),
+		}),
+		adminCommand({
+			name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return requiredUserId(words[1], usage);
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.kick(cap, socket, attachment, request, roomId, userId),
+		}),
+		ownerCommand({
+			name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", usageErrors: "reply",
+			parse: ({ words }) => passkeysArgs(words),
+			run: ({ runtime, socket, attachment, request, roomId }, args) => runtime.passkeysCommand(socket, attachment, request, roomId, args),
+		}),
+		adminCommand({
+			name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", usageErrors: "reply",
+			// A second leading `@` is taken off too, as this command always has.
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return userIdArg(requiredArg(words[1], usage));
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.underHistoryLease({ kind: "rewrite" }, (lease) => runtime.purge(cap, lease, socket, attachment, request, roomId, userId)),
+		}),
+		adminCommand({
+			name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				arity(words, 2, usage);
+				const from = requiredUserId(words[1], usage);
+				if (from === ADMIN_USER_ID) throw { name: "denied", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+				return { from, to: issuableUserId(stripMention(words[2])) };
+			},
+			audit: ({ from, to }) => ({ target: `${from} -> ${to}` }),
+			run: ({ cap, runtime, socket, request, roomId }, { from, to }) => runtime.underHistoryLease({ kind: "rewrite" }, (lease) => runtime.rename(cap, lease, socket, request, roomId, from, to)),
+		}),
+		adminCommand({
+			name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				if (words.length !== 2 && words.length !== 3) throw usageError(`Usage: ${usage}`);
+				return { userId: userIdArg(words[1]), ...(words.length === 3 ? { role: words[2].toLowerCase() } : {}) };
+			},
+			audit: ({ userId, role }) => ({ target: userId, action: role ?? "show" }),
+			run: ({ cap, runtime, socket, request, roomId }, { userId, role }) => runtime.role(cap, socket, request, roomId, userId, role),
+		}),
+		adminCommand({
+			name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", usageErrors: "reply",
+			parse: ({ line, body }, runtime) => serverArgs(line, body, runtime.config.limits),
+			audit: (args) => ({ action: args.field === "show" ? "show" : args.field === "avatar" ? (args.upload ? "avatar" : "avatar clear") : args.value === undefined ? `${args.field} clear` : args.field }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, args) => runtime.serverCommand(cap, socket, attachment, request, roomId, args),
+		}),
+		adminCommand({
+			name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", usageErrors: "violation",
+			parse: noArgs,
+			audit: () => ({}),
+			run: ({ cap, runtime, socket, request, roomId }) => runtime.sendStatus(cap, socket, request, roomId),
+		}),
+		adminCommand({
+			name: "toggle", usage: "/toggle <activity|uploads|presence|addmember|livetext>", help: "turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone", usageErrors: "reply",
+			parse: ({ words, usage }, runtime) => {
+				arity(words, 1, usage);
+				const word = requiredArg(words[1], usage);
+				const features = runtime.toggleFeatures();
+				return oneOf(word, features, `Usage: /toggle ${features.join("|")}`);
+			},
+			audit: (feature) => ({ target: feature }),
+			run: ({ cap, runtime, socket, request, roomId }, feature) => runtime.toggle(cap, socket, request, roomId, feature),
+		}),
+	]);
+
+	/**
 	 * `command` (§4.1): never logged, broadcast, or saved. The commands are
-	 * COMMANDS, each for its audience and roles; `/help` replies with a
-	 * `~private` notice listing those the sender may run. An unknown
-	 * command is an error the client shows; it is not a policy violation,
-	 * since people mistype.
+	 * commandTable's, each for its audience and roles, run by
+	 * dispatchCommand; `/help` replies with a `~private` notice listing
+	 * those the sender may run. An unknown command is an error the client
+	 * shows; it is not a policy violation, since people mistype.
 	 */
 	private async handleCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
@@ -7545,138 +8028,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!body) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		const text = optionalString(body, "text") ?? "";
 		if (!this.roomExists(roomId) || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
-		const line = text.trim();
-		const words = line.startsWith("/") ? line.slice(1).split(/\s+/) : [""];
-		const name = words[0].toLowerCase();
-		const command = this.commands().find((candidate) => candidate.name === name);
-		if (!command) {
-			const message = line.startsWith("/") ? `Unknown command /${name}; try /help` : "A command starts with /; try /help";
-			this.fail(socket, request, { name: "invalid_params", message: message.slice(0, 200) });
-			return;
-		}
-		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
-		if (command.audience === "registered" && attachment.tier !== "registered") throw { name: "denied", message: `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
-		if (command.audience === "owners" && !owner) {
-			throw { name: "denied", message: hasRole(attachment, "bot") ? `A bot can't use /${name}` : `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
-		}
-		const admin = owner && hasRole(attachment, "admin");
-		if (command.audience === "admins" && !admin) throw { name: "denied", message: `Only an admin can use /${name}` } satisfies ProtocolError;
-		if (command.roles && !command.roles.some((role) => hasRole(attachment, role))) {
-			throw { name: "denied", message: `/${name} needs one of the roles ${command.roles.join(", ")}` } satisfies ProtocolError;
-		}
-		// Live text starts with its own commands, or in a message (§4.8.3).
-		if (Array.isArray(body.embeds) && body.embeds.some((embed) => !!embed && typeof embed === "object" && ["terminal", "append"].includes((embed as Record<string, unknown>).kind as string))) {
-			throw { name: "invalid_params", message: "A terminal or append embed goes in a message; or use /embed-terminal or /embed-append" } satisfies ProtocolError;
-		}
-		if (command.name === "embed-terminal" || command.name === "embed-append") {
-			await this.liveCommand(socket, attachment, request, roomId, command.name === "embed-terminal" ? "terminal" : "append", text);
-			return;
-		}
-		if (command.name === "invite-bot") {
-			await this.inviteBot(socket, attachment, request, roomId);
-			return;
-		}
-		if (command.name === "invite-device") {
-			try {
-				const action = words[1];
-				const length = action === "list" ? [2] : action === "add" ? [2, 3] : action === "remove" ? [3] : [];
-				if (!length.includes(words.length)) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				if (action === "list") await this.listDevices(socket, attachment, request, roomId);
-				else if (action === "add") await this.inviteDevice(socket, attachment, request, roomId, words[2]);
-				else await this.removeDevice(socket, attachment, request, roomId, words[2]);
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "avatar") {
-			await this.startAvatar(socket, attachment, request, body);
-			return;
-		}
-		if (command.name === "emoji") {
-			try {
-				await this.emojiCommand(socket, attachment, request, roomId, words.slice(1), body);
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "server") {
-			try {
-				await this.serverCommand(socket, attachment, request, roomId, line, body);
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "passkeys") {
-			try {
-				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (["admin", "role", "kick", "rename", "purge", "toggle", "invite-token", "invite-code", "invite-purge"].includes(command.name)) {
-			try {
-				if (command.name === "role") {
-					if (words.length !== 2 && words.length !== 3) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-					this.role(socket, request, roomId, words[1], words[2]);
-					return;
-				}
-				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
-				const revoke = command.name === "admin" && words[1] === "remove";
-				// A user may be written `@user_id`, as a client's mention sends it (Appendix A.3).
-				const target = (revoke ? words[2] : words[1])?.replace(/^@/, "");
-				const argumentCount = command.name === "rename" || revoke ? 2 : 1;
-				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target, revoke);
-				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
-				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
-				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
-				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
-				else if (command.name === "invite-purge") await this.invitePurge(socket, attachment, request, roomId, target);
-				else if (command.name === "invite-code") await this.invite(socket, request, roomId, target);
-				else await this.rename(socket, request, roomId, target, words[2].replace(/^@/, ""));
-			} catch (error) {
-				// A mistyped or wrong user_id is an error to show, like an unknown
-				// command, not a policy violation.
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "status") {
-			await this.sendStatus(socket, request, roomId);
-			return;
-		}
-		// The reply a command causes comes before its result (§1).
-		const writes = attachment.tier !== "anonymous" || this.config.guestPosting;
-		const available = this.commands().filter((candidate) => (candidate.audience === "everyone" && (writes || !candidate.name.startsWith("embed-"))) || (candidate.audience === "registered" && attachment.tier === "registered") || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
-		this.send(socket, {
-			method: "message",
-			params: {
-				room_id: roomId,
-				from: { ...PRIVATE_IDENTITY },
-				body: { text: available.map((candidate) => `- \`${candidate.usage}\`: ${candidate.help}${candidate.audience === "admins" ? " (admin-only)" : ""}`).join("\n"), format: "markdown" },
-			},
+		await dispatchCommand(ApronDemoServer.commandTable, { socket, attachment, request, roomId, runtime: this }, attachment, text, body, {
+			fail: (error) => this.fail(socket, request, error),
+			protocolOf: errorToProtocol,
+			audit: this.audit,
+			now: nowMs(),
 		});
+	}
+
+	/** `/help`: a `~private` notice listing the commands the sender may run now, before the result (§1). */
+	private sendHelp({ socket, attachment, request, roomId }: CommandScope): void {
+		const posts = attachment.tier !== "anonymous" || this.config.guestPosting;
+		this.sendNotice(socket, roomId, helpText(ApronDemoServer.commandTable.listFor(attachment, this, posts)));
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/avatar` only while uploads are on, `/emoji` where they are configured, and `/embed-terminal` and `/embed-append` while live text is on. */
-	private commands(): typeof COMMANDS {
-		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads) &&
-			(!command.name.startsWith("embed-") || this.liveTextOn()));
+	/** The features `/toggle` turns off and on here: uploads, presence and live text only where configured. */
+	private toggleFeatures(): ToggleFeature[] {
+		return ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
 	}
 
 	/**
@@ -7755,10 +8124,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * users but admins and bots get `user` `you` with their new
 	 * `permissions`.
 	 */
-	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
-		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
-		const chosen = features.find((candidate) => candidate === feature);
-		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
+	private toggle(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, chosen: ToggleFeature): void {
+		assertAdmin(cap);
 		// Flipped from what is stored, never from a default stood in for it: one that cannot be read refuses the command.
 		this.readToggle(chosen);
 		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : chosen === "livetext" ? this.liveTextOn() : this.activityOn());
@@ -7826,22 +8193,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * result, and a removal is also told to the account's other connections.
 	 * Sessions a removed passkey started stay valid until they expire.
 	 */
-	private passkeysCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[]): void {
+	private passkeysCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: PasskeysArgs): void {
 		const userId = attachment.userId!;
-		const usage = { name: "invalid_params", message: "Usage: /passkeys, or /passkeys remove <n>" } satisfies ProtocolError;
-		if (args.length !== 0 && (args.length !== 2 || args[0] !== "remove" || !/^\d{1,2}$/.test(args[1]))) throw usage;
 		const passkeys = this.store.passkeys(userId, nowMs());
 		const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-		if (args.length === 0) {
+		if (args.remove === undefined) {
 			this.sendNotice(socket, roomId, passkeys.length
 				? ["Your passkeys:", ...passkeys.map((key, index) => `${index + 1}. \`${key.credentialId.slice(0, 8)}…\`, added ${day(key.createdMs)}, last used ${day(key.usedMs)}`)].join("\n")
 				: "Your account has no passkey. Register one while signed in to add it.");
 			this.reply(socket, request, {});
 			return;
 		}
-		const chosen = passkeys[Number(args[1]) - 1];
+		const chosen = passkeys[args.remove - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
-		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usage;
+		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw passkeysUsage();
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.
@@ -7865,17 +8230,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * with the write's `{embeds: [{embed_id, kind, write_url}]}`, after a
 	 * `~private` notice with the URL in copy-paste recipes. Nothing is posted
 	 * until the write arrives (liveWrite); one that never comes expires.
-	 * The rest of the command line is the terminal's plain title, or the
-	 * append's opening markdown, newlines and all; a non-empty opening, its
-	 * trailing whitespace trimmed, is followed by a paragraph break ("\n\n")
-	 * so the streamed text starts a new paragraph.
+	 * `rest`, the command's text after its first word (liveOpening), is the
+	 * terminal's plain title, or the append's opening markdown, newlines and
+	 * all; a non-empty opening, its trailing whitespace trimmed, is followed
+	 * by a paragraph break ("\n\n") so the streamed text starts a new
+	 * paragraph.
 	 */
-	private async liveCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, kind: LiveKind, text: string): Promise<void> {
+	private async liveCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, kind: LiveKind, rest: string): Promise<void> {
 		const identity = identityOf(attachment);
 		if (!identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const live = this.config.liveText!;
-		const rest = text.replace(/^\s*\/\S+[ \t]*(?:\r?\n)?/, "");
 		const replyTo = objectParam(request.params, "reply_to", false);
 		const replyId = replyTo === undefined ? undefined : requiredString(replyTo, "message_id");
 		await this.recoverLiveTexts();
@@ -7935,7 +8300,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const streaming = new Set<string>();
 			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
 			const expired = this.store.expireLiveTexts(streaming, now);
-			for (const record of expired.broadcasts) this.broadcastRecord(record);
+			await this.broadcastRecords(expired.broadcasts);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
 				if (session?.phase === "waiting") this.forgetWaitingLive(session);
@@ -8155,16 +8520,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// cut at the input limit, it is dropped, so the text ends at a whole character (§4.8.5).
 		session.readers.send(session.buffer.end(end === "size"));
 		const kept = session.buffer.kept();
+		// A terminal's output goes to R2, where uploads are on, and the snapshot
+		// refers to it: SQLite keeps a few bytes, not the output (TerminalStored).
+		const stored = entry.kind === "terminal" ? await this.storeTerminalOutput(kept, entry.limit) : undefined;
 		let published = false;
+		let used = false;
 		try {
 			await this.runMutation(async () => {
-				const finished = this.store.finishLiveText(entry.key, kept, nowMs());
-				for (const record of finished.broadcasts) this.broadcastRecord(record);
+				const finished = this.store.finishLiveText(entry.key, kept, nowMs(), stored);
+				used = !!finished.stored;
+				await this.broadcastRecords(finished.broadcasts);
 				published = !!finished.entry;
 			});
 		} catch {
 			// Left open: the alarm ends it, without what was kept.
 			end = "unavailable";
+		}
+		// Not referred to (the embed was removed, or the store kept it inline): not kept.
+		if (stored && !used) {
+			this.deleteMedia([stored.key]);
+			this.terminalOutputs.delete(stored.key);
 		}
 		session.readers.close();
 		this.liveSessions.delete(entry.id);
@@ -8185,10 +8560,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return liveAnswer(200, published || end === "removed" ? messages[end] : messages.removed);
 	}
 
-	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, body: Record<string, unknown>): Promise<void> {
-		const embeds = body.embeds;
-		const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
-		if (!attached) throw { name: "invalid_params", message: "Attach one image to /avatar as an upload embed" } satisfies ProtocolError;
+	/**
+	 * Writes a finished terminal's output (terminalOutput of what it kept) to
+	 * R2 as an attached file's kind, and remembers it for the broadcast that
+	 * follows; undefined, keeping it inline, without uploads, with nothing
+	 * kept, or when R2 fails.
+	 */
+	private async storeTerminalOutput(kept: Uint8Array, limit: number): Promise<TerminalStored | undefined> {
+		const media = this.runtimeEnv.MEDIA;
+		if (!this.config.uploads || !media) return undefined;
+		const output = terminalOutput(keepLast(kept, limit));
+		if (!output) return undefined;
+		const key = newTerminalOutputKey();
+		try {
+			await this.stalls.track("r2", "put", media.put(key, output, {
+				httpMetadata: { contentType: "text/plain; charset=utf-8", cacheControl: "public, max-age=604800, immutable" },
+			}));
+		} catch {
+			return undefined;
+		}
+		this.rememberOutput(key, output);
+		return { key, output };
+	}
+
+	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		let started = false;
 		await this.runMutation(async () => {
 			const upload = this.store.startAvatarUpload({ userId: attachment.userId!, now: nowMs() });
@@ -8207,18 +8602,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A removal answers with a `~private` notice before the result (§1). Either
 	 * change publishes a new catalog (publishEmoji).
 	 */
-	private async emojiCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[], body: Record<string, unknown>): Promise<void> {
-		if (args.length !== 2 || (args[0] !== "add" && args[0] !== "remove")) {
-			throw { name: "invalid_params", message: "Usage: /emoji add :name: with one image attached, or /emoji remove :name:" } satisfies ProtocolError;
-		}
-		const key = args[1];
-		if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
-			throw { name: "invalid_params", message: `A custom emoji is written :name:, with a name of 1 to ${MAX_EMOJI_NAME_CHARS} letters, digits, _, + or -` } satisfies ProtocolError;
-		}
-		if (args[0] === "add") {
-			const embeds = body.embeds;
-			const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
-			if (!attached) throw { name: "invalid_params", message: `Attach one image to /emoji add ${key} as an upload embed` } satisfies ProtocolError;
+	private async emojiCommand(grant: RoleCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, { action, key }: EmojiArgs): Promise<void> {
+		assertRoles(grant, EMOJI_ROLES);
+		if (action === "add") {
 			let started = false;
 			await this.runMutation(async () => {
 				const upload = this.store.startEmojiUpload({ userId: attachment.userId!, key, now: nowMs() });
@@ -8252,23 +8638,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `~private` notice before the result (§1), and a change sends every
 	 * connection a new `server` frame (announceServer).
 	 */
-	private async serverCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, line: string, body: Record<string, unknown>): Promise<void> {
-		// The text after the field is taken as typed, line breaks included.
-		const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
-		const value = rest.trim();
-		const chosen = field.toLowerCase();
-		const embeds = Array.isArray(body.embeds) ? body.embeds : [];
-		if (chosen !== "avatar" && embeds.length) throw { name: "invalid_params", message: "Only /server avatar takes an attachment" } satisfies ProtocolError;
-		if (!chosen) {
+	private async serverCommand(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: ServerArgs): Promise<void> {
+		assertAdmin(cap);
+		if (args.field === "show") {
 			this.sendNotice(socket, roomId, this.serverOverview());
 			this.reply(socket, request, {});
 			return;
 		}
-		if (chosen === "avatar") {
-			if (value) throw { name: "invalid_params", message: "Usage: /server avatar with one image attached, or alone to clear it" } satisfies ProtocolError;
-			if (embeds.length) {
-				const attached = embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
-				if (!attached) throw { name: "invalid_params", message: "Attach one image to /server avatar as an upload embed" } satisfies ProtocolError;
+		if (args.field === "avatar") {
+			if (args.upload) {
 				let started = false;
 				await this.runMutation(async () => {
 					const upload = this.store.startServerAvatarUpload({ userId: attachment.userId!, now: nowMs() });
@@ -8288,15 +8666,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, {});
 			return;
 		}
-		if (chosen !== "title" && chosen !== "description") throw { name: "invalid_params", message: "Usage: /server, /server title|description [<text>], or /server avatar" } satisfies ProtocolError;
-		if (chosen === "title" && !validServerTitle(value, this.config.limits)) {
-			throw { name: "invalid_params", message: `A server title is one line of at most ${this.config.limits.maxNameCodePoints} characters` } satisfies ProtocolError;
-		}
-		if (chosen === "description" && !validServerDescription(value)) {
-			throw { name: "invalid_params", message: `A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes` } satisfies ProtocolError;
-		}
+		const chosen = args.field;
 		const before = this.storedServerMetadata()[chosen];
-		const next = value || undefined;
+		const next = args.value;
 		if (next !== before) {
 			await this.runMutation(async () => {
 				this.store.setServerText(chosen, next, nowMs());
@@ -8426,8 +8798,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * it until they load history again. They may register a new passkey. The
 	 * sender gets a `~private` notice before the result (§1).
 	 */
-	private async purge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
-		const userId = target.replace(/^@/, "");
+	/** `lease`: an import must not run meanwhile (its later writes would put back what this removes). */
+	private async purge(cap: AdminCapability, _lease: RewriteLease, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
 		if (!this.store.identityExists(userId) && !this.connectionsOf(userId).length) {
@@ -8450,6 +8823,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
+		// The tiers below purge what they hold on the next alarm, in a second.
+		if (this.history) this.historySoon();
 		// A text left open by a failure here ends at its time limit, publishing nothing.
 		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
@@ -8522,6 +8897,50 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.deadlines.maintenance.soonest(now + 1_000);
 	}
 
+	/**
+	 * Runs history upkeep (runHistory) on an alarm in a second, for a
+	 * `/purge` or `/rename` the tiers below have to apply; history pages
+	 * that read them apply it meanwhile (HistoryChain.read).
+	 */
+	private historySoon(): void {
+		this.historySchedule.request();
+		this.maintenanceSoon(nowMs());
+		this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
+	}
+
+	/**
+	 * Runs `fn` under a history lease for `holder`, refusing (as `invalid_params`)
+	 * while what it excludes runs (src/history/schedule.ts); on release, a
+	 * cycle that waited for it is asked for.
+	 */
+	private async underHistoryLease<H extends HistoryHolder, R>(holder: H, fn: (lease: HistoryLease<H>) => Promise<R>): Promise<R> {
+		const lease = this.historySchedule.acquire(holder);
+		if (isRefusal(lease)) throw { name: "invalid_params", message: refusalMessage(lease) } satisfies ProtocolError;
+		// The schedule's lease lives in memory; an import's journal outlives a restart. An
+		// unfinished import resumed later would write back what a /purge or /rename removed.
+		if (holder.kind === "rewrite") {
+			let pending: boolean;
+			try {
+				pending = this.store.historyImportJournal() !== undefined;
+			} catch (error) {
+				lease.release();
+				throw error;
+			}
+			if (pending) {
+				lease.release();
+				throw { name: "invalid_params", message: "An unfinished history import is pending: run its `/history import <key>` again to finish it, or `/history import <key> restart` to abandon it; /purge and /rename wait until then" } satisfies ProtocolError;
+			}
+		}
+		try {
+			return await fn(lease);
+		} finally {
+			if (lease.release().cycleSoon) {
+				this.maintenanceSoon(nowMs());
+				this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
+			}
+		}
+	}
+
 	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
 	private async forgetDeviceToken(userId: string, tokenKey: string): Promise<void> {
 		try {
@@ -8563,10 +8982,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A.4). A taken `user_id` is `invalid_params`. The token does not expire;
 	 * `/purge` revokes it, and `/rename` moves it.
 	 */
-	private async inviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
-		const userId = target.replace(/^@/, "");
-		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${userId} is taken` } satisfies ProtocolError;
-		assertIssuableUserId(userId);
+	private async inviteToken(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: IssuableUserId): Promise<void> {
+		assertAdmin(cap);
 		await this.runMutation(async () => {
 			const created = this.store.createInvitedIdentity({ userId, name: userId, now: nowMs(), ipKey: attachment.ipKey });
 			// The new user's logged join of `general` goes to its members (§4.2.2).
@@ -8596,8 +9013,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/invite-token` gives it. Their account, posts and bot stay. Not the
 	 * sender, `admin`, or a bot; an unknown user is `invalid_params`.
 	 */
-	private async invitePurge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
-		const userId = target.replace(/^@/, "");
+	private async invitePurge(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only" } satisfies ProtocolError;
 		if (isBotId(userId)) throw { name: "denied", message: "A bot signs in with its token only; its owner replaces it with /invite-bot" } satisfies ProtocolError;
@@ -8720,6 +9137,160 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 	}
 
+	/**
+	 * What an archive's header says of this server (ARCHIVE.md §2): its
+	 * WebSocket URL, from PUBLIC_ORIGIN or else RP_ID, and the origins its
+	 * media loads from.
+	 */
+	private archiveHeader(): { server: string; media: string[] } {
+		const origin = this.config.uploads?.publicOrigin || this.config.liveText?.publicOrigin || `https://${this.config.rpId}`;
+		const host = new URL(origin).host;
+		const media = [...new Set([origin, ...(this.config.uploads?.mediaOrigin ? [this.config.uploads.mediaOrigin] : [])])];
+		return { server: `wss://${host}/`, media };
+	}
+
+	/** Exported records as clients get them: terminal output kept in R2 put back, its internal reference never written. */
+	private async exportRecords(records: ChatRecord[]): Promise<PublicRecord[]> {
+		const values = records.map(refsOf);
+		const held = values.filter((value) => value !== undefined);
+		if (held.length) await this.loadTerminalOutputs(held);
+		return asPublic(records.map((record, index) => {
+			const value = values[index];
+			return value ? { ...record, record_json: JSON.stringify(withTerminalOutputs(value, (key) => this.cachedOutput(key))) } : record;
+		}));
+	}
+
+	/** The chain exports and imports go through: the history chain, or SQLite alone. */
+	private archiveChain(): HistoryChain {
+		return archiveChain(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs } });
+	}
+
+	/** Where `/history export` writes backups and `/history import` reads them: the history blob store (HISTORY_BLOB), through HISTORY_CODECS. */
+	private backupStore(): BackupStore {
+		const store = blobStoreOf(this.runtimeEnv);
+		if (!store) throw { name: "invalid_params", message: "No backup store: bind an R2 bucket as HISTORY_BLOB (docs/configuration.md, Backups and imports)" } satisfies ProtocolError;
+		return new BackupStore(store, HISTORY_CODECS);
+	}
+
+	/** Writes one backup of `kind` with the configured settings (writeBackup). */
+	private writeBackup(backups: BackupStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
+		return writeBackup(this.archiveChain(), storeExport(this.store), backups, this.config.backups, kind, {
+			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
+			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
+		});
+	}
+
+	/**
+	 * `/history`: `status` shows each tier, its state and what holds of the
+	 * invariants; `export [<room_id>...]` writes a backup to the backup store
+	 * and names its key; `import <key> [dry-run] [match|new] [renumber]` reads
+	 * a backup or an ARCHIVE.md file from it (decoded through the codecs it
+	 * names) and reports what it added, or would.
+	 */
+	private async historyCommand(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, args: HistoryArgs): Promise<void> {
+		assertAdmin(cap);
+		const now = nowMs();
+		const done = (text: string) => {
+			this.sendNotice(socket, roomId, text);
+			this.reply(socket, request, {});
+		};
+		if (args.action === "export" || args.action === "import") {
+			await this.underHistoryLease({ kind: "job", job: args.action }, () => this.historyJob(cap, args, done));
+			return;
+		}
+		switch (args.action) {
+			case "status":
+				done([...await this.historyStatus(now), ...await detailLines(this.archiveChain())].join("\n"));
+				return;
+		}
+	}
+
+	/** `/history export` and `/history import` (historyCommand), one at a time. */
+	private async historyJob(cap: AdminCapability, args: Extract<HistoryArgs, { action: "export" | "import" }>, done: (text: string) => void): Promise<void> {
+		assertAdmin(cap);
+		// Without D1, an export would miss what it holds, and an import would place records wrongly.
+		const off = await this.d1Missing();
+		if (off) throw { name: "invalid_params", message: off === "unbound" ? `History tier ${D1_TIER} (D1) holds history but HISTORY_D1 is unbound in this deploy: exports and imports wait until it is bound` : `History tier ${D1_TIER} (D1) holds history but LIMIT_HISTORY_D1_RECORDS is 0 in this deploy: exports and imports wait until it is above 0` } satisfies ProtocolError;
+		switch (args.action) {
+			case "export": {
+				const store = this.backupStore();
+				let result: Awaited<ReturnType<typeof writeBackup>>;
+				try {
+					result = await this.writeBackup(store, "manual", args.roomIds);
+				} catch (error) {
+					// A failing store: said plainly; an upload begun is aborted.
+					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
+				}
+				const truncated = result.truncated.length
+					? `\nMembers truncated in ${result.truncated.length} rooms (${result.truncated.map((room) => `\`${room.room_id}\` ${room.kept} of ${room.members}`).join(", ")}): a listing carries at most ${MAX_LISTING_MEMBERS} members.`
+					: "";
+				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.${truncated}${importableWarning(result.records, result.decodedBytes)}`);
+				return;
+			}
+			case "import": {
+				const key = args.key;
+				const backups = this.backupStore();
+				let report: ImportReport;
+				try {
+					// Read twice as a stream, bounded stored and decoded (a small file may decode to a great deal), and by its records (MAX_IMPORT_RECORDS).
+					const opened = await backups.source(key, MAX_IMPORT_BYTES);
+					if (!opened) throw new Error(`No backup ${key}`);
+					report = await importArchive(this.archiveChain(), storeRestore(this.store), opened.source, {
+						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
+						// Only an authenticating codec, read to the end, makes a file this server's own.
+						provenance: opened.provenance,
+						users: args.users ?? "auto",
+						ids: args.renumber ? "renumber" : "original",
+						restart: args.restart,
+					});
+				} catch (error) {
+					// A damaged backup, an unknown codec or an unreadable file: said plainly, nothing written. A failure
+					// while writing (a day's budget spent, say) leaves the journal: the same command goes on from where it got.
+					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
+				}
+				done(importNotice(report));
+				if (!report.dryRun && report.roomsAdded.length) {
+					try { this.announceUpdated(this.store.listRooms(nowMs(), { withPrivate: true })); } catch { /* listed on the next room_list */ }
+				}
+				return;
+			}
+		}
+	}
+
+	/**
+	 * The scheduled backup (BACKUP_EVERY), on a full alarm: once its interval
+	 * has passed since the last, it writes one. A failure is logged and tried
+	 * again on the next interval's alarm; never throws.
+	 */
+	private async runScheduledBackup(now: number): Promise<void> {
+		const everySeconds = this.config.backups.everySeconds;
+		if (everySeconds === undefined || this.historySchedule.holder !== undefined) return;
+		try {
+			const last = this.store.historyMetaNumber(META_SCHEDULED_BACKUP, now);
+			if (now < last + everySeconds * 1_000) return;
+			const blobs = blobStoreOf(this.runtimeEnv);
+			const store = blobs && new BackupStore(blobs, HISTORY_CODECS);
+			const missing = await this.d1Missing();
+			if (!store || missing) {
+				// Said once a wake: a backup that silently never runs is no backup.
+				if (!this.backupUnboundWarned) {
+					this.backupUnboundWarned = true;
+					console.warn(JSON.stringify({ event: "history_export_unbound", reason: store ? `the D1 history tier is off (${missing === "unbound" ? "HISTORY_D1 unbound" : "LIMIT_HISTORY_D1_RECORDS is 0"})` : "no backup store: bind HISTORY_BLOB" }));
+				}
+				return;
+			}
+			// Noted first: a failing backup waits its interval rather than retrying on every alarm.
+			this.store.setHistoryMeta(META_SCHEDULED_BACKUP, String(now), now);
+			const result = await this.underHistoryLease({ kind: "job", job: "backup" }, () => this.writeBackup(store, "scheduled"));
+			console.log(JSON.stringify({ event: "history_export", key: result.key, records: result.records, decoded_bytes: result.decodedBytes, deleted: result.deleted.length }));
+			if (result.records > MAX_IMPORT_RECORDS || result.decodedBytes > MAX_IMPORT_BYTES) {
+				console.warn(JSON.stringify({ event: "history_export_unimportable", key: result.key, records: result.records, decoded_bytes: result.decodedBytes, max_import_records: MAX_IMPORT_RECORDS, max_import_bytes: MAX_IMPORT_BYTES }));
+			}
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "history_export_failed", message: error instanceof Error ? error.message : String(error) }));
+		}
+	}
+
 	/** Sends one connection a `~private` markdown notice in a room (Appendix A.1). */
 	private sendNotice(socket: WebSocketConnection, roomId: string, text: string): void {
 		this.send(socket, { method: "message", params: { room_id: roomId, from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
@@ -8730,8 +9301,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `admin` role; `/admin remove <user_id>` takes it away (not from `admin`
 	 * itself). The sender gets a `~private` notice before the result (§1).
 	 */
-	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string, remove = false): void {
-		const { changed, who } = this.changeRole(userId, "admin", !remove);
+	private grantAdmin(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: UserIdArg, remove: boolean): void {
+		assertAdmin(cap);
+		const { changed, who } = this.changeRole(cap, userId, "admin", !remove);
 		const text = remove
 			? (changed ? `${who} is no longer an admin.` : `${who} was not an admin.`)
 			: (changed ? `${who} is now an admin.` : `${who} is already an admin.`);
@@ -8746,13 +9318,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the admin commands, `mod` and `threader` let them move other users'
 	 * messages (as `admin` does), `admin` and `mod` let them create top-level
 	 * rooms, `admin`, `mod` and `friend` let them use `/emoji` (EMOJI_ROLES),
-	 * and `bot` makes them a bot. Any role puts their posts under the trusted
-	 * limits. The sender gets a
+	 * and `bot` makes them a bot. Any role but `unclaimed` puts their posts
+	 * under the trusted limits. The sender gets a
 	 * `~private` notice before the result (§1).
 	 */
-	private role(socket: WebSocketConnection, request: RequestFrame, roomId: string, target: string, requested?: string): void {
-		const userId = target.replace(/^@/, "");
-		if (requested === undefined) {
+	private role(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: UserIdArg, role?: string): void {
+		assertAdmin(cap);
+		if (role === undefined) {
 			const identity = userId.startsWith("guest_") ? null : this.store.getIdentity(userId);
 			if (!identity) throw { name: "invalid_params", message: `No registered user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 			const who = `**${identity.name || userId}** (\`${userId}\`)`;
@@ -8760,8 +9332,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, {});
 			return;
 		}
-		const role = requested.toLowerCase();
-		const { changed, on, who } = this.changeRole(userId, role);
+		const { changed, on, who } = this.changeRole(cap, userId, role);
 		const text = on
 			? (changed ? `${who} now has the role \`${role}\`.` : `${who} already has the role \`${role}\`.`)
 			: (changed ? `${who} no longer has the role \`${role}\`.` : `${who} did not have the role \`${role}\`.`);
@@ -8776,7 +9347,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connections and `new` to those who share a room with them, with
 	 * `roles: []` when the last role went.
 	 */
-	private changeRole(userId: string, role: string, on?: boolean): { changed: boolean; on: boolean; who: string } {
+	private changeRole(cap: AdminCapability, userId: string, role: string, on?: boolean): { changed: boolean; on: boolean; who: string } {
+		assertAdmin(cap);
 		const result = this.store.setRole({ userId, role, on, now: nowMs() });
 		const who = `**${result.name || userId}** (\`${userId}\`)`;
 		if (result.changed) {
@@ -8800,7 +9372,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `room_update` `left`; they may join again. The limits charged are the
 	 * admin's. The sender gets a `~private` notice before the result (§1).
 	 */
-	private async kick(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: string): Promise<void> {
+	private async kick(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't kick yourself; leave the room instead" } satisfies ProtocolError;
 		// Thrown after the mutation: runMutation treats any other error as fatal.
 		if (!await this.removeMember(attachment, roomId, userId)) throw { name: "invalid_params", message: `${userId} is not in this room`.slice(0, 200) } satisfies ProtocolError;
@@ -8878,13 +9451,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * again. Sessions and the user's bot keep the old `user_id`: a session for
 	 * it is `denied`, and the passkey signs in as the new one.
 	 */
-	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
-		if (from === ADMIN_USER_ID) throw { name: "denied", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
-		if (to === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${to} is taken` } satisfies ProtocolError;
-		assertIssuableUserId(to);
+	private async rename(cap: AdminCapability, _lease: RewriteLease, socket: WebSocketConnection, request: RequestFrame, roomId: string, from: UserIdArg, to: IssuableUserId): Promise<void> {
+		assertAdmin(cap);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
 		this.moveUserState(from, to);
+		if (this.history) this.historySoon();
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
 		// Clients keep nothing yet for the new `user_id`, so the object carries
@@ -8944,7 +9516,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * when account analytics are configured, at most once a minute), and the
 	 * object's own daily reservations against their budgets.
 	 */
-	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
+	private async sendStatus(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
+		assertAdmin(cap);
 		const now = nowMs();
 		// Read alongside the usage refresh; left out where it is not configured.
 		const active = activeUsersConfigured(this.runtimeEnv) ? this.activeUsersStatus(now) : undefined;
@@ -9044,11 +9617,40 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			...(active ? [await active] : []),
+			...this.roomCountLines(now),
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
+			...await this.historyStatus(now),
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/status`'s room lines: the public rooms and threads, and the private
+	 * rooms, started within roomCreationWindowSeconds (what the caps count),
+	 * and the older ones kept besides.
+	 */
+	private roomCountLines(now: number): string[] {
+		const limits = this.config.limits;
+		const rooms = this.store.roomCounts(now);
+		const window = limits.roomCreationWindowSeconds > 0 ? ` started in ${Math.round(limits.roomCreationWindowSeconds / 86_400)} days` : "";
+		const older = (n: number) => (n ? `, ${n.toLocaleString("en-US")} older` : "");
+		return [
+			`- Rooms and threads: ${rooms.public.recent.toLocaleString("en-US")} / ${limits.threadLimit.toLocaleString("en-US")}${window}${older(rooms.public.older)}`,
+			...(limits.privateRoomLimit > 0 ? [`- Private rooms: ${rooms.private.recent.toLocaleString("en-US")} / ${limits.privateRoomLimit.toLocaleString("en-US")}${window}${older(rooms.private.older)}`] : []),
+		];
+	}
+
+	/**
+	 * `/status`'s history lines: the records each tier holds (that only it
+	 * serves) against its limit, with what cleanup keeps of it, and a copy
+	 * that has stalled. Without tiers below, SQLite's alone, and why. Never
+	 * throws; the tiers below give up after 5 seconds.
+	 */
+	private async historyStatus(now: number): Promise<string[]> {
+		const d1Off = await this.d1Missing();
+		return statusLines({ limits: this.config.limits, hotRecords: () => this.store.hotRecords(now), ...(this.history ? { chain: this.history } : {}), ...(d1Off ? { d1Off } : {}) });
 	}
 
 	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */
@@ -9802,7 +10404,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
 		await this.asUploadOwner(write.key, () => this.runMutation(async () => {
 			finished = this.store.finishUpload(write, nowMs());
-			for (const record of finished.broadcasts) this.broadcastRecord(record);
+			await this.broadcastRecords(finished.broadcasts);
 		}));
 		this.deleteMedia(finished.deletedUploads);
 		if (finished.avatar) this.announceAvatar(finished.avatar.userId, finished.avatar.url);
@@ -9846,7 +10448,60 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connections, which get it together with their `joined` or `left`.
 	 */
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
-		this.deliver(recordFrame(record), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
+		this.deliver(recordFrame(this.withOutputs(record)), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
+	}
+
+	/**
+	 * Broadcasts records in order (broadcastRecord) once the terminal outputs
+	 * they refer to are read from R2 (loadTerminalOutputs). Awaited inside
+	 * runMutation, so no other change's records come between.
+	 */
+	private async broadcastRecords(records: readonly Broadcast[]): Promise<void> {
+		await this.loadTerminalOutputs(records.map((record) => record.params));
+		for (const record of records) this.broadcastRecord(record);
+	}
+
+	/** A record with its stored terminal outputs put back from the cache, or left out where not read (withTerminalOutputs). */
+	private withOutputs<T extends { params: Record<string, unknown> }>(record: T): T {
+		if (!hasOutputRef(record.params)) return record;
+		return { ...record, params: withTerminalOutputs(record.params, (key) => this.cachedOutput(key)) };
+	}
+
+	private cachedOutput(key: string): string | undefined {
+		const output = this.terminalOutputs.get(key);
+		if (output === undefined) return undefined;
+		// Most recently used last.
+		this.terminalOutputs.delete(key);
+		this.terminalOutputs.set(key, output);
+		return output;
+	}
+
+	private rememberOutput(key: string, output: string): void {
+		if (this.terminalOutputs.has(key)) return;
+		this.terminalOutputs.set(key, output);
+		this.terminalOutputCacheBytes += output.length;
+		for (const [oldest, kept] of this.terminalOutputs) {
+			if (this.terminalOutputCacheBytes <= TERMINAL_OUTPUT_CACHE_BYTES) break;
+			this.terminalOutputs.delete(oldest);
+			this.terminalOutputCacheBytes -= kept.length;
+		}
+	}
+
+	/**
+	 * Reads from R2 the stored terminal outputs `records` refer to that the
+	 * cache lacks, all at once. One that cannot be read (gone with its
+	 * lifecycle, or R2 unavailable) is left out of what is sent.
+	 */
+	private async loadTerminalOutputs(records: readonly unknown[]): Promise<void> {
+		const media = this.runtimeEnv.MEDIA;
+		const missing = [...new Set(records.flatMap(terminalOutputKeys))].filter((key) => !this.terminalOutputs.has(key));
+		if (!media || !missing.length) return;
+		await Promise.all(missing.map(async (key) => {
+			try {
+				const object = await this.stalls.track("r2", "get", media.get(key));
+				if (object) this.rememberOutput(key, await object.text());
+			} catch { /* sent without it */ }
+		}));
 	}
 
 	/**
@@ -9855,7 +10510,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * its `auth` result (§3.2), whether or not it was a member before.
 	 */
 	private broadcastHeld(socket: WebSocketConnection, record: Broadcast): void {
-		const frame = recordFrame(record);
+		const frame = recordFrame(this.withOutputs(record));
 		this.deliver(frame, record.rooms, undefined, socket);
 		const held = this.held.get(socket);
 		if (held) held.push(frame);

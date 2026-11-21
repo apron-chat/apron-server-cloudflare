@@ -77,8 +77,63 @@ VAPID_SUBJECT = "https://server.apron.chat"
 # src/config.ts DEFAULT_PUSH_HOSTS), and push.stupidtech.net added to them.
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
+# History (docs/configuration.md, History retention, History tiers, Backups
+# and imports): the paid plan's own limits, written out so this file says
+# what they are. SQLite keeps 5,000 records (moved down at once when the
+# database reaches its watermark), and no age limit; D1 (HISTORY_D1, below)
+# 100,000 more;
+# the cold tier (HISTORY_BLOB) keeps everything past that (0). Each daily
+# cleanup keeps 80% of each count.
+LIMIT_RETENTION_RECORDS = "5000"
+LIMIT_RETENTION_SECONDS = "0"
+LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+LIMIT_HISTORY_D1_RECORDS = "100000"
+LIMIT_HISTORY_COLD_RECORDS = "0"
+# The thread and private-room caps count the rooms started in the last 30
+# days: they limit how fast rooms are started, not how many exist, and rooms
+# are kept as long as their history (docs/configuration.md, Rooms). 0 counts
+# every room that exists.
+LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
+# Backups to HISTORY_BLOB under backups/: one a day (and an admin's
+# `/history export`), the newest 14 of each kind kept, private rooms
+# included, gzip-compressed. They are not encrypted: the bucket being
+# private is what keeps them so.
+BACKUP_EVERY = "1d"
+BACKUP_KEEP = "14"
+BACKUP_PRIVATE_ROOMS = "true"
+
+# The D1 history tier (src/history/d1.ts, docs/configuration.md, History
+# tiers). Records there stay in history but become read-only: once the
+# object's own SQLite holds more than LIMIT_RETENTION_RECORDS, the oldest
+# move here, where history pages still read them, but their messages can no
+# longer be edited, reacted to or replied to. The tier keeps
+# LIMIT_HISTORY_D1_RECORDS of them, then they go on to the cold tier, or
+# expire without one. Both counts are ceilings: once a day, cleanup moves
+# what is past LIMIT_CLEANUP_THRESHOLD_PERCENT (80) of each.
+# `/purge` and `/rename` reach this tier too (not the cold tier). Without
+# this binding and the cold tier's, records past SQLite's limits expire at
+# once. Once D1 holds
+# history, unbinding it while the cold tier is bound stops history moving
+# below SQLite until it is bound again. The object creates its table on
+# first use (the database keeps its first name, apron-archive). Previews
+# bind none (below), so theirs expire at once.
+[[d1_databases]]
+binding = "HISTORY_D1"
+database_name = "apron-archive"
+database_id = "67f4435a-f9d4-4c9a-89e0-c02f108d4fa2"
+
+# The cold history tier and backups (docs/configuration.md, History tiers,
+# Backups and imports): a private R2 bucket, no custom domain, no r2.dev
+# access, no CORS, no lifecycle rules (apron-history: Standard class,
+# ENAM, default jurisdiction). Records past D1's count go there in chunks
+# under history/ (kept by LIMIT_HISTORY_COLD_RECORDS) instead of expiring,
+# and the backups above run.
+[[r2_buckets]]
+binding = "HISTORY_BLOB"
+bucket_name = "apron-history"
+
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
-# f/ after 30 days and a/ after 61 or more (none for e/, custom emoji), a custom domain
+# f/ after 120 days and a/ after 61 or more (none for e/, custom emoji), a custom domain
 # for MEDIA_ORIGIN, and a CORS policy allowing GET from any origin for the
 # custom emoji catalog (docs/configuration.md, Uploads).
 [[r2_buckets]]

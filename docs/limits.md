@@ -161,8 +161,14 @@ mutation with the **same** `id`.
 | Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 30,000 per address; 400,000 on the server | `ext.limits` `read`. |
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
-A history page holds at most 50 records (20 by default) and 256 KiB. Records
-are kept for 30 days.
+A history page holds at most 50 records (20 by default) and 256 KiB. History
+keeps the latest 4,000 records (messages, edits, reactions and room changes) in
+the server's own storage, 80,000 more in a D1 history tier, and everything
+older in a cold tier in R2 (kept indefinitely by default), all read by history;
+each is trimmed back to its share once past it, and a flood that fills the
+server's own storage is moved down at once. Where the server has no tiers below it,
+4,000 are kept and older records expire. Messages below the server's own
+storage cannot be edited, reacted to or replied to.
 
 ### Server-wide spikes
 
@@ -277,16 +283,17 @@ first.
 
 | Cap | Limit |
 | --- | ---: |
-| Threads a user has started and still live | 25 |
-| Threads on the server (`thread_limit`) | 100 |
-| Private rooms a user has started / is a member of | 5 / 20 |
-| Private rooms on the server | 100 |
+| Threads a user has started in 30 days | 25 |
+| Threads started on the server in 30 days (`thread_limit`) | 100 |
+| Private rooms a user has started in 30 days / is a member of | 5 / 20 |
+| Private rooms started on the server in 30 days | 100 |
+| Rooms a user is a member of | 1,000 |
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
 | Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
-A thread stops counting when everyone has left it or its history expires.
+The thread and private-room caps count the rooms started in the last 30 days: they limit how fast rooms are started, not how many exist. A room stops counting 30 days after it was started, or as soon as everyone has left it; posting in, joining or leaving a room never needs a slot, however old. Rooms are kept as long as their history. A room list names every top-level room and the 200 most recently active threads; an older one is still there by its `room_id`. A user may be in at most 1,000 rooms; leave one to join another.
 
 ## Checklist: a well-behaved client
 

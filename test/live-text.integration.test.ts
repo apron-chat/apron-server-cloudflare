@@ -1,6 +1,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { terminalOg, type Store } from '../src/store';
+import type { Store } from '../src/store';
+import { terminalOg } from '../src/content/embeds';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
 // vitest.config.ts sets LIVE_TEXT_MAX_SECONDS 2, LIVE_TEXT_MODERATOR_MAX_SECONDS 3
@@ -188,6 +189,54 @@ describe('live text end to end', () => {
 			expect((await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } })).status).toBe(404);
 			const again = await SELF.fetch(result.write_url, { method: 'PUT', body: 'again', headers: { 'CF-Connecting-IP': ip() } });
 			expect(again.status).toBe(409);
+		} finally { writer.close(); watcher.close(); }
+	});
+
+	it('keeps a finished terminal\'s output in R2, not SQLite, and puts it back in history and later saves', async () => {
+		const userId = unique('archivist');
+		const writer = await signedIn(userId);
+		const watcher = await signedIn(unique('watcher'));
+		try {
+			const { frame } = await command(writer, 'term-r2', '/embed-terminal stored');
+			const [result] = frame.result.embeds;
+			const put = streamTo(result.write_url);
+			await put.send('\x1b[33mstored\x1b[0m\r\n');
+			const posted = (await until(watcher, fromUser(userId))).frame.params;
+			await put.end();
+			expect((await put.response).status).toBe(200);
+			const output = '\x1b[33mstored\x1b[0m\r\n';
+			const finished = (await until(watcher, isMessage(posted.message_id))).frame.params;
+			expect(finished.body.embeds[0].output).toBe(output);
+			expect(finished.body.embeds[0].output_ref).toBeUndefined();
+
+			// SQLite keeps a reference; R2 the output, as the message's attached file.
+			const stored = await runInDurableObject(stub(), async (_instance, state) => {
+				const record = state.storage.sql.exec<{ record_json: string }>('SELECT record_json FROM records WHERE log_id = ?', Number(finished.log_id)).one();
+				const embed = JSON.parse(record.record_json).body.embeds[0];
+				const upload = state.storage.sql.exec<{ upload_key: string; purpose: string; state: string; message_id: string }>(
+					'SELECT upload_key, purpose, state, message_id FROM uploads WHERE upload_key = ?', embed.output_ref?.key ?? '').toArray();
+				return { embed, upload };
+			});
+			expect(stored.embed.output).toBeUndefined();
+			expect(stored.embed.output_ref).toEqual({ key: expect.stringMatching(/^f\/[A-Za-z0-9_-]{22}$/), bytes: JSON.stringify(output).length });
+			expect(stored.upload).toEqual([{ upload_key: stored.embed.output_ref.key, purpose: 'file', state: 'done', message_id: posted.message_id }]);
+			const object = await env.MEDIA!.get(stored.embed.output_ref.key);
+			expect(await object!.text()).toBe(output);
+
+			// History puts it back, read from R2 once the object has forgotten it.
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as { terminalOutputs: Map<string, string> }).terminalOutputs.clear(); });
+			const page = (await request(watcher, 'history-r2', 'history', { after: String(BigInt(finished.log_id) - 1n), limit: 1 })).result;
+			expect(page.messages[0].body.embeds[0]).toEqual({ embed_id: result.embed_id, kind: 'terminal', title: 'stored', output, og: terminalOg('stored') });
+
+			// A save keeps it, and its broadcast carries it.
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as { terminalOutputs: Map<string, string> }).terminalOutputs.clear(); });
+			await request(writer, 'retitle', 'message', { message_id: posted.message_id, body: { text: '', embeds: [{ embed_id: result.embed_id, kind: 'terminal', title: 'renamed' }] } });
+			const retitled = (await until(watcher, (f) => isMessage(posted.message_id)(f) && f.params.body?.embeds?.[0]?.title === 'renamed')).frame.params;
+			expect(retitled.body.embeds[0]).toEqual({ embed_id: result.embed_id, kind: 'terminal', title: 'renamed', output, og: terminalOg('renamed') });
+
+			// Removing the embed deletes the object with its upload row.
+			await request(writer, 'remove', 'message', { message_id: posted.message_id, body: { text: 'no output' } });
+			await vi.waitFor(async () => expect(await env.MEDIA!.get(stored.embed.output_ref.key)).toBeNull());
 		} finally { writer.close(); watcher.close(); }
 	});
 

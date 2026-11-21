@@ -5,7 +5,8 @@ import { liveCommandNotice } from '../src/index';
 import { keepAppend, keepLast, LiveBuffer, liveTextString } from '../src/live-text';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
-import { LIVE_ORPHAN_GRACE_MS, liveInputLimit, liveResultEmbed, MAX_TERMINAL_OUTPUT_JSON_BYTES, Store, terminalOg, type LiveEntry, type StoreLiveTextConfig } from '../src/store';
+import { LIVE_ORPHAN_GRACE_MS, MAX_TERMINAL_OUTPUT_JSON_BYTES, Store, type LiveEntry, type StoreLiveTextConfig } from '../src/store';
+import { liveInputLimit, liveResultEmbed, terminalOg } from '../src/content/embeds';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
 
 const encode = (text: string) => new TextEncoder().encode(text);

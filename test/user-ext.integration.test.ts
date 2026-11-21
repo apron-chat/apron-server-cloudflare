@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { MAX_USER_EXT_BYTES } from '../src/store';
+import { MAX_USER_EXT_BYTES } from '../src/content/user';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
 // Capability `ext` (§4.13) on users: `me` merges it one level deep, complete

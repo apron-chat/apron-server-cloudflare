@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
-import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from "../src/budget";
-import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { BY_AGE, errorCode, expectRetryAfter, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
 const ROOMY: Partial<StoreConfig> = {
@@ -14,7 +14,7 @@ const ROOMY: Partial<StoreConfig> = {
 };
 
 const withStore = <T>(name: string, fn: Parameters<typeof withNamedStore<T>>[2], config: Partial<StoreConfig> = ROOMY) =>
-	withNamedStore(`mutation-${name}`, config, fn);
+	withNamedStore(`mutation-${name}`, { ...BY_AGE, ...config }, fn);
 
 function op(clock: TestClock, userId: string, requestId: string, method: string, params: Record<string, unknown>): StoreMutationInput {
 	return {
@@ -104,41 +104,21 @@ it("keeps an embed's og as plain text fields and drops the rest", async () => {
 	});
 });
 
-it("keeps og media only from ogMediaHosts, over https without credentials or a port", async () => {
-	const og = {
-		title: "Example",
-		image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", type: "image/png", width: 320, height: -1, alt: "An\nexample", extra: true },
-		video: { url: "javascript:alert(1)" },
-		audio: "https://cdn.example/a.mp3",
-	};
-	const sent = (store: Store, clock: TestClock, id: string, image: unknown) => {
-		const created = post(store, clock, "alice", id, { body: { text: "look", embeds: [{ kind: "link", url: "https://example.com", og: { ...og, image } }] } });
+// Which og media URLs a host list keeps is test/content/embeds.test.ts's; this checks the Store passes its ogMediaHosts.
+it("keeps og media only from the Store's ogMediaHosts", async () => {
+	const og = { title: "Example", image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", alt: "An\nexample" }, video: { url: "https://evil.example/v.mp4" } };
+	const sent = (store: Store, clock: TestClock, id: string) => {
+		const created = post(store, clock, "alice", id, { body: { text: "look", embeds: [{ kind: "link", url: "https://example.com", og }] } });
 		return (created.message?.body?.embeds as Record<string, unknown>[])[0];
 	};
 	await withStore("og-media", (store, clock) => {
-		expect(sent(store, clock, "ogm1", og.image)).toEqual({
+		expect(sent(store, clock, "ogm1")).toEqual({
 			kind: "link", url: "https://example.com",
-			og: { title: "Example", image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", type: "image/png", width: 320, alt: "An example" } },
+			og: { title: "Example", image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", alt: "An example" } },
 		});
-		expect((sent(store, clock, "ogm2", { url: "https://x.cdn.example/a.png" }).og as Record<string, unknown>).image).toEqual({ url: "https://x.cdn.example/a.png" });
-		// A backslash ends the host: the client loads the same canonical URL the server checked.
-		expect((sent(store, clock, "ogm3", { url: "https://i.ytimg.com\\@evil.example/a.png" }).og as Record<string, unknown>).image).toEqual({ url: "https://i.ytimg.com/@evil.example/a.png" });
-		for (const [i, url] of [
-			"https://evil.example/a.png", // not listed
-			"https://cdn.example/a.png", // `*.cdn.example` is subdomains only
-			"https://i.ytimg.com.evil.example/a.png",
-			"https://i.ytimg.com./a.png", // a trailing dot is another host name
-			"https://i.ytimg.com%2e/a.png",
-			"https://evil.example\\@i.ytimg.com/a.png",
-			"http://i.ytimg.com/a.png", // https only
-			"https://user@i.ytimg.com/a.png",
-			"https://i.ytimg.com:8443/a.png",
-		].entries()) {
-			expect(sent(store, clock, `ogm-bad-${i}`, { url }), url).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
-		}
-	}, { ...ROOMY, ogMediaHosts: ["i.ytimg.com", "*.cdn.example"] });
+	}, { ...ROOMY, ogMediaHosts: ["i.ytimg.com"] });
 	await withStore("og-media-off", (store, clock) => {
-		expect(sent(store, clock, "ogm4", og.image)).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
+		expect(sent(store, clock, "ogm2")).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
 	});
 });
 
@@ -793,6 +773,33 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		// A role taken away takes the permission with it.
 		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
 		expect(errorCode(() => store.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
+	});
+});
+
+it("keeps the ids of removed users a move logs again retired until the move expires", async () => {
+	await withStore("relog-retired", (store, clock, state) => {
+		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		const original = post(store, clock, "alice", "original", { body: { text: "misplaced" } });
+		store.mutate(op(clock, "bob", "react", "reactions", { message_id: original.result.message_id, emojis: ["👍"] }));
+		const threadId = thread(store, clock, "thread");
+		// As if alice and bob had since been removed, and carol too, long ago.
+		state.storage.sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:alice', '1000'), ('purged:bob', '1000'), ('purged:carol', '1000')");
+		const moved = store.mutate(op(clock, "mia", "move", "message", { message_id: original.result.message_id, room_id: threadId, body: original.message!.body }));
+		const reactionsLog = String(moved.broadcasts[1].params.log_id);
+		const marker = (userId: string) => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = ?", `purged:${userId}`).one().value;
+		// The author and the reactor are named again by the move's records; carol is not.
+		expect([marker("alice"), marker("bob"), marker("carol")]).toEqual([reactionsLog, reactionsLog, "1000"]);
+	});
+});
+
+it("drops an output_ref a client sends: only the server refers to stored terminal output", async () => {
+	await withStore("client-output-ref", (store, clock) => {
+		const posted = post(store, clock, "alice", "forged", { body: { text: "x", embeds: [{ kind: "x", output_ref: { key: "f/AAAAAAAAAAAAAAAAAAAAAA", bytes: 1e12 } }] } });
+		expect(posted.message!.body!.embeds).toEqual([expect.objectContaining({ kind: "x" })]);
+		expect((posted.message!.body!.embeds as Array<Record<string, unknown>>)[0].output_ref).toBeUndefined();
+		const page = store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
+		expect(JSON.stringify(page)).not.toContain("output_ref");
 	});
 });
 

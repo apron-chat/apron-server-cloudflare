@@ -812,11 +812,16 @@ three posts' worth, whichever way it starts. Every operation stayed within
 its reservation (the claim reserves a post's 264 / 120, the finish 104 / 88
 as maintenance).
 
-Stored: the finished terminal is one record, its `output` JSON-escaped (32 KB
-of colored output was 45,457 bytes of JSON, and the database grew 45,056
-bytes); the creation snapshot with `url` stays beside it (a few hundred
-bytes). The `output` is cut further while its JSON passes 128 KiB, its worst
-case (every byte a control character, six bytes of JSON each). An append adds
+Stored: the finished terminal is one record. Where uploads are on, its
+output is one R2 object (an attached file's, `f/<id>`: one Class A write a
+text, at most 100 a day, and a Class B read for each history page or save
+that needs it and finds it out of the object's 8 MB cache), and the record
+holds a reference to it, a few dozen bytes. Without uploads the record holds
+the `output` JSON-escaped (32 KB of colored output was 45,457 bytes of JSON,
+and the database grew 45,056 bytes). The creation snapshot with `url` stays
+beside it (a few hundred bytes). The `output` is cut further while its JSON passes 64 KiB: only
+output dense in control characters (six bytes of JSON each) reaches it, as
+colored output escapes to about 1.4 times its bytes. An append adds
 its kept text (at most 4 KB) to one record. The open-text row (`live_texts`)
 is at most a few kilobytes and is deleted when none is open. On Free (16 KB
 kept) the figures are the same rows, 22,754 bytes of JSON, and 24,576
@@ -870,7 +875,7 @@ included usage and this server's own budgets
 | Durable Object duration | 400,000 GB-s | daily stop at 90% of 12,900; monthly stop at 50% | one object awake all day: 10,800 (334,800) | 100 × (300 + 120) s at 128 MB: 5,250 (162,750) alone; 3,000 for ordinary users | still at most 10,800 (334,800): one object cannot be awake longer than the day |
 | SQL rows written | 50,000,000 | 800,000 a day (fails closed) | up to the ceiling | about 3,600 | within the same ceiling |
 | SQL rows read | 25,000,000,000 | 30,000,000 a day (fails closed) | up to the ceiling | about 5,000 | within the same ceiling |
-| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text of 31 days (30 and cleanup's day): at most 3,100 × 132 KiB ≈ 400 MiB (typical 45 KB each: about 130 MB) | within the same watermark |
+| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text the hot log holds, its latest 5,000 records: with uploads on, a reference a terminal (its output is in R2); without, at most 64 KiB of JSON a terminal (typical 45 KB each: about 130 MB a month), 5,000 at the cap about 312 MiB, under the watermark. The D1 history tier's records are in D1 | within the same watermark |
 | Logs (from 2026-12-01) | 50 GB | monthly stop at 50% | | about 32 invocations a text, sampled at 0.1: under 100 MB | + under 0.2% |
 
 So live text fits the plan: alone its worst month is a tenth of the included
@@ -923,6 +928,38 @@ persisted principal-limit rows retained the original daily post count and
 the second mutation was rejected by that daily limit. The SQLite file
 remained the same size across eviction (151,552 bytes, measured with schema
 10).
+
+## History in R2: the cold tier and backups
+
+The cold tier (SPEC section 9) writes chunks of 10,000 log IDs, gzip-encoded:
+a chunk measured 129 KB in the upgrade rehearsal (`wrangler dev`, local R2;
+short chat messages with reactions and edits), about 13 bytes a record. A
+chunk is written once (one Class A `PUT`; a merge after a retried copy writes
+one more) and, with `historyColdRecords` at 0 (production), never deleted;
+its index entry is a row in the object's SQLite, not an R2 operation. Reads
+past D1 fetch one chunk (one Class B `GET`) for every chunk a page reaches
+that is not among the two kept decoded in memory.
+
+Backups write the whole history once a day (`BACKUP_EVERY`), multipart in
+5 MiB parts (one Class A operation a part, plus the upload's start and
+finish), read every chunk once (Class B), and keep the newest 14
+(`BACKUP_KEEP`); a pruned one is one free `DELETE`.
+
+At the posting ceiling (10,000 posts a day on Paid; say 20,000 records a day
+with reactions, edits and memberships), against R2 Standard's free tier
+(10 GB-month, 1 million Class A and 10 million Class B operations a month):
+
+| | A month | Against the free tier |
+|---|---|---|
+| Chunks written | about 60 (2 a day) | 60 Class A |
+| Cold storage after a year | about 7.3 million records, about 95 MB | 1% of 10 GB |
+| A day's backup after a year | about 95 MB, about 20 parts | about 700 Class A, about 22,000 Class B (each backup reads every chunk) |
+| Backups kept | 14, about 1.3 GB after a year | 13% of 10 GB |
+| Deep reads | one `GET` per chunk a page reaches, past the two in memory | bounded by the history page limits |
+
+So the tiers below SQLite stay inside R2's free tier for years at the
+posting ceiling; backups, which copy the whole history daily, are the larger
+share, and grow with it.
 
 ## Storage pressure and page reuse
 

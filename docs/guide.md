@@ -291,16 +291,29 @@ used the old one; `/invite-device remove <id>` revokes it, and
 
 ## User-visible policies
 
-Only the last 30 days of records (messages, reactions, room changes, and
-registered users' memberships) are retained, 24 hours on Workers Free. Cleanup
-once a day (hourly on Free) normally exposes 30 to 31 days; quota exhaustion may
-delay physical deletion. The `general` room ID, the top-level rooms admins
+History (messages, edits, reactions, room changes, and registered users'
+memberships) is kept in tiers, all of it readable: the latest 4,000 records
+in the server's own storage, 80,000 more in its D1 history tier (80% of
+limits of 5,000 and 100,000, the rest headroom), and everything older in its
+cold tier in R2, kept indefinitely by default. A flood that fills the
+server's own storage is moved down at once, so posting pauses for minutes,
+not a day. Without the tiers below it, only those
+4,000 are kept and older records expire; 24 hours on Workers Free. Messages
+below the server's own storage can be read in history but not edited,
+reacted to or replied to. An admin's `/purge` or `/rename` reaches the
+server's own storage and the D1 tier, and is applied to everything read or
+exported from the cold tier, whose stored chunks keep the old records until
+they are trimmed. Cleanup runs once a day
+(hourly on Free), so up to a day's records more may show; quota exhaustion may
+delay physical deletion. Uploaded files are kept 120 days, so a message older
+than that shows without them. The `general` room ID, the top-level rooms admins
 and mods create, and the log head never rotate. Recent edits can keep old
 messages visible. Rooms keep their current record after its log entry
-expires; a thread or private room whose whole log has expired is removed (its
-members get `room_update` `left`), which frees its slot under the
-[caps](limits.md#hard-caps). It also goes, and frees its slot, as soon as the
-last one in it leaves (or is removed, or purged), and its messages go with it.
+expires. The [caps](limits.md#hard-caps) on threads and private rooms count
+the ones started in the last 30 days, so a room keeps taking posts however old
+it is, and stays listed with all its history; one whose whole log has expired
+everywhere is removed (its members get `room_update` `left`). A thread or
+private room also goes, and frees its slot, as soon as the last one in it leaves (or is removed, or purged), and its messages go with it.
 This is not secure erasure, and says nothing about provider backups or copies
 on clients.
 

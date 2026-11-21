@@ -37,7 +37,7 @@
  * so a stall that slows every event writes a few points a minute, not one
  * per event. Keys are fixed names, never user input. Neither ever throws.
  */
-export type StallKind = "handler" | "queue" | "mutation" | "r2" | "push" | "analytics" | "storage";
+export type StallKind = "handler" | "queue" | "mutation" | "r2" | "push" | "analytics" | "storage" | "d1";
 
 export interface StallWriter {
 	/**

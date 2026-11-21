@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 import { DEFAULT_LIMITS, MAX_PRIVATE_ROOM_LIMIT, PUSH_POLICY } from "../src/budget";
-import { PRIVATE_ROOM_PREFIX, RETENTION_MS, WAKE_SCOPES, type Store, type StoreConfig, type StoreMutationInput } from "../src/store";
-import { errorCode, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { PRIVATE_ROOM_PREFIX, WAKE_SCOPES, type Store, type StoreConfig, type StoreMutationInput } from "../src/store";
+import { BY_AGE, errorCode, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Private rooms (§4.2.4): `private_<log id>` rooms that only their members
 // see, counted apart from the threads.
@@ -16,7 +16,7 @@ const ROOMY: Partial<StoreConfig> = {
 };
 
 const withStore = <T>(name: string, fn: Parameters<typeof withNamedStore<T>>[2], config: Partial<StoreConfig> = {}) =>
-	withNamedStore(`private-${name}`, { ...ROOMY, ...config }, fn);
+	withNamedStore(`private-${name}`, { ...BY_AGE, ...ROOMY, ...config }, fn);
 
 let requests = 0;
 function op(clock: TestClock, userId: string, method: string, params: Record<string, unknown>): StoreMutationInput {

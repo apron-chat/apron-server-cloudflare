@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IDLE_CHANGES_PER_CONNECTION_MINUTE, PUSH_POLICY } from '../src/budget';
+import { authorizeAdmin, type AdminCapability } from '../src/commands/capability';
 import { pushPayload } from '../src/index';
 import { MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES, type Store } from '../src/store';
 
@@ -136,8 +137,10 @@ describe('push over the socket', () => {
 
 	it('lists wake scope joined only to connections whose user may wake for it, with a new server frame when that changes', async () => {
 		const wakeOf = (frame: Frame) => frame.params.push.wake;
+		// A role change is an admin's: the capability `/role` would carry, its audit event dropped.
 		const changeRole = (userId: string, on: boolean) => runInDurableObject(stub(), (instance) => {
-			(instance as unknown as { changeRole(userId: string, role: string, on?: boolean): unknown }).changeRole(userId, 'mod', on);
+			const cap = authorizeAdmin({ tier: 'registered', userId: 'admin', roles: ['admin'] }, 'role', { record() {} }, Date.now());
+			(instance as unknown as { changeRole(cap: AdminCapability, userId: string, role: string, on?: boolean): unknown }).changeRole(cap, userId, 'mod', on);
 		});
 		const regularId = unique('wregular');
 		const regular = await signedIn(regularId);

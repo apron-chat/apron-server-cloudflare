@@ -16,8 +16,11 @@ The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
-history pages, and member listings with them. History is kept 30 days instead
-of 24 hours, matching uploaded images, with daily cleanup; the database
+history pages, and member listings with them. History keeps the latest
+4,000 records in SQLite and 80,000 more in the D1 history tier where it is bound
+(80% of limits of 5,000 and 100,000),
+instead of 24 hours (see [History retention](#history-retention)),
+with daily cleanup, and uploaded files are kept 120 days to match; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
 
 Paid includes only a third of Free's Durable Object requests (1 million a
@@ -363,7 +366,7 @@ in `src/plans/paid.ts` sets the limits:
 | `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
 | `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
-| `fileRetentionSeconds` | 30 days |
+| `fileRetentionSeconds` | 120 days |
 | `avatarRetentionSeconds` | 60 days |
 | `avatarRefreshSeconds` | 30 days |
 | `lifecycleLagSeconds` | 1 day |
@@ -374,7 +377,7 @@ are set; set up all of these first:
 
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
-2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 30 days
+2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 120 days
    after upload and prefix `a/` 61 days after upload. They must be at least
    `fileRetentionSeconds` and `avatarRetentionSeconds` (a day more leaves
    R2's asynchronous deletes a margin); the server deletes expired objects
@@ -391,7 +394,7 @@ are set; set up all of these first:
    does not cache by default; without the rule every view is a billed R2 read.
 5. **Signing key.** `openssl rand -base64 48 | npx wrangler secret put
    UPLOAD_SIGNING_KEY --config wrangler.production.toml`. Rotating it
-   invalidates `write_url`s already issued, nothing else.
+   invalidates `write_url`s already issued.
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
    and create `apron_media_invalid` and `apron_media_nosniff`, from
    [the generated definitions](edge-rules.generated.json). With uploads,
@@ -729,6 +732,378 @@ wake costs one alarm (a Durable Object request) and about 9 metered
 maintenance writes (6 if the object was still in memory). See the
 [cost report](cost-report.md#user-status).
 
+## History retention
+
+History (the server-wide log) leaves the object's SQLite, the hot log, from
+its oldest end by three limits, and then, where the tiers below are bound,
+stays in D1 and R2 by two more ([History tiers](#history-tiers)). Each is a `LIMIT_*` var (`LIMIT_RETENTION_RECORDS`
+and so on), which both Wrangler configs write out:
+
+| Limit | Workers Paid | Workers Free |
+| --- | ---: | ---: |
+| `retentionRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
+| `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
+| `historyD1Records`: the D1 tier keeps the newest this many records that left | 100000 | 0 (off) |
+| `historyColdRecords`: the cold tier keeps the newest this many records past D1's | 0 (everything) | 0 (everything) |
+| `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
+
+A record leaves the hot log once it is past the latest `retentionRecords`, or
+once it is older than `retentionSeconds`. Without a tier below the hot log it
+expires then. Set
+`retentionRecords` to 0 for history by age alone, as on Free, or
+`retentionSeconds` to 0 for no age limit, as on Paid; at least one must be
+set. Each cleanup run reads up to `retentionRecords` index entries to find
+where the count ends, so it is at most 50,000; and the count, every record a
+largest snapshot (`maxSnapshotBytes`, twice over for its indexes and state
+rows), must fit under `databaseResumeLowWaterBytes`, so that cleanup at the
+watermark (below) always relieves it: about 13,600 records on Paid.
+
+**The limits are ceilings.** Each daily cleanup keeps `cleanupThresholdPercent`
+of each count limit (80%: 4,000 of the hot log's 5,000 and 80,000 of the
+D1 tier's 100,000, 84,000 in all): it moves what is past the hot log's share
+to the D1 tier, and what is past the D1 tier's to the cold tier, or expires
+it without one. The rest of each
+limit is headroom for a day's records, so the hot log reaches its limit only
+on a day that brings more than 1,000 records. 100 keeps each limit whole, as
+a floor rather than a ceiling.
+
+The count is of log records, not messages: edits, reactions, memberships and
+room changes count too, so 84,000 records are fewer messages. At the demo's
+traffic in November 2026 (about 115 records a day) they span about two
+years, the hot log's 4,000 about five weeks; a busier stretch keeps less time, a quieter one
+more.
+
+**A flood starts cleanup at once.** When a write meets the database's
+high-water mark (`databaseHighWaterBytes`, 768 MiB on Paid), it is refused
+and cleanup starts at the next alarm, whatever the daily schedule says: it
+moves what is past the count down to D1 (or, without tiers, expires it), and
+posting resumes once the database is under `databaseResumeLowWaterBytes`
+(640 MiB) again, minutes rather than a day later. While the database stays
+over the mark and cleanup has nothing more to move (or the copy into D1 is
+failing, which stalls and alerts as any failing copy does), it looks again
+every five minutes, not at every alarm. The cost is that a flood can push
+the last hours of real conversation into D1, where it is kept and readable
+but read-only (no edits, reactions or replies); `/purge` still reaches the
+flood there.
+
+Uploaded files expire by age (`fileRetentionSeconds`, 120 days on Paid), since
+the bucket's lifecycle rules can only expire by age: a message kept longer
+shows without its file. A removed account's `user_id` is retired until history
+has expired past the log position where it was removed (account upkeep,
+below), not for a time, so it follows whichever limit moves the log. With the
+cold tier keeping everything, that is never: history that names the account
+(an idle-pruned account's own posts, which stay, and other people's mentions
+of it) stays readable in some tier, and a new account given the same ID would
+take it over. Registration picks another ID instead (registered IDs are
+`<name>_<digits>` or `u_…`), so a retired ID costs nothing but its name.
+
+### Rooms and the caps
+
+The thread and private-room caps (`threadLimit`, `threadsPerUser`,
+`privateRoomLimit`, `privateRoomsPerUser`) count the rooms started within
+`roomCreationWindowSeconds` (`LIMIT_ROOM_CREATION_WINDOW_SECONDS`, 30 days on
+both plans), by their creation log ID: they limit how fast rooms are started,
+not how many exist. Posting in, reacting in, saving, moving into or out of,
+joining and leaving a room never needs a slot, however old the room. 0 counts
+every room that exists instead.
+
+Rooms are kept for as long as their history: a room is removed only when its
+whole log has left every tier (with keep-everything in the cold tier, never),
+or by an explicit removal (its last member leaving, `/purge`). Counting reads
+an index of the rooms table by kind and creation (`rooms_kind_created_idx`),
+so it follows the rooms started within the window, not how many the table
+holds; listings read one by kind and head (`rooms_kind_head_idx`). Both are
+additive: an object made before this version gets them from its first
+cleanup after the deploy (no schema version change); until then the same
+queries scan the table instead.
+
+What grows with the rooms kept, and its bounds:
+
+- A `room_list` names every top-level room and the 200 threads most recently
+  active (`LISTED_THREADS`); a maintenance listing the 400 most recently
+  active private rooms. An older thread is still listed by its `room_id`
+  (`room_list` with `room_id`) and read by `history`, and an export names
+  every room (`Store.allRooms`, read in pages).
+- A registered user may be a member of at most 1,000 rooms
+  (`MAX_MEMBERSHIPS_PER_USER`, in `src/budget.ts`): a join past it, or
+  creating a room, which joins its creator, is `denied` ("A user may be in at
+  most 1000 rooms; leave one to join another"). An import that would make
+  someone a member of more of its rooms is refused at planning, and restoring
+  never joins anyone past it: a join past it (a second or resumed import's,
+  from records or listings) is skipped and counted as `membersSkipped`. So the reads
+  of a user's own rooms stay bounded: their joined rooms are listed newest
+  first, at most `MAX_USER_ROOMS` (351), read in the membership index's order
+  so the read stops there, plus their top-level rooms (at most 17) and a room
+  just joined, however old (`MAX_LISTED_USER_ROOMS`, 370): a connection is
+  delivered to the rooms its user's listing names, and carries them all in
+  its attachment. A `/purge` or `/rename` of them reserves for at most that
+  many memberships.
+- `/purge`, `/rename` and idle-account pruning read every room row for its
+  creator; their reservations count the rows the table holds.
+
+`/status` shows the rooms started within the window against each cap, and
+the older ones kept besides.
+
+### History tiers
+
+History is kept in a chain of tiers joined by links (`src/history/`;
+[SPEC section 9](../SPEC.md#history-tiers)), newest first, in a fixed order that comes
+from the bindings alone (`src/history/config.ts`): the hot log (`hot`),
+then the D1 tier (`recent`, `src/history/d1.ts`) where a D1 database is
+bound as `HISTORY_D1` and `historyD1Records` is above 0, then the cold tier
+(`cold`, `src/history/cold/`) where an R2 bucket is bound as `HISTORY_BLOB`.
+There is no tier list to configure: changing the composition is a code
+change. `wrangler.toml` binds a local database and bucket; production binds
+`apron-archive` (which keeps the name it was created with) and the
+`apron-history` bucket, and Previews bind neither. The object creates its D1 table on first
+use.
+
+Records leaving the hot log are copied to the tier below first, and removed
+from SQLite only once copied: cleanup moves the hot floor no further than the
+last record copied (`history:head:through` in `_meta`). On each full alarm,
+before cleanup and again after a cleanup batch that removed records, the
+object runs one cycle of the chain, at most 24 steps, working from the
+deepest tier up: each tier's link from above delivers it the next queued
+`/purge` or `/rename`; the tier finds the floor its retention allows; its
+link below copies what is below that to the next tier (100 log IDs a step,
+a 10,000-record chunk into the cold tier), once the tier holds every queued
+rewrite; the tier raises its floor, and deletes what is below it (500
+records a step). History serves records
+in the tiers below as if they had never left: a page that reaches below the
+hot floor reads the rest from them, and `history_log_id` starts at the
+published floor, the floor of the deepest tier history reads, which it
+raises before that tier deletes anything. Rooms whose whole log is below the
+published floor go then, not when their records leave the hot log. Messages
+in a tier below the hot log are history only: like expired ones, they
+cannot be edited, reacted to or replied to.
+
+`/purge` and `/rename` reach the D1 tier too: the links deliver them down
+the chain in order, on an alarm a second later, and D1 applies each in one
+step; until it has, history pages that read it apply them in memory. The
+cold tier does not take them: it keeps each one (`history:kept:` in
+`_meta`) and applies them to everything read or exported from it, record by
+record, until its floor passes what it held then. Its chunks still hold the
+purged user's records until they are trimmed; exports and history leave them
+out (a history page may still show a reaction set on a purged message only
+the cold tier holds; exports drop those too). At most 200 of them wait for the links at
+once: past that, `/purge` and `/rename` answer `retry_after` until the links
+catch up.
+
+Finding the floor the D1 tier's retention allows reads the D1 index entries
+of the records it keeps (80,000 on Paid), so `historyD1Records` is at most
+100,000. It is found again only once the hot log copied into D1 or let
+records go since, or an hour after the last time otherwise, so in practice
+once a day, after the daily cleanup: about 2.4 million D1 rows read a month,
+of the 25 billion Workers Paid includes.
+
+The link into the cold tier copies whole chunks (10,000 log IDs): it waits
+while less than a chunk is due and D1 is under its limit, so D1 holds what
+has yet to make one besides its 80,000, between 80,000 and 89,999 records in
+steady state and never more than its limit and one chunk (110,000). Each
+time it looks, it counts what is due and, when that is short of a chunk, all
+D1 serves: up to about 90,000 rows read, a few times after each daily
+cleanup.
+Its 80,000 records stay within the included 5 GB even were each a
+maximum-size snapshot. Each history page below the hot floor is a D1 query.
+
+There is no fallback for a tier below that fails. Copying waits five minutes
+between tries rather than a second, and records stay in the hot log
+meanwhile, so it grows; at worst posting pauses at the database high-water
+mark, and nothing is lost. `/status` shows a stalled link (`- History copy
+SQLite → D1: failing since …`), and once a link has failed for 6 hours the
+admins are told (`history_stall`), once a stall. A history page that needs a
+tier that fails answers `retry_after`. With no tier below the hot log,
+records expire as they leave it, and only 4,000 are kept on Paid; the
+tiers' and links' state in `_meta` is forgotten, and turned on again, they start at
+the hot floor. The D1 tier is never skipped once it holds history, from
+the first copy into it on (not first at its first trim): with
+`HISTORY_D1` unbound (or `historyD1Records` 0) while its state remains and
+the cold tier is bound, history stops moving below SQLite rather than go to
+the cold tier past what D1 holds. SQLite keeps what it holds meanwhile;
+`/status` shows D1 **unbound** (or **off**, for a limit of 0, with what to
+change), the Worker logs `history_tier_unbound`,
+admins get `history_stall` after 6 hours, history pages below the hot floor
+answer `retry_after`, and exports and imports are refused, until it is
+bound again.
+
+`/history status` (admins) shows each tier's floor, how far its link has
+copied to the next and which rewrites it delivered, the published floor,
+and whether the chain's invariants hold.
+
+**The cold tier** keeps the oldest history in R2 as chunks of the whole
+log, about 10,000 log IDs each (every room's records over that stretch),
+under `history/<RP_ID>/` (so servers may share a bucket), each a complete
+ARCHIVE.md v1 file, gzip-encoded through the same codec chain as backups,
+with one small row a chunk in the object's SQLite (`history_chunks`: its
+bounds, size, and the rooms it holds). It serves every history page,
+joined rooms' too, reading only the chunks that hold one of the page's
+rooms, and keeps two decoded chunks in memory. Chunks are written once and
+only trimmed: it takes no `/purge` or `/rename` (above). It keeps
+everything unless `historyColdRecords` is set, when it deletes whole
+chunks, oldest first. The bucket must be private: no custom domain, no
+r2.dev URL, no CORS, no lifecycle rules.
+
+### Backups and imports
+
+A backup is the whole server's history, or some rooms', as one ARCHIVE.md
+v1 file in the `HISTORY_BLOB` bucket under `backups/`
+(`src/history/exports.ts`; [SPEC section 9](../SPEC.md#backups-and-imports)):
+every room with its current members (at most 10,000 a room: past that a
+room's members are truncated, by `user_id`, its `member_count` keeping the
+true count, and the notice names the room), the users those members and
+the records name, and the records of every tier, as they are logged,
+gzip-compressed. It is written as a stream (an R2 multipart
+upload), and a failure leaves no object. **Backups are not encrypted**: the
+bucket being private is what keeps them so, as it does the cold tier's
+chunks (no custom domain, no r2.dev URL, no CORS, and API tokens with R2
+access kept to those who may read the whole history). Plain string vars set
+them, checked when the Worker starts:
+
+| Var | Default | Production | Development |
+| --- | --- | --- | --- |
+| `BACKUP_EVERY`: how often the scheduled backup runs (`"6h"`, `"1d"`; empty: on demand only) | on demand | `"1d"` | `""` |
+| `BACKUP_KEEP`: how many backup files of each kind are kept, newest first | `14` | `"14"` | `"14"` |
+| `BACKUP_PRIVATE_ROOMS`: whether private rooms are backed up | `true` | `"true"` | `"true"` |
+
+Each backup's key is `backups/<RP_ID>-<kind>-<date>.jsonl.gz`, the kind
+`scheduled` or `manual`, with the codecs it went through recorded in its
+metadata (`codecs: gzip`); after writing one, the backups of its kind past
+the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
+
+- **The scheduled backup** runs on the first full alarm after
+  `BACKUP_EVERY` has passed since its last run (`history:export:scheduled`
+  in `_meta`, noted before it runs, so one that fails waits its interval).
+  Its result is logged (`history_export`, or `history_export_failed` with
+  the reason); without the bucket it is skipped, logged once a wake
+  (`history_export_unbound`).
+- **`/history export [<room_id>...]`** (admins) writes a `manual` one now,
+  of every room or of those named, with the same settings; without the
+  bucket, the command says so and writes nothing. Its notice names the
+  object's key. A second backup of a kind in the same second is refused
+  (keys are to the second); one export or import runs at a time, and none
+  while history upkeep runs (`src/history/schedule.ts`); `/purge` and
+  `/rename` are refused while an import runs, and an import while one of
+  them does, and also while an unfinished import's journal remains (after
+  a restart mid-import): finish it, or abandon it with `restart`, first.
+- **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
+  an object of the backup store (at most 250,000 records and 256 MiB,
+  stored and decoded: a backup past either is warned of when written), a
+  backup or any ARCHIVE.md v1 file put there, gzip-compressed (`.jsonl.gz`,
+  or its metadata says so) or plain (`.jsonl`), and adds what is new, after
+  planning the whole file:
+  rooms that exist here are skipped whole; records already held here are
+  skipped as duplicates, and others whose log ID is taken move to the next
+  free millisecond; records older than history here are dropped as expired.
+  `dry-run` reports what it would do, the log IDs it would add among it.
+  The file may be anyone's, so records are taken only as a client could
+  have sent them, by the same content policy posting uses
+  (`src/content/policy.ts`: bare users, bodies and reaction sets normalized
+  as posts are, room fields and snapshot sizes within a post's limits),
+  others dropped and counted. Users are never matched to existing
+  accounts: that takes a file verified as this server's own, and no codec
+  here verifies one (`auto`, the default, makes every user new, and `match`
+  is refused); a codec that authenticates, such as encryption added after
+  gzip, would make this server's own backups matchable again. A new user becomes a
+  placeholder account with no credential and the role `unclaimed` (their own
+  roles are not imported, and `unclaimed` alone does not raise posting
+  limits), renamed (`ada-2`) where the `user_id` is taken or retired, and
+  `imported-<id>` where it cannot be an account here (a guest's, a bot's, a
+  `~` notice's, or `admin`). An import that would make more placeholders
+  than `registeredIdentityCount` has room for is refused, and a dry run
+  shows the accounts in use. Holding a role, placeholders are never removed as idle (account upkeep),
+  and they count toward `registeredIdentityCount`. Kept log IDs may be at
+  most five minutes past the clock; a file with later ones is refused:
+  `renumber` gives every record a new log ID
+  instead. A room holding nothing past its creation (a new server's
+  `general`) is filled, not skipped. Only users the import uses get an
+  account: those a record names and the members a new room's listing names.
+  Those members are joined, with no membership record made, so members who
+  joined long ago and have not posted since are kept; one with no account
+  here, or past the private-room cap, is left out and counted. An import notes its plan before it
+  writes (one too large to note is refused: `renumber` it): run again after
+  a failure, the same file finishes; `restart` abandons an unfinished import
+  of another file, and the notice names the rooms it left part-restored.
+
+**How an import reads a file.** It streams the file twice and never holds
+it: the first pass indexes it (25 bytes a record) and plans, before
+anything is written; the second reads it again and writes as it goes, 200
+records a call, saving where it got to every 2,000 records
+(`history:import_progress` in `_meta`). A run that fails partway (a write
+refused, the day's maintenance budget spent, the object restarted) is
+finished by running the same command again: it plans again, then decodes
+the file from its start and discards what comes before the saved position
+without parsing it, and writes on from there. Measured for a synthetic
+backup of 200,000 messages (100 MiB decoded, 25 MiB gzip-compressed):
+
+| What | Measured |
+| --- | --- |
+| Index and plan, memory | within a 16 MiB V8 heap and 12 MiB of typed arrays (index 31 bytes a record held, plan 24) |
+| First pass (parse, content policy, index) in workerd | about 17 MiB a second: 6 seconds |
+| Skipping to a saved position (gzip decode, bytes discarded) in workerd | 88 to 130 MiB a second: under 1.2 seconds for the whole file |
+| A whole import into memory tiers | 6.6 seconds in one run; 26 seconds in five (four forced failures), of which skipping 1.8 seconds and planning again most of the rest |
+
+The bounds follow: 250,000 records keeps the index and plan near 40 MB of
+the object's 128 MB, and the first pass, which each run repeats, near 8
+seconds of an invocation's 30 seconds of CPU; 256 MiB decoded keeps it
+under about 15 seconds however large the records. Known limitations:
+each run after a failure indexes and plans the whole file again; a file
+whose rooms' records are not each in log order (this server always writes
+them so) is sorted in memory, up to 16 MiB decoded, and refused past that;
+and the tiers below the hot log are appended a checkpoint's worth at a
+time, so a file not in log order across rooms (this server writes one room
+after another) makes the cold tier merge into chunks it wrote already.
+
+**Codecs.** Backups and the cold tier's chunks go through `@apron/archive`
+codecs on their way to the bucket (`packages/archive/src/codec.ts`): each is
+a pair of standard Streams `TransformStream`s, composed with `pipeThrough`.
+Both use the history codec chain, `gzip` alone today (`HISTORY_CODECS` in
+`src/history/config.ts`, the one place it is named; nothing else names a
+codec). Encryption can be added later as a codec after it, with no change
+to how backups are named, pruned or read: the import decodes through
+whatever chain an object records.
+
+## Upgrading and rolling back
+
+This version moves history out of the object's SQLite into D1 and R2 by
+count, where earlier versions expired it by age (30 days). Deploying it over
+an older version loses nothing: the copy marker starts at 0, so nothing
+leaves SQLite until the tier below has written it, and a copy that fails
+stalls and alerts while SQLite holds everything (the hot log grows instead).
+It needs no schema change: the schema version and tables of the older
+version stay as they are, and it adds tables (`history_chunks`) and `_meta`
+keys (`history:*`) that the older version ignores.
+
+**Fix forward; do not roll back** once records have moved below SQLite (after
+the first daily cleanup that finds more than `retentionRecords`' share):
+
+- An older version knows neither the copy marker nor the tiers. It would
+  finish a cleanup this version started, whose cutoff is by count and may be
+  past what D1 holds yet, and apply its own age rule to SQLite: it deletes
+  records that were never copied and that it would itself have kept.
+- It removes thread and private rooms whose whole log is below its SQLite
+  floor, with their memberships, where this version keeps them because their
+  records are in D1 or R2.
+- It counts every thread row against `threadLimit`, however old, so it
+  refuses new threads until its own cleanup removes old ones (threads whose
+  whole log is below its SQLite floor). It ignores the rooms' kind indexes,
+  which SQLite keeps up to date for it.
+
+Records already in D1 and R2 survive a rollback, and come back into history
+when this version is deployed again. If a rollback cannot wait, make it in the
+first days after the deploy, before anything has moved, or deploy this
+version with a higher `LIMIT_RETENTION_RECORDS` instead (up to what the
+config check allows: about 13,600 on Workers Paid), which slows records
+moving without losing any.
+
+Roll back the code and its configuration together: revert the merge commit
+(so `wrangler.production.toml` goes back with the code) or use a Cloudflare
+version rollback. The older code refuses this version's configuration (it
+reads `LIMIT_RETENTION_SECONDS` of 0 as invalid and refuses `LIMIT_*` names
+it does not know), so deploying older code with this file would fail every
+request. Likewise, before deploying this version, make sure no production
+secret is named `LIMIT_*`: a deploy replaces vars but keeps secrets, and this
+version refuses unknown `LIMIT_*` names too.
+
 ## Runtime overrides
 
 Wrangler string variables use the exact names below. Every row of the numeric
@@ -738,7 +1113,12 @@ uppercase snake case (`LIMIT_MAX_FRAME_BYTES`), plain uppercase snake case
 Wrangler deployments should use the uppercase form; local tests may use
 camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
-`Number.MAX_SAFE_INTEGER` fail startup.
+`Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
+`retentionSeconds`, `historyD1Records`, `historyColdRecords` and
+`roomCreationWindowSeconds` also take `0`, which turns that bound off (for
+`historyD1Records`, the D1 tier; for `historyColdRecords`, the cold tier
+keeps everything; for `roomCreationWindowSeconds`, the room caps count every
+room that exists).
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -768,10 +1148,13 @@ defaults:
   posting limits are at least the registered ones. Global posting,
   registration, identity, and processed-frame caps are fixed demo ceilings.
   Low, high, and hard storage watermarks must be strictly ordered.
-- `retentionSeconds` is at least `cleanupSeconds`; `sessionTtlSeconds` is at
-  most 30 days; `retiredUserIdSeconds` is at least `retentionSeconds`;
-  `idleAccountSeconds` is at least a day and `retentionSeconds`;
-  `keptActiveAccounts` is at most `registeredIdentityCount`.
+- At least one of `retentionRecords` and `retentionSeconds` is set;
+  `retentionRecords` is at most 50,000 and `historyD1Records` at most 100,000;
+  `retentionSeconds`, when set, is at least `cleanupSeconds`;
+  `retentionRecords` largest snapshots, twice over, fit under
+  `databaseResumeLowWaterBytes`. `sessionTtlSeconds` is at most 30 days;
+  `idleAccountSeconds` is at least a day; `keptActiveAccounts` is at most
+  `registeredIdentityCount`.
 - `roomMetadataLimit` plus 1 KiB of envelope must fit `maxFrameBytes`;
   `roomMetadataMinLimit` is at most `roomMetadataLimit`; and
   `roomMetadataTotalLimit` is at least `roomMetadataLimit` less
@@ -822,7 +1205,7 @@ implementation and recalibrating its resource model.
 | `SERVER_TITLE` | The `server` frame's `title` (protocol §3.1), a one-line plain name within the display-name policy (80 code points); unset or empty, left out, and clients show the server's address. The public demo sets it in `wrangler.production.toml`. An admin's `/server title` overrides it (see [Server title, description and avatar](#server-title-description-and-avatar)) |
 | `SERVER_DESCRIPTION` | The `server` frame's `description`, a few words of CommonMark (at most 500 bytes) saying what the server is about; unset or empty, `general`'s description where it fits, else left out. The public demo sets it in `wrangler.production.toml`. An admin's `/server description` overrides it |
 | `SERVER_AVATAR` | The `server` frame's `avatar`, the server's square icon: an `https:` URL, or a small `data:image/{png,jpeg,gif,webp};base64,` URL (at most 8 KiB); unset or empty, left out. The public demo sets it in `wrangler.production.toml`, to apron-web's icon. An admin's `/server avatar` overrides it |
-| `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, `apron_device_`, or `apron_session_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
+| `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, `apron_device_`, or `apron_session_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars`. |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
 | `MEDIA_NOSNIFF` | `true` once the media host sends `X-Content-Type-Options: nosniff` (the `apron_media_nosniff` edge rule): attachments may then be Markdown text, listed as `text/markdown` in `ext.media.upload`. Unset or `false`, text is refused, as nothing would stop a page loading an uploaded text as a script. Not needed where `MEDIA_ORIGIN` is `PUBLIC_ORIGIN`: the Worker serves its uploads with `nosniff` itself |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s and live text `url`s point at; with `UPLOAD_SIGNING_KEY`, configures live text |
@@ -840,6 +1223,7 @@ implementation and recalibrating its resource model.
 | `METRICS_DATASET` | The Analytics Engine dataset the `METRICS` binding writes, for `/status` to read active users back (the binding does not tell the Worker its name; `npm run budget:check` holds the two equal); unset, `/status` leaves active users out |
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
+| `BACKUP_EVERY`, `BACKUP_KEEP`, `BACKUP_PRIVATE_ROOMS` | Backups of history to the `HISTORY_BLOB` bucket, gzip-compressed and not encrypted: a schedule (empty: on demand only), how many files of each kind are kept (default 14), whether private rooms are included (default `true`). See [Backups and imports](#backups-and-imports) |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
@@ -951,10 +1335,13 @@ user, one connected now or whose bot is, one whose bot holds a role of its
 own, or one with a live upload (its avatar expires first, up to 61 days after its
 owner's last sign-in). Its bot goes with it, and its passkeys, memberships,
 read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its
-content is past retention by then, or within the day cleanup may take. Its `user_id` is retired, as `/purge`
-retires one, for `retiredUserIdSeconds` (the message retention), then may be
-issued again, once every token of the old account and its bot is revoked:
-nothing logged names it any more, and a session carries the user handle it
+content stays in history, under the name it was posted with, until it
+expires like anything else. Its `user_id` is retired, as `/purge` retires one,
+at the log head: once history has expired past that position (by an hour of
+log IDs), or the whole log has, it may be issued again, once every token of
+the old account and its bot is revoked. A move or an editor's save that logs
+the account's content again moves its position to that record. Nothing logged
+names it any more by then, and a session carries the user handle it
 was issued under, so a new account under the id never resumes an old one's
 (a session from before sessions carried handles resumes only for an account
 from before then). Once a day the same upkeep clears mutes that ran out.
@@ -1016,12 +1403,12 @@ wall-clock jump cannot reset them. Cleanup and deduplication run in bounded
 batches/records, while `foreground*` and `maintenance*` are daily SQL
 operation budgets.
 
-`threadLimit` counts thread rooms (rooms with a `parent_room_id`) and the
-top-level rooms admins and mods create (at most 16 of them);
-`threadsPerUser` (at most `threadLimit`) caps the live threads one
+`threadLimit` counts active thread rooms (rooms with a `parent_room_id`)
+and the top-level rooms admins and mods create (at most 16 of them);
+`threadsPerUser` (at most `threadLimit`) caps the active threads one
 registered user has created, so one account cannot take every slot.
-`privateRoomLimit` (at most 200) counts private rooms apart from the
-threads; `privateRoomsPerUser` caps the live private rooms one registered
+`privateRoomLimit` (at most 200) counts active private rooms apart from the
+threads; `privateRoomsPerUser` caps the active private rooms one registered
 user has started, and `privateMembershipsPerUser` (at most 50, and at least
 `privateRoomsPerUser`) the private rooms one user is in, theirs and those
 others added them to, which `ext.settings.private_rooms` advertises.
@@ -1062,10 +1449,13 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
+- History: `retentionRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
+  `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
+- Durations: `retentionSeconds` ([History
+  retention](#history-retention)), `roomCreationWindowSeconds` ([Rooms and
+  the caps](#rooms-and-the-caps)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
-  resume), `idleAccountSeconds` and `retiredUserIdSeconds` (account upkeep,
-  above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  resume), `idleAccountSeconds` (account upkeep, above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
   `guestPresenceAlarmSeconds` (each at most 60, the last a multiple of the one
   before; see [User status](#user-status-presence)).
@@ -1097,7 +1487,10 @@ The numeric rows are grouped by their unit and enforcement scope:
   1,000; the newest page is always open): enough to look around every public
   room and thread before signing up, while scrolling further back is for
   accounts. Measuring a page reads up to that many rows, so a refused page is
-  still charged to the guest's address like a served one.
+  still charged to the guest's address like a served one. Only the object's
+  SQLite is counted: a page reaching below its floor, into a tier below,
+  counts as the full depth, so guests page there only through the newest
+  page or `after`.
 - Minute budgets: `historyRequestsPerUserMinute` and
   `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
   `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle
@@ -1120,13 +1513,15 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionSeconds` | 2592000 | 86400 |
+| `retentionRecords` | 5000 | 0 |
+| `retentionSeconds` | 0 | 86400 |
+| `historyD1Records` | 100000 | 0 |
+| `historyColdRecords` | 0 |  |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
 | `idleAccountSeconds` | 2592000 |  |
 | `keptActiveAccounts` | 100 |  |
-| `retiredUserIdSeconds` | 2592000 | 86400 |
 | `maxFrameBytes` | 32768 | 16384 |
 | `maxTextBytes` | 16384 | 4096 |
 | `maxSnapshotBytes` | 24576 | 8192 |
@@ -1201,6 +1596,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `cleanupBatch` | 100 |  |
 | `threadLimit` | 100 |  |
 | `threadsPerUser` | 25 |  |
+| `roomCreationWindowSeconds` | 2592000 |  |
 | `roomMetadataLimit` | 8192 |  |
 | `roomMetadataMinLimit` | 1024 |  |
 | `roomMetadataTotalLimit` | 262144 |  |

@@ -1,5 +1,27 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { readFileSync } from "node:fs";
+import { basename, delimiter, dirname } from "node:path";
 import { defineConfig } from "vitest/config";
+
+/**
+ * The archives `npm run roundtrip` names (scripts/roundtrip.mjs), read here
+ * since the Workers pool cannot read the host's files: ROUNDTRIP_SCENES, a
+ * JSON object of name → text (a scene's name is its directory's, as in
+ * scene.apron.chat's scenes/<name>/scene.jsonl), and ROUNDTRIP_ONLY to leave
+ * the fixtures out.
+ */
+function roundtripScenes(): Record<string, string> {
+	const paths = (process.env.ROUNDTRIP_SCENES ?? "").split(delimiter).filter(Boolean);
+	if (!paths.length) return process.env.ROUNDTRIP_ONLY ? { ROUNDTRIP_ONLY: "true" } : {};
+	const scenes: Record<string, string> = {};
+	for (const path of paths) {
+		const base = basename(path) === "scene.jsonl" ? basename(dirname(path)) : basename(path).replace(/\.jsonl$/, "");
+		let name = base;
+		for (let index = 2; name in scenes; index += 1) name = `${base}-${index}`;
+		scenes[name] = readFileSync(path, "utf8");
+	}
+	return { ROUNDTRIP_SCENES: JSON.stringify(scenes), ...(process.env.ROUNDTRIP_ONLY ? { ROUNDTRIP_ONLY: "true" } : {}) };
+}
 
 export default defineConfig({
 	plugins: [
@@ -40,11 +62,16 @@ export default defineConfig({
 					LIVE_TEXT_MAX_SECONDS: "2",
 					LIVE_TEXT_MODERATOR_MAX_SECONDS: "3",
 					LIVE_TEXT_WRITE_WINDOW_SECONDS: "3",
+					// The property tests' replay and soak switches (test/history/chain.test.ts),
+					// from the shell: HISTORY_SEED=… HISTORY_PATH=… or HISTORY_RUNS=… npx vitest run.
+					...Object.fromEntries(["HISTORY_SEED", "HISTORY_PATH", "HISTORY_RUNS"].flatMap((name) => (process.env[name] ? [[name, process.env[name]]] : []))),
+					// The scene round trip's extra archives (scripts/roundtrip.mjs).
+					...roundtripScenes(),
 				},
 			},
 		}),
 	],
 	test: {
-		include: ["test/**/*.test.ts"],
+		include: ["test/**/*.test.ts", "packages/*/test/**/*.test.ts"],
 	},
 });

@@ -4,6 +4,41 @@
 import { PAID_PLAN } from "./plans/paid.ts";
 
 export interface Limits {
+	/**
+	 * Message history (the server-wide log) keeps at least the latest this
+	 * many records in the object's SQLite: messages, edits, reactions and
+	 * room changes alike. Older ones leave it at the next cleanup (to the
+	 * tiers below where bound, else they expire), and at once when the
+	 * database reaches its storage watermark. 0 keeps no count, leaving
+	 * `retentionSeconds` alone to expire records.
+	 */
+	retentionRecords: number;
+	/**
+	 * Records past the limits above that the D1 history tier (binding
+	 * HISTORY_D1) keeps, newest first, before they go on to the cold tier or
+	 * expire. Records there stay in history but become read-only: they leave
+	 * the object's SQLite, the hot log, and history pages still serve them
+	 * from D1, but their messages can no longer be edited, reacted to or
+	 * replied to, as an expired one cannot. 0, or no binding, turns the tier
+	 * off.
+	 */
+	historyD1Records: number;
+	/**
+	 * Records the cold history tier (chunks in HISTORY_BLOB) keeps, newest
+	 * first, past those above; 0 keeps everything it is given.
+	 */
+	historyColdRecords: number;
+	/**
+	 * The share, in percent, of each history count limit that cleanup keeps:
+	 * the limits are ceilings, and each daily cleanup trims each back to this
+	 * share of it, so the rest is headroom for what a day brings before the
+	 * next one.
+	 */
+	cleanupThresholdPercent: number;
+	/**
+	 * A record older than this expires whatever the count. 0 sets no age
+	 * limit; at least one of it and `retentionRecords` is set.
+	 */
 	retentionSeconds: number;
 	cleanupSeconds: number;
 	challengeTtlSeconds: number;
@@ -18,13 +53,6 @@ export interface Limits {
 	idleAccountSeconds: number;
 	/** The most recently active accounts the idle prune always keeps, however idle. */
 	keptActiveAccounts: number;
-	/**
-	 * How long a removed account's `user_id` stays retired, never reissued:
-	 * at least `retentionSeconds`, so nothing logged still names it when it
-	 * may be taken again. Sessions carry the user handle they were issued
-	 * under, so a new account under the id never resumes an old one's.
-	 */
-	retiredUserIdSeconds: number;
 	maxFrameBytes: number;
 	maxTextBytes: number;
 	maxSnapshotBytes: number;
@@ -191,9 +219,19 @@ export interface Limits {
 	databaseHardTargetBytes: number;
 	databaseResumeLowWaterBytes: number;
 	cleanupBatch: number;
+	/** Public rooms and threads (`general` aside) that may be started within roomCreationWindowSeconds. */
 	threadLimit: number;
-	/** Live threads one registered user may have created; removed and expired ones do not count. */
+	/** Threads one registered user may start within roomCreationWindowSeconds. */
 	threadsPerUser: number;
+	/**
+	 * The window the room caps (`threadLimit`, `threadsPerUser`,
+	 * `privateRoomLimit`, `privateRoomsPerUser`) count rooms started in, by
+	 * their creation: they limit how fast rooms are started, not how many
+	 * exist, so posting in, joining or leaving an older room never needs a
+	 * slot, and rooms are kept for as long as their history. 0 counts every
+	 * room that exists.
+	 */
+	roomCreationWindowSeconds: number;
 	/** One room's serialized client fields (`title`, `description`, `ext`). */
 	roomMetadataLimit: number;
 	/**
@@ -210,9 +248,9 @@ export interface Limits {
 	 * grow the total past it is refused.
 	 */
 	roomMetadataTotalLimit: number;
-	/** Private rooms (§4.2.4) that may exist at once; they do not count against threadLimit. */
+	/** Private rooms (§4.2.4) that may be started within roomCreationWindowSeconds; they do not count against threadLimit. */
 	privateRoomLimit: number;
-	/** Live private rooms one registered user may have created; removed and expired ones do not count. */
+	/** Private rooms one registered user may start within roomCreationWindowSeconds. */
 	privateRoomsPerUser: number;
 	/** Private rooms one registered user may be a member of at once, the ones others added them to included. */
 	privateMembershipsPerUser: number;
@@ -569,6 +607,18 @@ export const MAX_GLOBAL_POSTS_PER_MINUTE = DEFAULT_LIMITS.globalPostsPerMinute;
 export const MAX_GLOBAL_POSTS_PER_DAY = DEFAULT_LIMITS.globalPostsPerDay;
 export const MAX_REGISTRATIONS_PER_DAY = DEFAULT_LIMITS.registrationsPerDay;
 export const MAX_CLEANUP_BATCH = 100;
+// Each cleanup run reads this many index entries to find where the count
+// ends; past it, history would also outgrow the log scans /rename and /purge
+// budget for (store.ts, RETAINED_SCAN_CAP).
+export const MAX_RETENTION_RECORDS = 50_000;
+// Each history cycle reads this many D1 index entries to find where the D1
+// tier's own count ends (D1HistoryTier.floorFor).
+export const MAX_HISTORY_D1_RECORDS = 100_000;
+
+/** The records a count limit keeps once cleanup trims it to its threshold (cleanupThresholdPercent); 0 for no limit. */
+export function thresholdRecords(limit: number, percent: number): number {
+	return limit > 0 ? Math.max(1, Math.floor((limit * percent) / 100)) : 0;
+}
 export const MAX_THREAD_LIMIT = 100;
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinLimit is bounded together by at most one history
@@ -582,11 +632,16 @@ export const MAX_ROOM_METADATA_TOTAL_LIMIT = MAX_HISTORY_RESPONSE_BYTES;
 // the private range, and the per-user ceiling the rooms one user can be in.
 export const MAX_PRIVATE_ROOM_LIMIT = 200;
 export const MAX_PRIVATE_MEMBERSHIPS_PER_USER = 50;
+// The most rooms one registered user may be a member of, private ones
+// included (store.ts, MEMBERSHIP_LIMIT_MESSAGE). Rooms are kept as long as
+// their history, so without it the reads of a user's own rooms (their
+// listing, a purge or rename of them) would grow without bound.
+export const MAX_MEMBERSHIPS_PER_USER = 1_000;
 // A move re-logs every reaction set of the moved message in one record, so the
 // per-message cap bounds that record, its SQL work, and its history response.
 export const MAX_REACTION_USERS_PER_MESSAGE = 64;
 export const MAX_REACTION_EMOJIS_PER_USER = 16;
-export const MAX_EMOJI_BYTES = 64;
+export { MAX_EMOJI_BYTES } from "./content/emoji.ts";
 export const MAX_CONNECTION_FRAME_RATE = 120;
 // The server-wide frame window is one in-memory timestamp per frame.
 export const MAX_GLOBAL_FRAMES_PER_MINUTE = 5_000;

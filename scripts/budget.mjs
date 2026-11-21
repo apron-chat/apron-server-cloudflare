@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { parse as parseToml } from 'smol-toml';
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_LIMITS, PLAN } from '../src/budget.ts';
 import { loadConfig } from '../src/config.ts';
 import { DATASET_PATTERN } from '../src/active-users.ts';
@@ -287,30 +288,26 @@ export function replaceBinding(source, binding) {
 }
 
 /**
- * A Wrangler config split in two: `production`, everything but the
- * `[previews.*]` tables, and `previews`, those tables with their headers
- * as they would be at the top level (`[previews.vars]` as `[vars]`), so
- * the checks here read either alike; undefined where there are none.
- * Previews are written as tables only, never as an inline `previews = {}`.
+ * A Wrangler config as Wrangler reads it: TOML text, parsed (smol-toml, the
+ * parser Wrangler uses), or a table already parsed, as it is.
+ */
+export function wranglerConfig(source) {
+	return typeof source === 'string' ? parseToml(source) : (source ?? {});
+}
+
+const isTable = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+const tables = (value) => (Array.isArray(value) ? value.filter(isTable) : []);
+
+/**
+ * A Wrangler config split in two: `production`, everything but `previews`,
+ * and `previews`, that table as a config of its own (`[previews.vars]` as
+ * `vars`), so the checks here read either alike; undefined where there is
+ * none. Each is a parsed config.
  */
 export function splitPreviews(source) {
-	const production = [];
-	const previews = [];
-	let target = production;
-	for (const line of source.split('\n')) {
-		const header = line.match(/^(\[\[?)\s*([A-Za-z0-9_.-]+)\s*(\]\]?)\s*(?:#.*)?$/);
-		if (header) {
-			const preview = header[2] === 'previews' || header[2].startsWith('previews.');
-			target = preview ? previews : production;
-			if (preview) {
-				target.push(header[2] === 'previews' ? '' : `${header[1]}${header[2].slice('previews.'.length)}${header[3]}`);
-				continue;
-			}
-		}
-		target.push(line);
-	}
-	if (/^previews\s*=/m.test(topLevelConfig(production.join('\n')))) throw new Error('Write previews as [previews.*] tables, not an inline table');
-	return { production: production.join('\n'), previews: previews.length ? `${previews.join('\n')}\n` : undefined };
+	const { previews, ...production } = wranglerConfig(source);
+	if (previews !== undefined && !isTable(previews)) throw new Error('previews must be a table');
+	return { production, previews };
 }
 
 /**
@@ -319,46 +316,30 @@ export function splitPreviews(source) {
  * whether it serves Previews (`previews_enabled`, default false).
  */
 export function customDomains(source) {
-	const routes = topLevelConfig(source).match(/^routes\s*=\s*\[([^\]]*)\]/m)?.[1] ?? '';
-	return [...routes.matchAll(/\{([^}]*)\}/g)]
-		.map(([, body]) => Object.fromEntries([...body.matchAll(/([a-z_]+)\s*=\s*("[^"]*"|true|false)/g)].map(([, key, value]) => [key, JSON.parse(value)])))
+	return tables(wranglerConfig(source).routes)
 		.filter((route) => route.custom_domain === true && typeof route.pattern === 'string')
 		.map((route) => ({ pattern: route.pattern, enabled: route.enabled !== false, previews: route.previews_enabled === true }));
 }
 
-function topLevelConfig(source) {
-	const firstTable = source.search(/^\s*\[/m);
-	return source.slice(0, firstTable < 0 ? source.length : firstTable);
+function configName(config, file) {
+	if (typeof config.name !== 'string' || !config.name) throw new Error(`${file} must define a Worker name`);
+	return config.name;
 }
 
-function configName(source, file) {
-	const match = topLevelConfig(source).match(/^name\s*=\s*"([^"]+)"\s*$/m);
-	if (!match) throw new Error(`${file} must define a Worker name`);
-	return match[1];
-}
-
-export function validateDeploymentConfiguration({ development, production: config, packageJson, workflow, budgetGuard = false, uploads = false, logSampleRate }) {
+export function validateDeploymentConfiguration({ development, production: source, packageJson, workflow, budgetGuard = false, uploads = false, logSampleRate }) {
 	// Production's own settings; the Previews' are checked apart (validatePreviews).
-	const { production, previews } = splitPreviews(config);
+	const { production, previews } = splitPreviews(source);
 	validatePreviews(production, previews);
 	validateMetricsDataset(production, 'production');
 	if (previews) validateMetricsDataset(previews, 'Previews');
-	const developmentName = configName(development, 'wrangler.toml');
-	const productionName = configName(production, 'wrangler.production.toml');
-	const productionTopLevel = topLevelConfig(production);
-	if (developmentName === productionName) {
+	const vars = wranglerVars(production);
+	if (configName(wranglerConfig(development), 'wrangler.toml') === configName(production, 'wrangler.production.toml')) {
 		throw new Error('Development and production Worker names must be distinct');
 	}
-	if (!/^workers_dev\s*=\s*false\s*(?:#.*)?$/m.test(productionTopLevel)) {
-		throw new Error('Production Wrangler config must disable workers.dev');
-	}
-	if (!/^preview_urls\s*=\s*false\s*(?:#.*)?$/m.test(productionTopLevel)) {
-		throw new Error('Production Wrangler config must disable preview URLs');
-	}
-	if (/^\[assets\]\s*(?:#.*)?$/m.test(production)) {
-		throw new Error('Production Worker must not bind static assets');
-	}
-	if (!/pattern\s*=\s*"server\.apron\.chat"\s*,\s*custom_domain\s*=\s*true/.test(productionTopLevel)) {
+	if (production.workers_dev !== false) throw new Error('Production Wrangler config must disable workers.dev');
+	if (production.preview_urls !== false) throw new Error('Production Wrangler config must disable preview URLs');
+	if (production.assets !== undefined) throw new Error('Production Worker must not bind static assets');
+	if (!customDomains(production).some((domain) => domain.pattern === 'server.apron.chat' && domain.enabled)) {
 		throw new Error('Production Wrangler config must use the server custom domain');
 	}
 	if (!packageJson?.scripts?.deploy?.includes('--config wrangler.production.toml')) {
@@ -370,10 +351,10 @@ export function validateDeploymentConfiguration({ development, production: confi
 	// A plan that bills past its included usage relies on the budget guard,
 	// which needs its minute cron and the zone it controls.
 	if (budgetGuard) {
-		if (!/^\[triggers\]\s*(?:#.*)?\n(?:[^\[].*\n)*?crons\s*=\s*\[[^\]]*"\* \* \* \* \*"[^\]]*\]/m.test(production)) {
+		if (!(production.triggers?.crons ?? []).includes('* * * * *')) {
 			throw new Error('Production Wrangler config must run the budget guard every minute');
 		}
-		if (!/^ZONE_ID\s*=\s*"[0-9a-f]{32}"\s*(?:#.*)?$/m.test(production)) {
+		if (typeof vars.ZONE_ID !== 'string' || !/^[0-9a-f]{32}$/.test(vars.ZONE_ID)) {
 			throw new Error('Production Wrangler config must set ZONE_ID for the budget guard');
 		}
 	}
@@ -381,26 +362,25 @@ export function validateDeploymentConfiguration({ development, production: confi
 	// production must not log more: Workers Logs sample every request unless
 	// head_sampling_rate says otherwise.
 	if (logSampleRate !== undefined) {
-		const observability = production.match(/^\[observability\]\s*(?:#.*)?\n((?:[^\[].*\n?)*)/m)?.[1] ?? '';
-		const off = /^enabled\s*=\s*false\s*(?:#.*)?$/m.test(observability);
-		const rate = Number(observability.match(/^head_sampling_rate\s*=\s*([0-9.]+)\s*(?:#.*)?$/m)?.[1] ?? (off ? 0 : 1));
+		const observability = isTable(production.observability) ? production.observability : {};
+		const off = observability.enabled === false;
+		const rate = Number(observability.head_sampling_rate ?? (off ? 0 : 1));
 		if (!off && !(rate <= logSampleRate)) {
 			throw new Error(`Production Wrangler config must sample logs at most at the plan's rate (head_sampling_rate <= ${logSampleRate})`);
 		}
 	}
 	// A plan with uploads needs its bucket and both origins, or uploads are off.
 	if (uploads) {
-		if (!/^\[\[r2_buckets\]\]\s*\n(?:[^\[].*\n)*?binding\s*=\s*"MEDIA"/m.test(production)) {
+		if (!tables(production.r2_buckets).some((bucket) => bucket.binding === 'MEDIA')) {
 			throw new Error('Production Wrangler config must bind the MEDIA bucket for uploads');
 		}
 		if (!mediaHostname(production)) throw new Error('Production Wrangler config must set MEDIA_ORIGIN to an https origin for uploads');
-		if (!/^PUBLIC_ORIGIN\s*=\s*"https:\/\/[a-z0-9.-]+"\s*(?:#.*)?$/m.test(production)) {
+		if (typeof vars.PUBLIC_ORIGIN !== 'string' || !/^https:\/\/[a-z0-9.-]+$/.test(vars.PUBLIC_ORIGIN)) {
 			throw new Error('Production Wrangler config must set PUBLIC_ORIGIN for upload write URLs');
 		}
 	}
 	// MEDIA_NOSNIFF says the media host's apron_media_nosniff rule is on; a typo would fail every request instead.
-	const nosniff = production.match(/^MEDIA_NOSNIFF\s*=\s*"([^"]*)"\s*(?:#.*)?$/m)?.[1];
-	if (nosniff !== undefined && nosniff !== 'true' && nosniff !== 'false') {
+	if (vars.MEDIA_NOSNIFF !== undefined && vars.MEDIA_NOSNIFF !== 'true' && vars.MEDIA_NOSNIFF !== 'false') {
 		throw new Error('Production Wrangler config must set MEDIA_NOSNIFF to "true" or "false"');
 	}
 }
@@ -420,13 +400,16 @@ function validatePreviews(production, previews) {
 	if (!previews) throw new Error('A custom domain with previews_enabled needs a previews block with the Worker\'s bindings');
 	if (domains.length !== 1) throw new Error('Previews need exactly one custom domain with previews_enabled');
 	if (domains[0].enabled) throw new Error('The Previews custom domain must serve only Previews (enabled = false)');
-	if (!/^\[durable_objects\]\s*(?:#.*)?\n(?:(?:[^\[\n].*)?\n)*?[^\[\n].*name\s*=\s*"DEMO"/m.test(previews)) {
+	if (!tables(previews.durable_objects?.bindings).some((binding) => binding.name === 'DEMO')) {
 		throw new Error('Previews must bind the DEMO Durable Object in [previews.durable_objects]');
 	}
-	if (/^(?:PUBLIC_ORIGIN|MEDIA_ORIGIN)\s*=\s*"[^"\s]/m.test(previews)) throw new Error('Previews must leave PUBLIC_ORIGIN and MEDIA_ORIGIN empty: each Preview has its own origin');
-	const names = (source, key) => [...source.matchAll(new RegExp(`^${key}\\s*=\\s*"([^"]+)"`, 'gm'))].map((match) => match[1]);
-	for (const key of ['bucket_name', 'dataset']) {
-		if (names(previews, key).some((name) => names(production, key).includes(name))) throw new Error(`Previews must not share production's ${key}`);
+	const vars = wranglerVars(previews);
+	if (['PUBLIC_ORIGIN', 'MEDIA_ORIGIN'].some((name) => typeof vars[name] === 'string' && vars[name].trim() !== '')) {
+		throw new Error('Previews must leave PUBLIC_ORIGIN and MEDIA_ORIGIN empty: each Preview has its own origin');
+	}
+	const names = (config, list, key) => tables(config[list]).map((entry) => entry[key]).filter((name) => typeof name === 'string');
+	for (const [list, key] of [['r2_buckets', 'bucket_name'], ['analytics_engine_datasets', 'dataset']]) {
+		if (names(previews, list, key).some((name) => names(production, list, key).includes(name))) throw new Error(`Previews must not share production's ${key}`);
 	}
 }
 
@@ -436,37 +419,42 @@ function validatePreviews(production, previews) {
  * from that name (src/active-users.ts), which the binding does not give the
  * Worker, so a mismatch would show another dataset's counts.
  */
-function validateMetricsDataset(source, label) {
-	const named = wranglerVars(source).METRICS_DATASET;
+function validateMetricsDataset(config, label) {
+	const named = wranglerVars(config).METRICS_DATASET;
 	if (named === undefined) return;
 	// What /status would refuse to put in its SQL, leaving the line out silently.
-	if (!DATASET_PATTERN.test(named)) throw new Error(`The ${label} METRICS_DATASET var (${named}) must be letters, digits and _`);
-	const bound = [...source.matchAll(/^\[\[analytics_engine_datasets\]\]\s*(?:#.*)?\n((?:[^\[\n].*\n?|\n)*)/gm)]
-		.map(([, table]) => ({ binding: table.match(/^binding\s*=\s*"([^"]+)"/m)?.[1], dataset: table.match(/^dataset\s*=\s*"([^"]+)"/m)?.[1] }))
-		.find((entry) => entry.binding === 'METRICS')?.dataset;
+	if (typeof named !== 'string' || !DATASET_PATTERN.test(named)) throw new Error(`The ${label} METRICS_DATASET var (${named}) must be letters, digits and _`);
+	const bound = tables(config.analytics_engine_datasets).find((entry) => entry.binding === 'METRICS')?.dataset;
 	if (named !== bound) throw new Error(`The ${label} METRICS_DATASET var (${named}) must name the dataset its METRICS binding writes (${bound ?? 'none'})`);
 }
 
 /** The host of a Wrangler config's `MEDIA_ORIGIN` var, if it sets an https one. */
 export function mediaHostname(source) {
-	return source.match(/^MEDIA_ORIGIN\s*=\s*"https:\/\/([a-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1];
+	const origin = wranglerVars(source).MEDIA_ORIGIN;
+	return typeof origin === 'string' ? origin.match(/^https:\/\/([a-z0-9.-]+)$/)?.[1] : undefined;
 }
 
 /** A Wrangler config's `RP_ID` var, if it sets one, lowercased as the Worker reads it. */
 export function relyingPartyId(source) {
-	return source.match(/^RP_ID\s*=\s*"([A-Za-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1].toLowerCase();
+	const rpId = wranglerVars(source).RP_ID;
+	return typeof rpId === 'string' && /^[A-Za-z0-9.-]+$/.test(rpId) ? rpId.toLowerCase() : undefined;
 }
 
-/** The `[vars]` table of a Wrangler config (or of its Previews, from splitPreviews), as the Worker's env gets them. */
+/**
+ * The `[vars]` table of a Wrangler config (or of its Previews, from
+ * splitPreviews), as the Worker's env gets them: every var, however it is
+ * written (basic or literal strings, numbers, tables).
+ */
 export function wranglerVars(source) {
-	const table = source.match(/^\[vars\]\s*(?:#.*)?\n((?:[^\[\n].*\n?|\n)*)/m)?.[1] ?? '';
-	return Object.fromEntries([...table.matchAll(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/gm)].map(([, name, value]) => [name, JSON.parse(value)]));
+	const vars = wranglerConfig(source).vars;
+	return isTable(vars) ? { ...vars } : {};
 }
 
 /** A `true`/`false` Wrangler var in `source`, else `fallback`. */
 export function wranglerSwitch(source, name, fallback) {
-	const value = source.match(new RegExp(`^${name}\\s*=\\s*"(true|false)"\\s*(?:#.*)?$`, 'im'))?.[1].toLowerCase();
-	return value === undefined ? fallback : value === 'true';
+	const value = wranglerVars(source)[name];
+	const text = typeof value === 'string' || typeof value === 'boolean' ? String(value).toLowerCase() : undefined;
+	return text === 'true' ? true : text === 'false' ? false : fallback;
 }
 
 /**
@@ -508,11 +496,16 @@ function main() {
 		outputs.push([file, replaceBinding(source, renderBinding({ attempts, prefix, location, live }, ADMISSION_BUDGET, flood, previews || undefined))]);
 	}
 	// Namespace IDs are the account's: no two configs may share one.
-	const ids = outputs.flatMap(([, source]) => [...source.matchAll(/^namespace_id\s*=\s*"(\d+)"/gm)].map((match) => match[1]));
+	const ids = outputs.flatMap(([, source]) => {
+		const { production, previews } = splitPreviews(source);
+		return [production, previews ?? {}].flatMap((config) => tables(config.ratelimits).map((limiter) => String(limiter.namespace_id)));
+	});
 	if (new Set(ids).size !== ids.length) throw new Error('Every rate limiter in every config needs its own namespace ID');
 	const { production: main, previews } = splitPreviews(production);
 	// Both sets of vars must load as the Worker loads them, or it would fail every request.
-	for (const vars of [wranglerVars(main), ...(previews ? [wranglerVars(previews)] : [])]) loadConfig(vars);
+	for (const part of [main, ...(previews ? [previews] : [])]) {
+		loadConfig(wranglerVars(part));
+	}
 	const hosts = customDomains(main).filter((domain) => domain.enabled);
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');
 	const hostname = hosts[0].pattern;

@@ -21,13 +21,16 @@
 //   $0.14, under the 12,900 daily share. User status spends
 //   it rather than requests: one timer keeps the object awake up to a minute
 //   after its last event while a status change waits to be announced.
-// - Storage: history is kept 30 days, matching uploaded images, and the
-//   database watermarks stop it at 768 MB (1 GB hard), a fifth of the 5
-//   GB-month included. A week of the demo's traffic in November 2026 was
-//   about 800 message records and a 1.5 MB database, so 30 days is a few MB;
-//   only a flood reaches the watermark, and then posting waits until enough
-//   of its records expire (up to 30 days) or an admin purges the flooder. Cleanup runs daily; it removes the same rows a day as hourly
-//   would, in batches that continue until it is caught up.
+// - Storage: SQLite keeps the latest 4,000 records, 80% of its 5,000 limit
+//   (80,000 more go to the D1 history tier where it is bound), and the database watermarks stop it at
+//   768 MB (1 GB hard), a fifth of the 5 GB-month included. A week of the
+//   demo's traffic in November 2026 was about 800 message records and a
+//   1.5 MB database, so 5,000 records are a few MB;
+//   only a flood reaches the watermark, and then cleanup starts at once
+//   (not at the daily slot), moving what is past the count down to D1, and
+//   posting resumes once the database is under the low-water mark. Cleanup
+//   otherwise runs daily; it removes the same rows a day as hourly would, in
+//   batches that continue until it is caught up.
 //
 // That is about $11 a day in all, and the daily cap stops the server at $5
 // first; early in a month the inclusions cover it (50 million rows written).
@@ -46,12 +49,27 @@ export const PAID_PLAN: Plan = Object.freeze({
 	name: "Workers Paid",
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
-		// A month of history (November 2026; a week before): storage is no
-		// constraint at the demo's traffic (above), and idleAccountSeconds (30
-		// days) bounds it, since retention may not outlast an account.
-		retentionSeconds: 30 * 24 * 60 * 60,
-		// A removed account's user_id may be taken again once its messages are gone.
-		retiredUserIdSeconds: 30 * 24 * 60 * 60,
+		// Limits of 5,000 records in the object's SQLite and 100,000 more in
+		// the D1 history tier where it is bound, of which cleanup keeps 80%
+		// (below): 84,000, about two years at the demo's traffic (above).
+		// D1's share stays within its included 5 GB even were every record
+		// there a maximum-size snapshot (80,000 × 24 KiB, about 1.9 GB). The
+		// cold tier (R2), where it is bound, keeps everything past that.
+		// A flood that reaches the database watermark starts cleanup at once,
+		// moving what is past the count down to D1 (Store.runCleanup), so
+		// posting waits minutes, not a day; the cost is that recent records it
+		// pushes out become read-only. No age limit: a removed account's
+		// user_id is retired until the log has moved past it, not for a time
+		// (Store.dueRetiredUserIds).
+		retentionRecords: 5_000,
+		retentionSeconds: 0,
+		historyD1Records: 100_000,
+		historyColdRecords: 0,
+		// Those are ceilings: each daily cleanup moves what is past 80% of
+		// SQLite's to D1, and what is past 80% of D1's to the cold tier
+		// (4,000 and 80,000 kept), which keeps everything; the rest is
+		// headroom for a day's records.
+		cleanupThresholdPercent: 80,
 		// Room for a long writeup in one message (about 2,500 words) rather
 		// than Free's 4 KiB. A post is kept once, as its record (message_state
 		// points at it, and a request's dedup row keeps a digest and the small
@@ -265,7 +283,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// at half the free 10 GB-month whatever the mix of types and sizes: 500
 	// full-size files a day for a month would be 75 GB. Uploads at that rate
 	// fill the cap in two days, and new uploads are then refused until enough
-	// expire, up to 31 days now rather than 8: /purge of the uploader frees
+	// expire, up to 121 days now rather than 31: /purge of the uploader frees
 	// theirs at once. In November 2026 the
 	// bucket held 68 objects, 8 MB.
 	uploads: Object.freeze({
@@ -279,15 +297,16 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// still bound the server's writes and storage.
 		uploadsPerUserDay: 30,
 		writeWindowSeconds: 10 * 60,
-		// As long as the messages they are attached to (retentionSeconds). The
-		// bucket's lifecycle rule for f/ must match: 30 days.
-		fileRetentionSeconds: 30 * 24 * 60 * 60,
+		// About as long as the hot log keeps its messages and well into the
+		// archive's: history now spans about two years at the demo's traffic,
+		// so older messages show without their images. The bucket's
+		// lifecycle rule for f/ must match: 120 days.
+		fileRetentionSeconds: 120 * 24 * 60 * 60,
 		// An avatar is kept while its owner signs in: any sign-in within
 		// avatarRefreshSeconds of its expiry writes it again (refreshAvatar).
-		// The refresh window covers retentionSeconds, the day cleanup may lag
-		// behind it, and a few days of one connection staying open (refresh
-		// runs at sign-in), so an avatar outlasts what its owner posted; one
-		// nobody signs in to for 60 days goes. An idle account is not pruned
+		// The refresh window covers a few days of one connection staying open
+		// (refresh runs at sign-in); one nobody signs in to for 60 days goes,
+		// though history may keep what its owner posted for longer. An idle account is not pruned
 		// while its avatar lives, so one with an avatar goes after up to 61
 		// days (with the lifecycle lag) rather than idleAccountSeconds' 30. The bucket's
 		// lifecycle rule for a/ must be at least this: 61 days or more leaves
@@ -308,9 +327,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// more texts a day, more readers, and more kept. A day at these limits is
 	// at most 3,200 Durable Object requests (100 writes, 30 reads each, and an
 	// alarm), a tenth of the 32,000 daily share; about 3,600 SQL rows written;
-	// and the kept text of 31 days (with cleanup's day) at most about 400 MB of SQLite (each
-	// terminal's output at most 128 KiB of JSON), half the high-water mark,
-	// which still bounds it (typically 45 KB each, about 130 MB). Streaming keeps the object awake, which the duration bound above
+	// and the kept text at most 64 KiB of JSON a terminal: typically 45 KB,
+	// about 130 MB a month, within the high-water mark, which still bounds
+	// it (docs/cost-report.md, Live text). Streaming keeps the object awake, which the duration bound above
 	// already covers (docs/cost-report.md, Live text).
 	liveText: Object.freeze({
 		...FREE_PLAN.liveText!,

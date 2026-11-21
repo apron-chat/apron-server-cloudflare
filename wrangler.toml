@@ -25,6 +25,26 @@ new_sqlite_classes = ["ApronDemoServer"]
 binding = "MEDIA"
 bucket_name = "apron-media-dev"
 
+# The cold history tier and backups (docs/configuration.md, History tiers,
+# Backups and imports): a private bucket, no public access. Used by the
+# tests and `wrangler dev` (miniflare's local R2): bound, it is the tier
+# below D1, keeping chunks under history/, and backups go under backups/.
+[[r2_buckets]]
+binding = "HISTORY_BLOB"
+bucket_name = "apron-history-dev"
+
+# The D1 history tier (src/history/d1.ts, docs/configuration.md, History
+# tiers). Records there stay in history but become read-only: past
+# LIMIT_RETENTION_RECORDS, the oldest move from the object's SQLite to D1,
+# where history pages still read them but their messages can no longer be
+# edited, reacted to or replied to; past LIMIT_HISTORY_D1_RECORDS more, they
+# go on to the cold tier (HISTORY_BLOB, above). Local development and the
+# tests use a local database; the id is a placeholder.
+[[d1_databases]]
+binding = "HISTORY_D1"
+database_name = "apron-archive-dev"
+database_id = "00000000-0000-0000-0000-000000000000"
+
 [vars]
 RP_ID = "localhost"
 RP_ORIGINS = "http://localhost:5173,http://localhost:8787"
@@ -40,6 +60,22 @@ SIGNAL_UNKNOWN_PASSKEYS = "false"
 ROOM_METADATA_LIMIT = "8192"
 ROOM_METADATA_MIN_LIMIT = "1024"
 ROOM_METADATA_TOTAL_LIMIT = "262144"
+
+# History (docs/configuration.md, History retention, History tiers, Backups
+# and imports): the plan's own limits written out, as in production.
+LIMIT_RETENTION_RECORDS = "5000"
+LIMIT_RETENTION_SECONDS = "0"
+LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+LIMIT_HISTORY_D1_RECORDS = "100000"
+LIMIT_HISTORY_COLD_RECORDS = "0"
+# The room caps count rooms started in the last 30 days, as in production.
+LIMIT_ROOM_CREATION_WINDOW_SECONDS = "2592000"
+# Backups on demand only (`/history export`, no schedule) to the local
+# HISTORY_BLOB bucket, the newest 14 of each kind kept, private rooms
+# included, gzip-compressed (not encrypted).
+BACKUP_EVERY = ""
+BACKUP_KEEP = "14"
+BACKUP_PRIVATE_ROOMS = "true"
 
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.

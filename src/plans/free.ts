@@ -7,14 +7,17 @@ import type { Plan } from "../budget.ts";
 export const FREE_PLAN: Plan = Object.freeze({
 	name: "Workers Free",
 	limits: Object.freeze({
+		// A day of history, by age alone (no count).
+		retentionRecords: 0,
 		retentionSeconds: 86_400,
+		historyD1Records: 0,
+		historyColdRecords: 0,
+		cleanupThresholdPercent: 80,
 		cleanupSeconds: 3_600,
 		challengeTtlSeconds: 120,
 		sessionTtlSeconds: 30 * 24 * 60 * 60,
 		idleAccountSeconds: 30 * 24 * 60 * 60,
 		keptActiveAccounts: 100,
-		// As long as messages are kept (retentionSeconds).
-		retiredUserIdSeconds: 86_400,
 		maxFrameBytes: 16_384,
 		maxTextBytes: 4_096,
 		maxSnapshotBytes: 8_192,
@@ -99,6 +102,8 @@ export const FREE_PLAN: Plan = Object.freeze({
 		threadLimit: 100,
 		// So one account cannot take every thread slot: a quarter of them.
 		threadsPerUser: 25,
+		// A quiet thread or private room stops counting after 30 days.
+		roomCreationWindowSeconds: 30 * 24 * 60 * 60,
 		// Room notes: a description long enough for an evergreen document;
 		// every room may hold 1 KiB whatever the total, and what rooms hold
 		// past it is bounded together, so a listing of every room stays bounded.

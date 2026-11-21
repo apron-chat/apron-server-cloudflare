@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
 import { customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerVars } from './budget.mjs';
+import { readFileSync } from 'node:fs';
+import { loadConfig } from '../src/config.ts';
 
 const namespaces = { attempts: '123', prefix: '124', location: '125', live: '126' };
 
@@ -194,8 +196,10 @@ test('with uploads, write URLs pass the invalid-request rule and the budget stop
 	// Every file the bucket serves is never sniffed: an uploaded text can't run as a script.
 	assert.deepEqual(edge.headers, { phase: 'http_response_headers_transform', rules: [{ ref: 'apron_media_nosniff', description: edge.headers.rules[0].description, expression: 'http.host eq "media.example.test"', action: 'rewrite', enabled: true, action_parameters: { headers: { 'X-Content-Type-Options': { operation: 'set', value: 'nosniff' } } } }] });
 	assert.equal(plain.headers, undefined);
-	assert.equal(mediaHostname('MEDIA_ORIGIN = "https://media.example.test"\n'), 'media.example.test');
-	assert.equal(mediaHostname('MEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
+	assert.equal(mediaHostname('[vars]\nMEDIA_ORIGIN = "https://media.example.test"\n'), 'media.example.test');
+	assert.equal(mediaHostname('[vars]\nMEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
+	// Only [vars] reach the Worker: a top-level key of the same name is no var.
+	assert.equal(mediaHostname('MEDIA_ORIGIN = "https://media.example.test"\n'), undefined);
 });
 
 test('with live text, write URLs and live reads pass the invalid-request rule', () => {
@@ -345,10 +349,12 @@ test('a Wrangler config\'s Previews are read apart from production\'s settings',
 		'',
 	].join('\n');
 	const { production, previews } = splitPreviews(source);
-	assert.doesNotMatch(production, /previews\.example\.test"\s*#|EXTERNAL_SIGN_IN|name = "B"/);
-	assert.match(production, /name = "A"/);
-	assert.match(previews, /^\[vars\]\nRP_ID = "previews\.example\.test"/m);
-	assert.match(previews, /^\[\[ratelimits\]\]\nname = "B"/m);
+	assert.equal(production.previews, undefined);
+	// smol-toml's tables have no prototype: compare their contents.
+	const plain = (value) => JSON.parse(JSON.stringify(value));
+	assert.deepEqual(plain(production.ratelimits), [{ name: 'A' }]);
+	assert.deepEqual(plain(previews.ratelimits), [{ name: 'B' }]);
+	assert.deepEqual(plain(previews.durable_objects), { bindings: [{ name: 'DEMO', class_name: 'C' }] });
 	assert.deepEqual(wranglerVars(previews), { RP_ID: 'previews.example.test', EXTERNAL_SIGN_IN: 'true' });
 	assert.deepEqual(wranglerVars(production), { RP_ID: 'example.test' });
 	// Production's switches are its own: the Previews' EXTERNAL_SIGN_IN does not reach its rule.
@@ -360,7 +366,9 @@ test('a Wrangler config\'s Previews are read apart from production\'s settings',
 		{ pattern: 'previews.example.test', enabled: false, previews: true },
 	]);
 	assert.equal(splitPreviews('name = "w"\n').previews, undefined);
-	assert.throws(() => splitPreviews('name = "w"\npreviews = { }\n'), /tables/);
+	// Parsed as Wrangler parses it: an inline table reads as [previews.*] tables do.
+	assert.deepEqual(plain(splitPreviews('name = "w"\npreviews = { vars = { RP_ID = "p.example.test" } }\n').previews), { vars: { RP_ID: 'p.example.test' } });
+	assert.throws(() => splitPreviews('name = "w"\npreviews = "x"\n'), /table/);
 });
 
 test('METRICS_DATASET, where set, names the dataset its METRICS binding writes, in production and in Previews', () => {
@@ -400,4 +408,16 @@ test('Previews need their own domain and DEMO binding, and share no bucket, data
 	assert.doesNotThrow(() => check(route(previewRoute) + production + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'));
 	// Production's own checks read production's settings only: a Preview's bucket does not stand in for its MEDIA binding.
 	assert.throws(() => check(route(previewRoute) + production.replace('binding = "MEDIA"', 'binding = "OTHER"') + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'), /MEDIA bucket/);
+});
+
+test("production writes out the plan's own history limits, and daily backups", () => {
+	const { production } = splitPreviews(readFileSync(new URL('../wrangler.production.toml', import.meta.url), 'utf8'));
+	const vars = wranglerVars(production);
+	const config = loadConfig(vars);
+	for (const key of ['retentionRecords', 'retentionSeconds', 'historyD1Records', 'historyColdRecords', 'cleanupThresholdPercent', 'roomCreationWindowSeconds']) {
+		const name = `LIMIT_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`;
+		assert.ok(Object.hasOwn(vars, name), `wrangler.production.toml sets ${name}`);
+		assert.equal(config.limits[key], DEFAULT_LIMITS[key], key);
+	}
+	assert.deepEqual(config.backups, { everySeconds: 86_400, keep: 14, privateRooms: true });
 });

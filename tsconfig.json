@@ -12,5 +12,5 @@
 		"types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
 		"lib": ["ES2022", "DOM", "DOM.Iterable"]
 	},
-	"include": ["src/**/*.ts", "test/**/*.ts", "worker-configuration.d.ts"]
+	"include": ["src/**/*.ts", "test/**/*.ts", "packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "worker-configuration.d.ts"]
 }
