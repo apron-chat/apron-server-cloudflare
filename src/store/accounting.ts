@@ -39,13 +39,15 @@ export function parseGuard(raw: string): AccountingGuard {
 
 /**
  * Operation names. Each reservation names its operation explicitly
- * (SqliteStore.reserveCost's `operation`): the SqliteStore method that made
- * it, as the names were first found from the stack, which overrun logs,
- * breaker keys and the sets below are keyed by. The metering entry points
- * the runtime calls (withMeter, withMeterAsync, the meter part), and the
- * history chain's state and cold chunk index closures, reserve as
- * `unknown`, the name the stack gave them. test/store/operation-names.test.ts
- * pins a representative set.
+ * (SqliteStore.reserveCost's `operation`), and overrun logs, breaker keys and
+ * the sets below are keyed by that name: the SqliteStore method that makes
+ * the reservation, which for code moved to a module is the method it moved
+ * from. History pages reserve as `history` (the name BREAKER_ALERT_ONLY
+ * lists), where the stack once named them `historyImpl`. The metering entry
+ * points the runtime calls (withMeter, withMeterAsync, the meter part), and
+ * the history chain's state and cold chunk index closures, reserve as
+ * `unknown`. test/store/operation-names.test.ts pins a representative set,
+ * and that every name in the sets below is one a reservation uses.
  */
 /**
  * Operations every request or connection passes through, which a breaker

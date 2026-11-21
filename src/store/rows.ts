@@ -2,7 +2,7 @@
 
 import { outputRef } from "../content/output-ref";
 import type { StoreLiveTextConfig } from "./config";
-import type { ClaimedPush, RoomMember, UploadPurpose, Identity, LiveEntry, PushSubscriptionRecord, SqlCursorLike } from "./types";
+import type { RoomMember, UploadPurpose, Identity, LiveEntry, PushSubscriptionRecord, SqlCursorLike } from "./types";
 import type { RawLimitRow } from "../limiter-cache";
 import type { Bucket } from "../limiter";
 import { MAX_ROLES_PER_USER, ROLE_PATTERN } from "../domain";

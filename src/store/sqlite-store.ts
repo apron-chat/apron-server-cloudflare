@@ -21,83 +21,68 @@ import { ReadsModule } from "./reads";
 import { AdmissionModule } from "./admission";
 import { PushModule } from "./push";
 import type {
-  AccountingGuard, Broadcast, PendingUpload, PushClaim, RoomMember, StoreCleanupResult, StoreHistoryQuery, UploadPurpose,
-  DurableSqlStorageLike, DurableStateLike, EmojiDraft, EmojiEdit, EmojiEntry, Identity, LiveEntry, LiveFinish, MessageSnapshot,
-  MutationMethod, OverrunNotice, PendingHistory, PushCandidate, RoomNotesCheck, RoomRecord, SqlCursorLike, SqlStorageLike,
-  StatusInputRecord, StoreClock, StoredServerMetadata, StoreHistoryResult, StoreMutationInput, StoreMutationResult, TerminalStored, Tier,
-  UploadFinish, UploadWrite,
+  AccountingGuard, Broadcast, PendingUpload, RoomMember, StoreCleanupResult, DurableSqlStorageLike, DurableStateLike, Identity, LiveEntry,
+  MessageSnapshot, MutationMethod, OverrunNotice, RoomNotesCheck, RoomRecord, SqlCursorLike, SqlStorageLike, StoreClock, StoreMutationInput,
+  StoreMutationResult, Tier,
 } from "./types";
 import {
-  assertSeen, bucketOf, bucketRow, canonicalize, type CarriedPasskey, changedExt, choiceColumn, cleanupSchedule, type CleanupSchedule,
-  clientRoomFields, clone, type CommitContext, cursorRows, dayCount, dayFor, digestOperation, emojiObjectKey, ensureText, idString,
-  integerColumn, isLiveEntry, isPlainObject, liveAvatar, liveUrl, type MemberCacheEntry, type MembershipRecord, type MetaCount, must,
-  numericBigInt, numericId, parseJson, parseRoles, parseUserExt, positiveLimit, pushRecord, randomKey, type RawCredentialRow,
-  type RawDedupRow, type RawIdentityRow, type RawLogState, type RawMaintenanceRow, type RawMemberRow, type RawMessageRow, type RawPushRow,
-  type RawReactionRow, type RawRecordRow, type RawRoomRow, type RawUploadRow, type ReactionsRecord, type RecordKind, restoredAvatar,
-  restoredEntries, restoredRecord, type RestoredRecord, roomHistoryFloor, roomHistoryLogId, roomIdList, seenColumn, settledMeta,
-  statusColumns, storedCreator, terminalOutputBytes, utf8Bytes, windowDays,
+  canonicalize, type CarriedPasskey, changedExt, cleanupSchedule, type CleanupSchedule, clientRoomFields, clone, type CommitContext,
+  cursorRows, dayCount, dayFor, digestOperation, ensureText, idString, integerColumn, isPlainObject, liveAvatar, liveUrl,
+  type MemberCacheEntry, type MembershipRecord, type MetaCount, must, parseJson, parseRoles, parseUserExt, type RawCredentialRow,
+  type RawDedupRow, type RawIdentityRow, type RawLogState, type RawMaintenanceRow, type RawMemberRow, type RawMessageRow,
+  type RawReactionRow, type RawRoomRow, type RawUploadRow, type ReactionsRecord, type RecordKind, restoredAvatar, restoredEntries,
+  restoredRecord, type RestoredRecord, roomHistoryLogId, roomIdList, seenColumn, settledMeta, statusColumns, storedCreator, utf8Bytes,
+  windowDays,
 } from "./rows";
 import { LimiterCache, type RawLimitRow } from "../limiter-cache";
 import {
   BUDGET_COLUMNS, type BudgetCost, type BudgetDelta, BudgetLedger, type BudgetSnapshot, type CostEstimate, type RawBudgetRow,
 } from "../budget-ledger";
 import {
-  EMOJI_OWNER, META_ACCOUNT_USAGE, META_ACCOUNTING_GUARD, META_ACCOUNTING_UNSAFE, META_ANNOUNCED_TIER, META_ATTACK_PAUSE, META_BOT_SWEEP,
-  META_EFFECTIVE_NOW, META_EMOJI_CATALOG, META_EMOJI_PREVIOUS, META_GUEST_NUMBER_MARK, META_HISTORY_EXPORT, META_HISTORY_IMPORT,
-  META_HISTORY_IMPORT_PROGRESS, META_HISTORY_KEPT, META_HISTORY_LINK, META_HISTORY_OPS, META_HISTORY_OPS_SEQ, META_HISTORY_PUBLISHED,
-  META_HISTORY_ROOMS_DUE, META_HISTORY_THROUGH, META_HISTORY_TIER, META_IDLE_ACTIVITY_SINCE, META_IDLE_PRUNE_DAY, META_IDLE_PRUNED,
-  META_LIVE_TEXTS, META_PRESENCE_ON, META_PURGE_ROOMS, META_PURGED_PREFIX, META_RENAMED_PREFIX, META_ROOM_NOTES_ALERTED,
-  META_SERVER_PREFIX, META_STORAGE_ALERTED, META_STORAGE_PRESSURE, META_THROTTLE_TRIPS, META_TOGGLE_PREFIX, META_UPLOAD_BYTES,
-  PUSH_UNREAD_SCOPE, SERVER_FIELDS, SERVER_OWNER, USER_LIMIT_SCOPES,
+  META_ACCOUNT_USAGE, META_ACCOUNTING_GUARD, META_ACCOUNTING_UNSAFE, META_ANNOUNCED_TIER, META_BOT_SWEEP, META_EFFECTIVE_NOW,
+  META_GUEST_NUMBER_MARK, META_HISTORY_EXPORT, META_HISTORY_IMPORT, META_HISTORY_IMPORT_PROGRESS, META_HISTORY_PUBLISHED,
+  META_HISTORY_ROOMS_DUE, META_HISTORY_THROUGH, META_IDLE_ACTIVITY_SINCE, META_IDLE_PRUNE_DAY, META_IDLE_PRUNED, META_PURGE_ROOMS,
+  META_PURGED_PREFIX, META_RENAMED_PREFIX, META_ROOM_NOTES_ALERTED, META_STORAGE_ALERTED, META_STORAGE_PRESSURE, USER_LIMIT_SCOPES,
 } from "./meta";
 import {
   ACCOUNTING_UNCERTAIN, BREAKER_ALERT_ONLY, BREAKER_EXEMPT, BREAKER_MS, BREAKER_OVERRUNS, BREAKER_WINDOW_MS, DEGRADED, emptyGuard,
-  maintenanceDelta, OPERATION_PAUSED, parseGuard, STORAGE_UNAVAILABLE, TRIP_WINDOW_MS,
+  maintenanceDelta, OPERATION_PAUSED, parseGuard, STORAGE_UNAVAILABLE,
 } from "./accounting";
 import { SettledMeta } from "../settled-meta";
-import type { ChunkIndex, ChunkRef } from "../history/cold/chunks";
 import { contentPolicy, type ContentPolicy } from "../content/policy";
 import {
-  JOINED_WAKE_CONDITION, lastActiveSql, MEMBER_TABLES, privateRange, PUBLIC_ROOMS, ROOM_COLUMNS, ROOM_INDEX_DDL, roomKind,
-  SCHEMA_10_COPIED_COLUMNS, SCHEMA_10_DROPPED_INDEXES, SCHEMA_9_INDEXES, SCHEMA_DDL, SCHEMA_VERSION, SEEN_COLUMN_PROBE,
-  UPGRADABLE_SCHEMA_VERSION,
+  lastActiveSql, MEMBER_TABLES, privateRange, PUBLIC_ROOMS, ROOM_COLUMNS, ROOM_INDEX_DDL, roomKind, SCHEMA_10_COPIED_COLUMNS,
+  SCHEMA_10_DROPPED_INDEXES, SCHEMA_9_INDEXES, SCHEMA_DDL, SCHEMA_VERSION, SEEN_COLUMN_PROBE, UPGRADABLE_SCHEMA_VERSION,
 } from "./schema";
 import {
-  BOOTSTRAP_ROW_RESERVATION, DEGRADE_SHARE, listedThreads, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES,
-  MAX_PUSHES_PER_MESSAGE, SEEN_WRITE_GRANULARITY_MS, thresholdRecords,
+  BOOTSTRAP_ROW_RESERVATION, DEGRADE_SHARE, listedThreads, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_MEMBERSHIPS_PER_USER,
+  SEEN_WRITE_GRANULARITY_MS, thresholdRecords,
 } from "../budget";
-import { type LimitCategory, limitData, StoreError } from "../store-error";
+import { StoreError } from "../store-error";
 import {
-  BOT_MODERATOR_ROLES, BOT_NAME_PATTERN, BOT_NAME_RULE, DEFAULT_JOINED_ROOMS, isPrivateRoomId, isProtocolId, JOINED_WAKE_ROLES,
-  LIVE_TEXT_LONG_ROLES, MAX_CREATED_ROOMS, MAX_LISTED_USER_ROOMS, MAX_PASSKEYS_PER_USER, MAX_PUSH_URL_BYTES, MAX_READ_RECEIPT_MEMBERS, MAX_ROLES_PER_USER,
-  MAX_ROOM_MUTES_PER_USER, MAX_USER_ROOMS, MODERATOR_ROLES, nextRoomMuteEnd, PRIVATE_ROOM_PREFIX, PUSH_ID_PATTERN, ROLE_PATTERN,
-  ROOM_CREATOR_ROLES, ROOM_ID, type RoomMute, seenStands, type StoredCredential, type StoredIdentity, UNCLAIMED_ROLE, WAKE_SCOPES,
+  BOT_MODERATOR_ROLES, BOT_NAME_PATTERN, BOT_NAME_RULE, DEFAULT_JOINED_ROOMS, isPrivateRoomId, isProtocolId, MAX_CREATED_ROOMS,
+  MAX_LISTED_USER_ROOMS, MAX_PASSKEYS_PER_USER, MAX_ROLES_PER_USER, MAX_ROOM_MUTES_PER_USER, MAX_USER_ROOMS, MODERATOR_ROLES,
+  PRIVATE_ROOM_PREFIX, ROLE_PATTERN, ROOM_CREATOR_ROLES, ROOM_ID, type StoredCredential, type StoredIdentity, UNCLAIMED_ROLE,
 } from "../domain";
 import { ADMIN_USER_ID, restorableUserId } from "../user-ids";
 import {
-  ACTIVITY_GRANULARITY_MS, ALL_WAKE, BOT_PREFIX, DEFAULT_ROOM_TITLE, DEFAULT_THREAD_TITLE, DEFAULT_WAKE, EMPTY_ROOM_SCAN,
-  GUEST_NUMBER_BLOCK_COST, HISTORY_SCAN_BATCH, HISTORY_SCAN_PAGES, HISTORY_TARGET_SCAN, IDLE_PRUNE_BATCH, IDLE_PRUNE_RUNS_PER_DAY,
-  LIMITER_IDLE_MS, LISTED_PRIVATE_ROOMS, LIVE_KINDS, LIVE_WRITES, MAX_CARRIED_PASSKEYS, MAX_HISTORY_REWRITES,
-  MAX_MEMBERSHIP_ROWS, MAX_PURGE_ROOMS, MAX_PUSH_SUBSCRIPTIONS_PER_USER, MAX_PUSH_WAKES_PER_USER, MAX_SAFE_ID, MEMBERSHIP_COUNT_READS,
-  MEMBERSHIP_LIMIT_MESSAGE, MINUTE_MS, MOVE_REACTION_SETS_PER_POST, PRESSURE_CLEANUP_RETRY_MS, PRIVATE_ROOM_COUNT_READS, PRIVATE_ROOM_ROWS, publicRoomRows,
-  PUSH_REFRESH_MS, RESTORE_ENTRIES_BATCH, RESTORE_ENTRIES_SINGLE, RESTORE_FUTURE_MS, RESTORE_RECORDS_BATCH,
-  RESTORE_REPLAY_CAP, RESTORE_USERS_BATCH, RETAINED_SCAN_CAP, RETIRED_MARKER_MARGIN, RETIRED_SWEEP_BATCH, roomCountReads,
-  ROOM_NOTES_NAMED, ROOM_TITLE, UPLOAD_SWEEP_BATCH, UPLOAD_WRITE_GRACE_MS, UPLOAD_WRITES,
+  ACTIVITY_GRANULARITY_MS, BOT_PREFIX, DEFAULT_ROOM_TITLE, DEFAULT_THREAD_TITLE, EMPTY_ROOM_SCAN, IDLE_PRUNE_BATCH, IDLE_PRUNE_RUNS_PER_DAY,
+  LIMITER_IDLE_MS, LISTED_PRIVATE_ROOMS, LIVE_KINDS, LIVE_WRITES, MAX_CARRIED_PASSKEYS, MAX_MEMBERSHIP_ROWS, MAX_PURGE_ROOMS,
+  MAX_PUSH_SUBSCRIPTIONS_PER_USER, MAX_PUSH_WAKES_PER_USER, MAX_SAFE_ID, MEMBERSHIP_COUNT_READS, MEMBERSHIP_LIMIT_MESSAGE, MINUTE_MS,
+  MOVE_REACTION_SETS_PER_POST, PRESSURE_CLEANUP_RETRY_MS, PRIVATE_ROOM_COUNT_READS, PRIVATE_ROOM_ROWS, publicRoomRows,
+  RESTORE_ENTRIES_BATCH, RESTORE_ENTRIES_SINGLE, RESTORE_FUTURE_MS, RESTORE_RECORDS_BATCH, RESTORE_REPLAY_CAP, RESTORE_USERS_BATCH,
+  RETAINED_SCAN_CAP, RETIRED_MARKER_MARGIN, RETIRED_SWEEP_BATCH, roomCountReads, ROOM_NOTES_NAMED, ROOM_TITLE, UPLOAD_WRITES,
 } from "./limits";
 import type { AccountUsageSnapshot } from "../account-usage";
-import type { ChatRecord, HistoryQuery, QueuedRewrite, Rewrite } from "../history/records";
-import { type ChainStatePort, MAX_KEPT_GROUPS } from "../history/state";
+import type { ChatRecord } from "../history/records";
 import {
   type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type RoomListing,
 } from "@apron/archive";
 import { clientUserExt, MAX_USER_EXT_BYTES, mergeExt, recordedUser, userExtFits } from "../content/user";
-import { type Bucket, chargeBucket, type Rate } from "../limiter";
 import { isEmptyBody, type MessageBody } from "../content/body";
 import { hasAppend, messageContent, sharesText, withEditedBy } from "../content/snapshot";
 import { liveResultEmbed, terminalOg, uploadResultEmbed, uploadTitle } from "../content/embeds";
-import { keepAppend, keepLast, liveDeadline, liveHolds, type LiveKind, liveTextString, terminalOutput } from "../live-text";
-import type { TerminalOutputRef } from "../content/output-ref";
-import type { StatusChoice } from "../presence";
+import type { LiveKind } from "../live-text";
 import { emojiIdentity, isEmojiKey } from "../content/emoji";
 
 export class SqliteStore {
@@ -3950,11 +3935,10 @@ export class SqliteStore {
   }
 
   /**
-   * Create, save, delete, restore, or move a message (section 3.5, §4.4).
-   * With `liveClaim`, the message a command's live text posts when its write
-   * arrives (claimLiveText): its new live embed is that text's.
+   * A live text command's message, posted as its write is claimed
+   * (claimLiveText, live-text.ts, through the Sql handle's commitLivePost):
+   * one commit of the log at `effective`, its new live embed `entry`'s.
    */
-  /** A live text command's message, posted as its write is claimed (claimLiveText): one commit of the log. */
   private commitLivePost(input: StoreMutationInput, effective: number, entry: LiveEntry): StoreMutationResult {
     const state = this.logState();
     const startLogId = state.last_log_id;
@@ -3964,6 +3948,11 @@ export class SqliteStore {
     return committed;
   }
 
+  /**
+   * Create, save, delete, restore, or move a message (section 3.5, §4.4).
+   * With `liveClaim`, the message a command's live text posts when its write
+   * arrives (claimLiveText): its new live embed is that text's.
+   */
   private commitMessage(input: StoreMutationInput, context: CommitContext, floor: number, liveClaim?: LiveEntry): StoreMutationResult {
     const params = input.params;
     if (params.log_id !== undefined) throw new StoreError("invalid_params", "log_id is server assigned");

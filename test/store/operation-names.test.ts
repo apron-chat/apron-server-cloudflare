@@ -6,7 +6,8 @@
  * metering entry points, and nested work (a message committed inside a
  * mutation's reservation), so moving code between modules cannot rename one
  * silently. The names are the SqliteStore method names the stack gave them
- * before names were explicit.
+ * before names were explicit, except history pages, which reserve as
+ * `history` (BREAKER_ALERT_ONLY's name) where the stack said `historyImpl`.
  */
 
 import { expect, it } from "vitest";
@@ -97,7 +98,7 @@ it("names each operation's reservations as before", async () => {
 			"rooms.counts": ["roomCounts"],
 			// The message is committed (commitMessage) inside the mutation's reservations.
 			"messages.mutate": ["commitMutation", "commitMutation"],
-			// Named after the method that reserves for every history read; BREAKER_ALERT_ONLY's "history" never matches it.
+			// Every history page reserves as "history", so BREAKER_ALERT_ONLY's "history" matches it: an overrun alerts, never pauses history.
 			"messages.historyAcrossTiers": ["history"],
 			"sqlite.history": ["history"],
 			"reads.setRoomMute": ["setRoomMute"],
