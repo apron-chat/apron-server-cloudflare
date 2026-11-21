@@ -101,14 +101,15 @@ export const DEFAULT_PARSE_OPTIONS: ParseOptions = {
 export const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity"]);
 
 /**
- * Methods clients send as requests, with an `id` (the table in §1.1). One
+ * Methods clients send as requests, with an `id` (the table in §1.1), and
+ * the extensions' requests this server implements (`ext:command_list`). One
  * sent without an `id` is ignored, as §1.1 lets a server: it changes
  * nothing and gets no reply, so a client can never believe an unanswered
  * change was applied.
  */
 export const REQUEST_METHODS: ReadonlySet<string> = new Set([
 	"auth", "me", "message", "command", "history", "room_list", "room_join", "room_leave",
-	"room_set", "reactions", "status", "push_register", "push_unregister",
+	"room_set", "reactions", "status", "push_register", "push_unregister", "ext:command_list",
 ]);
 
 /**

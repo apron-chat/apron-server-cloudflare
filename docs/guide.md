@@ -17,8 +17,8 @@ It speaks protocol 9 and advertises:
 
 - always: `history`, `edit`, `rooms`, `reactions`, `command` (`/help`,
   `/invite-bot`, and admin commands), `ext`, and the extensions
-  `ext:settings`, `ext:limits` and `ext:permissions` (EXTENSIONS.md), with
-  liveness pings (`server.ping`);
+  `ext:settings`, `ext:limits`, `ext:permissions` and `ext:command_list`
+  (EXTENSIONS.md), with liveness pings (`server.ping`);
 - `activity` (typing) with the Workers Paid budgets (`ACTIVITY` overrides);
 - `embed:upload` and `ext:media` when uploads are configured, and
   `ext:emoji` once an admin, mod or friend adds a custom emoji with

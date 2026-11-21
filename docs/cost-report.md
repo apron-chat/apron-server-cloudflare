@@ -416,7 +416,7 @@ posts.
 - History pages read membership records from the same room range as every
   other record, and look up no user objects. Cleanup purges a removed
   thread's membership rows in the same bounded batch. `~private` throttle
-  notices and `/help` replies need no SQL.
+  notices, `/help` replies and `ext:command_list` results need no SQL.
 
 ### Three-day traffic sample
 

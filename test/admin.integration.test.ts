@@ -62,16 +62,18 @@ it('lists and runs the admin commands for admins only', async () => {
 	try {
 		const help = await command(admin, 'help', '/help');
 		expect(help.frame.result).toEqual({});
-		expect(help.notice!.params.body.text).toContain('/admin [remove] <user_id>');
-		expect(help.notice!.params.body.text).toContain('/kick <user_id>');
+		// Each form of a command on its own line.
+		expect(help.notice!.params.body.text).toContain('- `/admin @user`: Make a registered user an admin (admin-only)');
+		expect(help.notice!.params.body.text).toContain('- `/admin remove @user`: Make a user no longer an admin (admin-only)');
+		expect(help.notice!.params.body.text).toContain('/kick @user');
 		expect(help.notice!.params.body.text).toContain('/status');
-		expect(help.notice!.params.body.text).toContain('/rename <old_user_id> <new_user_id>');
+		expect(help.notice!.params.body.text).toContain('/rename @user <new_user_id>');
 		// Admins' commands say so; everyone else's don't.
-		expect(help.notice!.params.body.text).toContain('- `/kick <user_id>`: remove a user from this room (admin-only)');
-		expect(help.notice!.params.body.text).toContain('/invite-purge <user_id>');
+		expect(help.notice!.params.body.text).toContain('- `/kick @user`: Remove a user from this room (admin-only)');
+		expect(help.notice!.params.body.text).toContain('/invite-purge @user');
 		expect(help.notice!.params.body.text).not.toMatch(/`\/invite-bot`.*\(admin-only\)/);
 		// Listed alphabetically.
-		const listed = [...help.notice!.params.body.text.matchAll(/^- `\/([a-z-]+)/gm)].map((match) => match[1]);
+		const listed = [...help.notice!.params.body.text.matchAll(/^- `\/([a-z-]+(?: [a-z]+)?)/gm)].map((match) => match[1]);
 		expect(listed.length).toBeGreaterThan(10);
 		expect(listed).toEqual([...listed].sort());
 
@@ -84,6 +86,67 @@ it('lists and runs the admin commands for admins only', async () => {
 			expect(denied.frame.error.code).toBe(-32001);
 			expect(denied.frame.error.message).toMatch(/Only an admin/);
 		}
+	} finally { admin.close(); alice.close(); }
+});
+
+it('ext:command_list lists each form the user may run, with its hint, uses and requires, in /help\'s order', async () => {
+	const admin = await signedInAdmin();
+	const aliceId = unique('alice');
+	const alice = await signedIn(aliceId);
+	try {
+		const list = async (peer: Peer, id: string) => (await request(peer, id, 'ext:command_list', {})).result.commands as Array<{ name: string; group?: string; description: string; hint?: string; uses?: string[]; requires?: string[] }>;
+		const helped = async (peer: Peer, id: string) => [...(await command(peer, id, '/help')).notice!.params.body.text.matchAll(/^- `\/([^`]+)`/gm)].map((match) => match[1]);
+		const usage = (form: { name: string; hint?: string }) => form.hint ? `${form.name} ${form.hint}` : form.name;
+
+		const all = await list(admin, 'admin-list');
+		expect(all.map(usage)).toEqual(await helped(admin, 'admin-help'));
+		// Sorted by name, a name that starts another first.
+		expect(all.map((form) => form.name)).toEqual(all.map((form) => form.name).sort());
+		for (const form of all) {
+			expect(Object.keys(form).every((key) => ['name', 'group', 'description', 'hint', 'uses', 'requires'].includes(key))).toBe(true);
+			// Every entry has a group the extension defines.
+			expect(['all', 'guest', 'member', 'room', 'role', 'admin']).toContain(form.group);
+			expect(form.name).toMatch(/^[a-z-]+( [a-z]+)?$/);
+			expect(form.description).not.toBe('');
+			if (form.uses) expect(form.uses.length).toBeGreaterThan(0);
+			// What a form requires it uses, and never the room.
+			if (form.requires) expect(form.requires.every((field) => form.uses!.includes(field) && field !== 'room_id')).toBe(true);
+		}
+		const byName = new Map(all.map((form) => [form.name, form]));
+		// A fixed word after the name is a form of its own; uses name the fields the form reads.
+		expect(byName.get('kick')).toEqual({ name: 'kick', group: 'admin', description: 'Remove a user from this room', hint: '@user', uses: ['room_id'] });
+		expect(byName.get('admin')).toEqual({ name: 'admin', group: 'admin', description: 'Make a registered user an admin', hint: '@user' });
+		expect(byName.get('admin remove')).toEqual({ name: 'admin remove', group: 'admin', description: 'Make a user no longer an admin', hint: '@user' });
+		expect(byName.get('emoji add')).toEqual({ name: 'emoji add', group: 'role', description: 'Add a custom emoji, or replace its image, from one attached image', hint: ':<name>:', uses: ['body.embeds'], requires: ['body.embeds'] });
+		expect(byName.get('emoji remove')).toEqual({ name: 'emoji remove', group: 'role', description: 'Remove a custom emoji', hint: ':<name>:' });
+		expect(byName.get('avatar')).toEqual({ name: 'avatar', group: 'member', description: 'Set your avatar from one attached image', uses: ['body.embeds'], requires: ['body.embeds'] });
+		expect(byName.get('server')).toEqual({ name: 'server', group: 'admin', description: 'Show this server\'s title, description, and avatar' });
+		// Without an image, /server avatar clears it: it uses one, and requires none.
+		expect(byName.get('server avatar')).toMatchObject({ uses: ['body.embeds'] });
+		expect(byName.get('server avatar')!.requires).toBeUndefined();
+		expect(byName.get('toggle')!.hint).toBe('activity|uploads|presence|addmember|livetext');
+		expect(byName.get('server title')!.hint).toBe('[<text>]');
+		expect(byName.get('passkeys remove')).toEqual({ name: 'passkeys remove', group: 'member', description: 'Remove one of your account\'s passkeys', hint: '<n>' });
+		expect(['invite-device add', 'invite-device list', 'invite-device remove'].map((name) => byName.get(name)?.hint)).toEqual(['[<id>]', undefined, '<id>']);
+		expect(['history export', 'history import', 'history status'].map((name) => byName.get(name)?.hint)).toEqual(['[<room_id>...]', '<key> [dry-run] [match|new] [renumber] [restart]', undefined]);
+		// The user-target commands read the user from the text alone.
+		for (const name of ['admin', 'invite-purge', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
+
+		// A command's forms share its group: the audience it is for.
+		expect(Object.fromEntries(['help', 'embed-append', 'avatar', 'invite-bot', 'invite-device list', 'passkeys', 'emoji remove', 'history status', 'toggle'].map((name) => [name, byName.get(name)!.group]))).toEqual({
+			'help': 'all', 'embed-append': 'all', 'avatar': 'member', 'invite-bot': 'member', 'invite-device list': 'member', 'passkeys': 'member', 'emoji remove': 'role', 'history status': 'admin', 'toggle': 'admin',
+		});
+		const word = (name: string) => name.split(' ')[0];
+		for (const form of all) expect(form.group, form.name).toBe(all.find((other) => word(other.name) === word(form.name))!.group);
+
+		// A registered user gets their own, and none of the admins'.
+		const own = await list(alice, 'alice-list');
+		expect(own.map(usage)).toEqual(await helped(alice, 'alice-help'));
+		expect(own.map((form) => form.name)).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove']);
+
+		// It changes with the user's roles: /emoji for a friend.
+		expect((await command(admin, 'friend', `/role ${aliceId} friend`)).frame.result).toEqual({});
+		expect((await list(alice, 'friend-list')).map((form) => form.name)).toEqual(expect.arrayContaining(['emoji add', 'emoji remove']));
 	} finally { admin.close(); alice.close(); }
 });
 
@@ -107,7 +170,7 @@ it('/admin makes a registered user an admin, but not a guest, bot, or unknown us
 		for (const target of [guestId, 'bot_nobody', 'nobody_123']) {
 			expect((await command(admin, `bad-${target}`, `/admin ${target}`)).frame.error.code).toBe(-32602);
 		}
-		expect((await command(admin, 'usage', '/admin')).frame.error.message).toBe('Usage: /admin [remove] <user_id>');
+		expect((await command(admin, 'usage', '/admin')).frame.error.message).toBe('Usage: /admin @user, or /admin remove @user');
 	} finally { admin.close(); carol.close(); guest.close(); }
 });
 
@@ -140,7 +203,7 @@ it('/kick removes a registered user or a guest from the room of the command', as
 		expect((await command(admin, 'kick-self', '/kick admin')).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'kick-nobody', '/kick nobody_123')).frame.error.code).toBe(-32602);
 		// Mistakes are shown, not counted as policy violations: the socket stays open.
-		expect((await command(admin, 'kick-usage', '/kick')).frame.error.message).toBe('Usage: /kick <user_id>');
+		expect((await command(admin, 'kick-usage', '/kick')).frame.error.message).toBe('Usage: /kick @user');
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); bob.close(); guest.close(); }
 });
@@ -300,7 +363,7 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		}
 		// The admin user's own user_id is fixed by policy: denied (§1.1).
 		expect((await command(admin, 'rename-admin', '/rename admin somebody_else')).frame.error.code).toBe(-32001);
-		expect((await command(admin, 'rename-usage', `/rename ${toId}`)).frame.error.message).toBe('Usage: /rename <old_user_id> <new_user_id>');
+		expect((await command(admin, 'rename-usage', `/rename ${toId}`)).frame.error.message).toBe('Usage: /rename @user <new_user_id>');
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); dave.close(); erin.close(); }
 });
@@ -372,7 +435,11 @@ it('/invite-device add mints up to five tokens, each with its own id, that sign 
 		return token;
 	};
 	try {
-		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain('/invite-device list|add|remove [<id>]');
+		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain([
+			'- `/invite-device add [<id>]`: Get a token that signs in as you on another device',
+			'- `/invite-device list`: List the tokens that sign in as you on other devices',
+			'- `/invite-device remove <id>`: Revoke a token that signs in as you on another device',
+		].join('\n'));
 
 		// The token signs in as the user from any origin.
 		const laptop = await mint('laptop');
@@ -398,7 +465,7 @@ it('/invite-device add mints up to five tokens, each with its own id, that sign 
 		expect(sixth.frame.error.code).toBe(-32001);
 		expect(sixth.frame.error.message).toContain('`laptop`, `phone`, `tablet`, `device_1`, `device_2`');
 		expect((await command(owner, 'device-unnamed-3', '/invite-device add')).frame.error.code).toBe(-32001);
-		expect((await command(owner, 'usage', '/invite-device')).frame.error.message).toBe('Usage: /invite-device list|add|remove [<id>]');
+		expect((await command(owner, 'usage', '/invite-device')).frame.error.message).toBe('Usage: /invite-device add [<id>], /invite-device list, or /invite-device remove <id>');
 		expect((await command(owner, 'usage-2', '/invite-device laptop')).frame.error.code).toBe(-32602);
 		expect((await command(owner, 'usage-3', '/invite-device add a b')).frame.error.code).toBe(-32602);
 		expect((await command(owner, 'usage-4', '/invite-device remove')).frame.error.code).toBe(-32602);
@@ -582,7 +649,7 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		expect((await command(admin, 'admin-user', '/invite-purge admin')).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'bot', `/invite-purge bot_${userId}`)).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'unknown', `/invite-purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
-		expect((await command(admin, 'usage', '/invite-purge')).frame.error.message).toBe('Usage: /invite-purge <user_id>');
+		expect((await command(admin, 'usage', '/invite-purge')).frame.error.message).toBe('Usage: /invite-purge @user');
 		const plain = await signedIn(unique('plain'));
 		opened.push(plain);
 		expect((await command(plain, 'plain', `/invite-purge ${otherAdminId}`)).frame.error.message).toMatch(/Only an admin/);
@@ -1280,7 +1347,7 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 	const labeled = await signedIn(userId);
 	const mate = await signedIn(unique('mate'));
 	try {
-		expect((await command(admin, 'help', '/help')).notice!.params.body.text).toContain('/role <user_id> [<role>]');
+		expect((await command(admin, 'help', '/help')).notice!.params.body.text).toContain('/role @user [<role>]');
 		const who = `**Name of ${userId}** (\`${userId}\`)`;
 		expect((await command(admin, 'show-none', `/role ${userId}`)).notice!.params.body.text).toBe(`${who} has no roles.`);
 
@@ -1317,7 +1384,7 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 		for (const [id, text] of [['builtin-admin', '/role admin admin'], ['builtin-bot', '/role admin bot']]) {
 			expect((await command(admin, `role-${id}`, text)).frame.error.code).toBe(-32001);
 		}
-		expect((await command(admin, 'usage', '/role')).frame.error.message).toBe('Usage: /role <user_id> [<role>]');
+		expect((await command(admin, 'usage', '/role')).frame.error.message).toBe('Usage: /role @user [<role>]');
 		expect((await command(labeled, 'denied', `/role ${userId} friend`)).frame.error.message).toMatch(/Only an admin/);
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); labeled.close(); mate.close(); }

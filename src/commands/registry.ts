@@ -1,8 +1,9 @@
 /**
  * The command registry and its one dispatcher (`command`, §4.1). Each
- * command is a CommandSpec: its name, usage and help, who may run it, when
- * the deployment offers it, a parser from its words to typed arguments, and
- * a handler that takes only those. The dispatcher looks a command up,
+ * command is a CommandSpec: its name, its forms (what `/help`, usage errors
+ * and `ext:command_list` say of it), who may run it, when the deployment
+ * offers it, a parser from its words to typed arguments, and a handler that
+ * takes only those. The dispatcher looks a command up,
  * authorizes the sender, parses, runs, and audits, in that order, for every
  * command alike; no handler checks who may run it.
  *
@@ -19,6 +20,64 @@ import { type AdminCapability, assertAdmin, assertRoles, authorizeAdmin, authori
 /** Who may run a command: anyone, registered users (bots included), owners (registered users but bots), or admins. */
 export type Audience = "everyone" | "registered" | "owners" | "admins";
 
+/** A field of a `command` request (§4.1), besides `body.text`, that changes what a command does (extension `ext:command_list`). */
+export type CommandField = "room_id" | "reply_to" | "body.mentions" | "body.embeds";
+
+/**
+ * One form of a command, as `/help` and `ext:command_list` list it. A
+ * command with fixed words after its name, such as `/emoji add` and
+ * `/emoji remove`, has a form for each; words that only choose a value,
+ * such as `/toggle`'s feature, stay in the hint.
+ */
+export interface CommandForm {
+	/** The fixed words after the command's name that choose this form, such as `add`; absent for the name alone. */
+	readonly words?: string;
+	/**
+	 * The text after the form's name, in `ext:command_list`'s suggested
+	 * convention: `<value>` to replace, `[…]` optional, `a|b` choices, `...`
+	 * repeats, `@user` a user written with its prefix; absent when nothing
+	 * follows the name.
+	 */
+	readonly hint?: string;
+	/** What the form does, in plain text, not empty. */
+	readonly description: string;
+	/**
+	 * The request fields besides `body.text` its handler reads: `room_id`
+	 * where it acts on the room it is sent in (not where it only sends its
+	 * reply), and `reply_to`, `body.mentions` or `body.embeds` where it takes
+	 * them, not where it only refuses them.
+	 */
+	readonly uses?: readonly CommandField[];
+	/** Those of `uses` it fails without; never `room_id`, which defaults to the default room. */
+	readonly requires?: readonly CommandField[];
+}
+
+/**
+ * Who may use a command, as `ext:command_list` groups it for display, from
+ * the widest to the narrowest: `all` (everyone), `guest`, `member`
+ * (registered users and owners), `room` (those with a part in running a
+ * room), `role` (owners holding one of a command's roles) or `admin`. No
+ * command here is for guests alone, or gated on a room.
+ */
+export type CommandGroup = "all" | "guest" | "member" | "room" | "role" | "admin";
+
+/** A command's group, from its audience and roles. */
+function groupOf(audience: Audience, roles: readonly string[] | undefined): CommandGroup {
+	if (audience === "everyone") return "all";
+	if (audience === "admins") return "admin";
+	return roles ? "role" : "member";
+}
+
+/** A form as `ext:command_list` returns it: its full name, its command's group, its description, and its hint, uses and requires where it has them. */
+export interface ListedForm {
+	readonly name: string;
+	readonly group: CommandGroup;
+	readonly description: string;
+	readonly hint?: string;
+	readonly uses?: readonly CommandField[];
+	readonly requires?: readonly CommandField[];
+}
+
 /** A command line as the dispatcher split it, for a command's parser. */
 export interface CommandLine {
 	/** The command's text as sent. */
@@ -29,7 +88,7 @@ export interface CommandLine {
 	readonly words: readonly string[];
 	/** The command's `body`, for what it has attached. */
 	readonly body: Readonly<Record<string, unknown>>;
-	/** The command's usage line, for its usage errors. */
+	/** The command's usage, each of its forms (formsUsage), for its usage errors. */
 	readonly usage: string;
 }
 
@@ -41,8 +100,8 @@ export interface ScopeBase {
 /** What each kind of command spec has. */
 interface SpecBase<C extends ScopeBase, Args> {
 	name: string;
-	usage: string;
-	help: string;
+	/** Its forms, in the order of their names, the name alone first where it is one. */
+	forms: readonly [CommandForm, ...CommandForm[]];
 	/**
 	 * What an `invalid_params` error from parsing or running becomes: `reply`
 	 * answers it without counting a policy violation (a mistyped argument,
@@ -101,8 +160,10 @@ export interface PreparedCommand<C extends ScopeBase> {
 /** A registered command: its spec with the argument type sealed in, as the table and dispatcher hold it. */
 export interface Command<C extends ScopeBase> {
 	readonly name: string;
+	/** Its usage, each of its forms (formsUsage). */
 	readonly usage: string;
-	readonly help: string;
+	/** Its forms, as `/help` and `ext:command_list` list them. */
+	readonly forms: readonly ListedForm[];
 	readonly audience: Audience;
 	readonly roles?: readonly string[];
 	readonly usageErrors: "reply" | "violation";
@@ -121,13 +182,44 @@ export interface CommandHelpers<C extends ScopeBase> {
 	publicCommand<Args>(spec: PublicSpec<C, Args>): Command<C>;
 }
 
+/**
+ * A spec's forms as listed, each named by the command's name and its words,
+ * with the command's group, checked to say what `ext:command_list` asks: a
+ * description, and `requires` within `uses` and without `room_id`.
+ */
+function listedForms(name: string, group: CommandGroup, forms: readonly CommandForm[]): ListedForm[] {
+	return forms.map((form) => {
+		const full = form.words ? `${name} ${form.words}` : name;
+		if (!form.description) throw new Error(`/${full} has no description`);
+		if (form.requires?.some((field) => field === "room_id" || !form.uses?.includes(field))) throw new Error(`/${full} requires a field it does not use, or room_id`);
+		return Object.freeze({
+			name: full, group, description: form.description,
+			...(form.hint ? { hint: form.hint } : {}),
+			...(form.uses?.length ? { uses: Object.freeze([...form.uses]) } : {}),
+			...(form.requires?.length ? { requires: Object.freeze([...form.requires]) } : {}),
+		});
+	});
+}
+
+/** A form as `/help` and usage errors write it: `/emoji add :<name>:`. */
+function formUsage(form: ListedForm): string {
+	return `/${form.name}${form.hint ? ` ${form.hint}` : ""}`;
+}
+
+/** A command's usage: each of its forms, such as `/passkeys, or /passkeys remove <n>`. */
+function formsUsage(forms: readonly ListedForm[]): string {
+	const written = forms.map(formUsage);
+	return written.length > 1 ? `${written.slice(0, -1).join(", ")}, or ${written[written.length - 1]}` : written[0];
+}
+
 /** Seals a spec into a Command: `bind` turns its parsed arguments into the handler call, checking the grants it needs. */
 function seal<C extends ScopeBase, Args>(
 	spec: SpecBase<C, Args>, audience: Audience, roles: readonly string[] | undefined, posting: boolean,
 	bind: (args: Args) => (ctx: C, grants: Grants) => Promise<void> | void, audit?: (args: Args) => AuditDetails,
 ): Command<C> {
+	const forms = Object.freeze(listedForms(spec.name, groupOf(audience, roles), spec.forms));
 	return Object.freeze({
-		name: spec.name, usage: spec.usage, help: spec.help, audience, ...(roles ? { roles } : {}), usageErrors: spec.usageErrors, posting,
+		name: spec.name, usage: formsUsage(forms), forms, audience, ...(roles ? { roles } : {}), usageErrors: spec.usageErrors, posting,
 		available: (runtime: C["runtime"]) => spec.available?.(runtime) ?? true,
 		prepare(line: CommandLine, runtime: C["runtime"]): PreparedCommand<C> {
 			const args = spec.parse(line, runtime);
@@ -161,8 +253,9 @@ function helpersFor<C extends ScopeBase>(): CommandHelpers<C> {
 }
 
 /**
- * A runtime's commands, in the order `/help` lists them: alphabetical,
- * which the constructor checks, with no name twice.
+ * A runtime's commands, in the order `/help` and `ext:command_list` list
+ * them: alphabetical, and so each command's forms, which the constructor
+ * checks, with no name twice.
  */
 export class CommandTable<C extends ScopeBase> {
 	readonly commands: readonly Command<C>[];
@@ -170,6 +263,10 @@ export class CommandTable<C extends ScopeBase> {
 	constructor(commands: readonly Command<C>[]) {
 		for (let index = 1; index < commands.length; index++) {
 			if (!(commands[index - 1].name < commands[index].name)) throw new Error(`Commands are listed alphabetically, each once: /${commands[index].name} is out of place`);
+		}
+		const forms = commands.flatMap((command) => command.forms.map((form) => form.name));
+		for (let index = 1; index < forms.length; index++) {
+			if (!(forms[index - 1] < forms[index])) throw new Error(`Forms are listed alphabetically, each once: /${forms[index]} is out of place`);
 		}
 		this.commands = Object.freeze([...commands]);
 	}
@@ -188,8 +285,8 @@ export class CommandTable<C extends ScopeBase> {
 	}
 
 	/**
-	 * The commands offered now that the sender may run, as `/help` lists
-	 * them: those for everyone (the `posting` ones only if they may post,
+	 * The commands offered now that the sender may run, as `/help` and
+	 * `ext:command_list` list them: those for everyone (the `posting` ones only if they may post,
 	 * `posts`), for registered users if they are one, for owners if they are
 	 * one holding any roles the command needs, and every one for an admin.
 	 */
@@ -209,9 +306,14 @@ export function defineCommands<C extends ScopeBase>(build: (define: CommandHelpe
 	return new CommandTable(build(helpersFor<C>()));
 }
 
-/** `/help`'s list: each command's usage and help, admins' marked "(admin-only)". */
+/** `/help`'s list: each form of the commands, its name, hint and description, admins' marked "(admin-only)". */
 export function helpText(commands: readonly Command<ScopeBase>[]): string {
-	return commands.map((command) => `- \`${command.usage}\`: ${command.help}${command.audience === "admins" ? " (admin-only)" : ""}`).join("\n");
+	return commands.flatMap((command) => command.forms.map((form) => `- \`${formUsage(form)}\`: ${form.description}${command.audience === "admins" ? " (admin-only)" : ""}`)).join("\n");
+}
+
+/** `ext:command_list`'s `commands`: each form of the commands, in their order. */
+export function commandList(commands: readonly Command<ScopeBase>[]): ListedForm[] {
+	return commands.flatMap((command) => command.forms);
 }
 
 /** What the dispatcher needs of the runtime beyond the handlers' scope. */

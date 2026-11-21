@@ -2,8 +2,9 @@
 
 The demo speaks Apron protocol **10**. Its `server` frame advertises the
 capabilities `history`, `edit`, `rooms`, `reactions`, `command`, and `ext`,
-the extensions `ext:settings`, `ext:limits`, and `ext:permissions`, and
-`server.ping` (45 seconds). Others depend on the deployment:
+the extensions `ext:settings`, `ext:limits`, `ext:permissions`, and
+`ext:command_list`, and `server.ping` (45 seconds). Others depend on the
+deployment:
 
 - `activity` (typing) is on with the Workers Paid budgets and off with the
   Free ones; `ACTIVITY` overrides either (see
@@ -122,7 +123,9 @@ within it:
   avatar (below), `/toggle activity|uploads|presence|addmember|livetext`, and
   `/invite-purge <user_id>`, which signs a user out everywhere, removes
   their passkeys and tokens, and gives the admin a new token for them.
-  `/help` lists commands alphabetically and marks the admins' "(admin-only)". An
+  `/help` lists commands alphabetically, each form on its own line (such as
+  `/emoji add :<name>:` and `/emoji remove :<name>:`), and marks the admins'
+  "(admin-only)"; `ext:command_list` returns the same list as data. An
   unknown command is `invalid_params`, and one the sender may not run
   `denied`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
@@ -517,6 +520,11 @@ Every extension the frame advertises is defined in
   registered user with `admin`, `mod` or `threader`, or an owner's bot with
   `threader`, who may also add anyone to a thread. It
   is the server's: `me` ignores an `ext.permissions` it writes.
+- `ext:command_list` answers the request of its name with the commands
+  `/help` lists, after auth: each form's `name`, `group` (who may use it:
+  `all`, `member`, `role` for `/emoji`, or `admin`), `description`, and its
+  `hint` (the text after the name), `uses` (`room_id`, `reply_to` or
+  `body.embeds`) and `requires` (`body.embeds`) where it has them.
 - `ext:emoji`, once a custom emoji has been added, carries
   `server.params.ext.emoji.catalog_url`, the catalog's URL on the media
   origin. Registered users with the role `admin`, `mod` or `friend`, other

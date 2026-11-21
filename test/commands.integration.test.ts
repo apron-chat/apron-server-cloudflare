@@ -3,7 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { noAuditSink, type AdminAuditEvent, type AuditSink } from '../src/commands/audit';
 import { AdminCapability, assertAdmin, assertRoles, authorizeAdmin, authorizeRoles, RoleCapability } from '../src/commands/capability';
-import type { CommandTable, ScopeBase } from '../src/commands/registry';
+import { commandList, defineCommands, helpText, type CommandTable, type ScopeBase } from '../src/commands/registry';
 import { ApronDemoServer } from '../src/index';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
 
@@ -217,6 +217,31 @@ describe('the command registry', () => {
 				expect(events).toEqual(spec.audience === 'admins' ? [{ event: 'admin_action', actor: 'admin', command: spec.name, outcome: 'failed', reason: 'invalid_params', at: expect.any(Number) }] : []);
 			}
 		} finally { admin.close(); }
+	});
+});
+
+describe('command forms', () => {
+	const form = (spec: Record<string, unknown>) => defineCommands<ScopeBase>(({ publicCommand }) => [
+		publicCommand({ name: 'demo', usageErrors: 'reply', parse: () => ({}), run: () => {}, ...spec } as never),
+	]);
+
+	it('name each form by its words, and write the usage and the list from them', () => {
+		const table = form({ forms: [{ description: 'Show it' }, { words: 'add', hint: '<id>', description: 'Add one', uses: ['body.embeds'], requires: ['body.embeds'] }] });
+		const [demo] = table.commands;
+		expect(demo.usage).toBe('/demo, or /demo add <id>');
+		expect(commandList(table.commands)).toEqual([
+			{ name: 'demo', group: 'all', description: 'Show it' },
+			{ name: 'demo add', group: 'all', description: 'Add one', hint: '<id>', uses: ['body.embeds'], requires: ['body.embeds'] },
+		]);
+		expect(helpText(table.commands)).toBe('- `/demo`: Show it\n- `/demo add <id>`: Add one');
+	});
+
+	it('refuse a form without a description, a requires outside uses or naming room_id, and forms out of order', () => {
+		expect(() => form({ forms: [{ description: '' }] })).toThrow(/no description/);
+		expect(() => form({ forms: [{ description: 'x', requires: ['reply_to'] }] })).toThrow(/requires/);
+		expect(() => form({ forms: [{ description: 'x', uses: ['room_id'], requires: ['room_id'] }] })).toThrow(/requires/);
+		expect(() => form({ forms: [{ words: 'b', description: 'x' }, { words: 'a', description: 'y' }] })).toThrow(/out of place/);
+		expect(() => form({ forms: [{ words: 'a', description: 'x' }, { words: 'a', description: 'y' }] })).toThrow(/out of place/);
 	});
 });
 

@@ -116,7 +116,7 @@ import {
 import { arity, inviteUses, issuableUserId, oneOf, passkeyNumber, requiredArg, requiredUserId, roomIdArgs, stripMention, userIdArg, usageError, type InviteUses, type IssuableUserId, type PasskeyNumber, type RoomIdArg, type UserIdArg } from "./commands/args";
 import { noAuditSink, type AuditSink } from "./commands/audit";
 import { type AdminCapability, assertAdmin, assertRoles, type RoleCapability } from "./commands/capability";
-import { defineCommands, dispatchCommand, helpText } from "./commands/registry";
+import { commandList, defineCommands, dispatchCommand, helpText, type Command } from "./commands/registry";
 import {
 	authorizationServerMetadata,
 	AUTHORIZE_PATH,
@@ -660,16 +660,11 @@ function deviceArgs(words: readonly string[], usage: string): DeviceArgs {
 /** `/passkeys`' arguments: list the sender's passkeys, or remove the one numbered `remove`. */
 type PasskeysArgs = { remove?: PasskeyNumber };
 
-/** `/passkeys`' usage error, which names its two forms rather than its usage line. */
-function passkeysUsage(): ProtocolError {
-	return usageError("Usage: /passkeys, or /passkeys remove <n>");
-}
-
-function passkeysArgs(words: readonly string[]): PasskeysArgs {
+function passkeysArgs(words: readonly string[], usage: string): PasskeysArgs {
 	const args = words.slice(1);
 	if (args.length === 0) return {};
-	if (args.length !== 2 || args[0] !== "remove") throw passkeysUsage();
-	return { remove: passkeyNumber(args[1], passkeysUsage()) };
+	if (args.length !== 2 || args[0] !== "remove") throw usageError(`Usage: ${usage}`);
+	return { remove: passkeyNumber(args[1], usageError(`Usage: ${usage}`)) };
 }
 
 /** `/emoji`'s arguments: add (with its image attached) or remove the custom emoji `key`, written `:name:`. */
@@ -679,7 +674,7 @@ function emojiArgs(words: readonly string[], body: Readonly<Record<string, unkno
 	const args = words.slice(1);
 	const action = args[0];
 	if (args.length !== 2 || (action !== "add" && action !== "remove")) {
-		throw usageError("Usage: /emoji add :name: with one image attached, or /emoji remove :name:");
+		throw usageError("Usage: /emoji add :<name>: with one image attached, or /emoji remove :<name>:");
 	}
 	const key = args[1];
 	if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
@@ -696,7 +691,7 @@ function emojiArgs(words: readonly string[], body: Readonly<Record<string, unkno
  */
 type ServerArgs = { field: "show" } | { field: "avatar"; upload: boolean } | { field: "title" | "description"; value?: string };
 
-function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limits: RuntimeConfig["limits"]): ServerArgs {
+function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limits: RuntimeConfig["limits"], usage: string): ServerArgs {
 	// The text after the field is taken as typed, line breaks included.
 	const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
 	const value = rest.trim();
@@ -709,7 +704,7 @@ function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limit
 		if (embeds.length && !oneUploadEmbed(embeds)) throw usageError("Attach one image to /server avatar as an upload embed");
 		return { field: "avatar", upload: embeds.length > 0 };
 	}
-	if (chosen !== "title" && chosen !== "description") throw usageError("Usage: /server, /server title|description [<text>], or /server avatar");
+	if (chosen !== "title" && chosen !== "description") throw usageError(`Usage: ${usage}`);
 	if (chosen === "title" && !validServerTitle(value, limits)) throw usageError(`A server title is one line of at most ${limits.maxNameCodePoints} characters`);
 	if (chosen === "description" && !validServerDescription(value)) throw usageError(`A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes`);
 	return value ? { field: chosen, value } : { field: chosen };
@@ -3432,6 +3427,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:settings", "ext:limits",
 					...(this.config.uploads ? ["ext:media"] : []),
 					"ext:permissions",
+					// The `command`s each user may run, as `/help` lists them (handleCommandList).
+					"ext:command_list",
 					// Mentioned users may save the text its sender shares (Store.commitMessage).
 					"ext:editors",
 					// Custom emoji (ext:emoji), once an admin has added one.
@@ -3871,6 +3868,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "command":
 				await this.handleCommand(socket, attachment, request);
+				return;
+			case "ext:command_list":
+				this.handleCommandList(socket, attachment, request);
 				return;
 			case "ping":
 				// The exact ping bytes are answered by the runtime; a ping with other
@@ -7854,8 +7854,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * users, bots included), `owners` (registered users other than bots, so
 	 * a bot neither invites nor manages sign-ins; with `roles`, those holding
 	 * one of them), or `admins` (the `APRON_ADMIN_TOKEN` user and those given
-	 * the `admin` role). Kept in alphabetical order, the order `/help` lists
-	 * them in, admins' marked "(admin-only)". Each parses its words before
+	 * the `admin` role). Kept in alphabetical order, the order `/help` and
+	 * `ext:command_list` list them in, admins' marked "(admin-only)" by
+	 * `/help`. Each lists its forms (CommandForm), a fixed word after its
+	 * name, such as `/emoji add`, a form of its own: its hint, description,
+	 * and the request fields its handler reads (`uses`) and fails without
+	 * (`requires`), which `/help`, usage errors and `ext:command_list` show.
+	 * A hint writes an existing user as `@user`. Each parses its words before
 	 * it runs, and the dispatcher (dispatchCommand) checks who may run it, so
 	 * no handler does; an admin command's handler gets the AdminCapability
 	 * the privileged methods demand, and says what it acted on for the audit
@@ -7866,7 +7871,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private static readonly commandTable = defineCommands<CommandScope>(({ adminCommand, ownerCommand, registeredCommand, publicCommand }) => [
 		adminCommand({
-			name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", usageErrors: "reply",
+			name: "admin", usageErrors: "reply",
+			forms: [
+				{ hint: "@user", description: "Make a registered user an admin" },
+				{ words: "remove", hint: "@user", description: "Make a user no longer an admin" },
+			],
 			parse: ({ words, usage }) => {
 				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
 				const remove = words[1] === "remove";
@@ -7877,7 +7886,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, request, roomId }, { remove, userId }) => runtime.grantAdmin(cap, socket, request, roomId, userId, remove),
 		}),
 		registeredCommand({
-			name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", usageErrors: "violation",
+			name: "avatar", usageErrors: "violation",
+			forms: [{ description: "Set your avatar from one attached image", uses: ["body.embeds"], requires: ["body.embeds"] }],
 			available: (runtime) => runtime.uploadsOn(),
 			parse: ({ body }) => {
 				if (!oneUploadEmbed(body.embeds)) throw usageError("Attach one image to /avatar as an upload embed");
@@ -7886,42 +7896,56 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ runtime, socket, attachment, request }) => runtime.startAvatar(socket, attachment, request),
 		}),
 		publicCommand({
-			name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", usageErrors: "violation", posting: true,
+			name: "embed-append", usageErrors: "violation", posting: true,
+			forms: [{ hint: "[<markdown>]", description: "Get a link to stream text into a message in this room, such as an LLM's reply, after the opening <markdown>; the message appears when the stream starts", uses: ["room_id", "reply_to"] }],
 			available: (runtime) => runtime.liveTextOn(),
 			parse: ({ text }) => liveOpening(text),
 			run: ({ runtime, socket, attachment, request, roomId }, opening) => runtime.liveCommand(socket, attachment, request, roomId, "append", opening),
 		}),
 		publicCommand({
-			name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", usageErrors: "violation", posting: true,
+			name: "embed-terminal", usageErrors: "violation", posting: true,
+			forms: [{ hint: "[<title>]", description: "Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts", uses: ["room_id", "reply_to"] }],
 			available: (runtime) => runtime.liveTextOn(),
 			parse: ({ text }) => liveOpening(text),
 			run: ({ runtime, socket, attachment, request, roomId }, title) => runtime.liveCommand(socket, attachment, request, roomId, "terminal", title),
 		}),
 		ownerCommand({
-			name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", usageErrors: "reply",
+			name: "emoji", usageErrors: "reply",
+			forms: [
+				{ words: "add", hint: ":<name>:", description: "Add a custom emoji, or replace its image, from one attached image", uses: ["body.embeds"], requires: ["body.embeds"] },
+				{ words: "remove", hint: ":<name>:", description: "Remove a custom emoji" },
+			],
 			roles: EMOJI_ROLES,
 			available: (runtime) => !!runtime.config.uploads,
 			parse: ({ words, body }) => emojiArgs(words, body),
 			run: ({ grant, runtime, socket, attachment, request, roomId }, args) => runtime.emojiCommand(grant, socket, attachment, request, roomId, args),
 		}),
 		publicCommand({
-			name: "help", usage: "/help", help: "list the commands you can use here", usageErrors: "violation",
+			name: "help", usageErrors: "violation",
+			forms: [{ description: "List the commands that you can use" }],
 			parse: noArgs,
 			run: (scope) => scope.runtime.sendHelp(scope),
 		}),
 		adminCommand({
-			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart]", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, as written or through the codecs its name or metadata gives) from it (running a failed import again finishes it; restart abandons another file's)", usageErrors: "reply",
+			name: "history", usageErrors: "reply",
+			forms: [
+				{ words: "export", hint: "[<room_id>...]", description: "Back up history, or the rooms named, to the backup store" },
+				{ words: "import", hint: "<key> [dry-run] [match|new] [renumber] [restart]", description: "Import a backup or archive (ARCHIVE.md, as written or through the codecs its name or metadata gives) from the backup store; running a failed import again finishes it, and restart abandons another file's" },
+				{ words: "status", description: "Show where history is kept, and the state of each tier" },
+			],
 			parse: ({ words, usage }) => historyArgs(words, usage),
 			audit: (args) => ({ action: args.action, target: args.action === "import" ? args.key : args.action === "export" ? args.roomIds.join(" ") : undefined }),
 			run: ({ cap, runtime, socket, request, roomId }, args) => runtime.historyCommand(cap, socket, request, roomId, args),
 		}),
 		ownerCommand({
-			name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", usageErrors: "violation",
+			name: "invite-bot", usageErrors: "violation",
+			forms: [{ description: "Get a sign-in token for your bot; a new one replaces the last" }],
 			parse: noArgs,
 			run: ({ runtime, socket, attachment, request, roomId }) => runtime.inviteBot(socket, attachment, request, roomId),
 		}),
 		adminCommand({
-			name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, usageErrors: "reply",
+			name: "invite-code", usageErrors: "reply",
+			forms: [{ hint: "<uses>", description: `Get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; 0 revokes it` }],
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
 				return inviteUses(requiredArg(words[1], usage), MAX_JOIN_USES);
@@ -7930,14 +7954,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, request, roomId }, uses) => runtime.invite(cap, socket, request, roomId, uses),
 		}),
 		ownerCommand({
-			name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", usageErrors: "reply",
+			name: "invite-device", usageErrors: "reply",
+			forms: [
+				{ words: "add", hint: "[<id>]", description: "Get a token that signs in as you on another device" },
+				{ words: "list", description: "List the tokens that sign in as you on other devices" },
+				{ words: "remove", hint: "<id>", description: "Revoke a token that signs in as you on another device" },
+			],
 			parse: ({ words, usage }) => deviceArgs(words, usage),
 			run: ({ runtime, socket, attachment, request, roomId }, args) => args.action === "list" ? runtime.listDevices(socket, attachment, request, roomId)
 				: args.action === "add" ? runtime.inviteDevice(socket, attachment, request, roomId, args.id)
 				: runtime.removeDevice(socket, attachment, request, roomId, args.id),
 		}),
 		adminCommand({
-			name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", usageErrors: "reply",
+			name: "invite-purge", usageErrors: "reply",
+			forms: [{ hint: "@user", description: "Sign a user out everywhere, remove their passkeys and tokens, and get a new token for them" }],
 			// A second leading `@` is taken off too, as this command always has.
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
@@ -7947,7 +7977,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.invitePurge(cap, socket, attachment, request, roomId, userId),
 		}),
 		adminCommand({
-			name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", usageErrors: "reply",
+			name: "invite-token", usageErrors: "reply",
+			forms: [{ hint: "<user_id>", description: "Create a user who signs in with a token instead of a passkey, and get the token" }],
 			// A second leading `@` is taken off too, as this command always has.
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
@@ -7957,7 +7988,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.inviteToken(cap, socket, attachment, request, roomId, userId),
 		}),
 		adminCommand({
-			name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", usageErrors: "reply",
+			name: "kick", usageErrors: "reply",
+			forms: [{ hint: "@user", description: "Remove a user from this room", uses: ["room_id"] }],
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
 				return requiredUserId(words[1], usage);
@@ -7966,12 +7998,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.kick(cap, socket, attachment, request, roomId, userId),
 		}),
 		ownerCommand({
-			name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", usageErrors: "reply",
-			parse: ({ words }) => passkeysArgs(words),
+			name: "passkeys", usageErrors: "reply",
+			forms: [
+				{ description: "List your account's passkeys" },
+				{ words: "remove", hint: "<n>", description: "Remove one of your account's passkeys" },
+			],
+			parse: ({ words, usage }) => passkeysArgs(words, usage),
 			run: ({ runtime, socket, attachment, request, roomId }, args) => runtime.passkeysCommand(socket, attachment, request, roomId, args),
 		}),
 		adminCommand({
-			name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", usageErrors: "reply",
+			name: "purge", usageErrors: "reply",
+			forms: [{ hint: "@user", description: "Disconnect a user and delete their account, bot, and everything they posted or uploaded" }],
 			// A second leading `@` is taken off too, as this command always has.
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
@@ -7981,7 +8018,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.underHistoryLease({ kind: "rewrite" }, (lease) => runtime.purge(cap, lease, socket, attachment, request, roomId, userId)),
 		}),
 		adminCommand({
-			name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", usageErrors: "reply",
+			name: "rename", usageErrors: "reply",
+			forms: [{ hint: "@user <new_user_id>", description: "Change a registered user's user_id" }],
 			parse: ({ words, usage }) => {
 				arity(words, 2, usage);
 				const from = requiredUserId(words[1], usage);
@@ -7992,7 +8030,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, request, roomId }, { from, to }) => runtime.underHistoryLease({ kind: "rewrite" }, (lease) => runtime.rename(cap, lease, socket, request, roomId, from, to)),
 		}),
 		adminCommand({
-			name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", usageErrors: "reply",
+			name: "role", usageErrors: "reply",
+			forms: [{ hint: "@user [<role>]", description: "Show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)" }],
 			parse: ({ words, usage }) => {
 				if (words.length !== 2 && words.length !== 3) throw usageError(`Usage: ${usage}`);
 				return { userId: userIdArg(words[1]), ...(words.length === 3 ? { role: words[2].toLowerCase() } : {}) };
@@ -8001,19 +8040,27 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, request, roomId }, { userId, role }) => runtime.role(cap, socket, request, roomId, userId, role),
 		}),
 		adminCommand({
-			name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", usageErrors: "reply",
-			parse: ({ line, body }, runtime) => serverArgs(line, body, runtime.config.limits),
+			name: "server", usageErrors: "reply",
+			forms: [
+				{ description: "Show this server's title, description, and avatar" },
+				{ words: "avatar", description: "Set this server's avatar from one attached image, or without one clear it back to the deployment's", uses: ["body.embeds"] },
+				{ words: "description", hint: "[<text>]", description: "Set this server's description, or without the text clear it back to the deployment's" },
+				{ words: "title", hint: "[<text>]", description: "Set this server's title, or without the text clear it back to the deployment's" },
+			],
+			parse: ({ line, body, usage }, runtime) => serverArgs(line, body, runtime.config.limits, usage),
 			audit: (args) => ({ action: args.field === "show" ? "show" : args.field === "avatar" ? (args.upload ? "avatar" : "avatar clear") : args.value === undefined ? `${args.field} clear` : args.field }),
 			run: ({ cap, runtime, socket, attachment, request, roomId }, args) => runtime.serverCommand(cap, socket, attachment, request, roomId, args),
 		}),
 		adminCommand({
-			name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", usageErrors: "violation",
+			name: "status", usageErrors: "violation",
+			forms: [{ description: "Show today's Cloudflare usage and the demo's budgets" }],
 			parse: noArgs,
 			audit: () => ({}),
 			run: ({ cap, runtime, socket, request, roomId }) => runtime.sendStatus(cap, socket, request, roomId),
 		}),
 		adminCommand({
-			name: "toggle", usage: "/toggle <activity|uploads|presence|addmember|livetext>", help: "turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone", usageErrors: "reply",
+			name: "toggle", usageErrors: "reply",
+			forms: [{ hint: "activity|uploads|presence|addmember|livetext", description: "Turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone" }],
 			parse: ({ words, usage }, runtime) => {
 				arity(words, 1, usage);
 				const word = requiredArg(words[1], usage);
@@ -8051,11 +8098,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 	}
 
-	/** `/help`: a `~private` notice listing the commands the sender may run now, before the result (§1). */
+	/** `/help`: a `~private` notice listing the commands the sender may run now, each form on its own line, before the result (§1). */
 	private sendHelp({ socket, attachment, request, roomId }: CommandScope): void {
-		const posts = attachment.tier !== "anonymous" || this.config.guestPosting;
-		this.sendNotice(socket, roomId, helpText(ApronDemoServer.commandTable.listFor(attachment, this, posts)));
+		this.sendNotice(socket, roomId, helpText(this.commandsFor(attachment)));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `ext:command_list` (extension `ext:command_list`): the forms of the
+	 * commands the sender may run on this connection, as `/help` lists them
+	 * (commandsFor), each with its `name` and `description`, and its `hint`,
+	 * `uses` and `requires` where it has them. Its params are ignored: the
+	 * list is the same in every room.
+	 */
+	private handleCommandList(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
+		this.reply(socket, request, { commands: commandList(this.commandsFor(attachment)) });
+	}
+
+	/** The commands offered now that this connection may run, for `/help` and `ext:command_list`: those that post only for those who may post. */
+	private commandsFor(attachment: ConnectionAttachment): Command<CommandScope>[] {
+		const posts = attachment.tier !== "anonymous" || this.config.guestPosting;
+		return ApronDemoServer.commandTable.listFor(attachment, this, posts);
 	}
 
 	/** The features `/toggle` turns off and on here: uploads, presence and live text only where configured. */
@@ -8221,7 +8285,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const chosen = passkeys[args.remove - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
-		if (!this.store.credentials.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw passkeysUsage();
+		if (!this.store.credentials.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usageError(`Usage: ${ApronDemoServer.commandTable.get("passkeys").usage}`);
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.
