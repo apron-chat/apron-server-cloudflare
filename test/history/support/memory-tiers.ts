@@ -271,6 +271,15 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 		},
 	};
 
+	progressText: string | undefined;
+
+	readonly progress: Cell<string> = {
+		get: async () => this.progressText,
+		set: async (value) => {
+			this.progressText = value ?? undefined;
+		},
+	};
+
 	async roomIsEmpty(roomId: string): Promise<boolean> {
 		return this.rooms_.has(roomId) && !this.all().some((record) => record.room_id === roomId);
 	}

@@ -9,7 +9,7 @@ import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER
 import { type D1Off, detailLines, statusLines } from "./history/status";
 import { storeExport, storeRestore } from "./history/store-head";
 import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./content/output-ref";
-import { type BackupKind, BackupStore, MAX_IMPORT_BYTES, importableWarning, writeBackup } from "./history/exports";
+import { type BackupKind, BackupStore, MAX_IMPORT_BYTES, MAX_IMPORT_RECORDS, importableWarning, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryChain } from "./history/chain";
 import { type ChatRecord, type PublicRecord, asPublic } from "./history/records";
@@ -9203,7 +9203,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const truncated = result.truncated.length
 					? `\nMembers truncated in ${result.truncated.length} rooms (${result.truncated.map((room) => `\`${room.room_id}\` ${room.kept} of ${room.members}`).join(", ")}): a listing carries at most ${MAX_LISTING_MEMBERS} members.`
 					: "";
-				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.${truncated}${importableWarning(result.decodedBytes)}`);
+				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.${truncated}${importableWarning(result.records, result.decodedBytes)}`);
 				return;
 			}
 			case "import": {
@@ -9211,10 +9211,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const backups = this.backupStore();
 				let report: ImportReport;
 				try {
-					// Read whole and bounded, stored and decoded (a small file may decode to a great deal), before anything is written.
-					const opened = await backups.open(key, MAX_IMPORT_BYTES);
+					// Read twice as a stream, bounded stored and decoded (a small file may decode to a great deal), and by its records (MAX_IMPORT_RECORDS).
+					const opened = await backups.source(key, MAX_IMPORT_BYTES);
 					if (!opened) throw new Error(`No backup ${key}`);
-					report = await importArchive(this.archiveChain(), storeRestore(this.store), opened.archive, {
+					report = await importArchive(this.archiveChain(), storeRestore(this.store), opened.source, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
 						// Only an authenticating codec, read to the end, makes a file this server's own.
 						provenance: opened.provenance,
@@ -9223,7 +9223,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 						restart: args.restart,
 					});
 				} catch (error) {
-					// A damaged backup, an unknown codec or an unreadable file: said plainly, nothing written.
+					// A damaged backup, an unknown codec or an unreadable file: said plainly, nothing written. A failure
+					// while writing (a day's budget spent, say) leaves the journal: the same command goes on from where it got.
 					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
 				}
 				done(importNotice(report));
@@ -9261,7 +9262,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.store.setHistoryMeta(META_SCHEDULED_BACKUP, String(now), now);
 			const result = await this.underHistoryLease({ kind: "job", job: "backup" }, () => this.writeBackup(store, "scheduled"));
 			console.log(JSON.stringify({ event: "history_export", key: result.key, records: result.records, decoded_bytes: result.decodedBytes, deleted: result.deleted.length }));
-			if (result.decodedBytes > MAX_IMPORT_BYTES) console.warn(JSON.stringify({ event: "history_export_unimportable", key: result.key, decoded_bytes: result.decodedBytes, max_import_bytes: MAX_IMPORT_BYTES }));
+			if (result.records > MAX_IMPORT_RECORDS || result.decodedBytes > MAX_IMPORT_BYTES) {
+				console.warn(JSON.stringify({ event: "history_export_unimportable", key: result.key, records: result.records, decoded_bytes: result.decodedBytes, max_import_records: MAX_IMPORT_RECORDS, max_import_bytes: MAX_IMPORT_BYTES }));
+			}
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "history_export_failed", message: error instanceof Error ? error.message : String(error) }));
 		}

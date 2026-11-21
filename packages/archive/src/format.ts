@@ -212,7 +212,7 @@ export function jsonlWriter(sink: (line: string) => Promise<void>, options: Json
 }
 
 /** The object a line holds, or undefined for a blank line, a line that is not JSON, or JSON that is not an object. */
-function parseLine(line: string): JsonObject | undefined {
+export function parseLine(line: string): JsonObject | undefined {
 	const text = line.trim();
 	if (!text || text[0] !== "{") return undefined;
 	try {
@@ -273,7 +273,7 @@ function checkLineLength(line: string, lineNumber: number): void {
 }
 
 /** The header, from the first JSON object line (undefined when there is none); throws unless it carries `apron_archive: 1`. */
-function checkHeader(first: JsonObject | undefined, lineNumber: number): ArchiveHeader {
+export function checkHeader(first: JsonObject | undefined, lineNumber: number): ArchiveHeader {
 	if (!first) throw new Error("not an Apron archive: no JSON object line");
 	if (first.apron_archive !== 1) {
 		throw new Error(first.apron_archive === undefined

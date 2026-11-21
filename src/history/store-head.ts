@@ -53,6 +53,8 @@ export interface RestoreStore {
 	restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): { joined: number; left: number; skipped: number };
 	historyImportJournal(): string | undefined;
 	setHistoryImportJournal(value: string | null): void;
+	historyImportProgress(): string | undefined;
+	setHistoryImportProgress(value: string | null): void;
 }
 
 /** What an export needs of the Store. */
@@ -111,6 +113,10 @@ export function storeRestore(store: RestoreStore): RestorePort {
 		journal: {
 			get: async () => store.historyImportJournal(),
 			set: async (value) => store.setHistoryImportJournal(value),
+		},
+		progress: {
+			get: async () => store.historyImportProgress(),
+			set: async (value) => store.setHistoryImportProgress(value),
 		},
 	};
 }
