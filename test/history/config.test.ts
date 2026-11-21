@@ -7,7 +7,7 @@ import { withStore } from "../helpers/store";
 
 const LIMITS: HistoryLimits = { historyHotRecords: 5_000, historyMaxAgeSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 const clock = { now: () => 0 };
-const store = { historyStatePort: () => ({}) } as unknown as ChainStore;
+const store = { head: (name: string) => ({ name }), state: () => ({}) } as unknown as ChainStore;
 /** The chain for these bindings and limits, as the Worker builds it: the layout first. */
 const build = (envOf: HistoryEnv, limits: HistoryLimits, options: BlobStoreChoice & { chunkIndex?: () => MemoryChunkIndex } = {}) =>
 	buildHistoryChain({ layout: historyLayout(envOf, limits, options), limits, store, clock, ...(options.chunkIndex ? { chunkIndex: options.chunkIndex } : {}) });
@@ -27,7 +27,7 @@ describe("history tiers from bindings", () => {
 		// The cold tier keeps everything at 0, else LIMIT_HISTORY_COLD_RECORDS.
 		const kept = (historyColdRecords: number) => withStore(`history-config-cold-${historyColdRecords}`, {}, async (real) => {
 			const limits = { ...LIMITS, historyColdRecords };
-			const chain = buildHistoryChain({ layout: historyLayout({}, limits, memory), limits, store: real, clock, chunkIndex: (tier) => real.chunkIndex(tier) })!;
+			const chain = buildHistoryChain({ layout: historyLayout({}, limits, memory), limits, store: real.history, clock, chunkIndex: (tier) => real.history.chunkIndex(tier) })!;
 			return (await chain.stats())[1].retention.records;
 		});
 		expect(await kept(0)).toBeUndefined();

@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vitest";
-import { Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { type Lifecycle, openStore, type Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { BY_AGE, errorCode, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { sqliteOf } from "../src/store/open";
 
 const withStore = <T>(name: string, config: Partial<StoreConfig>, fn: Parameters<typeof withNamedStore<T>>[2]) =>
 	withNamedStore(`history-${name}`, { ...BY_AGE, ...config }, fn);
@@ -43,14 +44,14 @@ const ROOMY: Partial<StoreConfig> = {
 
 it("starts general with only its seeded creation record", async () => {
 	await withStore("unused-boundary", {}, (store, clock) => {
-		const room = store.getRoomState();
+		const room = sqliteOf(store).getRoomState();
 		expect(room).toEqual({
 			room_id: "general", log_id: room.log_id, title: "General",
 			latest_log_id: room.log_id, history_log_id: room.log_id,
 		});
 		expect(room.log_id).toMatch(/^[1-9][0-9]*$/);
 
-		const page = store.history({ roomId: "general", after: 0n, now: clock.value });
+		const page = sqliteOf(store).history({ roomId: "general", after: 0n, now: clock.value });
 		expect(page.rooms).toEqual([room]);
 		expect(page.messages).toBeUndefined();
 		expect(page.reactions).toBeUndefined();
@@ -64,16 +65,16 @@ it("starts general with only its seeded creation record", async () => {
 
 it("returns inclusive, bounded forward and backward pages with true bounds", async () => {
 	await withStore("pagination", {}, (store, clock) => {
-		const general = store.getRoomState();
+		const general = sqliteOf(store).getRoomState();
 		const logs: bigint[] = [];
 		for (let index = 0; index < 51; index += 1) {
 			if (index > 0 && index % 5 === 0) clock.value += 61_000;
-			logs.push(logId(store.mutate(messageInput(clock, `page-${index}`, {
+			logs.push(logId(store.messages.mutate(messageInput(clock, `page-${index}`, {
 				body: { format: "plain", text: `entry-${index}` },
 			}))));
 		}
 
-		const forward = store.history({ roomId: "general", after: logs[0], limit: 2, now: clock.value });
+		const forward = sqliteOf(store).history({ roomId: "general", after: logs[0], limit: 2, now: clock.value });
 		expect(messagesOf(forward).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
 		expect(forward.first_log_id).toBe(String(logs[0]));
 		expect(forward.last_log_id).toBe(String(logs[1]));
@@ -81,31 +82,31 @@ it("returns inclusive, bounded forward and backward pages with true bounds", asy
 		expect(forward.latest_log_id).toBe(String(logs[50]));
 		expect(forward.history_log_id).toBe(general.log_id);
 
-		const forwardContinuation = store.history({ roomId: "general", after: logs[1] + 1n, limit: 2, now: clock.value });
+		const forwardContinuation = sqliteOf(store).history({ roomId: "general", after: logs[1] + 1n, limit: 2, now: clock.value });
 		expect(messagesOf(forwardContinuation).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
 
-		const backward = store.history({ roomId: "general", before: logs[50], limit: 2, now: clock.value });
+		const backward = sqliteOf(store).history({ roomId: "general", before: logs[50], limit: 2, now: clock.value });
 		expect(messagesOf(backward).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(49, 51));
 		expect(backward.first_log_id).toBe(String(logs[49]));
 		expect(backward.last_log_id).toBe(String(logs[50]));
 		expect(backward.more).toBe(true);
 
-		const backwardContinuation = store.history({ roomId: "general", before: BigInt(backward.first_log_id!) - 1n, limit: 2, now: clock.value });
+		const backwardContinuation = sqliteOf(store).history({ roomId: "general", before: BigInt(backward.first_log_id!) - 1n, limit: 2, now: clock.value });
 		expect(messagesOf(backwardContinuation).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(47, 49));
 
-		const bounded = store.history({ roomId: "general", after: logs[0], limit: 500, now: clock.value });
+		const bounded = sqliteOf(store).history({ roomId: "general", after: logs[0], limit: 500, now: clock.value });
 		expect(messagesOf(bounded)).toHaveLength(50);
 		expect(bounded.first_log_id).toBe(String(logs[0]));
 		expect(bounded.last_log_id).toBe(String(logs[49]));
 		expect(bounded.more).toBe(true);
-		const finalPage = store.history({ roomId: "general", after: logs[49] + 1n, limit: 50, now: clock.value });
+		const finalPage = sqliteOf(store).history({ roomId: "general", after: logs[49] + 1n, limit: 50, now: clock.value });
 		expect(messagesOf(finalPage).map((entry) => BigInt(entry.log_id))).toEqual([logs[50]]);
 		expect(finalPage.more).toBe(false);
 
-		const limitedEmpty = store.history({ roomId: "general", after: logs[50] + 1n, limit: 50, now: clock.value });
+		const limitedEmpty = sqliteOf(store).history({ roomId: "general", after: logs[50] + 1n, limit: 50, now: clock.value });
 		expect(limitedEmpty).toEqual({ more: false, latest_log_id: String(logs[50]), history_log_id: general.log_id });
 
-		const exactRange = store.history({ roomId: "general", after: logs[10], before: logs[11], limit: 50, now: clock.value });
+		const exactRange = sqliteOf(store).history({ roomId: "general", after: logs[10], before: logs[11], limit: 50, now: clock.value });
 		expect(messagesOf(exactRange).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(10, 12));
 		expect(exactRange.more).toBe(false);
 	});
@@ -113,15 +114,15 @@ it("returns inclusive, bounded forward and backward pages with true bounds", asy
 
 it("counts records of every kind toward limit and spans first_log_id/last_log_id across kinds", async () => {
 	await withStore("mixed-kinds", ROOMY, (store, clock) => {
-		const created = store.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "Mixed" }));
+		const created = store.messages.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "Mixed" }));
 		const roomId = String(created.result.room_id);
-		const message = store.mutate(op(clock, "m1", "message", { room_id: roomId, body: { text: "first" } }));
-		const reaction = store.mutate(op(clock, "r1", "reactions", { message_id: message.result.message_id, emojis: ["👍"] }, "bob"));
-		const edit = store.mutate(op(clock, "m2", "message", { message_id: message.result.message_id, room_id: roomId, body: { text: "edited" } }));
-		const renamed = store.mutate(op(clock, "rename", "room_set", { room_id: roomId, title: "Renamed" }, "bob"));
+		const message = store.messages.mutate(op(clock, "m1", "message", { room_id: roomId, body: { text: "first" } }));
+		const reaction = store.messages.mutate(op(clock, "r1", "reactions", { message_id: message.result.message_id, emojis: ["👍"] }, "bob"));
+		const edit = store.messages.mutate(op(clock, "m2", "message", { message_id: message.result.message_id, room_id: roomId, body: { text: "edited" } }));
+		const renamed = store.messages.mutate(op(clock, "rename", "room_set", { room_id: roomId, title: "Renamed" }, "bob"));
 		const all = [created, message, reaction, edit, renamed].map((result) => String(logId(result)));
 
-		const first = store.history({ roomId, after: 0n, limit: 2, now: clock.value });
+		const first = sqliteOf(store).history({ roomId, after: 0n, limit: 2, now: clock.value });
 		expect(first.rooms?.map((room) => room.log_id)).toEqual([all[0]]);
 		expect(messagesOf(first).map((entry) => entry.log_id)).toEqual([all[1]]);
 		expect(first.reactions).toBeUndefined();
@@ -129,25 +130,25 @@ it("counts records of every kind toward limit and spans first_log_id/last_log_id
 		// Room records in history carry the room's delivery fields, as room_list's do.
 		expect(first.rooms?.[0]).toMatchObject({ title: "Mixed", latest_log_id: all[4], history_log_id: all[0] });
 
-		const second = store.history({ roomId, after: BigInt(first.last_log_id!) + 1n, limit: 2, now: clock.value });
+		const second = sqliteOf(store).history({ roomId, after: BigInt(first.last_log_id!) + 1n, limit: 2, now: clock.value });
 		expect(second.rooms).toBeUndefined();
 		expect(second.reactions?.map((record) => record.log_id)).toEqual([all[2]]);
 		expect(messagesOf(second).map((entry) => entry.log_id)).toEqual([all[3]]);
 		expect([second.first_log_id, second.last_log_id, second.more]).toEqual([all[2], all[3], true]);
 
-		const third = store.history({ roomId, after: BigInt(second.last_log_id!) + 1n, limit: 2, now: clock.value });
+		const third = sqliteOf(store).history({ roomId, after: BigInt(second.last_log_id!) + 1n, limit: 2, now: clock.value });
 		expect(third.rooms?.map((room) => room.title)).toEqual(["Renamed"]);
 		expect(third.messages).toBeUndefined();
 		expect([third.first_log_id, third.last_log_id, third.more]).toEqual([all[4], all[4], false]);
 
-		const newest = store.history({ roomId, limit: 3, now: clock.value });
+		const newest = sqliteOf(store).history({ roomId, limit: 3, now: clock.value });
 		expect([newest.first_log_id, newest.last_log_id, newest.more]).toEqual([all[2], all[4], true]);
 		expect(newest.reactions?.map((record) => record.log_id)).toEqual([all[2]]);
 		expect(messagesOf(newest).map((entry) => entry.log_id)).toEqual([all[3]]);
 		expect(newest.rooms?.map((room) => room.log_id)).toEqual([all[4]]);
 
 		// The thread's log is separate from its parent's.
-		const parent = store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const parent = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(parent.messages).toBeUndefined();
 		expect(parent.rooms?.map((room) => room.room_id)).toEqual(["general"]);
 	});
@@ -155,17 +156,17 @@ it("counts records of every kind toward limit and spans first_log_id/last_log_id
 
 it("stops at a UTF-8 response byte cap without skipping a contiguous record", async () => {
 	await withStore("byte-cap", {}, (store, clock) => {
-		const first = logId(store.mutate(messageInput(clock, "byte-1", { body: { format: "plain", text: "first" } })));
-		const second = logId(store.mutate(messageInput(clock, "byte-2", { body: { format: "plain", text: "second" } })));
-		const large = logId(store.mutate(messageInput(clock, "byte-3", { body: { format: "plain", text: "x".repeat(3_800) } })));
+		const first = logId(store.messages.mutate(messageInput(clock, "byte-1", { body: { format: "plain", text: "first" } })));
+		const second = logId(store.messages.mutate(messageInput(clock, "byte-2", { body: { format: "plain", text: "second" } })));
+		const large = logId(store.messages.mutate(messageInput(clock, "byte-3", { body: { format: "plain", text: "x".repeat(3_800) } })));
 
-		const capped = store.history({ roomId: "general", after: first, limit: 50, maxBytes: 4_500, now: clock.value });
+		const capped = sqliteOf(store).history({ roomId: "general", after: first, limit: 50, maxBytes: 4_500, now: clock.value });
 		expect(messagesOf(capped).map((entry) => BigInt(entry.log_id))).toEqual([first, second]);
 		expect(capped.first_log_id).toBe(String(first));
 		expect(capped.last_log_id).toBe(String(second));
 		expect(capped.more).toBe(true);
 
-		const continuation = store.history({ roomId: "general", after: second + 1n, limit: 50, maxBytes: 256 * 1024, now: clock.value });
+		const continuation = sqliteOf(store).history({ roomId: "general", after: second + 1n, limit: 50, maxBytes: 256 * 1024, now: clock.value });
 		expect(messagesOf(continuation).map((entry) => BigInt(entry.log_id))).toEqual([large]);
 		expect(continuation.more).toBe(false);
 	});
@@ -173,48 +174,48 @@ it("stops at a UTF-8 response byte cap without skipping a contiguous record", as
 
 it("rejects unknown rooms and returns a known empty thread's creation record", async () => {
 	await withStore("room-filters", {}, (store, clock) => {
-		const created = store.mutate(op(clock, "empty-thread", "room_set", { parent_room_id: "general", title: "No messages yet" }));
+		const created = store.messages.mutate(op(clock, "empty-thread", "room_set", { parent_room_id: "general", title: "No messages yet" }));
 		const roomId = String(created.result.room_id);
-		store.mutate(messageInput(clock, "outside-thread", { body: { format: "plain", text: "outside the empty thread" } }));
-		const empty = store.history({ roomId, limit: 50, now: clock.value });
+		store.messages.mutate(messageInput(clock, "outside-thread", { body: { format: "plain", text: "outside the empty thread" } }));
+		const empty = sqliteOf(store).history({ roomId, limit: 50, now: clock.value });
 		expect(empty.rooms?.map((room) => room.room_id)).toEqual([roomId]);
 		expect(empty.messages).toBeUndefined();
 		expect(empty.latest_log_id).toBe(roomId);
 		expect(empty.history_log_id).toBe(roomId);
 
-		expect(errorCode(() => store.history({ roomId: "missing", now: clock.value }))).toBe("invalid_params");
-		expect(errorCode(() => store.history({ roomId: "", now: clock.value }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).history({ roomId: "missing", now: clock.value }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).history({ roomId: "", now: clock.value }))).toBe("invalid_params");
 	});
 });
 
 it("lets a guest page back guestHistoryDepth records from each room's head, and no further", async () => {
 	await withStore("guest-depth", { ...ROOMY, guestHistoryDepth: 4 }, (store, clock) => {
-		const created = store.mutate(op(clock, "guest-thread", "room_set", { parent_room_id: "general", title: "Look around" }));
+		const created = store.messages.mutate(op(clock, "guest-thread", "room_set", { parent_room_id: "general", title: "Look around" }));
 		const thread = String(created.result.room_id);
 		const logs: bigint[] = [];
 		for (let index = 0; index < 8; index += 1) {
-			logs.push(logId(store.mutate(messageInput(clock, `guest-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
+			logs.push(logId(store.messages.mutate(messageInput(clock, `guest-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
 		}
-		store.mutate(messageInput(clock, "in-thread", { room_id: thread, body: { format: "plain", text: "in the thread" } }));
+		store.messages.mutate(messageInput(clock, "in-thread", { room_id: thread, body: { format: "plain", text: "in the thread" } }));
 		const head = logs[logs.length - 1];
 		const guest = { roomId: "general", limit: 2, now: clock.value, guest: true };
 		// The newest page, as a client without a checkpoint asks for it: `before` the head (§4.3.5).
-		const newest = store.history({ ...guest, before: head });
+		const newest = sqliteOf(store).history({ ...guest, before: head });
 		expect(messagesOf(newest).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(-2));
 		// A head the client captured a little earlier is still the newest page.
-		expect(messagesOf(store.history({ ...guest, before: logs[6] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5, 7));
+		expect(messagesOf(sqliteOf(store).history({ ...guest, before: logs[6] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5, 7));
 		// Scrolling back while fewer than four records lie past `before`.
-		expect(messagesOf(store.history({ ...guest, before: logs[4] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3, 5));
+		expect(messagesOf(sqliteOf(store).history({ ...guest, before: logs[4] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3, 5));
 		// Four past it is as far as a guest goes: older pages are for accounts.
-		const denied = (() => { try { store.history({ ...guest, before: logs[3] }); } catch (error) { return error as { code: string; message: string }; } })();
+		const denied = (() => { try { sqliteOf(store).history({ ...guest, before: logs[3] }); } catch (error) { return error as { code: string; message: string }; } })();
 		expect(denied).toMatchObject({ code: "denied", message: "Sign in to load older history" });
-		expect(messagesOf(store.history({ roomId: "general", limit: 2, now: clock.value, before: logs[3] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
+		expect(messagesOf(sqliteOf(store).history({ roomId: "general", limit: 2, now: clock.value, before: logs[3] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
 		// A window bounded by both, and catching up with `after`, stay open.
-		expect(messagesOf(store.history({ ...guest, after: logs[0], before: logs[1] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
+		expect(messagesOf(sqliteOf(store).history({ ...guest, after: logs[0], before: logs[1] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
 		// Every room is measured from its own head: a quiet thread opens however busy general is.
-		const threadPage = store.history({ roomId: thread, limit: 2, now: clock.value, guest: true, before: logs[0] });
+		const threadPage = sqliteOf(store).history({ roomId: thread, limit: 2, now: clock.value, guest: true, before: logs[0] });
 		expect(threadPage.rooms?.map((room) => room.room_id)).toEqual([thread]);
-		expect(errorCode(() => store.history({ ...guest, roomId: "missing", before: head }))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).history({ ...guest, roomId: "missing", before: head }))).toBe("invalid_params");
 	});
 });
 
@@ -222,33 +223,33 @@ it("counts a guest's page reaching below the hot floor as deep as it may go: wha
 	await withStore("guest-depth-tiers", { ...ROOMY, guestHistoryDepth: 3, tiered: true }, (store, clock, state) => {
 		const logs: bigint[] = [];
 		for (let index = 0; index < 6; index += 1) {
-			logs.push(logId(store.mutate(messageInput(clock, `tiered-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
+			logs.push(logId(store.messages.mutate(messageInput(clock, `tiered-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
 		}
 		// The four oldest moved to the tier below (D1): SQLite holds the newest two, history is published from the first.
 		const sql = state.storage.sql;
 		sql.exec("DELETE FROM records WHERE log_id < ?", Number(logs[4]));
 		sql.exec("UPDATE log_state SET history_floor = ? WHERE id = 1", Number(logs[4]));
 		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', ?)", String(logs[0]));
-		const reopened = new Store(state, { ...ROOMY, guestHistoryDepth: 3, tiered: true }, clock.clock);
-		reopened.initialize();
+		const reopened = openStore(state, { ...ROOMY, guestHistoryDepth: 3, tiered: true }, clock.clock);
+		reopened.lifecycle.initialize();
 		const guest = { roomId: "general", limit: 1, now: clock.value, guest: true };
 		// Three records lie past logs[2] (one in D1): as deep as a guest goes, though SQLite holds two of them.
-		expect(errorCode(() => reopened.history({ ...guest, before: logs[2] }))).toBe("denied");
-		expect(errorCode(() => reopened.history({ ...guest, before: logs[1] }))).toBe("denied");
+		expect(errorCode(() => sqliteOf(reopened).history({ ...guest, before: logs[2] }))).toBe("denied");
+		expect(errorCode(() => sqliteOf(reopened).history({ ...guest, before: logs[1] }))).toBe("denied");
 		// SQLite alone holds fewer than three past logs[2]: counted there only, the page would pass.
 		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE room_id = 'general' AND log_id > ?", Number(logs[2])).one().count).toBeLessThan(3);
 		// Within SQLite, guests page as before; accounts page anywhere.
-		expect(() => reopened.history({ ...guest, before: logs[5] })).not.toThrow();
-		expect(() => reopened.history({ roomId: "general", limit: 1, now: clock.value, before: logs[2] })).not.toThrow();
+		expect(() => sqliteOf(reopened).history({ ...guest, before: logs[5] })).not.toThrow();
+		expect(() => sqliteOf(reopened).history({ roomId: "general", limit: 1, now: clock.value, before: logs[2] })).not.toThrow();
 	});
 });
 
 it("holds an unclaimed placeholder to the registered posting limits, not the trusted ones", async () => {
 	await withStore("unclaimed-limits", { ...ROOMY, registeredPostsPerMinute: 2, trustedPostsPerMinute: 100, registeredPostsPerDay: 100, trustedPostsPerDay: 100 }, (store, clock) => {
-		store.restoreUsers([{ user_id: "zed", name: "Zed" }], clock.value);
-		store.createInvitedIdentity({ userId: "pal", name: "Pal", now: clock.value, ipKey: "ip" });
-		store.setRole({ userId: "pal", role: "friend", on: true, now: clock.value });
-		const post = (userId: string, index: number) => () => store.mutate(op(clock, `${userId}-${index}`, "message", { room_id: "general", body: { format: "plain", text: `${userId} ${index}` } }, userId));
+		sqliteOf(store).restoreUsers([{ user_id: "zed", name: "Zed" }], clock.value);
+		store.accounts.createInvited({ userId: "pal", name: "Pal", now: clock.value, ipKey: "ip" });
+		store.accounts.setRole({ userId: "pal", role: "friend", on: true, now: clock.value });
+		const post = (userId: string, index: number) => () => store.messages.mutate(op(clock, `${userId}-${index}`, "message", { room_id: "general", body: { format: "plain", text: `${userId} ${index}` } }, userId));
 		for (let index = 0; index < 2; index += 1) post("zed", index)();
 		expect(errorCode(post("zed", 2))).toBe("retry_after");
 		for (let index = 0; index < 3; index += 1) post("pal", index)();
@@ -259,65 +260,65 @@ it("keeps a refused guest page charged to its address, since measuring it read r
 	await withStore("guest-depth-charge", { ...ROOMY, guestHistoryDepth: 2 }, (store, clock, state) => {
 		const logs: bigint[] = [];
 		for (let index = 0; index < 4; index += 1) {
-			logs.push(logId(store.mutate(messageInput(clock, `charge-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
+			logs.push(logId(store.messages.mutate(messageInput(clock, `charge-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
 		}
 		const ipRows = () => state.storage.sql.exec<{ count: number }>(
 			"SELECT COUNT(*) AS count FROM principal_limits WHERE scope = 'history' AND principal_key = 'ip:guest-ip'").one().count;
 		const guest = { roomId: "general", limit: 1, now: clock.value, guest: true, userId: "guest_1", ipKey: "guest-ip" };
 		expect(ipRows()).toBe(0);
-		expect(errorCode(() => store.history({ ...guest, before: logs[0] }))).toBe("denied");
+		expect(errorCode(() => sqliteOf(store).history({ ...guest, before: logs[0] }))).toBe("denied");
 		expect(ipRows()).toBe(1);
 	});
 });
 
 it("advances a fully expired head past the room and keeps future IDs valid", async () => {
 	await withStore("expired-head", {}, (store, clock) => {
-		const logs = [0, 1, 2].map((index) => logId(store.mutate(messageInput(clock, `expired-${index}`, {
+		const logs = [0, 1, 2].map((index) => logId(store.messages.mutate(messageInput(clock, `expired-${index}`, {
 			body: { format: "plain", text: `expired-${index}` },
 		}))));
-		expect(store.getRoomState().latest_log_id).toBe(String(logs[2]));
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(String(logs[2]));
 
 		clock.value += RETENTION_MS + 1;
-		const cleanup = store.runCleanup(clock.value);
+		const cleanup = store.lifecycle.runCleanup(clock.value);
 		const expectedFloor = logs[2] + 1n;
 		expect(cleanup.history_floor).toBe(String(expectedFloor));
 		expect(cleanup.latest_id).toBe(String(logs[2]));
-		const room = store.getRoomState();
+		const room = sqliteOf(store).getRoomState();
 		expect(room.history_log_id).toBeNull();
 		expect(room.latest_log_id).toBe(String(logs[2]));
 
-		const empty = store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const empty = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(empty).toEqual({ more: false, latest_log_id: String(logs[2]), history_log_id: null });
 
-		const future = logId(store.mutate(messageInput(clock, "after-expiry", { body: { format: "plain", text: "new" } })));
+		const future = logId(store.messages.mutate(messageInput(clock, "after-expiry", { body: { format: "plain", text: "new" } })));
 		expect(future).toBeGreaterThanOrEqual(expectedFloor);
-		expect(store.getRoomState().latest_log_id).toBe(String(future));
-		expect(store.getRoomState().history_log_id).toBe(String(expectedFloor));
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(String(future));
+		expect(sqliteOf(store).getRoomState().history_log_id).toBe(String(expectedFloor));
 	});
 });
 
 it("continues bounded cleanup while retaining recent edits and moves out of a thread", async () => {
 	await withStore("cleanup-continuation", { ...ROOMY, cleanupBatch: 2 }, (store, clock) => {
-		const root = store.mutate(messageInput(clock, "cleanup-root", { body: { format: "plain", text: "root-old" } }));
+		const root = store.messages.mutate(messageInput(clock, "cleanup-root", { body: { format: "plain", text: "root-old" } }));
 		const rootId = String(root.result.message_id);
-		const thread = store.mutate(op(clock, "cleanup-thread", "room_set", { parent_room_id: "general", title: "Retained thread", description: "About the root" }));
+		const thread = store.messages.mutate(op(clock, "cleanup-thread", "room_set", { parent_room_id: "general", title: "Retained thread", description: "About the root" }));
 		const threadId = String(thread.result.room_id);
-		const reply = store.mutate(op(clock, "cleanup-reply", "message", { room_id: threadId, body: { format: "plain", text: "reply-old" } }));
+		const reply = store.messages.mutate(op(clock, "cleanup-reply", "message", { room_id: threadId, body: { format: "plain", text: "reply-old" } }));
 		const replyId = String(reply.result.message_id);
-		store.mutate(messageInput(clock, "cleanup-padding-1", { body: { format: "plain", text: "padding-1" } }));
-		const lastExpiredLog = logId(store.mutate(messageInput(clock, "cleanup-padding-2", { body: { format: "plain", text: "padding-2" } })));
+		store.messages.mutate(messageInput(clock, "cleanup-padding-1", { body: { format: "plain", text: "padding-1" } }));
+		const lastExpiredLog = logId(store.messages.mutate(messageInput(clock, "cleanup-padding-2", { body: { format: "plain", text: "padding-2" } })));
 
 		// The creation records expire, but the latest root edit and the move of
 		// the reply out of the thread remain inside the retention interval.
 		clock.value += RETENTION_MS - 1_000;
-		const recentRootLog = logId(store.mutate(messageInput(clock, "cleanup-root-edit", { message_id: rootId, body: { format: "plain", text: "root-recent" } })));
-		const departureLog = logId(store.mutate(messageInput(clock, "cleanup-reply-move", { message_id: replyId, body: { format: "plain", text: "reply-departed" } })));
+		const recentRootLog = logId(store.messages.mutate(messageInput(clock, "cleanup-root-edit", { message_id: rootId, body: { format: "plain", text: "root-recent" } })));
+		const departureLog = logId(store.messages.mutate(messageInput(clock, "cleanup-reply-move", { message_id: replyId, body: { format: "plain", text: "reply-departed" } })));
 
 		clock.value += 2_000;
 		const floors: string[] = [];
 		let runs = 0;
 		for (; runs < 12; runs += 1) {
-			const result = store.runCleanup(clock.value);
+			const result = store.lifecycle.runCleanup(clock.value);
 			floors.push(result.history_floor);
 			if (!result.did_work && result.next_due_ms > clock.value) break;
 			clock.value = result.next_due_ms + 1;
@@ -325,10 +326,10 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		expect(runs).toBeGreaterThan(1);
 		expect(floors).toEqual([...floors].sort((left, right) => Number(BigInt(left) - BigInt(right))));
 
-		const room = store.getRoomState();
+		const room = sqliteOf(store).getRoomState();
 		expect(BigInt(room.history_log_id!)).toBe(lastExpiredLog + 1n);
 		expect(BigInt(room.latest_log_id)).toBe(departureLog);
-		const history = store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		const history = sqliteOf(store).history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(history.history_log_id).toBe(room.history_log_id);
 		expect(messagesOf(history).map((entry) => BigInt(entry.log_id))).toEqual([recentRootLog, departureLog]);
 		expect(messagesOf(history)[0].body?.text).toBe("root-recent");
@@ -339,11 +340,11 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		expect(BigInt(room.log_id)).toBeLessThan(BigInt(rootId));
 
 		// The thread keeps its room record: the move still touches its log.
-		const retained = store.getRoomState(threadId);
+		const retained = sqliteOf(store).getRoomState(threadId);
 		expect(retained).toMatchObject({ log_id: threadId, title: "Retained thread", latest_log_id: String(departureLog) });
 		expect(retained.description).toBe("About the root");
 		expect(retained.history_log_id).toBe(room.history_log_id);
-		const threadHistory = store.history({ roomId: threadId, limit: 50, now: clock.value });
+		const threadHistory = sqliteOf(store).history({ roomId: threadId, limit: 50, now: clock.value });
 		expect(messagesOf(threadHistory).map((entry) => BigInt(entry.log_id))).toEqual([departureLog]);
 		expect(threadHistory.rooms).toBeUndefined();
 	});
@@ -351,36 +352,36 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 
 it("removes thread rooms whose entire log expired and keeps rooms with retained records", async () => {
 	await withStore("thread-expiry", ROOMY, (store, clock, state) => {
-		const stale = String(store.mutate(op(clock, "stale", "room_set", { parent_room_id: "general", title: "Stale" })).result.room_id);
-		store.mutate(op(clock, "stale-post", "message", { room_id: stale, body: { text: "old" } }));
-		const active = String(store.mutate(op(clock, "active", "room_set", { parent_room_id: "general", title: "Active" })).result.room_id);
+		const stale = String(store.messages.mutate(op(clock, "stale", "room_set", { parent_room_id: "general", title: "Stale" })).result.room_id);
+		store.messages.mutate(op(clock, "stale-post", "message", { room_id: stale, body: { text: "old" } }));
+		const active = String(store.messages.mutate(op(clock, "active", "room_set", { parent_room_id: "general", title: "Active" })).result.room_id);
 		clock.value += RETENTION_MS - 60_000;
-		const recent = store.mutate(op(clock, "active-post", "message", { room_id: active, body: { text: "recent" } }));
+		const recent = store.messages.mutate(op(clock, "active-post", "message", { room_id: active, body: { text: "recent" } }));
 		clock.value += 120_000;
 
 		const removed: string[] = [];
 		for (let run = 0; run < 8; run += 1) {
-			const result = store.runCleanup(clock.value);
+			const result = store.lifecycle.runCleanup(clock.value);
 			removed.push(...result.removed_rooms);
 			if (!result.did_work && result.next_due_ms > clock.value) break;
 			clock.value = result.next_due_ms + 1;
 		}
 		expect(removed).toEqual([stale]);
-		expect(store.getRoom(stale)).toBeNull();
-		expect(errorCode(() => store.mutate(op(clock, "late", "message", { room_id: stale, body: { text: "late" } })))).toBe("invalid_params");
-		expect(errorCode(() => store.history({ roomId: stale, now: clock.value }))).toBe("invalid_params");
+		expect(store.rooms.get(stale)).toBeNull();
+		expect(errorCode(() => store.messages.mutate(op(clock, "late", "message", { room_id: stale, body: { text: "late" } })))).toBe("invalid_params");
+		expect(errorCode(() => sqliteOf(store).history({ roomId: stale, now: clock.value }))).toBe("invalid_params");
 
 		// The active thread's creation record expired, so its room record is
 		// still listed (with its original log_id) while history starts later.
-		const kept = store.getRoomState(active);
+		const kept = sqliteOf(store).getRoomState(active);
 		expect(kept.log_id).toBe(active);
 		expect(BigInt(kept.history_log_id!)).toBeGreaterThan(BigInt(active));
 		expect(kept.latest_log_id).toBe(recent.message?.log_id);
-		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general", active]);
+		expect(store.rooms.list().map((room) => room.room_id)).toEqual(["general", active]);
 		// The released slot allows another thread under a one-thread ceiling.
-		const limited = new Store(state, { ...ROOMY, maxThreads: 2 }, clock.clock);
-		limited.initialize();
-		expect(limited.mutate(op(clock, "replacement", "room_set", { parent_room_id: "general", title: "Replacement" })).result.room_id).toBeTruthy();
+		const limited = openStore(state, { ...ROOMY, maxThreads: 2 }, clock.clock);
+		limited.lifecycle.initialize();
+		expect(limited.messages.mutate(op(clock, "replacement", "room_set", { parent_room_id: "general", title: "Replacement" })).result.room_id).toBeTruthy();
 	});
 });
 
@@ -427,15 +428,15 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 
 		clock.value += RETENTION_MS + 1;
 		const deleted = { records: 0, messages: 0, reactions: 0, rooms: 0, memberships: 0, requests: 0, limiters: 0 };
-		let lastResult: ReturnType<Store["runCleanup"]> | undefined;
+		let lastResult: ReturnType<Lifecycle["runCleanup"]> | undefined;
 		for (let run = 0; run < 10; run += 1) {
-			const before = store.storageAccounting();
+			const before = sqliteOf(store).storageAccounting();
 			try {
-				lastResult = store.runCleanup(clock.value);
+				lastResult = store.lifecycle.runCleanup(clock.value);
 			} catch (error) {
 				throw new Error(`full cleanup batch failed: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
 			}
-			const after = store.storageAccounting();
+			const after = sqliteOf(store).storageAccounting();
 			// The native reservation is per bounded maintenance batch. This
 			// catches an underestimated cleanupCost without requiring a mock SQL
 			// cursor or relying on a particular number of index rows.
@@ -456,7 +457,7 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 		expect(lastResult?.latest_id).toBe("200");
 		expect(lastResult?.did_work).toBe(false);
 		expect(state.storage.sql.exec("SELECT value FROM _meta WHERE key = 'thread_count'").one().value).toBe("0");
-		expect(store.getRoomState()).toMatchObject({ room_id: "general", latest_log_id: "200", history_log_id: null });
+		expect(sqliteOf(store).getRoomState()).toMatchObject({ room_id: "general", latest_log_id: "200", history_log_id: null });
 		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM message_state").one().count).toBe(0);
 		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM reaction_state").one().count).toBe(0);
 	});
@@ -490,9 +491,9 @@ it("keeps every cleanup batch within its reservation when expiring records name 
 		clock.value += RETENTION_MS + 1;
 		const deleted = { records: 0, messages: 0, reactions: 0 };
 		for (let run = 0; run < 200; run += 1) {
-			const before = store.storageAccounting();
-			const result = store.runCleanup(clock.value);
-			const after = store.storageAccounting();
+			const before = sqliteOf(store).storageAccounting();
+			const result = store.lifecycle.runCleanup(clock.value);
+			const after = sqliteOf(store).storageAccounting();
 			expect(after.writes - before.writes).toBeLessThanOrEqual(after.reservedWrites - before.reservedWrites);
 			expect(after.reads - before.reads).toBeLessThanOrEqual(after.reservedReads - before.reservedReads);
 			deleted.records += result.deleted_records;
@@ -502,7 +503,7 @@ it("keeps every cleanup batch within its reservation when expiring records name 
 			clock.value = result.next_due_ms + 1;
 		}
 		expect(deleted).toEqual({ records: 101, messages: 1, reactions: 64 });
-		expect(store.accountingStatus().unsafe).toBe(false);
+		expect(store.ops.accountingStatus().unsafe).toBe(false);
 		expect(sql.exec("SELECT COUNT(*) AS count FROM reaction_state").one().count).toBe(0);
 		expect(sql.exec("SELECT COUNT(*) AS count FROM message_state").one().count).toBe(0);
 	});
@@ -512,12 +513,12 @@ it("finishes removing an expired thread room after a saturated batch", async () 
 	// Regression: the room was left over when the deletion pass filled the
 	// batch, and the next run's idle check ended the job before removing it.
 	await withStore("thread-expiry-saturated", { ...ROOMY, retentionMs: 60_000, cleanupBatch: 2, maxThreads: 1 }, (store, clock) => {
-		const threadId = String(store.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "T" })).result.room_id);
+		const threadId = String(store.messages.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "T" })).result.room_id);
 		// Past the first cleanup deadline; everything is older than retention.
 		clock.value += 25 * 60 * 60_000;
 		const removed: string[] = [];
 		for (let run = 0; run < 8; run += 1) {
-			const result = store.runCleanup(clock.value);
+			const result = store.lifecycle.runCleanup(clock.value);
 			removed.push(...result.removed_rooms);
 			if (!result.did_work && result.next_due_ms > clock.value) {
 				// The job must not end (hourly deadline) while the room remains.
@@ -527,23 +528,23 @@ it("finishes removing an expired thread room after a saturated batch", async () 
 			clock.value = result.next_due_ms + 1;
 		}
 		expect(removed).toEqual([threadId]);
-		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general"]);
-		expect(store.mutate(op(clock, "thread-2", "room_set", { parent_room_id: "general", title: "T2" })).result.room_id).toBeTruthy();
+		expect(store.rooms.list().map((room) => room.room_id)).toEqual(["general"]);
+		expect(store.messages.mutate(op(clock, "thread-2", "room_set", { parent_room_id: "general", title: "T2" })).result.room_id).toBeTruthy();
 	});
 });
 
 it("lists only rooms whose history_log_id moved, charged to maintenance", async () => {
 	await withStore("changed-rooms", ROOMY, (store, clock) => {
-		const stale = String(store.mutate(op(clock, "stale", "room_set", { parent_room_id: "general", title: "Stale" })).result.room_id);
+		const stale = String(store.messages.mutate(op(clock, "stale", "room_set", { parent_room_id: "general", title: "Stale" })).result.room_id);
 		clock.value += RETENTION_MS - 60_000;
-		store.mutate(op(clock, "stale-post", "message", { room_id: stale, body: { text: "keeps the room" } }));
-		const fresh = String(store.mutate(op(clock, "fresh", "room_set", { parent_room_id: "general", title: "Fresh" })).result.room_id);
+		store.messages.mutate(op(clock, "stale-post", "message", { room_id: stale, body: { text: "keeps the room" } }));
+		const fresh = String(store.messages.mutate(op(clock, "fresh", "room_set", { parent_room_id: "general", title: "Fresh" })).result.room_id);
 		clock.value += 120_000;
-		const before = store.budget(clock.value);
-		const result = store.runCleanup(clock.value);
+		const before = sqliteOf(store).budget(clock.value);
+		const result = store.lifecycle.runCleanup(clock.value);
 		expect(result.history_floor).not.toBe(result.previous_floor);
-		const changed = store.listRooms(clock.value, { maintenance: true, changedSinceFloor: Number(result.previous_floor) });
-		const after = store.budget(clock.value);
+		const changed = store.rooms.list(clock.value, { maintenance: true, changedSinceFloor: Number(result.previous_floor) });
+		const after = sqliteOf(store).budget(clock.value);
 		// General and the stale thread lost history; the fresh thread's bound
 		// is its own creation record, which did not move.
 		expect(changed.map((room) => room.room_id).sort()).toEqual(["general", stale].sort());
@@ -554,7 +555,7 @@ it("lists only rooms whose history_log_id moved, charged to maintenance", async 
 });
 
 function register(store: Store, clock: TestClock, userId: string, rooms?: string[]) {
-	return store.registerIdentity({
+	return store.accounts.register({
 		userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
 		credential: { credentialId: `cred-${userId}`, userId, publicKey: "AAAA", counter: 0 }, ...(rooms ? { rooms } : {}),
 	});
@@ -574,68 +575,68 @@ it("logs registered memberships in the room's log and returns them in history's 
 			{ log_id: expect.any(String), room_id: "general", members: [{ user, joined: true }] },
 		]);
 		const start = identity.broadcasts[0].params.log_id as string;
-		expect(store.getRoomState().latest_log_id).toBe(start);
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(start);
 
 		// Creating a thread logs the room record, then the creator's membership.
-		const created = store.mutate(registered(clock, "thread", "room_set", { parent_room_id: "general", title: "Members" }, "reg_a"));
+		const created = store.messages.mutate(registered(clock, "thread", "room_set", { parent_room_id: "general", title: "Members" }, "reg_a"));
 		const roomId = String(created.result.room_id);
 		expect(created.membership?.params).toEqual({ log_id: expect.any(String), room_id: roomId, members: [{ user, joined: true }] });
 		expect(created.membership?.rooms).toEqual([roomId]);
 		expect(created.room?.latest_log_id).toBe(created.membership?.params.log_id);
 		expect(BigInt(created.room!.latest_log_id)).toBeGreaterThan(BigInt(roomId));
 		// A guest creator's membership lives in its connection: nothing logged.
-		const guestRoom = store.mutate(op(clock, "guest-thread", "room_set", { parent_room_id: "general", title: "Guest" }, "guest_x"));
+		const guestRoom = store.messages.mutate(op(clock, "guest-thread", "room_set", { parent_room_id: "general", title: "Guest" }, "guest_x"));
 		expect(guestRoom.membership).toBeUndefined();
 		expect(guestRoom.room?.latest_log_id).toBe(guestRoom.room?.log_id);
 
-		const leave = store.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId, join: false, now: clock.value });
+		const leave = store.rooms.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId, join: false, now: clock.value });
 		expect(leave.changed).toBe(true);
 		expect(leave.rooms).toEqual(["general"]);
 		expect(leave.membership?.params).toEqual({ log_id: expect.any(String), room_id: roomId, members: [{ user, joined: false }] });
 		expect(leave.room?.latest_log_id).toBe(leave.membership?.params.log_id);
 		// Leaving again changes nothing and logs nothing.
-		const again = store.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId, join: false, now: clock.value });
+		const again = store.rooms.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId, join: false, now: clock.value });
 		expect(again).toEqual({ rooms: ["general"], changed: false });
-		const rejoin = store.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId, join: true, now: clock.value });
+		const rejoin = store.rooms.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId, join: true, now: clock.value });
 		expect(rejoin.rooms).toEqual(["general", roomId]);
-		expect(errorCode(() => store.changeMembership({ userId: "guest_x", ipKey: "ip", roomId, join: true, now: clock.value }))).toBe("denied");
-		expect(errorCode(() => store.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId: "missing", join: true, now: clock.value }))).toBe("invalid_params");
+		expect(errorCode(() => store.rooms.changeMembership({ userId: "guest_x", ipKey: "ip", roomId, join: true, now: clock.value }))).toBe("denied");
+		expect(errorCode(() => store.rooms.changeMembership({ userId: "reg_a", ipKey: "ip-reg_a", roomId: "missing", join: true, now: clock.value }))).toBe("invalid_params");
 
-		const page = store.history({ roomId, after: 0n, limit: 50, now: clock.value });
+		const page = sqliteOf(store).history({ roomId, after: 0n, limit: 50, now: clock.value });
 		expect(page.rooms?.map((room) => room.room_id)).toEqual([roomId]);
 		expect(page.messages).toBeUndefined();
 		expect(page.memberships).toEqual([created.membership?.params, leave.membership?.params, rejoin.membership?.params]);
 		expect([page.first_log_id, page.last_log_id]).toEqual([roomId, rejoin.membership?.params.log_id]);
 		// A membership counts toward limit like any record, in log order.
-		const firstTwo = store.history({ roomId, after: 0n, limit: 2, now: clock.value });
+		const firstTwo = sqliteOf(store).history({ roomId, after: 0n, limit: 2, now: clock.value });
 		expect(firstTwo.rooms).toHaveLength(1);
 		expect(firstTwo.memberships).toEqual([created.membership?.params]);
 		expect(firstTwo.more).toBe(true);
-		const generalPage = store.history({ roomId: "general", after: BigInt(start), before: BigInt(start), now: clock.value });
+		const generalPage = sqliteOf(store).history({ roomId: "general", after: BigInt(start), before: BigInt(start), now: clock.value });
 		expect(generalPage.memberships).toEqual([identity.broadcasts[0].params]);
 
 		// Members are listed from storage, in user_id order, with current names.
 		register(store, clock, "reg_b", ["general", roomId, "no-such-room"]);
-		expect(store.getIdentity("reg_b")?.rooms).toEqual(["general", roomId]);
-		const members = store.roomMembers(["general", roomId, guestRoom.room!.room_id], 100, clock.value);
+		expect(store.accounts.get("reg_b")?.rooms).toEqual(["general", roomId]);
+		const members = store.rooms.members(["general", roomId, guestRoom.room!.room_id], 100, clock.value);
 		expect(members.get("general")).toEqual([{ user_id: "reg_a", name: "Name of reg_a", roles: [] }, { user_id: "reg_b", name: "Name of reg_b", roles: [] }]);
 		expect(members.get(roomId)?.map((member) => member.user_id)).toEqual(["reg_a", "reg_b"]);
 		expect(members.has(guestRoom.room!.room_id)).toBe(false);
-		expect(store.roomMembers([roomId], 1, clock.value).get(roomId)?.map((member) => member.user_id)).toEqual(["reg_a"]);
+		expect(store.rooms.members([roomId], 1, clock.value).get(roomId)?.map((member) => member.user_id)).toEqual(["reg_a"]);
 	});
 });
 
 it("purges an expired thread's memberships in bounded batches after removing it", async () => {
 	await withStore("membership-purge", { ...ROOMY, cleanupBatch: 2 }, (store, clock, state) => {
-		const thread = String(store.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "Leaving" })).result.room_id);
+		const thread = String(store.messages.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "Leaving" })).result.room_id);
 		for (const userId of ["reg_1", "reg_2", "reg_3"]) register(store, clock, userId, [thread]);
 		clock.value += RETENTION_MS + 1;
 		const removed: string[] = [];
 		let purged = 0;
 		for (let run = 0; run < 40; run += 1) {
-			const before = store.storageAccounting();
-			const result = store.runCleanup(clock.value);
-			const after = store.storageAccounting();
+			const before = sqliteOf(store).storageAccounting();
+			const result = store.lifecycle.runCleanup(clock.value);
+			const after = sqliteOf(store).storageAccounting();
 			expect(after.writes - before.writes).toBeLessThanOrEqual(after.reservedWrites - before.reservedWrites);
 			removed.push(...result.removed_rooms);
 			purged += result.deleted_memberships;
@@ -645,7 +646,7 @@ it("purges an expired thread's memberships in bounded batches after removing it"
 		expect(removed).toEqual([thread]);
 		expect(purged).toBe(3);
 		// Once the room is removed, the users' rooms no longer include it.
-		expect(store.getIdentity("reg_1")?.rooms).toEqual([]);
+		expect(store.accounts.get("reg_1")?.rooms).toEqual([]);
 		const rows = state.storage.sql.exec("SELECT COUNT(*) AS count FROM memberships WHERE room_id = ?", thread).one();
 		expect(rows.count).toBe(0);
 		expect(state.storage.sql.exec("SELECT value FROM _meta WHERE key = 'purge_rooms'").one().value).toBe("[]");
@@ -654,18 +655,18 @@ it("purges an expired thread's memberships in bounded batches after removing it"
 
 it("keeps the log head where it was when a commit rolls back after taking its log ID", async () => {
 	await withStore("rolled-back-head", ROOMY, (store, clock) => {
-		store.mutate(messageInput(clock, "kept", { body: { text: "kept" } }));
-		const head = store.logBounds().latest_log_id;
+		store.messages.mutate(messageInput(clock, "kept", { body: { text: "kept" } }));
+		const head = sqliteOf(store).logBounds().latest_log_id;
 		// The storage check after the commit fails (a store at its target): the records roll back.
-		const check = vi.spyOn(store as unknown as { assertStorageTarget(): void }, "assertStorageTarget").mockImplementationOnce(() => {
+		const check = vi.spyOn(sqliteOf(store) as unknown as { assertStorageTarget(): void }, "assertStorageTarget").mockImplementationOnce(() => {
 			throw new Error("over the target");
 		});
 		clock.value += 1_000;
-		expect(() => store.mutate(messageInput(clock, "refused", { body: { text: "refused" } }))).toThrow("over the target");
+		expect(() => store.messages.mutate(messageInput(clock, "refused", { body: { text: "refused" } }))).toThrow("over the target");
 		check.mockRestore();
 		// No record has the refused post's log ID, so the head does not claim it.
-		expect(store.logBounds().latest_log_id).toBe(head);
-		const next = store.mutate(messageInput(clock, "next", { body: { text: "next" } }));
+		expect(sqliteOf(store).logBounds().latest_log_id).toBe(head);
+		const next = store.messages.mutate(messageInput(clock, "next", { body: { text: "next" } }));
 		expect(logId(next)).toBeGreaterThan(BigInt(head));
 	});
 });

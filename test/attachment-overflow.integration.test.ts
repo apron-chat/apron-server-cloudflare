@@ -13,7 +13,7 @@ async function signedIn(userId: string, register = true): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as { store: Store; issueSession(userId: string, origin: string, now: number): Promise<string> };
 		if (register) {
-			runtime.store.registerIdentity({
+			runtime.store.accounts.register({
 				userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 			});

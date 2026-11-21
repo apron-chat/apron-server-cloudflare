@@ -2,7 +2,7 @@
 
 import type { LiveKind } from "../live-text";
 import type { ChatRecord, HistoryQuery } from "../history/records";
-import type { MembershipRecord, PendingUpload, ReactionsRecord } from "./rows";
+import type { MembershipRecord, ReactionsRecord } from "./rows";
 import type { StatusChoice } from "../presence";
 import type { RoomMute } from "../domain";
 
@@ -337,4 +337,85 @@ export interface RoomNotesCheck {
   full?: true;
   /** On a refusal, the public rooms holding the most past the minimum. */
   rooms?: Array<{ room_id: string; title?: string; bytes: number }>;
+}
+
+/** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
+export interface PendingUpload {
+  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar, `e/<id>` for a custom emoji or the server's avatar. */
+  key: string;
+  purpose: UploadPurpose;
+  embedId: string;
+  maxBytes: number;
+  writeExpiresMs: number;
+}
+
+/**
+ * What an upload is for: an attached `file`, a user's `avatar`, a custom
+ * `emoji`, or the server's own avatar (`server`, `/server avatar`).
+ */
+export type UploadPurpose = "file" | "avatar" | "emoji" | "server";
+
+export interface StoreHistoryQuery {
+  /** One room's log (§4.3.1); omitted, the log of `roomIds`. */
+  roomId?: string;
+  /**
+   * Without `roomId`, the log of these rooms together (§4.3): the rooms whose
+   * deliveries the requesting connection receives. Unknown ones, and private
+   * ones the requester is not in, are left out. Omitted, the default room.
+   */
+  roomIds?: readonly string[];
+  after?: string | bigint;
+  before?: string | bigint;
+  limit?: number;
+  now?: number;
+  /** Request identity for history quota accounting. */
+  userId?: string;
+  ipKey?: string;
+  /**
+   * A guest: charged to its address alone, which bounds every guest there,
+   * so a crowd of guests writes no limiter row each.
+   */
+  guest?: boolean;
+  maxBytes?: number;
+}
+
+export interface StoreCleanupResult {
+  /** The internal server-wide retention floor F after this run. */
+  history_floor: string;
+  /** F before this run; rooms' history_log_id changed when these differ. */
+  previous_floor: string;
+  /** The server-wide log head. */
+  latest_id: string;
+  deleted_records: number;
+  deleted_messages: number;
+  deleted_reactions: number;
+  /** Membership rows of removed thread rooms purged by this run. */
+  deleted_memberships: number;
+  deleted_requests: number;
+  deleted_limiters: number;
+  /** Thread rooms whose entire log expired; announce them as removed. */
+  removed_rooms: string[];
+  next_due_ms: number;
+  did_work: boolean;
+}
+
+/**
+ * A registered room member as listings carry it, with the `status` they
+ * chose and their `seen` (absent when none is recorded) when asked for.
+ */
+export interface RoomMember {
+  user_id: string;
+  name: string;
+  avatar?: string;
+  roles: string[];
+  ext?: Record<string, unknown>;
+  choice?: StatusChoice;
+  seen?: number;
+}
+
+/** What a message's wake claimed (Store.claimPushes). */
+export interface PushClaim {
+  subscriptions: ClaimedPush[];
+  /** Subscriptions left out by the daily server or sender allowance. */
+  skipped: number;
 }

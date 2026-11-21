@@ -1,8 +1,11 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { MAX_LISTED_USER_ROOMS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
+import { MAX_LISTED_USER_ROOMS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES } from '../src/domain';
+import { type Store, StoreError, defaultStoreConfig, openStore } from '../src/store';
 import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS, UPLOAD_POLICY } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
+import { sqliteOf } from "../src/store/open";
+import type { SqliteStore } from '../src/store/sqlite-store';
 
 // A day's retention with hourly cleanup, for tests that watch records expire.
 const ONE_DAY_RETENTION = { retentionMs: 86_400_000, cleanupIntervalMs: 3_600_000 };
@@ -58,8 +61,8 @@ function messageInput(
 	};
 }
 
-type Accounting = ReturnType<Store['storageAccounting']>;
-type Budget = ReturnType<Store['budget']>;
+type Accounting = ReturnType<SqliteStore['storageAccounting']>;
+type Budget = ReturnType<SqliteStore['budget']>;
 
 function diffAccounting(after: Accounting, before: Accounting) {
 	return {
@@ -86,7 +89,7 @@ type Cost = { observed: ReturnType<typeof diffAccounting>; reserved: ReturnType<
 
 /** The budget and accounting counters before an operation (see {@link costSince}). */
 function snapshot(store: Store): Snapshot {
-	return { budget: store.budget(), accounting: store.storageAccounting() };
+	return { budget: sqliteOf(store).budget(), accounting: sqliteOf(store).storageAccounting() };
 }
 
 /**
@@ -96,11 +99,11 @@ function snapshot(store: Store): Snapshot {
  * from the day row.
  */
 function costSince(store: Store, before: Snapshot): Cost {
-	const accounting = store.storageAccounting();
+	const accounting = sqliteOf(store).storageAccounting();
 	return {
 		observed: diffAccounting(accounting, before.accounting),
 		reserved: {
-			...diffBudget(store.budget(), before.budget),
+			...diffBudget(sqliteOf(store).budget(), before.budget),
 			reads: accounting.reservedReads - before.accounting.reservedReads,
 			writes: accounting.reservedWrites - before.accounting.reservedWrites,
 		},
@@ -159,29 +162,29 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-three-days-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(ONE_DAY_RETENTION), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(ONE_DAY_RETENTION), clock);
+			store.lifecycle.initialize();
 			const base = clock.now();
 			const { costs: operationCosts, measure } = costLog(store);
 
-			const first = measure('day-0 create', () => store.commitMutation(messageInput(clock, 'audit-user', 'day zero', 'day-0')));
+			const first = measure('day-0 create', () => store.messages.commit(messageInput(clock, 'audit-user', 'day zero', 'day-0')));
 			const firstMessageId = first.result.message_id as string | undefined;
 			expect(firstMessageId).toBeTruthy();
 
 			clock.set(clock.now() + DAY + 2 * HOUR);
-			measure('day-1 create', () => store.commitMutation(messageInput(clock, 'audit-user', 'day one', 'day-1')));
+			measure('day-1 create', () => store.messages.commit(messageInput(clock, 'audit-user', 'day one', 'day-1')));
 
 			clock.set(clock.now() + DAY);
-			measure('day-2 edit retained message', () => store.commitMutation(messageInput(clock, 'audit-user', 'edited after original expiry', 'day-2-edit', firstMessageId)));
-			measure('day-2 create', () => store.commitMutation(messageInput(clock, 'audit-user', 'day two', 'day-2')));
+			measure('day-2 edit retained message', () => store.messages.commit(messageInput(clock, 'audit-user', 'edited after original expiry', 'day-2-edit', firstMessageId)));
+			measure('day-2 create', () => store.messages.commit(messageInput(clock, 'audit-user', 'day two', 'day-2')));
 
 			clock.set(clock.now() + 11 * HOUR);
-			const cleanup = measure('cleanup', () => store.runCleanup(clock.now()));
-			const history = measure('history after cleanup', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
-			const room = store.getRoomState();
-			const observed = store.storageAccounting();
-			const budget = store.budget();
-			const size = store.databaseSize();
+			const cleanup = measure('cleanup', () => store.lifecycle.runCleanup(clock.now()));
+			const history = measure('history after cleanup', () => sqliteOf(store).historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			const room = sqliteOf(store).getRoomState();
+			const observed = sqliteOf(store).storageAccounting();
+			const budget = sqliteOf(store).budget();
+			const size = store.ops.databaseSize();
 
 			// The seeded general room record, the day-0 create, and the day-1
 			// create expire; the day-0 message survives through its day-2 edit.
@@ -214,11 +217,11 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-refund-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
-			store.commitMutation(messageInput(clock, 'refund-user', 'warm up', 'warm'));
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
+			store.messages.commit(messageInput(clock, 'refund-user', 'warm up', 'warm'));
 			const before = snapshot(store);
-			store.commitMutation(messageInput(clock, 'refund-user', 'refunded', 'refund'));
+			store.messages.commit(messageInput(clock, 'refund-user', 'refunded', 'refund'));
 			const { observed, reserved } = costSince(store, before);
 			return {
 				reserved: reserved.writes,
@@ -253,14 +256,14 @@ describe('measured storage accounting', () => {
 		});
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, config, clock);
-			store.initialize();
-			const accepted = store.commitMutation(messageInput(clock, 'reject-user', 'accepted', 'accepted'));
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
+			const accepted = store.messages.commit(messageInput(clock, 'reject-user', 'accepted', 'accepted'));
 			const afterAccepted = snapshot(store);
 
 			let quotaError: unknown;
 			try {
-				store.commitMutation(messageInput(clock, 'reject-user', 'rejected by post quota', 'rejected'));
+				store.messages.commit(messageInput(clock, 'reject-user', 'rejected by post quota', 'rejected'));
 			} catch (error) {
 				quotaError = error;
 			}
@@ -275,19 +278,19 @@ describe('measured storage accounting', () => {
 			expect(rejectedObserved.reads).toBeLessThanOrEqual(rejectedReserved.reads);
 			expect(rejectedObserved.writes).toBeLessThanOrEqual(rejectedReserved.writes);
 
-			let previousCapacityAccounting = store.storageAccounting();
+			let previousCapacityAccounting = sqliteOf(store).storageAccounting();
 			let reachedStableDenial = false;
 			// Rejected attempts are charged only what they read and wrote, so
 			// draining the small ceiling takes more of them.
 			for (let attempt = 0; attempt < 400; attempt += 1) {
 				let capacityError: unknown;
 				try {
-					store.commitMutation(messageInput(clock, 'reject-user', 'capacity stop', `capacity-${attempt}`));
+					store.messages.commit(messageInput(clock, 'reject-user', 'capacity stop', `capacity-${attempt}`));
 				} catch (error) {
 					capacityError = error;
 				}
 				expectRetryAfter(capacityError);
-				const currentAccounting = store.storageAccounting();
+				const currentAccounting = sqliteOf(store).storageAccounting();
 				if (currentAccounting.reads === previousCapacityAccounting.reads &&
 					currentAccounting.writes === previousCapacityAccounting.writes &&
 					currentAccounting.operations === previousCapacityAccounting.operations) {
@@ -304,7 +307,7 @@ describe('measured storage accounting', () => {
 				acceptedAccounting: afterAccepted.accounting,
 				rejectedObserved,
 				rejectedReserved,
-				budget: store.budget(),
+				budget: sqliteOf(store).budget(),
 				transitionCount: Number(transitions),
 			};
 		});
@@ -325,29 +328,29 @@ describe('measured storage accounting', () => {
 		const clockValue = futureUtcNoon();
 		const first = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(clockValue);
-			const store = new Store(state, config, clock);
-			store.initialize();
-			store.commitMutation(messageInput(clock, 'persistent-user', 'only daily post', 'persistent'));
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
+			store.messages.commit(messageInput(clock, 'persistent-user', 'only daily post', 'persistent'));
 			const limits = state.storage.sql.exec('SELECT scope, principal_key, level, level_ms, day, posts_day FROM principal_limits').toArray();
-			return { size: store.databaseSize(), budget: store.budget(), limits };
+			return { size: store.ops.databaseSize(), budget: sqliteOf(store).budget(), limits };
 		});
 		await evictDurableObject(stub);
 		const second = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(clockValue);
-			const store = new Store(state, config, clock);
-			store.initialize();
-			const afterInit = store.storageAccounting();
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
+			const afterInit = sqliteOf(store).storageAccounting();
 			expect(afterInit.writes).toBe(0);
 			let error: unknown;
 			try {
-				store.commitMutation(messageInput(clock, 'persistent-user', 'must remain limited', 'persistent-retry'));
+				store.messages.commit(messageInput(clock, 'persistent-user', 'must remain limited', 'persistent-retry'));
 			} catch (candidate) {
 				error = candidate;
 			}
 			expectRetryAfter(error);
 			const limits = state.storage.sql.exec('SELECT scope, principal_key, level, level_ms, day, posts_day FROM principal_limits').toArray();
 			const transitions = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE kind = 'message'").one().count;
-			return { afterInit, budget: store.budget(), size: store.databaseSize(), limits, transitions: Number(transitions) };
+			return { afterInit, budget: sqliteOf(store).budget(), size: store.ops.databaseSize(), limits, transitions: Number(transitions) };
 		});
 		console.info('accounting-persistence', JSON.stringify({ first, second }));
 		expect(second.budget.posts).toBe(first.budget.posts + 1);
@@ -360,8 +363,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-room-list-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! } }), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig({ push: { ...PUSH_POLICY! } }), clock);
+			store.lifecycle.initialize();
 			state.storage.transactionSync(() => {
 				for (let index = 1; index <= 100; index += 1) {
 					state.storage.sql.exec(
@@ -374,7 +377,7 @@ describe('measured storage accounting', () => {
 			});
 
 			const beforeListing = snapshot(store);
-			const rooms = store.listRooms(clock.now());
+			const rooms = store.rooms.list(clock.now());
 			const listing = costSince(store, beforeListing);
 			expect(rooms).toHaveLength(101);
 			expect(rooms[0].room_id).toBe('general');
@@ -384,7 +387,7 @@ describe('measured storage accounting', () => {
 			// A registration that starts in 100 rooms (a guest's, carried over)
 			// stores and logs a membership in each.
 			const beforeRegistration = snapshot(store);
-			const registered = store.registerIdentity({
+			const registered = store.accounts.register({
 				userId: 'lister', name: 'Lister', userHandle: 'lister-handle', now: clock.now(), ipKey: 'lister-ip',
 				credential: { credentialId: 'lister-credential', userId: 'lister', publicKey: 'key', counter: 0 },
 				rooms: ['general', ...Array.from({ length: 99 }, (_, index) => `thread-${index + 1}`), 'expired-thread'],
@@ -393,7 +396,7 @@ describe('measured storage accounting', () => {
 			expect(registered.broadcasts).toHaveLength(100);
 			expectWithinReserve(registration);
 			const beforeJoin = snapshot(store);
-			const joined = store.changeMembership({ userId: 'lister', ipKey: 'lister-ip', roomId: 'thread-100', join: true, now: clock.now() });
+			const joined = store.rooms.changeMembership({ userId: 'lister', ipKey: 'lister-ip', roomId: 'thread-100', join: true, now: clock.now() });
 			const join = costSince(store, beforeJoin);
 			expect(joined.rooms).toHaveLength(101);
 			expect(joined.rooms).not.toContain('expired-thread');
@@ -409,7 +412,7 @@ describe('measured storage accounting', () => {
 				}
 			});
 			const beforeMembers = snapshot(store);
-			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
+			const members = store.rooms.members(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
 			const memberListing = costSince(store, beforeMembers);
 			expect([...members.values()].every((list) => list.length === DEFAULT_LIMITS.roomListMembersPerRoom)).toBe(true);
 			expectWithinReserve(memberListing);
@@ -429,11 +432,11 @@ describe('measured storage accounting', () => {
 				}
 			});
 			const beforeStatus = snapshot(store);
-			const withStatus = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now(), undefined, true);
+			const withStatus = store.rooms.members(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now(), undefined, true);
 			const statusListing = costSince(store, beforeStatus);
 			expect(withStatus.get('general')?.find((member) => member.user_id === 'member-1')?.choice).toBe('dnd');
 			expectWithinReserve(statusListing);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			return { rooms: rooms.length, ...listing, registration, join, memberListing, statusListing };
 		});
 		console.info('accounting-room-list', JSON.stringify(result));
@@ -444,8 +447,8 @@ describe('measured storage accounting', () => {
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const maxThreads = 250;
-			const store = new Store(state, defaultStoreConfig({ maxThreads }), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig({ maxThreads }), clock);
+			store.lifecycle.initialize();
 			// More recent threads than the cap allows, as after a window lengthened
 			// since, and more rooms than a user's own listing (MAX_USER_ROOMS, 351).
 			const count = maxThreads + 150;
@@ -461,20 +464,20 @@ describe('measured storage accounting', () => {
 			});
 
 			const beforeListing = snapshot(store);
-			const rooms = store.listRooms(clock.now());
+			const rooms = store.rooms.list(clock.now());
 			const listing = costSince(store, beforeListing);
 			// Every one is named: a listing names twice the thread limit.
 			expect(rooms).toHaveLength(count + 1);
 			expectWithinReserve(listing);
 
 			const beforeCounts = snapshot(store);
-			expect(store.roomCounts(clock.now()).public.recent).toBe(count);
+			expect(store.rooms.counts(clock.now()).public.recent).toBe(count);
 			const counting = costSince(store, beforeCounts);
 			expectWithinReserve(counting);
 
 			// A registration that starts in as many rooms as the thread limit.
 			const beforeRegistration = snapshot(store);
-			const registered = store.registerIdentity({
+			const registered = store.accounts.register({
 				userId: 'lister', name: 'Lister', userHandle: 'lister-handle', now: clock.now(), ipKey: 'lister-ip',
 				credential: { credentialId: 'lister-credential', userId: 'lister', publicKey: 'key', counter: 0 },
 				rooms: ['general', ...Array.from({ length: maxThreads }, (_, index) => `thread-${index + 1}`)],
@@ -488,11 +491,11 @@ describe('measured storage accounting', () => {
 				for (const room of rooms) state.storage.sql.exec('INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)', room.room_id, 'lister');
 			});
 			const beforeMembers = snapshot(store);
-			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
+			const members = store.rooms.members(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembersPerRoom, clock.now());
 			const memberListing = costSince(store, beforeMembers);
 			expect(rooms.every((room) => members.get(room.room_id)?.some((member) => member.user_id === 'lister'))).toBe(true);
 			expectWithinReserve(memberListing);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			return { rooms: rooms.length, listing, counting, registration, memberListing };
 		});
 		console.info('accounting-room-list-scaled', JSON.stringify(result));
@@ -502,8 +505,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-registration-guest-rooms');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
 			// A guest joins older threads too, so more rooms than the thread limit;
 			// past what a connection carries (MAX_LISTED_USER_ROOMS), the rest are not joined.
 			const count = MAX_LISTED_USER_ROOMS + 10;
@@ -519,7 +522,7 @@ describe('measured storage accounting', () => {
 			});
 			const rooms = ['general', ...Array.from({ length: count }, (_, index) => `thread-${index + 1}`)];
 			const before = snapshot(store);
-			const registered = store.registerIdentity({
+			const registered = store.accounts.register({
 				userId: 'carrier', name: 'Carrier', userHandle: 'carrier-handle', now: clock.now(), ipKey: 'carrier-ip',
 				credential: { credentialId: 'carrier-credential', userId: 'carrier', publicKey: 'key', counter: 0 },
 				// Duplicates count once.
@@ -539,8 +542,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-member-status-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! }, memberCacheMs: MINUTE }), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig({ push: { ...PUSH_POLICY! }, memberCacheMs: MINUTE }), clock);
+			store.lifecycle.initialize();
 			const members = DEFAULT_LIMITS.roomListMembersPerRoom;
 			// Four rooms of `members` registered members each: none with status
 			// state; each with two live waking registrations and a room mute
@@ -580,16 +583,16 @@ describe('measured storage accounting', () => {
 				}
 			});
 			// Rows written behind the store's back: start from nothing kept.
-			(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+			(sqliteOf(store) as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
 			const listing: Record<string, { plain: Cost; status: Cost; perMember: number }> = {};
 			for (const population of populations) {
-				(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+				(sqliteOf(store) as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
 				const beforePlain = snapshot(store);
-				store.roomMembers([population], members, clock.now());
+				store.rooms.members([population], members, clock.now());
 				const plain = costSince(store, beforePlain);
-				(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+				(sqliteOf(store) as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
 				const beforeStatus = snapshot(store);
-				store.roomMembers([population], members, clock.now(), undefined, true);
+				store.rooms.members([population], members, clock.now(), undefined, true);
 				const status = costSince(store, beforeStatus);
 				expectWithinReserve(plain);
 				expectWithinReserve(status);
@@ -602,9 +605,9 @@ describe('measured storage accounting', () => {
 			expect(listing.worst.perMember).toBeLessThanOrEqual(1.05);
 
 			// A listing again within memberCacheMs reads nothing and reserves nothing.
-			store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			store.rooms.members(['mixed'], members, clock.now(), undefined, true);
 			const beforeReuse = snapshot(store);
-			const reused = store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const reused = store.rooms.members(['mixed'], members, clock.now(), undefined, true);
 			const reuse = costSince(store, beforeReuse);
 			expect(reuse.observed).toEqual({ reads: 0, writes: 0, operations: 0 });
 			expect(reuse.reserved.reads).toBe(0);
@@ -613,22 +616,22 @@ describe('measured storage accounting', () => {
 			expect([chosen('mixed-000'), chosen('mixed-001'), chosen('mixed-002'), chosen('mixed-007')]).toEqual(['online', 'invisible', 'online', '']);
 			// Without status, a different listing.
 			const beforePlainAgain = snapshot(store);
-			store.roomMembers(['mixed'], members, clock.now(), undefined, false);
+			store.rooms.members(['mixed'], members, clock.now(), undefined, false);
 			expect(costSince(store, beforePlainAgain).observed.reads).toBeGreaterThan(0);
 			// Any write to what a listing read ends the reuse.
-			store.registerIdentity({
+			store.accounts.register({
 				userId: 'writer', name: 'Writer', userHandle: 'writer-handle', now: clock.now(), ipKey: 'writer-ip',
 				credential: { credentialId: 'writer-credential', userId: 'writer', publicKey: 'key', counter: 0 },
 			});
 			const beforeWrite = snapshot(store);
-			store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			store.rooms.members(['mixed'], members, clock.now(), undefined, true);
 			const afterWrite = costSince(store, beforeWrite);
 			expect(afterWrite.observed.reads).toBeGreaterThan(2 * members);
 			// And so does time: past memberCacheMs it is read again.
 			const beforeExpiry = snapshot(store);
-			store.roomMembers(['mixed'], members, clock.now() + MINUTE, undefined, true);
+			store.rooms.members(['mixed'], members, clock.now() + MINUTE, undefined, true);
 			expect(costSince(store, beforeExpiry).observed.reads).toBeGreaterThan(2 * members);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			return { listing, reuse };
 		});
 		console.info('accounting-member-status', JSON.stringify(result));
@@ -638,8 +641,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-history-cardinality-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
 			const totalRows = 180;
 			const kinds = ['message', 'reactions', 'room'] as const;
 			state.storage.transactionSync(() => {
@@ -661,7 +664,7 @@ describe('measured storage accounting', () => {
 			});
 
 			const before = snapshot(store);
-			const page = store.historyPage({ roomId: 'general', after: '0', limit: 50, now: clock.now() });
+			const page = sqliteOf(store).historyPage({ roomId: 'general', after: '0', limit: 50, now: clock.now() });
 			const cost = costSince(store, before);
 			expect((page.rooms?.length ?? 0) + messagesOf(page).length + (page.reactions?.length ?? 0)).toBe(50);
 			expect(page.rooms).toHaveLength(17);
@@ -688,10 +691,10 @@ describe('measured storage accounting', () => {
 		});
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, config, clock);
-			store.initialize();
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
 			const identity = (userId: string) => ({ user_id: userId, name: 'n'.repeat(config.maxNameBytes) });
-			const created = store.commitMutation({
+			const created = store.messages.commit({
 				userId: 'mover', ipKey: 'move-ip', requestId: 'target', method: 'message', now: clock.now(),
 				params: { room_id: 'general', body: { text: 'moving' } }, identity: identity('mover'),
 			});
@@ -701,7 +704,7 @@ describe('measured storage accounting', () => {
 			let reactionCost: Cost | undefined;
 			for (let index = 0; index < 64; index += 1) {
 				const before = snapshot(store);
-				store.commitMutation({
+				store.messages.commit({
 					userId: `reactor-${index}`, ipKey: `react-ip-${index}`, requestId: `react-${index}`, method: 'reactions', now: clock.now(),
 					params: { message_id: messageId, emojis }, identity: identity(`reactor-${index}`),
 				});
@@ -709,12 +712,12 @@ describe('measured storage accounting', () => {
 				expectWithinReserve(cost);
 				if (!reactionCost || cost.observed.writes >= reactionCost.observed.writes) reactionCost = cost;
 			}
-			const thread = store.commitMutation({
+			const thread = store.messages.commit({
 				userId: 'mover', ipKey: 'move-ip', requestId: 'thread', method: 'room_set', now: clock.now(),
 				params: { parent_room_id: 'general', title: 'Destination' }, identity: identity('mover'),
 			});
 			const beforeMove = snapshot(store);
-			const moved = store.commitMutation({
+			const moved = store.messages.commit({
 				userId: 'mover', ipKey: 'move-ip', requestId: 'move', method: 'message', now: clock.now(),
 				params: { message_id: messageId, room_id: thread.result.room_id, body: { text: 'moved' } }, identity: identity('mover'),
 			});
@@ -724,7 +727,7 @@ describe('measured storage accounting', () => {
 			const recordBytes = new TextEncoder().encode(JSON.stringify(moved.broadcasts[1].params)).byteLength;
 			expectWithinReserve(move);
 			// The re-logged record still fits one history response.
-			const page = store.historyPage({ roomId: String(thread.result.room_id), after: '0', limit: 50, now: clock.now() });
+			const page = sqliteOf(store).historyPage({ roomId: String(thread.result.room_id), after: '0', limit: 50, now: clock.now() });
 			expect(page.reactions?.[0].reactions).toHaveLength(64);
 			expect(recordBytes).toBeLessThan(config.maxHistoryResponseBytes);
 			return { reaction: reactionCost, move, recordBytes };
@@ -738,15 +741,15 @@ describe('measured storage accounting', () => {
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const midnight = (Math.floor(Date.now() / DAY) + 2) * DAY;
 			const clock = new FakeClock(midnight - 20_000);
-			const store = new Store(state, config, clock);
-			store.initialize();
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
 			const { costs, measure, measureFailure } = costLog(store);
 			const maximumText = 'x'.repeat(config.maxTextBytes);
 			// Preserve a large extension field as part of the snapshot so this
 			// calibration reaches the snapshot ceiling instead of measuring only
 			// the body-text limit; the rest of the snapshot is about 250 bytes.
 			const maximumExtensions = { ext: { padding: 'p'.repeat(config.maxSnapshotBytes - config.maxTextBytes - 342) } };
-			const first = measure('maximum snapshot create', () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, 'maximum-create', undefined, maximumExtensions)));
+			const first = measure('maximum snapshot create', () => store.messages.commit(messageInput(clock, 'calibration-user', maximumText, 'maximum-create', undefined, maximumExtensions)));
 			const messageId = first.result.message_id as string | undefined;
 			expect(messageId).toBeTruthy();
 			const snapshotBytes = JSON.stringify(first.message).length;
@@ -757,36 +760,36 @@ describe('measured storage accounting', () => {
 			// sixth is intentionally rejected before the UTC rollover.
 			for (let index = 0; index < 4; index += 1) {
 				clock.set(midnight - 19_000 + index * 1_000);
-				measure(`maximum snapshot edit pre-midnight ${index + 1}`, () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, `maximum-edit-pre-${index}`, messageId, maximumExtensions)));
+				measure(`maximum snapshot edit pre-midnight ${index + 1}`, () => store.messages.commit(messageInput(clock, 'calibration-user', maximumText, `maximum-edit-pre-${index}`, messageId, maximumExtensions)));
 			}
 			clock.set(midnight - 15_000);
-			const rejected = measureFailure('sixth pre-midnight post', () => store.commitMutation(messageInput(clock, 'calibration-user', 'must be rejected', 'pre-midnight-rejected')));
+			const rejected = measureFailure('sixth pre-midnight post', () => store.messages.commit(messageInput(clock, 'calibration-user', 'must be rejected', 'pre-midnight-rejected')));
 			expectRetryAfter(rejected);
 
 			for (let index = 0; index < 5; index += 1) {
 				clock.set(midnight + 61_000 + index * 1_000);
-				measure(`post-midnight burst ${index + 1}`, () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, `maximum-create-post-${index}`, undefined, maximumExtensions)));
+				measure(`post-midnight burst ${index + 1}`, () => store.messages.commit(messageInput(clock, 'calibration-user', maximumText, `maximum-create-post-${index}`, undefined, maximumExtensions)));
 			}
 
 			for (let group = 0; group < 2; group += 1) {
 				const start = midnight + 130_000 + group * 61_000;
 				for (let index = 0; index < 4; index += 1) {
 					clock.set(start + index * 1_000);
-					measure(`maximum snapshot edit group ${group + 1}.${index + 1}`, () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, `maximum-edit-${group}-${index}`, messageId, maximumExtensions)));
+					measure(`maximum snapshot edit group ${group + 1}.${index + 1}`, () => store.messages.commit(messageInput(clock, 'calibration-user', maximumText, `maximum-edit-${group}-${index}`, messageId, maximumExtensions)));
 				}
 			}
 
 			// Maximum snapshots fill a history response before its record limit,
 			// so the 18 accepted transitions span pages.
 			const accepted: ReturnType<typeof messagesOf> = [];
-			let page = store.historyPage({ roomId: 'general', limit: 50, now: clock.now() });
+			let page = sqliteOf(store).historyPage({ roomId: 'general', limit: 50, now: clock.now() });
 			accepted.push(...messagesOf(page));
 			while (page.more && page.first_log_id) {
-				page = store.historyPage({ roomId: 'general', limit: 50, before: page.first_log_id, now: clock.now() });
+				page = sqliteOf(store).historyPage({ roomId: 'general', limit: 50, before: page.first_log_id, now: clock.now() });
 				accepted.push(...messagesOf(page));
 			}
 			// As the store holds it: a principal's row is written at most once a minute.
-			const limiter = store.limiterDay('post', 'anonymous:audit-ip', clock.now());
+			const limiter = sqliteOf(store).limiterDay('post', 'anonymous:audit-ip', clock.now());
 			expect(new Set(accepted.map((entry) => entry.log_id)).size).toBe(18);
 			expect(limiter.posts_day).toBe(13);
 			expect(limiter.day).toBe(new Date(clock.now()).toISOString().slice(0, 10));
@@ -826,14 +829,14 @@ describe('measured storage accounting', () => {
 		});
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, config, clock);
-			store.initialize();
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
 			const foregroundDay = new Date(clock.now()).toISOString().slice(0, 10);
 			let acceptedMutations = 0;
 			// Mutations are charged what they actually wrote, so more fit.
 			for (let index = 0; index < 200; index += 1) {
 				try {
-					store.commitMutation(messageInput(clock, 'maintenance-user', `accepted-${index}`, `maintenance-${index}`));
+					store.messages.commit(messageInput(clock, 'maintenance-user', `accepted-${index}`, `maintenance-${index}`));
 					acceptedMutations += 1;
 				} catch (candidate) {
 					expectRetryAfter(candidate);
@@ -843,25 +846,25 @@ describe('measured storage accounting', () => {
 			expect(acceptedMutations).toBeGreaterThanOrEqual(2);
 			let error: unknown;
 			try {
-				store.commitMutation(messageInput(clock, 'maintenance-user', 'foreground exhausted', 'maintenance-final'));
+				store.messages.commit(messageInput(clock, 'maintenance-user', 'foreground exhausted', 'maintenance-final'));
 			} catch (candidate) {
 				error = candidate;
 			}
 			expectRetryAfter(error);
-			const beforeCleanup = store.storageAccounting();
+			const beforeCleanup = sqliteOf(store).storageAccounting();
 			clock.set(clock.now() + DAY + HOUR + 1);
 			// One run deletes what its reservation covers; posts cost few enough rows that more were accepted than that.
-			const cleanup = store.runCleanup(clock.now());
+			const cleanup = store.lifecycle.runCleanup(clock.now());
 			for (let run = 0; run < 10; run += 1) {
 				// The next batch is due a moment after the last.
 				clock.set(clock.now() + MINUTE);
-				const next = store.runCleanup(clock.now());
+				const next = store.lifecycle.runCleanup(clock.now());
 				if (!next.deleted_records && !next.deleted_messages) break;
 				cleanup.deleted_records += next.deleted_records;
 				cleanup.deleted_messages += next.deleted_messages;
 				cleanup.history_floor = next.history_floor;
 			}
-			const afterCleanup = store.storageAccounting();
+			const afterCleanup = sqliteOf(store).storageAccounting();
 			const maintenanceDay = new Date(clock.now()).toISOString().slice(0, 10);
 			const budgetRows = state.storage.sql.exec<{
 				day: string;
@@ -887,8 +890,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-read-receipts-room-size-v1');
 		await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
 			const sql = state.storage.sql;
 			const fill = (roomId: string, count: number) => {
 				for (let index = 0; index < count; index += 1) sql.exec('INSERT INTO memberships (room_id, user_id) VALUES (?, ?)', roomId, `m${String(index).padStart(3, '0')}`);
@@ -908,9 +911,9 @@ describe('measured storage accounting', () => {
 			sql.exec('INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)', 'm001', 'private_ten', 301);
 			// Eleven members: too large.
 			fill('private_eleven', 11);
-			const found = store.roomReadCursors(['private_large', 'private_ten', 'private_eleven'], 'm001', clock.now());
+			const found = store.reads.roomCursors(['private_large', 'private_ten', 'private_eleven'], 'm001', clock.now());
 			expect([...found]).toEqual([['private_ten', [['m009', '309']]]]);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
@@ -920,8 +923,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-top-level-rooms-v1');
 		await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
 			state.storage.transactionSync(() => {
 				const room = (roomId: string, parent: string | null, logId: number) => state.storage.sql.exec(
 					`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
@@ -932,10 +935,10 @@ describe('measured storage accounting', () => {
 				for (let index = 1; index <= 16; index += 1) room(`top-${index}`, null, clock.now() + index);
 				for (let index = 1; index <= 120; index += 1) room(`thread-${index}`, 'general', clock.now() + 100 + index);
 			});
-			const ids = store.topLevelRoomIds(clock.now());
+			const ids = store.rooms.topLevelIds(clock.now());
 			expect(ids).toHaveLength(17);
 			expect(ids[0]).toBe('general');
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
@@ -943,8 +946,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-avatar-scan-v1');
 		await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
+			store.lifecycle.initialize();
 			const sql = state.storage.sql;
 			const upload = (key: string, purpose: string, uploadState: string) => sql.exec(
 				`INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
@@ -961,12 +964,12 @@ describe('measured storage accounting', () => {
 				upload('a/old', 'avatar', 'done');
 				upload('a/new', 'avatar', 'writing');
 			});
-			const replaced = store.finishUpload({ key: 'a/new', ok: true, bytes: 512, contentType: 'image/png' }, clock.now());
+			const replaced = store.uploads.finish({ key: 'a/new', ok: true, bytes: 512, contentType: 'image/png' }, clock.now());
 			expect(replaced.accepted).toBe(true);
 			expect(replaced.deletedUploads).toEqual(['a/old']);
-			expect(store.accountingStatus().unsafe).toBe(false);
-			expect(store.clearAvatar({ userId: 'heavy', now: clock.now() })).toEqual({ changed: true, deletedUploads: ['a/new'] });
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
+			expect(store.uploads.clearAvatar({ userId: 'heavy', now: clock.now() })).toEqual({ changed: true, deletedUploads: ['a/new'] });
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
@@ -974,8 +977,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-server-avatar-scan-v1');
 		await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
+			store.lifecycle.initialize();
 			const sql = state.storage.sql;
 			const upload = (key: string, uploadState: string) => sql.exec(
 				`INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
@@ -987,10 +990,10 @@ describe('measured storage accounting', () => {
 				for (let index = 0; index < 3 * UPLOAD_POLICY!.uploadsPerUserDay; index += 1) upload(`a/pending-${index}`, 'writing');
 				upload('a/server-old', 'done');
 			});
-			expect(store.finishUpload({ key: 'a/pending-0', ok: true, bytes: 512, contentType: 'image/png' }, clock.now()).deletedUploads).toEqual(['a/server-old']);
-			expect(store.accountingStatus().unsafe).toBe(false);
-			expect(store.clearServerAvatar(clock.now()).deletedUploads).toEqual(['a/pending-0']);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.uploads.finish({ key: 'a/pending-0', ok: true, bytes: 512, contentType: 'image/png' }, clock.now()).deletedUploads).toEqual(['a/server-old']);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
+			expect(store.server.clearAvatar(clock.now()).deletedUploads).toEqual(['a/pending-0']);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
@@ -998,8 +1001,8 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-idle-bots-v1');
 		await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
 			state.storage.transactionSync(() => {
 				for (let index = 0; index < 60; index += 1) {
 					state.storage.sql.exec(
@@ -1011,10 +1014,10 @@ describe('measured storage accounting', () => {
 			});
 			const sweep = { before: clock.now(), limit: 4, intervalMs: DAY, graceMs: HOUR };
 			// The first sweep only schedules the next, a grace later.
-			expect(store.idleBots({ now: clock.now(), ...sweep })).toEqual([]);
+			expect(store.accounts.idleBots({ now: clock.now(), ...sweep })).toEqual([]);
 			clock.set(clock.now() + 2 * HOUR);
-			expect(store.idleBots({ now: clock.now(), ...sweep })).toEqual(['bot-0', 'bot-1', 'bot-2', 'bot-3']);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.accounts.idleBots({ now: clock.now(), ...sweep })).toEqual(['bot-0', 'bot-1', 'bot-2', 'bot-3']);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
@@ -1023,16 +1026,16 @@ describe('measured storage accounting', () => {
 		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, config, clock);
-			store.initialize();
+			const store = openStore(state, config, clock);
+			store.lifecycle.initialize();
 			const { costs, measure, measureAsync } = costLog(store);
 
-			measure('auth attempt reservation', () => store.reserveAuthAttempt({ ipKey: 'matrix-auth', now: clock.now() }));
-			measure('frame reservation', () => store.reserveFrames({ ipKey: 'matrix-frame-ip', now: clock.now(), count: 1 }));
-			measure('frame block', () => store.reserveFrames({ ipKey: 'matrix-block-ip', now: clock.now(), count: DEFAULT_LIMITS.frameLease }));
-			measure('guest number block', () => store.reserveGuestNumbers(DEFAULT_LIMITS.guestNumberBlock, clock.now()));
-			measure('connection admission reservation', () => store.reserveConnection({ ipKey: 'matrix-connection-ip', now: clock.now() }));
-			measure('identity registration', () => store.registerIdentity({
+			measure('auth attempt reservation', () => store.admission.reserveAuthAttempt({ ipKey: 'matrix-auth', now: clock.now() }));
+			measure('frame reservation', () => store.admission.reserveFrames({ ipKey: 'matrix-frame-ip', now: clock.now(), count: 1 }));
+			measure('frame block', () => store.admission.reserveFrames({ ipKey: 'matrix-block-ip', now: clock.now(), count: DEFAULT_LIMITS.frameLease }));
+			measure('guest number block', () => store.admission.reserveGuestNumbers(DEFAULT_LIMITS.guestNumberBlock, clock.now()));
+			measure('connection admission reservation', () => store.admission.reserveConnection({ ipKey: 'matrix-connection-ip', now: clock.now() }));
+			measure('identity registration', () => store.accounts.register({
 				userId: 'matrix-user',
 				name: 'Matrix user',
 				userHandle: 'matrix-handle',
@@ -1040,154 +1043,154 @@ describe('measured storage accounting', () => {
 				now: clock.now(),
 				ipKey: 'matrix-registration-ip',
 			}));
-			measure('credential lookup', () => store.getCredential('matrix-credential'));
-			measure('identity lookup', () => store.getIdentity('matrix-user'));
-			measure('identity count', () => store.countIdentities());
-			measure('credential IDs lookup', () => store.credentialIdsForUser('matrix-user'));
-			measure('credential counter update', () => store.updateCredentialCounter('matrix-credential', 1));
+			measure('credential lookup', () => store.credentials.get('matrix-credential'));
+			measure('identity lookup', () => store.accounts.get('matrix-user'));
+			measure('identity count', () => sqliteOf(store).countIdentities());
+			measure('credential IDs lookup', () => store.credentials.idsForUser('matrix-user'));
+			measure('credential counter update', () => store.credentials.updateCounter('matrix-credential', 1));
 			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), pushId: 'p'.repeat(64) };
-			measure('push subscription register', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
-			measure('push subscription register again, unchanged', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
-			expect(measure('push wake claim', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('push subscription register', () => store.push.register({ ...subscription, now: clock.now() }));
+			measure('push subscription register again, unchanged', () => store.push.register({ ...subscription, now: clock.now() }));
+			expect(measure('push wake claim', () => store.push.claim({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
 			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
-			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
-			measure('push registrations clear', () => store.clearPushSubscriptions('matrix-other', clock.now()));
-			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
+			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.push.claim({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('push registrations clear', () => store.push.clearSubscriptions('matrix-other', clock.now()));
+			measure('gone push subscription forget', () => store.push.forgetSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
-			const create = measure('message create', () => store.commitMutation({
+			const create = measure('message create', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-message', method: 'message', now: clock.now(),
 				params: { room_id: 'general', body: { text: 'matrix message', format: 'plain' } }, identity,
 			}));
-			measure('deduplicated mutation retry', () => store.commitMutation({
+			measure('deduplicated mutation retry', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-message', method: 'message', now: clock.now(),
 				params: { room_id: 'general', body: { text: 'matrix message', format: 'plain' } }, identity,
 			}));
 			const messageId = create.result.message_id as string;
-			expect(measure('push reply author lookup', () => store.messageAuthor(messageId, clock.now()))).toBe('matrix-user');
-			store.registerPushSubscription({ ...subscription, now: clock.now() });
-			expect(measure('push wake claim for a reply', () => store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
+			expect(measure('push reply author lookup', () => store.messages.author(messageId, clock.now()))).toBe('matrix-user');
+			store.push.register({ ...subscription, now: clock.now() });
+			expect(measure('push wake claim for a reply', () => store.push.claim({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
 			// The unread count the claims kept on the recipient counter, zeroed as the user comes back: written once, then nothing.
-			measure('push unread clear', () => store.clearPushUnread('matrix-user', clock.now()));
-			measure('push unread clear, already zero', () => store.clearPushUnread('matrix-user', clock.now()));
+			measure('push unread clear', () => store.push.clearUnread('matrix-user', clock.now()));
+			measure('push unread clear, already zero', () => store.push.clearUnread('matrix-user', clock.now()));
 			// A sign-in zeroes it in the reservation that reads the user's status and mutes.
-			store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-unread-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() });
-			expect(measure('status inputs at sign-in, zeroing unread', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
+			store.push.claim({ senderId: 'matrix-replier', roomId: 'matrix-unread-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() });
+			expect(measure('status inputs at sign-in, zeroing unread', () => store.reads.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
 			expect(state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = 'user:matrix-user'").one().uploads_day).toBe(0);
 			// A moderator who kept `joined`: the read each message makes for them, and their claim (role and membership checked).
-			store.registerIdentity({
+			store.accounts.register({
 				userId: 'matrix-mod', name: 'Matrix mod', userHandle: 'matrix-mod-handle', now: clock.now(), ipKey: 'matrix-mod-ip',
 				credential: { credentialId: 'matrix-mod-credential', userId: 'matrix-mod', publicKey: 'matrix-public-key', counter: 0 },
 			});
-			store.setRole({ userId: 'matrix-mod', role: 'mod', on: true, now: clock.now() });
-			measure('push subscription register, keeping joined', () => store.registerPushSubscription({ ...subscription, userId: 'matrix-mod', wake: WAKE_SCOPES.joined, now: clock.now() }));
-			expect(measure('push joined wakers', () => store.joinedWakers(clock.now()))).toEqual(['matrix-mod']);
-			expect(measure('push wake claim for joined', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-mod', reasons: WAKE_SCOPES.joined }], now: clock.now() })).subscriptions).toHaveLength(1);
-			measure('reaction set', () => store.commitMutation({
+			store.accounts.setRole({ userId: 'matrix-mod', role: 'mod', on: true, now: clock.now() });
+			measure('push subscription register, keeping joined', () => store.push.register({ ...subscription, userId: 'matrix-mod', wake: WAKE_SCOPES.joined, now: clock.now() }));
+			expect(measure('push joined wakers', () => store.push.joinedWakers(clock.now()))).toEqual(['matrix-mod']);
+			expect(measure('push wake claim for joined', () => store.push.claim({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-mod', reasons: WAKE_SCOPES.joined }], now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('reaction set', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-react-ip', requestId: 'matrix-react', method: 'reactions', now: clock.now(),
 				params: { message_id: messageId, emojis: ['👍', '🎉'] }, identity,
 			}));
-			const threadId = measure('thread room create', () => store.commitMutation({
+			const threadId = measure('thread room create', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-thread-ip', requestId: 'matrix-thread', method: 'room_set', now: clock.now(),
 				params: { parent_room_id: 'general', title: 'Matrix thread', description: 'What the matrix measures' }, identity,
 			})).result.room_id as string;
-			measure('thread room update', () => store.commitMutation({
+			measure('thread room update', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-thread-ip', requestId: 'matrix-thread-update', method: 'room_set', now: clock.now(),
 				params: { room_id: threadId, title: 'Matrix thread renamed', ext: { demo: true } }, identity,
 			}));
-			const membership = (join: boolean) => store.changeMembership({ userId: 'matrix-user', ipKey: 'matrix-member-ip', roomId: threadId, join, now: clock.now() });
+			const membership = (join: boolean) => store.rooms.changeMembership({ userId: 'matrix-user', ipKey: 'matrix-member-ip', roomId: threadId, join, now: clock.now() });
 			expect(measure('registered room leave', () => membership(false)).changed).toBe(true);
 			expect(measure('registered room join', () => membership(true)).rooms).toEqual(['general', threadId]);
 			// A guest's join or leave stores nothing but is charged as a post: the first creates its limiter rows, the next finds them cached.
-			const guestMembership = () => store.chargeGuestMembership({ ipKey: 'matrix-guest-ip', now: clock.now() });
+			const guestMembership = () => store.rooms.chargeGuestMembership({ ipKey: 'matrix-guest-ip', now: clock.now() });
 			measure('guest room join (creates its limiter rows)', guestMembership);
 			measure('guest room leave (limiter rows cached)', guestMembership);
-			expect(measure('empty new message', () => store.commitMutation({
+			expect(measure('empty new message', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-empty', method: 'message', now: clock.now(),
 				params: { body: { text: '' } }, identity,
 			}))).toEqual({ result: {}, broadcasts: [] });
-			measure('message move with reactions', () => store.commitMutation({
+			measure('message move with reactions', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-move', method: 'message', now: clock.now(),
 				params: { message_id: messageId, room_id: threadId, body: { text: 'matrix moved', format: 'plain' } }, identity,
 			}));
-			measure('registered name mutation', () => store.commitMutation({
+			measure('registered name mutation', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-nick-ip', requestId: 'matrix-nick', method: 'me', now: clock.now(),
 				params: { name: 'Matrix renamed' }, identity,
 			}));
-			measure('history page', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			measure('history page', () => sqliteOf(store).historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
 			// With the quota: the first page creates the user's and the IP's limiter rows; the next, within a minute, writes neither.
-			const charged = () => store.history({ roomId: 'general', limit: 50, now: clock.now(), userId: 'matrix-reader', ipKey: 'matrix-reader-ip' });
+			const charged = () => sqliteOf(store).history({ roomId: 'general', limit: 50, now: clock.now(), userId: 'matrix-reader', ipKey: 'matrix-reader-ip' });
 			measure('charged history page, a new user and IP', charged);
 			measure('charged history page, again within a minute', charged);
-			measure('room record lookup', () => store.getRoomState());
-			measure('room join lookup', () => store.getRoom(threadId));
-			measure('room listing', () => store.listRooms(clock.now()));
-			measure('room members (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembersPerRoom, clock.now()));
-			measure('room members with status (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembersPerRoom, clock.now(), undefined, true));
-			expect(measure('status inputs at sign-in, nothing stored', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
-			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
-			measure('status set', () => store.setStatus({ userId: 'matrix-user', choice: 'dnd', now: clock.now() }));
+			measure('room record lookup', () => sqliteOf(store).getRoomState());
+			measure('room join lookup', () => store.rooms.get(threadId));
+			measure('room listing', () => store.rooms.list(clock.now()));
+			measure('room members (general and one thread)', () => store.rooms.members(['general', threadId], DEFAULT_LIMITS.roomListMembersPerRoom, clock.now()));
+			measure('room members with status (general and one thread)', () => store.rooms.members(['general', threadId], DEFAULT_LIMITS.roomListMembersPerRoom, clock.now(), undefined, true));
+			expect(measure('status inputs at sign-in, nothing stored', () => store.reads.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
+			measure('mute set', () => store.accounts.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
+			measure('status set', () => store.accounts.setStatus({ userId: 'matrix-user', choice: 'dnd', now: clock.now() }));
 			// A close's seen, settled by the store: written when none (or an old one) is stored, else the stored one standing.
-			expect(measure('seen settled, written', () => store.settleSeen({ userId: 'matrix-user', at: clock.now(), now: clock.now() }))).toBe(clock.now());
-			expect(measure('seen settled, the stored one standing', () => store.settleSeen({ userId: 'matrix-user', at: clock.now() + 60_000, now: clock.now() }))).toBe(clock.now());
-			expect(measure('push wake claim, dnd and muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
-			measure('room mute set', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'general', untilMs: clock.now() + 60_000, now: clock.now() }));
-			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
-			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
-			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
+			expect(measure('seen settled, written', () => store.reads.settleSeen({ userId: 'matrix-user', at: clock.now(), now: clock.now() }))).toBe(clock.now());
+			expect(measure('seen settled, the stored one standing', () => store.reads.settleSeen({ userId: 'matrix-user', at: clock.now() + 60_000, now: clock.now() }))).toBe(clock.now());
+			expect(measure('push wake claim, dnd and muted', () => store.push.claim({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			measure('room mute set', () => store.reads.setRoomMute({ userId: 'matrix-user', roomId: 'general', untilMs: clock.now() + 60_000, now: clock.now() }));
+			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.reads.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
+			store.accounts.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
+			store.accounts.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
 			// Choosing invisible records seen with the status, in one reservation
 			// and transaction, when the stored one is older than
 			// SEEN_WRITE_GRANULARITY_MS; a sign-in reads it with the identity row.
 			// (The change is dated past the stored seen's 10 minutes, so it writes.)
 			const later = clock.now() + SEEN_WRITE_GRANULARITY_MS + 1;
-			expect(measure('status set to invisible, with seen', () => store.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later, now: clock.now() }))).toEqual({ changed: true, seen: later });
-			expect(store.statusInputs('matrix-user', clock.now())).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
-			expect(store.getIdentity('matrix-user')?.seen).toBe(later);
+			expect(measure('status set to invisible, with seen', () => store.accounts.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later, now: clock.now() }))).toEqual({ changed: true, seen: later });
+			expect(store.reads.statusInputs('matrix-user', clock.now())).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
+			expect(store.accounts.get('matrix-user')?.seen).toBe(later);
 			// A seen for a user with no identity row writes no row.
-			expect(measure('seen settled, unknown user', () => store.settleSeen({ userId: 'matrix-nobody', at: clock.now(), now: clock.now() }))).toBeUndefined();
-			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
+			expect(measure('seen settled, unknown user', () => store.reads.settleSeen({ userId: 'matrix-nobody', at: clock.now(), now: clock.now() }))).toBeUndefined();
+			store.accounts.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			// Within SEEN_WRITE_GRANULARITY_MS of the stored seen, the store
 			// decides it stands, from the identity row it reads anyway: the
 			// status alone is written.
-			expect(measure('status set to invisible, the stored seen standing', () => store.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later + 60_000, now: clock.now() }))).toEqual({ changed: true, seen: later });
-			expect(store.getIdentity('matrix-user')?.seen).toBe(later);
-			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
+			expect(measure('status set to invisible, the stored seen standing', () => store.accounts.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later + 60_000, now: clock.now() }))).toEqual({ changed: true, seen: later });
+			expect(store.accounts.get('matrix-user')?.seen).toBe(later);
+			store.accounts.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			// The thread's parent is muted: a wake for the thread is silenced by it, but for a mention.
-			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			expect(measure('push wake claim, the thread\'s parent muted', () => store.push.claim({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			// The most room mutes a user may hold: the sign-in reads them all.
 			state.storage.transactionSync(() => {
 				for (let index = 1; index < MAX_ROOM_MUTES_PER_USER; index += 1) {
 					state.storage.sql.exec('INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)', 'matrix-user', `muted-${String(index).padStart(3, '0')}`, index % 2 ? MUTE_FOREVER : clock.now() + 30_000);
 				}
 			});
-			expect(measure('status inputs at sign-in, 100 room mutes', () => store.statusInputs('matrix-user', clock.now())).roomMutes).toHaveLength(MAX_ROOM_MUTES_PER_USER);
-			expect(measure('room mute set past the cap, refused', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'one-too-many', untilMs: MUTE_FOREVER, now: clock.now() }))).toEqual({ changed: false, refused: true });
+			expect(measure('status inputs at sign-in, 100 room mutes', () => store.reads.statusInputs('matrix-user', clock.now())).roomMutes).toHaveLength(MAX_ROOM_MUTES_PER_USER);
+			expect(measure('room mute set past the cap, refused', () => store.reads.setRoomMute({ userId: 'matrix-user', roomId: 'one-too-many', untilMs: MUTE_FOREVER, now: clock.now() }))).toEqual({ changed: false, refused: true });
 			clock.set(clock.now() + 60_001);
 			// Half the mutes ran out: they go, and their place is free.
-			expect(measure('room mute expiry, 50 of 100 ran out', () => store.expireRoomMutes('matrix-user', clock.now())).expired).toHaveLength(MAX_ROOM_MUTES_PER_USER / 2);
-			measure('room mute clear', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'muted-001', untilMs: null, now: clock.now() }));
+			expect(measure('room mute expiry, 50 of 100 ran out', () => store.reads.expireRoomMutes('matrix-user', clock.now())).expired).toHaveLength(MAX_ROOM_MUTES_PER_USER / 2);
+			measure('room mute clear', () => store.reads.setRoomMute({ userId: 'matrix-user', roomId: 'muted-001', untilMs: null, now: clock.now() }));
 			state.storage.sql.exec("DELETE FROM room_mutes WHERE user_id = 'matrix-user'");
 			// Read cursors (§4.6): a membership probe and an upsert each, a row and no index.
 			const read = String(create.result.message_id);
-			measure('read cursor written, new', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
-			measure('read cursor written, moved', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', String(Number(read) + 1)]], now: clock.now() }));
-			measure('read cursor written, not past the one kept', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
-			measure('read cursor written, a room not joined', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['matrix-not-joined', read]], now: clock.now() }));
-			expect(measure('read cursors at a listing', () => store.readCursors('matrix-user', clock.now()))).toEqual(new Map([['general', String(Number(read) + 1)]]));
+			measure('read cursor written, new', () => store.reads.saveCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
+			measure('read cursor written, moved', () => store.reads.saveCursors({ userId: 'matrix-user', cursors: [['general', String(Number(read) + 1)]], now: clock.now() }));
+			measure('read cursor written, not past the one kept', () => store.reads.saveCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
+			measure('read cursor written, a room not joined', () => store.reads.saveCursors({ userId: 'matrix-user', cursors: [['matrix-not-joined', read]], now: clock.now() }));
+			expect(measure('read cursors at a listing', () => store.reads.cursors('matrix-user', clock.now()))).toEqual(new Map([['general', String(Number(read) + 1)]]));
 			// Read receipts: a private room's members joined to their cursors, by primary key.
-			const privateRoom = String(store.mutate({
+			const privateRoom = String(store.messages.mutate({
 				userId: 'matrix-user', ipKey: 'matrix-ip', requestId: 'matrix-private', method: 'room_set', now: clock.now(), identity: { user_id: 'matrix-user' }, params: { private: true },
 			}).result.room_id);
-			store.saveReadCursors({ userId: 'matrix-user', cursors: [[privateRoom, read]], now: clock.now() });
-			expect(measure('read receipts at a listing, one private room', () => store.roomReadCursors([privateRoom], 'matrix-other', clock.now()))).toEqual(new Map([[privateRoom, [['matrix-user', read]]]]));
-			measure('room member count (read receipts, live)', () => store.roomMemberCount(privateRoom, clock.now()));
+			store.reads.saveCursors({ userId: 'matrix-user', cursors: [[privateRoom, read]], now: clock.now() });
+			expect(measure('read receipts at a listing, one private room', () => store.reads.roomCursors([privateRoom], 'matrix-other', clock.now()))).toEqual(new Map([[privateRoom, [['matrix-user', read]]]]));
+			measure('room member count (read receipts, live)', () => store.rooms.memberCount(privateRoom, clock.now()));
 			clock.set(clock.now() + DAY + HOUR + 1);
-			measure('cleanup', () => store.runCleanup(clock.now()));
-			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
+			measure('cleanup', () => store.lifecycle.runCleanup(clock.now()));
+			await measureAsync('alarm scheduling', () => store.lifecycle.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
 			expect(costs).toHaveLength(70);
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));
@@ -1200,10 +1203,10 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-query-plans-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
-			store.initialize();
+			const store = openStore(state, defaultStoreConfig(), clock);
+			store.lifecycle.initialize();
 			for (let index = 0; index < 4; index += 1) {
-				store.commitMutation(messageInput(clock, 'plan-user', `plan-${index}`, `plan-${index}`));
+				store.messages.commit(messageInput(clock, 'plan-user', `plan-${index}`, `plan-${index}`));
 			}
 			const sql = state.storage.sql;
 			const plans = {
@@ -1241,7 +1244,7 @@ describe('measured storage accounting', () => {
 					JOIN rooms r ON r.room_id = m.room_id
 					WHERE m.user_id = ? ORDER BY r.created_log_id LIMIT ?`, 'plan-user', 101),
 			};
-			return { plans, databaseSize: store.databaseSize() };
+			return { plans, databaseSize: store.ops.databaseSize() };
 		});
 		console.info('accounting-query-plans', JSON.stringify(result));
 		// Tables keyed by text or composite keys are WITHOUT ROWID (schema 10): their lookups name the primary key.

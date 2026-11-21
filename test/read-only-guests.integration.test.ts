@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
+import type { Store } from '../src/store';
 
 let nextIp = 1;
 
@@ -22,10 +23,10 @@ const connect = (origin: string | null = 'http://localhost:5173') => open({ ip: 
 async function signedIn(userId: string): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as {
-			store: { registerIdentity(input: Record<string, unknown>): unknown };
+			store: { accounts: { register(input: Record<string, unknown>): unknown } };
 			issueSession(userId: string, origin: string, now: number): Promise<string>;
 		};
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -276,7 +277,7 @@ it('keeps scrolling back for accounts: a guest gets the newest page, charged to 
 		expect((await request(guest, 'past-head', 'history', { room_id: 'general', before: '999999999999999' })).result).toBeTruthy();
 		// Scrolling back more than guestHistoryDepth records from the head is for accounts.
 		const setDepth = (depth: number) => runInDurableObject(stub(), (instance) => {
-			(instance as unknown as { store: { config: { guestHistoryDepth: number } } }).store.config.guestHistoryDepth = depth;
+			(instance as unknown as { store: Store }).store.ops.config.guestHistoryDepth = depth;
 		});
 		await setDepth(1);
 		try {

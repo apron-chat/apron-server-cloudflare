@@ -15,10 +15,10 @@ const unique = (prefix: string) => `${prefix}_${crypto.randomUUID().slice(0, 8)}
 async function register(userId: string): Promise<string> {
 	return runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as {
-			store: { registerIdentity(input: Record<string, unknown>): unknown };
+			store: { accounts: { register(input: Record<string, unknown>): unknown } };
 			issueSession(userId: string, origin: string, now: number): Promise<string>;
 		};
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId, name: userId, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});

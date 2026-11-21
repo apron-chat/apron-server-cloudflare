@@ -371,9 +371,9 @@ describe('configuration policy boundaries', () => {
 
 	it('marks the daily frame budget so the object closes every socket on it', async () => {
 		await withStore('frame-budget-reason', { processedFramesPerDay: 10 }, (store, clock) => {
-			store.reserveFrames({ ipKey: 'frame-budget-ip', now: clock.value, count: 10 });
+			store.admission.reserveFrames({ ipKey: 'frame-budget-ip', now: clock.value, count: 10 });
 			let error: unknown;
-			try { store.reserveFrames({ ipKey: 'frame-budget-other-ip', now: clock.value, count: 1 }); }
+			try { store.admission.reserveFrames({ ipKey: 'frame-budget-other-ip', now: clock.value, count: 1 }); }
 			catch (caught) { error = caught; }
 			expect(error).toBeInstanceOf(StoreError);
 			expect((error as StoreError).data).toEqual({ reason: 'frame_budget' });

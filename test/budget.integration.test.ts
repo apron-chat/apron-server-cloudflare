@@ -1,14 +1,15 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
-import { Store } from '../src/store';
+import { type Store, openStore } from '../src/store';
+import { sqliteOf } from "../src/store/open";
 
 it('closes accounting while a budget write fails, and reopens once the staged write lands', async () => {
 	const stub = env.DEMO.getByName('budget-reservation-failure');
 	const now = Date.now() + 1_000;
 	await runInDurableObject(stub, (_instance, state) => {
-		const store = new Store(state, {}, { now: () => now });
-		store.initialize();
+		const store = openStore(state, {}, { now: () => now });
+		store.lifecycle.initialize();
 		const reserved = () => state.storage.sql.exec<{ reads_reserved: number; writes_reserved: number }>(
 			'SELECT reads_reserved, writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1',
 		).one();
@@ -21,18 +22,18 @@ it('closes accounting while a budget write fails, and reopens once the staged wr
 		// The reservation is staged; the write that settles it fails after the
 		// operation. That closes accounting as uncertain, the marker written
 		// outside the failed statement, so nothing runs on a lagging row.
-		store.getRoomState();
+		sqliteOf(store).getRoomState();
 		expect(marker()).toBe('uncertain');
 		expect(reserved()).toEqual(before);
-		expect(store.accountingStatus()).toMatchObject({ unsafe: false, uncertain: true });
+		expect(store.ops.accountingStatus()).toMatchObject({ unsafe: false, uncertain: true });
 		// While the write still fails, work is refused as storage unavailable.
-		expect(() => store.getRoomState()).toThrow('storage is unavailable');
+		expect(() => sqliteOf(store).getRoomState()).toThrow('storage is unavailable');
 
 		// Storage works again: the next operation writes what was staged first,
 		// then runs, and the marker clears without an operator.
 		state.storage.sql.exec('DROP TRIGGER fail_budget_reservation');
-		expect(() => store.getRoomState()).not.toThrow();
-		expect(store.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
+		expect(() => sqliteOf(store).getRoomState()).not.toThrow();
+		expect(store.ops.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
 		expect(marker()).toBe('0');
 		expect(reserved().reads_reserved).toBeGreaterThan(before.reads_reserved);
 	});
@@ -46,13 +47,13 @@ it('reopens accounting a storage failure left uncertain on the next wake, chargi
 	).one();
 	let before = { maintenance_reads: 0, maintenance_writes: 0 };
 	await runInDurableObject(stub, (_instance, state) => {
-		const store = new Store(state, {}, { now: () => now });
-		store.initialize();
+		const store = openStore(state, {}, { now: () => now });
+		store.lifecycle.initialize();
 		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
 			BEFORE UPDATE OF reads_reserved ON resource_budgets
 			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
-		store.getRoomState();
-		expect(store.accountingStatus().uncertain).toBe(true);
+		sqliteOf(store).getRoomState();
+		expect(store.ops.accountingStatus().uncertain).toBe(true);
 		// The instance goes before the staged write lands.
 		state.storage.sql.exec('DROP TRIGGER fail_budget_reservation');
 		before = maintenance(state);
@@ -60,13 +61,13 @@ it('reopens accounting a storage failure left uncertain on the next wake, chargi
 
 	await evictDurableObject(stub);
 	await runInDurableObject(stub, (_instance, state) => {
-		const restarted = new Store(state, {}, { now: () => now });
-		restarted.initialize();
+		const restarted = openStore(state, {}, { now: () => now });
+		restarted.lifecycle.initialize();
 		// A wake writes nothing: the first operation charges for what was lost, then runs.
-		expect(restarted.accountingStatus()).toMatchObject({ unsafe: false, uncertain: true });
+		expect(restarted.ops.accountingStatus()).toMatchObject({ unsafe: false, uncertain: true });
 		expect(maintenance(state)).toEqual(before);
-		expect(() => restarted.getRoomState()).not.toThrow();
-		expect(restarted.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
+		expect(() => sqliteOf(restarted).getRoomState()).not.toThrow();
+		expect(restarted.ops.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
 		expect(state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1").one().value).toBe('0');
 		const after = maintenance(state);
 		expect(after.maintenance_reads).toBeGreaterThanOrEqual(before.maintenance_reads + Math.ceil(DEFAULT_LIMITS.sqlReadsPerDay / 100));
@@ -80,18 +81,18 @@ it('reopens accounting a storage failure left uncertain on the next wake, chargi
 it('writes an async operation\'s reservation before it awaits, and status writes the budget row once', async () => {
 	await runInDurableObject(env.DEMO.getByName('budget-async-and-status'), async (_instance, state) => {
 		const now = Date.now() + 1_000;
-		const store = new Store(state, {}, { now: () => now });
-		store.initialize();
+		const store = openStore(state, {}, { now: () => now });
+		store.lifecycle.initialize();
 		const reserved = () => state.storage.sql.exec<{ writes_reserved: number }>(
 			'SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1',
 		).one().writes_reserved;
-		store.getRoomState();
+		sqliteOf(store).getRoomState();
 		const before = reserved();
 		// Nothing settles it: an eviction during the await must not lose it.
-		const during = await store.withMeterAsync('foreground', { writes: 100 }, async () => reserved(), now);
+		const during = await store.meter.foreground({ writes: 100 }, async () => reserved(), now);
 		expect(during).toBeGreaterThanOrEqual(before + 100);
-		const writes = store.storageAccounting().writes;
-		store.status(now);
-		expect(store.storageAccounting().writes - writes).toBe(1);
+		const writes = sqliteOf(store).storageAccounting().writes;
+		store.ops.status(now);
+		expect(sqliteOf(store).storageAccounting().writes - writes).toBe(1);
 	});
 });

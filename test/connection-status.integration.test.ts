@@ -1,7 +1,8 @@
 import { env, evictDurableObject, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
-import { Store } from '../src/store';
+import { type Store, openStore } from '../src/store';
+import { sqliteOf } from "../src/store/open";
 
 const headers = { Origin: 'http://localhost:5173', 'CF-Connecting-IP': '198.18.7.1' };
 
@@ -64,14 +65,14 @@ it('does not keep reporting yesterday\'s exhausted budget after UTC rollover', a
 	await runInDurableObject(env.DEMO.getByName('status-rollover'), (_instance, state) => {
 		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = ?, writes_reserved = ?', DEFAULT_LIMITS.foregroundWritesPerDay, DEFAULT_LIMITS.foregroundWritesPerDay);
 		let now = Date.now();
-		const store = new Store(state, {}, () => now);
-		store.initialize();
-		const before = store.storageAccounting();
-		expect(() => store.checkConnectionBudget()).toThrow('Demo capacity reached');
-		expect(store.storageAccounting()).toEqual(before);
+		const store = openStore(state, {}, () => now);
+		store.lifecycle.initialize();
+		const before = sqliteOf(store).storageAccounting();
+		expect(() => store.admission.checkConnectionBudget()).toThrow('Demo capacity reached');
+		expect(sqliteOf(store).storageAccounting()).toEqual(before);
 		now += 86400000;
-		expect(() => store.checkConnectionBudget()).not.toThrow();
-		expect(store.storageAccounting()).toEqual(before);
+		expect(() => store.admission.checkConnectionBudget()).not.toThrow();
+		expect(sqliteOf(store).storageAccounting()).toEqual(before);
 	});
 });
 

@@ -4,9 +4,10 @@ import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
 import { loadConfig } from '../src/config';
 import { attachmentTypes, fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
-import { Store, UPLOAD_WRITE_GRACE_MS, type EmojiDraft, type StoreError } from '../src/store';
+import { type EmojiDraft, type Store, type StoreError, UPLOAD_WRITE_GRACE_MS, openStore } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
-import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
+import { errorCode, expectRetryAfter, sqliteIn, type TestClock, withStore } from './helpers/store';
+import { sqliteOf } from "../src/store/open";
 
 const MEDIA = 'https://media.test';
 const UPLOADS = { ...UPLOAD_POLICY!, mediaOrigin: MEDIA };
@@ -30,14 +31,14 @@ function webm(bytes = 64): Uint8Array {
 }
 
 function register(store: Store, clock: TestClock, userId: string): void {
-	store.registerIdentity({
+	store.accounts.register({
 		userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
 		credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 	});
 }
 
 function post(store: Store, clock: TestClock, userId: string, params: Record<string, unknown>) {
-	return store.commitMutation({ userId, ipKey: `ip-${userId}`, method: 'message', now: clock.value, params, identity: { user_id: userId, name: `Name of ${userId}` } });
+	return store.messages.commit({ userId, ipKey: `ip-${userId}`, method: 'message', now: clock.value, params, identity: { user_id: userId, name: `Name of ${userId}` } });
 }
 
 type Write = { key: string; max_bytes: number; expires_ms: number };
@@ -48,7 +49,7 @@ describe('store uploads', () => {
 		await withStore('uploads-retry', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'rita');
 			const params = { body: { text: 'retried', embeds: [{ kind: 'upload', title: 'dot.png' }] } };
-			const send = () => store.commitMutation({ userId: 'rita', ipKey: 'ip-rita', requestId: 'retry-1', method: 'message', now: clock.value, params, identity: { user_id: 'rita', name: 'Name of rita' } });
+			const send = () => store.messages.commit({ userId: 'rita', ipKey: 'ip-rita', requestId: 'retry-1', method: 'message', now: clock.value, params, identity: { user_id: 'rita', name: 'Name of rita' } });
 			const first = send();
 			const write = writeOf(first.result);
 			// Before the write, a retry gets the same grant, and nothing is executed again.
@@ -56,8 +57,8 @@ describe('store uploads', () => {
 			expect(early.deduplicated).toBe(true);
 			expect(early.broadcasts).toEqual([]);
 			expect(early.result).toEqual(first.result);
-			expect(store.claimUpload(write.write.key, clock.value)).toBe(true);
-			store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			expect(store.uploads.claim(write.write.key, clock.value)).toBe(true);
+			store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
 			// Once the write is done, the retry names the message and embed, without a grant.
 			const late = send();
 			expect(late.deduplicated).toBe(true);
@@ -79,14 +80,14 @@ describe('store uploads', () => {
 			expect(created.uploads).toHaveLength(1);
 
 			// The write finishes: a server snapshot completes the embed.
-			expect(store.claimUpload(write.write.key, clock.value)).toBe(true);
-			expect(store.claimUpload(write.write.key, clock.value)).toBe(false);
-			const finished = store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png', width: 1, height: 1 }, clock.value);
+			expect(store.uploads.claim(write.write.key, clock.value)).toBe(true);
+			expect(store.uploads.claim(write.write.key, clock.value)).toBe(false);
+			const finished = store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png', width: 1, height: 1 }, clock.value);
 			expect(finished.accepted).toBe(true);
 			const completed = (finished.broadcasts[0].params.body as { embeds: Array<Record<string, unknown>> }).embeds[1];
 			const url = `${MEDIA}/${write.write.key}`;
 			expect(completed).toEqual({ embed_id: embeds[1].embed_id, kind: 'upload', title: 'dot.png', url, og: { title: 'dot.png', image: { url, type: 'image/png', width: 1, height: 1 } } });
-			expect(store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value).accepted).toBe(false);
+			expect(store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value).accepted).toBe(false);
 
 			// A save sends embeds back by id; the server restores the upload's url and og.
 			clock.value += 1_000;
@@ -108,15 +109,15 @@ describe('store uploads', () => {
 			register(store, clock, 'vera');
 			const created = post(store, clock, 'vera', { body: { embeds: [{ kind: 'upload', title: 'voice-message.webm' }] } });
 			const write = writeOf(created.result);
-			expect(store.claimUpload(write.write.key, clock.value)).toBe(true);
-			const finished = store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
+			expect(store.uploads.claim(write.write.key, clock.value)).toBe(true);
+			const finished = store.uploads.finish({ key: write.write.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
 			expect(finished.accepted).toBe(true);
 			const url = `${MEDIA}/${write.write.key}`;
 			expect((finished.broadcasts[0].params.body as { embeds: unknown[] }).embeds[0]).toEqual({ embed_id: write.embed_id, kind: 'upload', title: 'voice-message.webm', url, og: { title: 'voice-message.webm', audio: { url, type: 'audio/webm' } } });
 
-			const avatar = store.startAvatarUpload({ userId: 'vera', now: clock.value });
-			expect(store.claimUpload(avatar.key, clock.value)).toBe(true);
-			const refused = store.finishUpload({ key: avatar.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
+			const avatar = store.uploads.startAvatar({ userId: 'vera', now: clock.value });
+			expect(store.uploads.claim(avatar.key, clock.value)).toBe(true);
+			const refused = store.uploads.finish({ key: avatar.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
 			expect(refused).toMatchObject({ accepted: false, deletedUploads: [avatar.key] });
 		});
 	});
@@ -128,31 +129,31 @@ describe('store uploads', () => {
 			const alone = post(store, clock, 'bob', { body: { embeds: [{ kind: 'upload' }] } });
 			// A failed write publishes the message without the embed (§4.8.3).
 			const failedKey = writeOf(withText.result).write.key;
-			expect(store.claimUpload(failedKey, clock.value)).toBe(true);
-			const failed = store.finishUpload({ key: failedKey, ok: false }, clock.value);
+			expect(store.uploads.claim(failedKey, clock.value)).toBe(true);
+			const failed = store.uploads.finish({ key: failedKey, ok: false }, clock.value);
 			expect(failed.accepted).toBe(false);
 			expect(failed.deletedUploads).toEqual([failedKey]);
 			expect(failed.broadcasts[0].params).toMatchObject({ message_id: withText.result.message_id, body: { text: 'caption', embeds: [] } });
 			// Past its window and grace, a write never started is failed by the sweep;
 			// a message left with nothing is a tombstone.
-			expect(store.expirePendingUploads(clock.value)).toMatchObject({ broadcasts: [], next: writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS });
+			expect(store.uploads.expirePending(clock.value)).toMatchObject({ broadcasts: [], next: writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS });
 			// An alarm after a wake reads the same deadline from storage.
-			expect(store.nextUploadDeadline(clock.value)).toBe(writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS);
+			expect(store.uploads.nextDeadline(clock.value)).toBe(writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS);
 			clock.value += UPLOADS.writeWindowSeconds * 1_000 + UPLOAD_WRITE_GRACE_MS + 1;
-			expect(store.claimUpload(writeOf(alone.result).write.key, clock.value)).toBe(false);
-			const expired = store.expirePendingUploads(clock.value);
+			expect(store.uploads.claim(writeOf(alone.result).write.key, clock.value)).toBe(false);
+			const expired = store.uploads.expirePending(clock.value);
 			expect(expired.broadcasts).toHaveLength(1);
 			expect(expired.broadcasts[0].params).toMatchObject({ message_id: alone.result.message_id, deleted: true });
 			expect(expired.broadcasts[0].params.body).toBeUndefined();
 			expect(expired.next).toBeUndefined();
-			expect(store.nextUploadDeadline(clock.value)).toBeUndefined();
+			expect(store.uploads.nextDeadline(clock.value)).toBeUndefined();
 			// A message deleted while its write was in flight does not take the object.
 			clock.value += 1_000;
 			const deleted = post(store, clock, 'bob', { body: { text: 'soon gone', embeds: [{ kind: 'upload' }] } });
 			const key = writeOf(deleted.result).write.key;
-			expect(store.claimUpload(key, clock.value)).toBe(true);
+			expect(store.uploads.claim(key, clock.value)).toBe(true);
 			expect(post(store, clock, 'bob', { message_id: deleted.result.message_id, deleted: true }).deletedUploads).toEqual([key]);
-			expect(store.finishUpload({ key, ok: true, bytes: 10, contentType: 'image/png' }, clock.value).accepted).toBe(false);
+			expect(store.uploads.finish({ key, ok: true, bytes: 10, contentType: 'image/png' }, clock.value).accepted).toBe(false);
 		});
 	});
 
@@ -172,9 +173,9 @@ describe('store uploads', () => {
 			// The server's count is charged by writes claimed, not uploads started:
 			// Carol's two and Dave's two started, none written, leave it open.
 			const daves = keys(post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } }).result);
-			for (const key of [...carols, daves[0]]) expect(store.claimUpload(key, clock.value)).toBe(true);
+			for (const key of [...carols, daves[0]]) expect(store.uploads.claim(key, clock.value)).toBe(true);
 			// Three claimed: Dave's other write is refused until the reset, and no upload starts.
-			expect(store.claimUpload(daves[1], clock.value)).toBe('closed');
+			expect(store.uploads.claim(daves[1], clock.value)).toBe('closed');
 			try { post(store, clock, 'erin', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Daily upload limit reached for the server');
 			expect((error as StoreError).data).toEqual({ ext: { limits: 'upload' } });
@@ -183,22 +184,22 @@ describe('store uploads', () => {
 			try { post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Upload storage is full');
 			expect((error as StoreError).data).toEqual({ ext: { limits: 'upload' } });
-			store.startAvatarUpload({ userId: 'dave', now: clock.value });
+			store.uploads.startAvatar({ userId: 'dave', now: clock.value });
 		});
 	});
 
 	it('refuses new uploads while an admin has turned them off', async () => {
 		await withStore('uploads-off', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'frank');
-			expect(store.toggle('uploads', clock.value)).toBeUndefined();
-			store.setToggle('uploads', false, clock.value);
-			expect(store.toggle('uploads', clock.value)).toBe(false);
+			expect(store.server.toggle('uploads', clock.value)).toBeUndefined();
+			store.server.setToggle('uploads', false, clock.value);
+			expect(store.server.toggle('uploads', clock.value)).toBe(false);
 			expect(errorCode(() => post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } }))).toBe('denied');
-			expect(errorCode(() => store.startAvatarUpload({ userId: 'frank', now: clock.value }))).toBe('denied');
+			expect(errorCode(() => store.uploads.startAvatar({ userId: 'frank', now: clock.value }))).toBe('denied');
 			// Other embeds still post.
 			post(store, clock, 'frank', { body: { embeds: [{ kind: 'link', url: 'https://example.com' }] } });
-			store.setToggle('uploads', undefined, clock.value);
-			expect(store.toggle('uploads', clock.value)).toBeUndefined();
+			store.server.setToggle('uploads', undefined, clock.value);
+			expect(store.server.toggle('uploads', clock.value)).toBeUndefined();
 			post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } });
 		});
 	});
@@ -211,8 +212,8 @@ describe('store uploads', () => {
 				return { key: writeOf(result).write.key, messageId: result.message_id as string };
 			};
 			const write = (key: string) => {
-				expect(store.claimUpload(key, clock.value)).toBe(true);
-				store.finishUpload({ key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+				expect(store.uploads.claim(key, clock.value)).toBe(true);
+				store.uploads.finish({ key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
 			};
 			const written = upload('written').key;
 			write(written);
@@ -226,16 +227,16 @@ describe('store uploads', () => {
 			state.storage.sql.exec('UPDATE uploads SET expires_ms = created_ms + ?', week);
 			clock.value += week + UPLOADS.lifecycleLagSeconds * 1_000 + 1;
 			// The written file is kept on, to its expiry under the current setting; the unwritten one and the orphan go.
-			const swept = store.cleanupUploads(clock.value);
+			const swept = store.uploads.cleanup(clock.value);
 			expect(swept.count).toBe(3);
 			expect([...swept.deleted].sort()).toEqual([unwritten, orphan.key].sort());
 			const expires = (key: string) => state.storage.sql.exec<{ expires_ms: number }>('SELECT expires_ms FROM uploads WHERE upload_key = ?', key).toArray()[0]?.expires_ms;
 			const created = state.storage.sql.exec<{ created_ms: number }>('SELECT created_ms FROM uploads WHERE upload_key = ?', written).one().created_ms;
 			expect(expires(written)).toBe(created + UPLOADS.fileRetentionSeconds * 1_000);
-			expect(store.cleanupUploads(clock.value)).toEqual({ count: 0, deleted: [] });
+			expect(store.uploads.cleanup(clock.value)).toEqual({ count: 0, deleted: [] });
 			// Past that expiry and the lifecycle lag, it goes as usual.
 			clock.value = created + (UPLOADS.fileRetentionSeconds + UPLOADS.lifecycleLagSeconds) * 1_000 + 1;
-			expect(store.cleanupUploads(clock.value)).toEqual({ count: 1, deleted: [written] });
+			expect(store.uploads.cleanup(clock.value)).toEqual({ count: 1, deleted: [written] });
 			expect(expires(written)).toBeUndefined();
 		});
 	});
@@ -249,20 +250,20 @@ describe('store uploads', () => {
 		expect(UPLOADS.avatarRetentionSeconds).toBeGreaterThan(UPLOADS.avatarRefreshSeconds);
 		await withStore('uploads-avatar-active', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'ivy');
-			const upload = store.startAvatarUpload({ userId: 'ivy', now: clock.value });
-			store.claimUpload(upload.key, clock.value);
-			store.finishUpload({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value);
+			const upload = store.uploads.startAvatar({ userId: 'ivy', now: clock.value });
+			store.uploads.claim(upload.key, clock.value);
+			store.uploads.finish({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value);
 			// A sign-in with no more than the message retention and cleanup's day left refreshes it.
 			clock.value += (UPLOADS.avatarRetentionSeconds - kept) * 1_000 + 1;
-			expect(store.avatarRefreshDue('ivy', clock.value)).toBe(upload.key);
-			store.renewAvatar({ userId: 'ivy', key: upload.key, now: clock.value });
+			expect(store.uploads.avatarRefreshDue('ivy', clock.value)).toBe(upload.key);
+			store.uploads.renewAvatar({ userId: 'ivy', key: upload.key, now: clock.value });
 			const signedIn = clock.value;
 			// Nobody signs in again: it is still shown as long as anything posted then is kept.
 			clock.value = signedIn + kept * 1_000;
-			expect(store.getIdentity('ivy')!.avatar).toBe(`${MEDIA}/${upload.key}`);
+			expect(store.accounts.get('ivy')!.avatar).toBe(`${MEDIA}/${upload.key}`);
 			// And gone once its owner has stayed away the whole avatar retention.
 			clock.value = signedIn + UPLOADS.avatarRetentionSeconds * 1_000;
-			expect(store.getIdentity('ivy')!.avatar).toBeUndefined();
+			expect(store.accounts.get('ivy')!.avatar).toBeUndefined();
 		});
 	});
 
@@ -270,40 +271,40 @@ describe('store uploads', () => {
 		await withStore('uploads-avatar', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'erin');
 			const setAvatar = () => {
-				const upload = store.startAvatarUpload({ userId: 'erin', now: clock.value });
+				const upload = store.uploads.startAvatar({ userId: 'erin', now: clock.value });
 				expect(upload.key).toMatch(/^a\//);
 				expect(upload.maxBytes).toBe(UPLOADS.maxAvatarBytes);
-				store.claimUpload(upload.key, clock.value);
-				return { upload, finished: store.finishUpload({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value) };
+				store.uploads.claim(upload.key, clock.value);
+				return { upload, finished: store.uploads.finish({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value) };
 			};
 			const first = setAvatar();
 			expect(first.finished).toMatchObject({ accepted: true, broadcasts: [], avatar: { userId: 'erin', url: `${MEDIA}/${first.upload.key}` }, deletedUploads: [] });
-			expect(store.getIdentity('erin')!.avatar).toBe(`${MEDIA}/${first.upload.key}`);
-			expect(store.roomMembers(['general'], 10, clock.value).get('general')).toContainEqual({ user_id: 'erin', name: 'Name of erin', avatar: `${MEDIA}/${first.upload.key}`, roles: [] });
+			expect(store.accounts.get('erin')!.avatar).toBe(`${MEDIA}/${first.upload.key}`);
+			expect(store.rooms.members(['general'], 10, clock.value).get('general')).toContainEqual({ user_id: 'erin', name: 'Name of erin', avatar: `${MEDIA}/${first.upload.key}`, roles: [] });
 			// A new avatar replaces the old one, whose object goes.
 			const second = setAvatar();
 			expect(second.finished.deletedUploads).toEqual([first.upload.key]);
 			// Not due for a refresh until avatarRefreshSeconds before it expires.
-			expect(store.avatarRefreshDue('erin', clock.value)).toBeNull();
+			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBeNull();
 			clock.value += (UPLOADS.avatarRetentionSeconds - UPLOADS.avatarRefreshSeconds) * 1_000 + 1;
-			expect(store.avatarRefreshDue('erin', clock.value)).toBe(second.upload.key);
-			store.renewAvatar({ userId: 'erin', key: second.upload.key, now: clock.value });
-			expect(store.avatarRefreshDue('erin', clock.value)).toBeNull();
+			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBe(second.upload.key);
+			store.uploads.renewAvatar({ userId: 'erin', key: second.upload.key, now: clock.value });
+			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBeNull();
 			// Past its expiry it is no longer shown, and past the lifecycle lag cleanup forgets it.
 			clock.value += UPLOADS.avatarRetentionSeconds * 1_000 + 1;
-			expect(store.getIdentity('erin')!.avatar).toBeUndefined();
-			expect(store.avatarRefreshDue('erin', clock.value)).toBeNull();
+			expect(store.accounts.get('erin')!.avatar).toBeUndefined();
+			expect(store.uploads.avatarRefreshDue('erin', clock.value)).toBeNull();
 			clock.value += UPLOADS.lifecycleLagSeconds * 1_000;
 			// Its key comes back for the caller to delete from R2.
-			expect(store.cleanupUploads(clock.value)).toEqual({ count: 1, deleted: [second.upload.key] });
+			expect(store.uploads.cleanup(clock.value)).toEqual({ count: 1, deleted: [second.upload.key] });
 			// Clearing removes a live one.
 			setAvatar();
-			expect(store.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
-			expect(store.clearAvatar({ userId: 'erin', now: clock.value })).toEqual({ changed: false, deletedUploads: [] });
+			expect(store.uploads.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
+			expect(store.uploads.clearAvatar({ userId: 'erin', now: clock.value })).toEqual({ changed: false, deletedUploads: [] });
 			// A new user_id is a user clients keep nothing for: /rename gets every
 			// profile field to announce (§3.3), the live avatar included.
 			const third = setAvatar();
-			expect(store.renameIdentity({ from: 'erin', to: 'erin_2', now: clock.value })).toMatchObject({
+			expect(store.accounts.rename({ from: 'erin', to: 'erin_2', now: clock.value })).toMatchObject({
 				name: 'Name of erin', avatar: `${MEDIA}/${third.upload.key}`, roles: [],
 			});
 		});
@@ -314,18 +315,18 @@ describe('store uploads', () => {
 		await withStore('uploads-emoji', config, (store, clock, state) => {
 			register(store, clock, 'ada');
 			const add = (key: string, side = 1) => {
-				const upload = store.startEmojiUpload({ userId: 'ada', key, now: clock.value });
+				const upload = store.uploads.startEmoji({ userId: 'ada', key, now: clock.value });
 				expect(upload).toMatchObject({ key: expect.stringMatching(/^e\/[A-Za-z0-9_-]{22}$/), maxBytes: UPLOADS.maxEmojiBytes });
-				expect(store.claimUpload(upload.key, clock.value)).toBe(true);
-				const draft = store.emojiDraft({ add: { key: upload.key, ok: true, bytes: 64, contentType: 'image/png', width: side, height: side } }, clock.value)!;
-				const committed = store.commitEmoji(draft, clock.value);
+				expect(store.uploads.claim(upload.key, clock.value)).toBe(true);
+				const draft = store.server.emojiDraft({ add: { key: upload.key, ok: true, bytes: 64, contentType: 'image/png', width: side, height: side } }, clock.value)!;
+				const committed = store.server.commitEmoji(draft, clock.value);
 				expect(committed.applied).toBe(true);
 				return { upload, draft, committed };
 			};
 			const stored = () => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'emoji_catalog'").toArray()[0]?.value;
-			expect(store.emojiCatalog(clock.value)).toBeNull();
+			expect(store.server.emojiCatalog(clock.value)).toBeNull();
 			const a = add(':a:');
-			expect(store.emojiCatalog(clock.value)).toEqual({ url: `${MEDIA}/${a.draft.key}`, keys: new Set([':a:']) });
+			expect(store.server.emojiCatalog(clock.value)).toEqual({ url: `${MEDIA}/${a.draft.key}`, keys: new Set([':a:']) });
 			expect(a.draft.key).toMatch(/^e\/c\/[0-9a-f]{64}\.json$/);
 			expect(stored()).toBe(a.draft.json);
 			expect(JSON.parse(stored()!)).toEqual({ ':a:': { url: `${MEDIA}/${a.upload.key}`, width: 1, height: 1 } });
@@ -334,24 +335,24 @@ describe('store uploads', () => {
 			// At the cap a new key is denied; a known one may still be replaced,
 			// releasing the catalog two back. Its old image stays with the
 			// previous catalog, which refers to it.
-			expect(errorCode(() => store.startEmojiUpload({ userId: 'ada', key: ':c:', now: clock.value }))).toBe('denied');
+			expect(errorCode(() => store.uploads.startEmoji({ userId: 'ada', key: ':c:', now: clock.value }))).toBe('denied');
 			const replaced = add(':a:', 2);
 			expect(replaced.committed.deletedUploads).toEqual([a.draft.key]);
 			expect(JSON.parse(stored()!)).toEqual({ ':a:': { url: `${MEDIA}/${replaced.upload.key}`, width: 2, height: 2 }, ':b:': { url: `${MEDIA}/${b.upload.key}`, width: 1, height: 1 } });
 			// A draft made from a catalog that changed since does not apply.
-			const stale = store.emojiDraft({ remove: ':b:' }, clock.value)!;
-			expect(store.commitEmoji(store.emojiDraft({ remove: ':a:' }, clock.value)!, clock.value)).toEqual({ applied: true, deletedUploads: [a.upload.key, b.draft.key] });
-			expect(store.commitEmoji(stale, clock.value)).toEqual({ applied: false, deletedUploads: [] });
-			expect(store.emojiDraft({ remove: ':a:' }, clock.value)).toBeNull();
+			const stale = store.server.emojiDraft({ remove: ':b:' }, clock.value)!;
+			expect(store.server.commitEmoji(store.server.emojiDraft({ remove: ':a:' }, clock.value)!, clock.value)).toEqual({ applied: true, deletedUploads: [a.upload.key, b.draft.key] });
+			expect(store.server.commitEmoji(stale, clock.value)).toEqual({ applied: false, deletedUploads: [] });
+			expect(store.server.emojiDraft({ remove: ':a:' }, clock.value)).toBeNull();
 			// Emoji never expire, and purging the admin who added them leaves them.
 			clock.value += 400 * 86_400_000;
-			store.cleanupUploads(clock.value);
-			expect(store.purgeUsers({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
-			expect(store.emojiCatalog(clock.value)?.keys).toEqual(new Set([':b:']));
+			store.uploads.cleanup(clock.value);
+			expect(store.accounts.purge({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
+			expect(store.server.emojiCatalog(clock.value)?.keys).toEqual(new Set([':b:']));
 			// After a wake, the catalog is read again from its row.
-			const woken = new Store(state, config, clock.clock);
-			woken.initialize();
-			expect(woken.emojiCatalog(clock.value)).toEqual(store.emojiCatalog(clock.value));
+			const woken = openStore(state, config, clock.clock);
+			woken.lifecycle.initialize();
+			expect(woken.server.emojiCatalog(clock.value)).toEqual(store.server.emojiCatalog(clock.value));
 		});
 	});
 
@@ -361,50 +362,50 @@ describe('store uploads', () => {
 			const sql = state.storage.sql;
 			const storedBytes = () => Number(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'upload_bytes'").toArray()[0]?.value ?? 0);
 			const meta = () => Object.fromEntries(sql.exec<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key LIKE 'server:%'").toArray().map((row) => [row.key, row.value]));
-			expect(store.serverMetadata(clock.value)).toEqual({});
-			store.setServerText('title', 'Chat Club', clock.value);
-			store.setServerText('description', 'Talk about *clubs*.', clock.value);
-			expect(store.serverMetadata(clock.value)).toEqual({ title: 'Chat Club', description: 'Talk about *clubs*.' });
-			store.setServerText('description', undefined, clock.value);
+			expect(store.server.metadata(clock.value)).toEqual({});
+			store.server.setText('title', 'Chat Club', clock.value);
+			store.server.setText('description', 'Talk about *clubs*.', clock.value);
+			expect(store.server.metadata(clock.value)).toEqual({ title: 'Chat Club', description: 'Talk about *clubs*.' });
+			store.server.setText('description', undefined, clock.value);
 			expect(meta()).toEqual({ 'server:title': 'Chat Club' });
 
 			// An avatar is an avatar in size, kept under e/ as the server's.
 			const start = () => {
-				const upload = store.startServerAvatarUpload({ userId: 'ada', now: clock.value });
+				const upload = store.uploads.startServerAvatar({ userId: 'ada', now: clock.value });
 				expect(upload).toMatchObject({ key: expect.stringMatching(/^e\/[A-Za-z0-9_-]{22}$/), maxBytes: UPLOADS.maxAvatarBytes });
-				expect(store.claimUpload(upload.key, clock.value)).toBe(true);
+				expect(store.uploads.claim(upload.key, clock.value)).toBe(true);
 				return upload;
 			};
 			const first = start();
 			expect(storedBytes()).toBe(UPLOADS.maxAvatarBytes);
 			// It is no custom emoji, and only an image becomes the avatar.
-			expect(store.emojiDraft({ add: { key: first.key, ok: true, bytes: 64, contentType: 'image/png' } }, clock.value)).toBeNull();
-			const finished = store.finishUpload({ key: first.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			expect(store.server.emojiDraft({ add: { key: first.key, ok: true, bytes: 64, contentType: 'image/png' } }, clock.value)).toBeNull();
+			const finished = store.uploads.finish({ key: first.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
 			expect(finished).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${first.key}`, deletedUploads: [] });
 			expect(storedBytes()).toBe(64);
 			expect(sql.exec<{ owner_id: string; expires_ms: number }>('SELECT owner_id, expires_ms FROM uploads WHERE upload_key = ?', first.key).one()).toEqual({ owner_id: '~server', expires_ms: Number.MAX_SAFE_INTEGER });
 			const audio = start();
-			expect(store.finishUpload({ key: audio.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value)).toMatchObject({ accepted: false, deletedUploads: [audio.key] });
+			expect(store.uploads.finish({ key: audio.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value)).toMatchObject({ accepted: false, deletedUploads: [audio.key] });
 			// A new one replaces the old, whose object goes at once.
 			const second = start();
-			expect(store.finishUpload({ key: second.key, ok: true, bytes: 32, contentType: 'image/png' }, clock.value)).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${second.key}`, deletedUploads: [first.key] });
+			expect(store.uploads.finish({ key: second.key, ok: true, bytes: 32, contentType: 'image/png' }, clock.value)).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${second.key}`, deletedUploads: [first.key] });
 			expect(storedBytes()).toBe(32);
 
 			// It never expires, and renaming or purging the admin who set it leaves it.
 			clock.value += 400 * 86_400_000;
-			store.cleanupUploads(clock.value);
-			store.renameIdentity({ from: 'ada', to: 'ada_2', now: clock.value });
-			expect(store.purgeUsers({ userIds: ['ada_2'], now: clock.value }).deletedUploads).toEqual([]);
-			expect(store.serverMetadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
+			store.uploads.cleanup(clock.value);
+			store.accounts.rename({ from: 'ada', to: 'ada_2', now: clock.value });
+			expect(store.accounts.purge({ userIds: ['ada_2'], now: clock.value }).deletedUploads).toEqual([]);
+			expect(store.server.metadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
 			expect(storedBytes()).toBe(32);
 
 			// After a wake, the values are read again from their rows.
-			const woken = new Store(state, { uploads: UPLOADS }, clock.clock);
-			woken.initialize();
-			expect(woken.serverMetadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
+			const woken = openStore(state, { uploads: UPLOADS }, clock.clock);
+			woken.lifecycle.initialize();
+			expect(woken.server.metadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
 			// Clearing the avatar releases its image.
-			expect(woken.clearServerAvatar(clock.value)).toEqual({ changed: true, deletedUploads: [second.key] });
-			expect(woken.clearServerAvatar(clock.value)).toEqual({ changed: false, deletedUploads: [] });
+			expect(woken.server.clearAvatar(clock.value)).toEqual({ changed: true, deletedUploads: [second.key] });
+			expect(woken.server.clearAvatar(clock.value)).toEqual({ changed: false, deletedUploads: [] });
 			expect(storedBytes()).toBe(0);
 			expect(meta()).toEqual({ 'server:title': 'Chat Club' });
 		});
@@ -415,13 +416,13 @@ describe('store uploads', () => {
 		await withStore('uploads-emoji-superseded', config, (store, clock, state) => {
 			register(store, clock, 'ada');
 			const add = (key: string, bytes: number) => {
-				const upload = store.startEmojiUpload({ userId: 'ada', key, now: clock.value });
-				expect(store.claimUpload(upload.key, clock.value)).toBe(true);
-				return commit(store.emojiDraft({ add: { key: upload.key, ok: true, bytes, contentType: 'image/png' } }, clock.value)!, upload.key);
+				const upload = store.uploads.startEmoji({ userId: 'ada', key, now: clock.value });
+				expect(store.uploads.claim(upload.key, clock.value)).toBe(true);
+				return commit(store.server.emojiDraft({ add: { key: upload.key, ok: true, bytes, contentType: 'image/png' } }, clock.value)!, upload.key);
 			};
-			const remove = (key: string) => commit(store.emojiDraft({ remove: key }, clock.value)!);
+			const remove = (key: string) => commit(store.server.emojiDraft({ remove: key }, clock.value)!);
 			const commit = (draft: EmojiDraft, image?: string) => {
-				const committed = store.commitEmoji(draft, clock.value);
+				const committed = store.server.commitEmoji(draft, clock.value);
 				expect(committed.applied).toBe(true);
 				// The stored-bytes count is always the sum of the rows kept.
 				expect(storedBytes()).toBe(rowBytes());
@@ -469,13 +470,13 @@ describe('store uploads', () => {
 			// A superseded image counts against the stored-bytes cap, and not
 			// against maxEmoji; it is the server's, so purges and expiry leave it.
 			clock.value += 400 * 86_400_000;
-			store.cleanupUploads(clock.value);
-			expect(store.purgeUsers({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
+			store.uploads.cleanup(clock.value);
+			expect(store.accounts.purge({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
 			expect(states()).toEqual({ [z2.image!]: 'superseded', [z3.image!]: 'done' });
 			// It survives a wake, and the next change after it releases it.
-			const woken = new Store(state, config, clock.clock);
-			woken.initialize();
-			const committed = woken.commitEmoji(woken.emojiDraft({ remove: ':z:' }, clock.value)!, clock.value);
+			const woken = openStore(state, config, clock.clock);
+			woken.lifecycle.initialize();
+			const committed = woken.server.commitEmoji(woken.server.emojiDraft({ remove: ':z:' }, clock.value)!, clock.value);
 			expect(committed).toEqual({ applied: true, deletedUploads: [z2.image, z2.catalog] });
 			expect(states()).toEqual({ [z3.image!]: 'superseded' });
 			expect(storedBytes()).toBe(rowBytes());
@@ -490,20 +491,20 @@ describe('store uploads', () => {
 			const edited = theirs.result.message_id as string;
 			post(store, clock, 'mallory', { message_id: edited, body: { text: 'more spam', embeds: [{ embed_id: (theirs.message!.body!.embeds as Array<{ embed_id: string }>)[0].embed_id, kind: 'upload' }] } });
 			const kept = post(store, clock, 'trent', { body: { text: 'hello' } });
-			const react = (userId: string, messageId: string) => store.commitMutation({ userId, ipKey: `ip-${userId}`, method: 'reactions', now: clock.value, params: { message_id: messageId, emojis: ['👍'] }, identity: { user_id: userId } });
+			const react = (userId: string, messageId: string) => store.messages.commit({ userId, ipKey: `ip-${userId}`, method: 'reactions', now: clock.value, params: { message_id: messageId, emojis: ['👍'] }, identity: { user_id: userId } });
 			react('mallory', kept.result.message_id as string);
 			react('trent', kept.result.message_id as string);
 			react('trent', edited);
 			// A move re-logs every reaction set on the message in one record.
-			const thread = store.commitMutation({ userId: 'trent', ipKey: 'ip-trent', method: 'room_set', now: clock.value, params: { parent_room_id: 'general', title: 'T' }, identity: { user_id: 'trent' } });
+			const thread = store.messages.commit({ userId: 'trent', ipKey: 'ip-trent', method: 'room_set', now: clock.value, params: { parent_room_id: 'general', title: 'T' }, identity: { user_id: 'trent' } });
 			post(store, clock, 'trent', { message_id: kept.result.message_id, room_id: thread.room!.room_id, body: { text: 'hello' } });
-			store.setRole({ userId: 'mallory', role: 'admin', on: true, now: clock.value });
-			const before = store.countIdentities();
+			store.accounts.setRole({ userId: 'mallory', role: 'admin', on: true, now: clock.value });
+			const before = sqliteOf(store).countIdentities();
 
-			const purged = store.purgeUsers({ userIds: ['mallory', 'bot_mallory'], now: clock.value });
+			const purged = store.accounts.purge({ userIds: ['mallory', 'bot_mallory'], now: clock.value });
 			expect(purged).toEqual({ messages: 1, reactions: 1, deletedUploads: [writeOf(theirs.result).write.key] });
-			expect(store.getIdentity('mallory')).toBeNull();
-			expect(store.countIdentities()).toBe(before - 1);
+			expect(store.accounts.get('mallory')).toBeNull();
+			expect(sqliteOf(store).countIdentities()).toBe(before - 1);
 			const sql = state.storage.sql;
 			const records = sql.exec<{ kind: string; record_json: string }>('SELECT kind, record_json FROM records').toArray();
 			expect(records.some((row) => row.record_json.includes('mallory'))).toBe(false);
@@ -526,16 +527,16 @@ describe('store uploads', () => {
 			const embedId = (theirs.message!.body!.embeds as Array<{ embed_id: string }>)[0].embed_id;
 			post(store, clock, 'oscar', { message_id: messageId, body: { text: 'mine, edited', embeds: [{ embed_id: embedId, kind: 'upload' }] } });
 			const kept = post(store, clock, 'peggy', { body: { text: 'hello' } });
-			const react = (userId: string, id: string) => store.commitMutation({ userId, ipKey: `ip-${userId}`, method: 'reactions', now: clock.value, params: { message_id: id, emojis: ['👍'] }, identity: { user_id: userId, name: `Name of ${userId}` } });
+			const react = (userId: string, id: string) => store.messages.commit({ userId, ipKey: `ip-${userId}`, method: 'reactions', now: clock.value, params: { message_id: id, emojis: ['👍'] }, identity: { user_id: userId, name: `Name of ${userId}` } });
 			react('oscar', kept.result.message_id as string);
 			react('peggy', kept.result.message_id as string);
 			react('peggy', messageId);
 			// A move re-logs every reaction set on the message in one record.
-			const thread = store.commitMutation({ userId: 'peggy', ipKey: 'ip-peggy', method: 'room_set', now: clock.value, params: { parent_room_id: 'general', title: 'T' }, identity: { user_id: 'peggy' } });
+			const thread = store.messages.commit({ userId: 'peggy', ipKey: 'ip-peggy', method: 'room_set', now: clock.value, params: { parent_room_id: 'general', title: 'T' }, identity: { user_id: 'peggy' } });
 			post(store, clock, 'peggy', { message_id: kept.result.message_id, room_id: thread.room!.room_id, body: { text: 'hello' } });
 
-			expect(store.renameIdentity({ from: 'oscar', to: 'oskar', now: clock.value }).name).toBe('Name of oscar');
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.accounts.rename({ from: 'oscar', to: 'oskar', now: clock.value }).name).toBe('Name of oscar');
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 			const sql = state.storage.sql;
 			const dump = (table: string) => sql.exec(`SELECT * FROM ${table}`).toArray().map((row) => JSON.stringify(row)).join('\n');
 			for (const table of ['records', 'message_state', 'reaction_state', 'uploads', 'accepted_requests', 'principal_limits', 'memberships']) {
@@ -589,7 +590,7 @@ describe('uploads end to end', () => {
 	async function signedIn(userId: string): Promise<Peer> {
 		const token = await runInDurableObject(stub(), async (instance) => {
 			const runtime = instance as unknown as { store: Store; issueSession(userId: string, origin: string, now: number): Promise<string> };
-			runtime.store.registerIdentity({
+			runtime.store.accounts.register({
 				userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 			});
@@ -967,7 +968,7 @@ describe('uploads end to end', () => {
 			quiet.alice.send({ id: 'typing', method: 'activity', params: { room_id: 'general', typing: 5 } });
 			expect((await exchange(quiet.alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing')).toEqual([]);
 			quiet.alice.close(); quiet.bob.close();
-			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('activity'))).toBeUndefined();
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.server.toggle('activity'))).toBeUndefined();
 		} finally { admin.close(); }
 	});
 
@@ -1170,7 +1171,7 @@ describe('uploads end to end', () => {
 
 			// Stored values survive a restart and override the variables; clearing one falls back to its variable.
 			await setVariables({ title: 'From Variable', description: 'Variable *description*.', avatar: 'https://example.com/icon.png' });
-			await runInDurableObject(stub(), (instance) => { (instance as unknown as { store: { serverCache: unknown } }).store.serverCache = null; });
+			await runInDurableObject(stub(), (instance) => { (sqliteIn(instance) as unknown as { serverCache: unknown }).serverCache = null; });
 			const restarted = await connect();
 			expect((await restarted.next()).params).toMatchObject({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.', avatar });
 			restarted.close();

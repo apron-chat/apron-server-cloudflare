@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { PRIVATE_ROOM_PREFIX } from '../src/store';
+import { PRIVATE_ROOM_PREFIX } from '../src/domain';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
 // Private rooms over the socket (§4.2.4): only members list, read, post in,
@@ -17,10 +17,10 @@ const unique = (prefix: string) => `${prefix}_${crypto.randomUUID().slice(0, 8)}
 async function register(userId: string): Promise<string> {
 	return runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as {
-			store: { registerIdentity(input: Record<string, unknown>): unknown };
+			store: { accounts: { register(input: Record<string, unknown>): unknown } };
 			issueSession(userId: string, origin: string, now: number): Promise<string>;
 		};
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId, name: userId, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});

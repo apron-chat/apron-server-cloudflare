@@ -7,9 +7,9 @@ import { expect, it } from "vitest";
 import { type ChatRecord, type ScanStats, textSource, writeArchiveToString } from "@apron/archive";
 import { importArchive } from "../../src/history/archive/import";
 import { archiveChain } from "../../src/history/config";
-import { storeRestore } from "../../src/history/store-head";
-import { Store, type StoreConfig } from "../../src/store";
+import { type Store, type StoreConfig, openStore } from "../../src/store";
 import { withStore } from "../helpers/store";
+import { sqliteOf } from "../../src/store/open";
 
 const CONFIG: Partial<StoreConfig> = {
 	guestPostsPerMinute: 1_000, registeredPostsPerMinute: 1_000, trustedPostsPerMinute: 1_000,
@@ -49,12 +49,12 @@ it("goes on from the line it got to in a new Store after a failure midway, to wh
 	const base = Date.now() - 600_000;
 	const text = await archiveText(base);
 	const expected = await withStore("stream-reference", CONFIG, async (store, clock, state) => {
-		const report = await importArchive(archiveChain(undefined, { store, limits: LIMITS, clock: clock.clock }), storeRestore(store), textSource(text), { clock: clock.clock });
+		const report = await importArchive(archiveChain(undefined, { store: store.history, limits: LIMITS, clock: clock.clock }), store.history.restore(), textSource(text), { clock: clock.clock });
 		expect(report).toMatchObject({ records: 1_500, rejected: 0 });
 		return contents(state);
 	});
 	await withStore("stream-resume", CONFIG, async (store, clock, state) => {
-		const restore = storeRestore(store);
+		const restore = store.history.restore();
 		let calls = 0;
 		const failing = { ...restore, restoreRoom: async (...args: Parameters<typeof restore.restoreRoom>) => {
 			calls += 1;
@@ -62,20 +62,20 @@ it("goes on from the line it got to in a new Store after a failure midway, to wh
 			return restore.restoreRoom(...args);
 		} };
 		const options = { clock: clock.clock, checkpoint: 250, batch: 100 };
-		await expect(importArchive(archiveChain(undefined, { store, limits: LIMITS, clock: clock.clock }), failing, textSource(text), options)).rejects.toThrow("injected failure");
-		expect(store.historyImportJournal()).toBeDefined();
-		const saved = JSON.parse(store.historyImportProgress()!) as { line: number; offset: number; entry: number };
+		await expect(importArchive(archiveChain(undefined, { store: store.history, limits: LIMITS, clock: clock.clock }), failing, textSource(text), options)).rejects.toThrow("injected failure");
+		expect(store.history.importJournal()).toBeDefined();
+		const saved = JSON.parse(sqliteOf(store).historyImportProgress()!) as { line: number; offset: number; entry: number };
 		expect(saved.entry).toBeGreaterThan(0);
 
 		// A new Store over the same object, as after a restart.
-		const again = new Store(state, CONFIG, clock.clock);
-		again.initialize();
+		const again = openStore(state, CONFIG, clock.clock);
+		again.lifecycle.initialize();
 		const stats: ScanStats = { skipped: 0, scanned: 0 };
-		const report = await importArchive(archiveChain(undefined, { store: again, limits: LIMITS, clock: clock.clock }), storeRestore(again), textSource(text), { ...options, stats });
+		const report = await importArchive(archiveChain(undefined, { store: again.history, limits: LIMITS, clock: clock.clock }), again.history.restore(), textSource(text), { ...options, stats });
 		expect(report).toMatchObject({ resumed: true, records: 1_500 });
 		expect(stats.skipped).toBe(saved.offset);
-		expect(again.historyImportJournal()).toBeUndefined();
-		expect(again.historyImportProgress()).toBeUndefined();
+		expect(again.history.importJournal()).toBeUndefined();
+		expect(sqliteOf(again).historyImportProgress()).toBeUndefined();
 		const got = contents(state);
 		expect(got.rooms).toContainEqual(expect.objectContaining({ room_id: String(base + 1), parent_room_id: "lobby" }));
 		expect(got).toEqual(expected);

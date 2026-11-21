@@ -15,9 +15,10 @@ import type { HistoryChain } from "../../src/history/chain";
 import { buildHistoryChain, historyLayout } from "../../src/history/config";
 import type { HistorySchedule } from "../../src/history/schedule";
 import { chainStateStore } from "../../src/history/state";
-import type { Store } from "../../src/store";
+import { type Store } from "../../src/store";
 import { connect, greeting, request } from "../helpers/socket";
 import { expectRetryAfter } from "../helpers/store";
+import { sqliteOf } from "../../src/store/open";
 
 const MIB = 1024 * 1024;
 const DAY_MS = 86_400_000;
@@ -26,7 +27,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The runtime's parts these tests drive (private members, reached as the tests reach them elsewhere). */
 type Runtime = {
-	store: Store & { config: Record<string, unknown> }; config: { limits: Record<string, number> }; history?: HistoryChain;
+	store: Store; config: { limits: Record<string, number> }; history?: HistoryChain;
 	runtimeEnv: Record<string, unknown>; d1Held?: boolean; historySchedule: HistorySchedule;
 	deadlines: { maintenance: { at?: number; clear(): void } };
 	underHistoryLease(holder: { kind: "job"; job: "export" }, fn: () => Promise<void>): Promise<void>;
@@ -43,12 +44,12 @@ async function inObject(name: string, d1Records: number, fn: (object: Awaited<Re
 }
 
 function harness(runtime: Runtime, state: DurableObjectState, name: string, d1Records: number) {
-	runtime.store.config = { ...runtime.store.config, historyHotRecords: 3, cleanupThresholdPercent: 100, ...FAST };
+	(sqliteOf(runtime.store) as unknown as { config: Record<string, unknown> }).config = { ...runtime.store.ops.config, historyHotRecords: 3, cleanupThresholdPercent: 100, ...FAST };
 	runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, historyHotRecords: 3, historyD1Records: d1Records, cleanupThresholdPercent: 100 } };
 	const server = `${name}-${Date.now()}`;
 	const build = (bindings: Record<string, unknown>) => buildHistoryChain({
-		layout: historyLayout(bindings as never, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store,
-		clock: { now: Date.now }, chunkIndex: (tier) => runtime.store.chunkIndex(tier), server,
+		layout: historyLayout(bindings as never, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store.history,
+		clock: { now: Date.now }, chunkIndex: (tier) => runtime.store.history.chunkIndex(tier), server,
 	});
 	runtime.history = build(env as never);
 	const sql = <T extends Record<string, SqlStorageValue>>(query: string, ...bindings: unknown[]) => state.storage.sql.exec<T>(query, ...bindings).toArray();
@@ -59,7 +60,7 @@ function harness(runtime: Runtime, state: DurableObjectState, name: string, d1Re
 		async post(count: number, roomId = "general"): Promise<number[]> {
 			const ids: number[] = [];
 			for (let index = 0; index < count; index += 1, posted += 1) {
-				const result = runtime.store.mutate({ userId: "p", ipKey: "ip", requestId: `${name}-${posted}`, method: "message", now: Date.now(), params: { room_id: roomId, body: { format: "plain", text: `m ${posted}` } }, identity: { user_id: "p", name: "p" } });
+				const result = runtime.store.messages.mutate({ userId: "p", ipKey: "ip", requestId: `${name}-${posted}`, method: "message", now: Date.now(), params: { room_id: roomId, body: { format: "plain", text: `m ${posted}` } }, identity: { user_id: "p", name: "p" } });
 				ids.push(Number(result.message!.log_id));
 				await sleep(2);
 			}
@@ -68,7 +69,7 @@ function harness(runtime: Runtime, state: DurableObjectState, name: string, d1Re
 		/** Makes cleanup due now, as its scheduled time or a job's next step would. */
 		cleanupNow() {
 			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
-			runtime.store.forgetCleanupDue();
+			sqliteOf(runtime.store).forgetCleanupDue();
 		},
 		/** Full alarms with cleanup due: copy, delete, trim, publish. */
 		async cycles(count: number) {
@@ -80,11 +81,11 @@ function harness(runtime: Runtime, state: DurableObjectState, name: string, d1Re
 		/** Skips a running job's one-second pause, so a test need not sleep through it. */
 		continueJob() {
 			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1 AND cleanup_cursor IS NOT NULL");
-			runtime.store.forgetCleanupDue();
+			sqliteOf(runtime.store).forgetCleanupDue();
 		},
 		scheduleTomorrow() {
 			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", Date.now() + DAY_MS);
-			runtime.store.forgetCleanupDue();
+			sqliteOf(runtime.store).forgetCleanupDue();
 		},
 		jobRunning: () => sql<{ cursor: number | null }>("SELECT cleanup_cursor AS cursor FROM maintenance WHERE id = 1")[0].cursor !== null,
 		hotLogs: () => sql<{ log_id: number }>("SELECT log_id FROM records ORDER BY log_id").map((row) => Number(row.log_id)),
@@ -104,24 +105,24 @@ function harness(runtime: Runtime, state: DurableObjectState, name: string, d1Re
 		},
 		/** Puts the database past its high-water mark and makes a post meet it; the size it had. */
 		flood(): number {
-			const size = runtime.store.databaseSize()!;
-			Object.assign(runtime.store.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
+			const size = runtime.store.ops.databaseSize()!;
+			Object.assign(runtime.store.ops.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
 			let error: unknown;
-			try { runtime.store.mutate({ userId: "p", ipKey: "ip", requestId: `${name}-refused`, method: "message", now: Date.now(), params: { room_id: "general", body: { format: "plain", text: "refused" } }, identity: { user_id: "p", name: "p" } }); } catch (caught) { error = caught; }
+			try { runtime.store.messages.mutate({ userId: "p", ipKey: "ip", requestId: `${name}-refused`, method: "message", now: Date.now(), params: { room_id: "general", body: { format: "plain", text: "refused" } }, identity: { user_id: "p", name: "p" } }); } catch (caught) { error = caught; }
 			expectRetryAfter(error);
-			expect(runtime.store.takeAlarmChange()).toBe(true);
+			expect(runtime.store.lifecycle.takeAlarmChange()).toBe(true);
 			return size;
 		},
 		/** Under the low-water mark again. */
 		relieve(size: number) {
-			Object.assign(runtime.store.config, { storageLowWaterBytes: size * 2, storageHighWaterBytes: size * 3, storageHardTargetBytes: size * 3 + 64 * MIB });
+			Object.assign(runtime.store.ops.config, { storageLowWaterBytes: size * 2, storageHighWaterBytes: size * 3, storageHardTargetBytes: size * 3 + 64 * MIB });
 		},
 		/** Runs alarms and checks none of them finds cleanup due or sets the next alarm to now, and nothing leaves SQLite. */
 		async expectNoSpin() {
 			const before = object.hotLogs().length;
 			const seen: Array<number | null> = [];
 			for (let round = 0; round < 5; round += 1) {
-				expect(runtime.store.cleanupDue(Date.now())).toBe(false);
+				expect(runtime.store.lifecycle.cleanupDue(Date.now())).toBe(false);
 				await runtime.alarm();
 				const alarm = await state.storage.getAlarm();
 				seen.push(alarm === null ? null : alarm - Date.now());
@@ -151,15 +152,15 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 		const logs = await runInDurableObject(stub(), async (instance, state) => {
 			const runtime = instance as unknown as Runtime;
 			// Three records in SQLite, four more in D1.
-			runtime.store.config = { ...runtime.store.config, historyHotRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100, ...FAST };
+			(sqliteOf(runtime.store) as unknown as { config: Record<string, unknown> }).config = { ...runtime.store.ops.config, historyHotRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100, ...FAST };
 			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, historyHotRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };
 			// The chain takes its tiers' limits when built.
-			runtime.history = buildHistoryChain({ layout: historyLayout(env, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
+			runtime.history = buildHistoryChain({ layout: historyLayout(env, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store.history, clock: { now: Date.now } });
 			const logs: string[] = [];
 			for (let index = 0; index < 10; index += 1) {
 				// One sender's message among those D1 will hold, for /purge below.
 				const userId = index === 5 ? "archive-victim" : "archive-poster";
-				const result = runtime.store.mutate({
+				const result = runtime.store.messages.mutate({
 					userId, ipKey: "archive-ip", requestId: `archive-${index}`, method: "message", now: Date.now(),
 					params: { room_id: "general", body: { format: "plain", text: `message ${index}` } },
 					identity: { user_id: userId, name: userId },
@@ -171,7 +172,7 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 			// Cleanup due on each alarm, until it settles: copy, remove, find D1's limit, publish it, trim.
 			for (let round = 0; round < 8; round += 1) {
 				state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
-				runtime.store.forgetCleanupDue();
+				sqliteOf(runtime.store).forgetCleanupDue();
 				await runtime.alarm();
 			}
 			const hot = state.storage.sql.exec<{ log_id: number }>("SELECT log_id FROM records ORDER BY log_id").toArray().map((row) => String(row.log_id));
@@ -181,7 +182,7 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 
 		// D1 holds the four newest records that left SQLite; the rest expired.
 		expect(await inD1()).toEqual(logs.slice(3, 7));
-		const bounds = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.logBounds());
+		const bounds = await runInDurableObject(stub(), (instance) => sqliteOf((instance as unknown as Runtime).store).logBounds());
 		expect(bounds.history_floor).toBe(logs[3]);
 
 		// History serves both, newest page first, as one log.
@@ -200,12 +201,12 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 		// /purge: queued for the link into D1, and applied to pages that read it before D1 has it.
 		await runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime;
-			runtime.store.purgeUsers({ userIds: ["archive-victim"] });
-			expect(runtime.store.historyRewrites()).toEqual([{ seq: 1, rewrite: { user: "archive-victim", into: null, messages: [] } }]);
+			runtime.store.accounts.purge({ userIds: ["archive-victim"] });
+			expect(runtime.store.history.rewrites()).toEqual([{ seq: 1, rewrite: { user: "archive-victim", into: null, messages: [] } }]);
 			// A tier that finds more of the user's messages adds them to the rewrite, once each; another seq is left alone.
-			runtime.store.amendHistoryPurge(1, ["no-such-message", "no-such-message"]);
-			runtime.store.amendHistoryPurge(9, ["other"]);
-			expect(runtime.store.historyRewrites()).toEqual([{ seq: 1, rewrite: { user: "archive-victim", into: null, messages: ["no-such-message"] } }]);
+			sqliteOf(runtime.store).amendHistoryPurge(1, ["no-such-message", "no-such-message"]);
+			sqliteOf(runtime.store).amendHistoryPurge(9, ["other"]);
+			expect(runtime.store.history.rewrites()).toEqual([{ seq: 1, rewrite: { user: "archive-victim", into: null, messages: ["no-such-message"] } }]);
 		});
 		expect(await inD1()).toEqual(logs.slice(3, 7));
 		const purgedPage = [logs[3], logs[4], ...logs.slice(6)];
@@ -214,9 +215,9 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 		await runInDurableObject(stub(), async (instance, state) => {
 			const runtime = instance as unknown as Runtime;
 			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
-			runtime.store.forgetCleanupDue();
+			sqliteOf(runtime.store).forgetCleanupDue();
 			await runtime.alarm();
-			expect(runtime.store.historyRewrites()).toEqual([]);
+			expect(runtime.store.history.rewrites()).toEqual([]);
 		});
 		expect(await inD1()).toEqual([logs[3], logs[4], logs[6]]);
 		// /status shows what each holds against its limit.
@@ -234,7 +235,7 @@ it("moves records past SQLite into D1, serves them in history, applies /purge th
 it("loses nothing when SQLite copies straight into the cold tier, and pages every room's messages back down the chain", async () => {
 	await inObject("head-to-cold", 0, async (object) => {
 		const { runtime } = object;
-		const thread = String(runtime.store.mutate({ userId: "p", ipKey: "ip", requestId: "thread", method: "room_set", now: Date.now(), params: { parent_room_id: "general", title: "Long ago" }, identity: { user_id: "p", name: "p" } }).result.room_id);
+		const thread = String(runtime.store.messages.mutate({ userId: "p", ipKey: "ip", requestId: "thread", method: "room_set", now: Date.now(), params: { parent_room_id: "general", title: "Long ago" }, identity: { user_id: "p", name: "p" } }).result.room_id);
 		const posted: Record<string, number[]> = { general: [], [thread]: [] };
 		for (let index = 0; index < 75; index += 1) {
 			posted.general.push(...await object.post(1));
@@ -252,7 +253,7 @@ it("loses nothing when SQLite copies straight into the cold tier, and pages ever
 			expect(await object.messages(roomId), roomId).toEqual(logs);
 		}
 		// The thread is kept, and listed, however much of its history went down.
-		expect(runtime.store.listRooms(Date.now()).some((room) => room.room_id === thread)).toBe(true);
+		expect(runtime.store.rooms.list(Date.now()).some((room) => room.room_id === thread)).toBe(true);
 	});
 });
 
@@ -265,16 +266,16 @@ it("moves a flood at the storage watermark down to D1 at once, never before D1 h
 		const size = object.flood();
 
 		// The next alarm does the full work: the cleanup the watermark asked for starts though its scheduled time is a day off.
-		expect(runtime.store.cleanupDue(Date.now())).toBe(true);
+		expect(runtime.store.lifecycle.cleanupDue(Date.now())).toBe(true);
 		await runtime.alarm();
 		expect(object.jobRunning()).toBe(true);
 
-		const links = chainStateStore(runtime.store.historyStatePort(), "hot");
+		const links = chainStateStore(sqliteOf(runtime.store).historyStatePort(), "hot");
 		for (let round = 0; round < 40 && object.hotLogs().length > 3; round += 1) {
 			object.continueJob();
 			await runtime.alarm();
 			// Copy before delete: SQLite's floor never passes what the link into D1 has copied.
-			const { hot } = runtime.store.historyFloors(Date.now());
+			const { hot } = sqliteOf(runtime.store).historyFloors(Date.now());
 			expect(hot).toBeLessThanOrEqual((await links.loadLink("hot")).through + 1);
 		}
 		expect(object.hotLogs().length).toBe(3);

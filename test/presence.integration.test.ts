@@ -1,11 +1,13 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS } from '../src/budget';
-import { MUTE_FOREVER, type Store } from '../src/store';
+import { MUTE_FOREVER } from '../src/domain';
+import { type Store } from '../src/store';
 import { StoreError } from '../src/store-error';
 import { connect as open, exchange, request, status as statusRequest, statusOnly, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
-import { withStore } from './helpers/store';
+import { sqliteIn, withStore } from './helpers/store';
+import { sqliteOf } from "../src/store/open";
 
 let nextIp = 1;
 const stub = () => env.DEMO.getByName('public-demo-v1');
@@ -47,7 +49,7 @@ async function unpingedTimeout(seconds: number): Promise<void> {
 
 async function register(userId: string): Promise<void> {
 	await runInDurableObject(stub(), (instance) => {
-		(instance as unknown as Runtime).store.registerIdentity({
+		(instance as unknown as Runtime).store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -119,7 +121,7 @@ async function choose(peer: Peer, value: unknown): Promise<Frame> {
 async function listing(observer: Peer): Promise<Map<string, Record<string, unknown>>> {
 	await runInDurableObject(stub(), (instance) => {
 		// Each listing in these tests reads afresh, whatever an earlier one kept.
-		(instance as unknown as { store: { memberCache: Map<string, unknown> } }).store.memberCache.clear();
+		(sqliteIn(instance) as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
 	});
 	// Listings are limited per user per minute: let one pass.
 	offset += 10_000;
@@ -185,9 +187,9 @@ function statements(state: DurableObjectState, match: RegExp, run: () => unknown
 async function measured(run: (runtime: Runtime & Record<string, any>, state: DurableObjectState) => void): Promise<{ queries: string[]; reads: number; writes: number }> {
 	return runInDurableObject(stub(), (instance, state) => {
 		const runtime = instance as unknown as Runtime & Record<string, any>;
-		const before = runtime.store.storageAccounting();
+		const before = sqliteOf(runtime.store).storageAccounting();
 		const sql = statements(state, /./, () => run(runtime, state));
-		const after = runtime.store.storageAccounting();
+		const after = sqliteOf(runtime.store).storageAccounting();
 		return { queries: sql.queries, reads: after.reads - before.reads, writes: after.writes - before.writes };
 	});
 }
@@ -269,7 +271,7 @@ describe('the status a user chooses (§4.5)', () => {
 			const later = await signIn(bobId, { existing: true });
 			expect(later.auth.result.you.status).toBe('dnd');
 			later.peer.close();
-			const accounting = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.accountingStatus());
+			const accounting = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.ops.accountingStatus());
 			expect(accounting.unsafe).toBe(false);
 		} finally { alice.close(); bob.close(); bobToo.close(); }
 	});
@@ -281,12 +283,12 @@ describe('the status a user chooses (§4.5)', () => {
 		await runInDurableObject(stub(), (instance) => {
 			const { store } = instance as unknown as Runtime;
 			const now = Date.now();
-			store.setStatus({ userId: ids.dnd, choice: 'dnd', now });
-			store.setStatus({ userId: ids.hidden, choice: 'invisible', now });
-			store.setStatus({ userId: ids.none, choice: '', now });
-			store.setMute({ userId: ids.muted, untilMs: now + 3_600_000, now });
+			store.accounts.setStatus({ userId: ids.dnd, choice: 'dnd', now });
+			store.accounts.setStatus({ userId: ids.hidden, choice: 'invisible', now });
+			store.accounts.setStatus({ userId: ids.none, choice: '', now });
+			store.accounts.setMute({ userId: ids.muted, untilMs: now + 3_600_000, now });
 			// A registration that wakes for messages never makes anyone idle.
-			store.registerPushSubscription({ userId: ids.pushed, url: `https://push.example.net/${ids.pushed}`, p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+			store.push.register({ userId: ids.pushed, url: `https://push.example.net/${ids.pushed}`, p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		});
 		const observer = await signedIn(observerId);
 		try {
@@ -311,7 +313,7 @@ describe('the status a user chooses (§4.5)', () => {
 			const cost = await runInDurableObject(stub(), (instance, state) => {
 				const runtime = instance as unknown as Runtime & { membersOf(ids: string[]): unknown };
 				const measure = () => {
-					(runtime.store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+					(sqliteOf(runtime.store) as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
 					return statements(state, /FROM memberships m/, () => runtime.membersOf(['general']));
 				};
 				const on = measure();
@@ -662,7 +664,7 @@ describe('user status timing', () => {
 			await runInDurableObject(stub(), async (instance, state) => {
 				const runtime = instance as unknown as Runtime & { alarm(): Promise<void> };
 				state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
-				runtime.store.forgetCleanupDue();
+				sqliteOf(runtime.store).forgetCleanupDue();
 				await runtime.alarm();
 			});
 			expect(told(await drain(watcher), leaverId)).toEqual(['offline']);
@@ -697,8 +699,8 @@ describe('user status timing', () => {
 				const runtime = instance as unknown as AlarmRuntime;
 				// Nothing but the status change is due when the alarm fires.
 				state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
-				runtime.store.forgetCleanupDue();
-				const cleanup = vi.spyOn(runtime.store, 'runCleanup');
+				sqliteOf(runtime.store).forgetCleanupDue();
+				const cleanup = vi.spyOn(sqliteOf(runtime.store), 'runCleanup');
 				const refresh = vi.spyOn(runtime.accountUsage, 'refresh');
 				await runtime.alarm();
 				await runtime.alarmTail;
@@ -722,8 +724,8 @@ describe('user status timing', () => {
 		const runAlarm = (cleanupDue: boolean) => runInDurableObject(stub(), async (instance, state) => {
 			const runtime = instance as unknown as Runtime & { alarm(): Promise<void>; alarmTail: Promise<void> };
 			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', cleanupDue ? 0 : Date.now() + 3_600_000);
-			runtime.store.forgetCleanupDue();
-			const cleanup = vi.spyOn(runtime.store, 'runCleanup');
+			sqliteOf(runtime.store).forgetCleanupDue();
+			const cleanup = vi.spyOn(sqliteOf(runtime.store), 'runCleanup');
 			await runtime.alarm();
 			await runtime.alarmTail;
 			const calls = cleanup.mock.calls.length;
@@ -750,7 +752,7 @@ describe('user status timing', () => {
 			await peer.next();
 			peer.send({ method: 'status', params: { idle: false } });
 			await runInDurableObject(stub(), (instance) => {
-				vi.spyOn((instance as unknown as Runtime).store, 'statusInputs').mockImplementationOnce(() => { throw new Error('storage unavailable'); });
+				vi.spyOn(sqliteOf((instance as unknown as Runtime).store), 'statusInputs').mockImplementationOnce(() => { throw new Error('storage unavailable'); });
 			});
 			// Signing in without them would show an invisible user as connected: the sign-in fails instead.
 			const failed = await request(peer, 'auth-failed', 'auth', { scheme: 'token', token });
@@ -794,33 +796,33 @@ describe('user status timing', () => {
 	it('/rename and /purge move and delete the user status row and room mutes', async () => {
 		const userId = 'rn';
 		await withStore('presence-rename', { push: { ...PUSH_POLICY! } }, (store, clock) => {
-			store.registerIdentity({
+			store.accounts.register({
 				userId, name: 'Rn', userHandle: 'handle-rn', now: clock.value, ipKey: 'ip-rn',
 				credential: { credentialId: 'cred-rn', userId, publicKey: 'AAAA', counter: 0 },
 			});
 			const now = clock.value;
-			store.setStatus({ userId, choice: 'invisible', now });
-			store.setMute({ userId, untilMs: now + 60_000, now });
-			store.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
-			store.settleSeen({ userId, at: now - 1_000, now });
-			store.renameIdentity({ from: userId, to: `${userId}x`, now });
-			expect(store.statusInputs(userId, now)).toEqual({ choice: 'online', roomMutes: [] });
-			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', muteUntil: now + 60_000, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			store.accounts.setStatus({ userId, choice: 'invisible', now });
+			store.accounts.setMute({ userId, untilMs: now + 60_000, now });
+			store.reads.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
+			store.reads.settleSeen({ userId, at: now - 1_000, now });
+			store.accounts.rename({ from: userId, to: `${userId}x`, now });
+			expect(store.reads.statusInputs(userId, now)).toEqual({ choice: 'online', roomMutes: [] });
+			expect(store.reads.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', muteUntil: now + 60_000, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
 			// `seen` moves with the identity row, which a sign-in reads.
-			expect(store.getIdentity(`${userId}x`)?.seen).toBe(now - 1_000);
-			store.setMute({ userId: `${userId}x`, untilMs: null, now });
-			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
-			store.purgeUsers({ userIds: [`${userId}x`], now });
-			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'online', roomMutes: [] });
-			expect(store.getIdentity(`${userId}x`)).toBeNull();
-			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.accounts.get(`${userId}x`)?.seen).toBe(now - 1_000);
+			store.accounts.setMute({ userId: `${userId}x`, untilMs: null, now });
+			expect(store.reads.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			store.accounts.purge({ userIds: [`${userId}x`], now });
+			expect(store.reads.statusInputs(`${userId}x`, now)).toEqual({ choice: 'online', roomMutes: [] });
+			expect(store.accounts.get(`${userId}x`)).toBeNull();
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
 	it('/toggle presence turns status off and on for everyone, keeping the chosen status and mutes while off', async () => {
 		const adminId = unique('admin');
 		await register(adminId);
-		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: adminId, role: 'admin', on: true }); });
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.accounts.setRole({ userId: adminId, role: 'admin', on: true }); });
 		const admin = await signedIn(adminId, { existing: true });
 		const watcherId = unique('watcher');
 		const watcher = await signedIn(watcherId);
@@ -917,9 +919,8 @@ async function storeMutes(userId: string): Promise<void> {
 	await runInDurableObject(stub(), (instance) => {
 		const { store } = instance as unknown as Runtime;
 		const now = Date.now();
-		store.setMute({ userId, untilMs: now + 3_600_000, now });
-		(store as unknown as { setRoomMute(input: { userId: string; roomId: string; untilMs: number | null; now?: number }): unknown })
-			.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
+		store.accounts.setMute({ userId, untilMs: now + 3_600_000, now });
+		store.reads.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
 	});
 }
 
@@ -1091,7 +1092,7 @@ describe('server.status and what follows a sign-in (§3.1, §4.5)', () => {
 			expect(sent.filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ room_id: 'general', mute: true }]);
 			expect((await drain(other)).filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ room_id: 'general', mute: true }]);
 			expect(await idleOf()).toEqual([false, true]);
-			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.reads.statusInputs(userId, Date.now()));
 			expect(stored).toEqual({ choice: 'online', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
 			// idle with a room_id and no mute is invalid_params (§4.5): nothing changes, nothing is sent.
 			const refused = await statusRequest(peer, { room_id: 'nowhere', idle: false });
@@ -1149,8 +1150,8 @@ describe('sign-ins, listings and attendance', () => {
 		for (const id of Object.values(ids)) await register(id);
 		await runInDurableObject(stub(), (instance) => {
 			const { store } = instance as unknown as Runtime;
-			store.setStatus({ userId: ids.none, choice: '', now: Date.now() });
-			store.setStatus({ userId: ids.dnd, choice: 'dnd', now: Date.now() });
+			store.accounts.setStatus({ userId: ids.none, choice: '', now: Date.now() });
+			store.accounts.setStatus({ userId: ids.dnd, choice: 'dnd', now: Date.now() });
 		});
 		const observer = await signedIn(observerId);
 		const dnd = await signedIn(ids.dnd, { existing: true });
@@ -1160,7 +1161,7 @@ describe('sign-ins, listings and attendance', () => {
 		});
 		/** The users of a `room_update` `joined` for general, as a repeated join sends it. */
 		const joined = async (id: string): Promise<Map<string, Record<string, unknown>>> => {
-			await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { memberCache: Map<string, unknown> } }).store.memberCache.clear());
+			await runInDurableObject(stub(), (instance) => (sqliteIn(instance) as unknown as { memberCache: Map<string, unknown> }).memberCache.clear());
 			const { skipped } = await exchange(observer, id, 'room_join', { room_id: 'general' });
 			const update = skipped.find((frame) => frame.method === 'room_update' && frame.params.joined);
 			expect(update, id).toBeDefined();
@@ -1236,7 +1237,7 @@ describe('sign-ins, listings and attendance', () => {
 				});
 			}
 			expect(told(await drain(watcher), userId)).toEqual([]);
-			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.reads.statusInputs(userId, Date.now()));
 			expect(stored.choice).toBe('online');
 			// None of them spent the status limit: the limit's worth of changes still applies.
 			for (let index = 0; index < PUSH_POLICY!.mutesPerUserMinute; index++) {
@@ -1256,7 +1257,7 @@ describe('sign-ins, listings and attendance', () => {
 			const order: string[] = [];
 			await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as Runtime & { issueSession: Runtime['issueSession'] };
-				vi.spyOn(runtime.store, 'statusInputs').mockImplementationOnce(() => { order.push('read'); throw new Error('storage unavailable'); });
+				vi.spyOn(sqliteOf(runtime.store), 'statusInputs').mockImplementationOnce(() => { order.push('read'); throw new Error('storage unavailable'); });
 				const issue = runtime.issueSession.bind(runtime);
 				vi.spyOn(runtime, 'issueSession').mockImplementation((...args) => { order.push('issue'); return issue(...args); });
 			});
@@ -1359,7 +1360,7 @@ describe('a guest connection signing in (§3.3)', () => {
 			// An invisible account an invite token signs in to.
 			const invitedId = unique('invited');
 			await register(invitedId);
-			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.setStatus({ userId: invitedId, choice: 'invisible', now: Date.now() }));
+			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.accounts.setStatus({ userId: invitedId, choice: 'invisible', now: Date.now() }));
 			const invite = `apron_invite_${crypto.randomUUID().replaceAll('-', '')}`;
 			await runInDurableObject(stub(), async (_instance, state) => state.storage.put(`invite-token:${await sha256Hex(invite)}`, { v: 1, userId: invitedId }));
 
@@ -1597,7 +1598,7 @@ describe('seen: when the shown status last became offline (§4.5.2)', () => {
 				runtime.membersOf(['general']);
 				// Past SEEN_WRITE_GRANULARITY_MS, so it is written.
 				const later = Number(offline.seen) + SEEN_WRITE_GRANULARITY_MS + 1_000;
-				runtime.store.settleSeen({ userId: leaverId, at: later, now: Date.now() });
+				runtime.store.reads.settleSeen({ userId: leaverId, at: later, now: Date.now() });
 				let members: Map<string, Array<{ user_id: string; seen?: string }>> | undefined;
 				const sql = statements(state, /FROM memberships m/, () => { members = runtime.membersOf(['general']); });
 				return { queries: sql.queries, seen: members!.get('general')!.find((user) => user.user_id === leaverId)?.seen, later };
@@ -1798,7 +1799,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		const userId = unique('reader');
 		await register(userId);
 		const recorded = Date.now() - 60_000;
-		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.reads.settleSeen({ userId, at: recorded, now: Date.now() }); });
 		const sql = await recordSql();
 		const peer = await signedIn(userId, { existing: true, handle: `handle-${userId}` });
 		try {
@@ -1891,8 +1892,9 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 	function replaceSettle(settle: (real: (input: { userId: string; at: number; now?: number }) => number | undefined, input: { userId: string; at: number; now?: number }, runtime: Runtime & Record<string, any>) => number | undefined): Promise<void> {
 		return runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime & Record<string, any>;
-			const real = runtime.store.settleSeen.bind(runtime.store);
-			vi.spyOn(runtime.store, 'settleSeen').mockImplementation((input) => settle(real, input, runtime));
+			const sqlite = sqliteOf(runtime.store);
+			const real = sqlite.settleSeen.bind(sqlite);
+			vi.spyOn(sqlite, 'settleSeen').mockImplementation((input) => settle(real, input, runtime));
 		});
 	}
 
@@ -1957,7 +1959,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		await register(userId);
 		// A seen recorded long ago, which no longer stands.
 		const recorded = Date.now() - 3 * SEEN_WRITE_GRANULARITY_MS;
-		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.reads.settleSeen({ userId, at: recorded, now: Date.now() }); });
 		const sql = await recordSql();
 		const peers = [await signedIn(userId, { existing: true }), await signedIn(userId, { existing: true })];
 		try {
@@ -2071,7 +2073,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 	it('shows each user shown offline after /toggle presence comes back on as offline since then, with no write per user', async () => {
 		const adminId = unique('admin');
 		await register(adminId);
-		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: adminId, role: 'admin', on: true }); });
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.accounts.setRole({ userId: adminId, role: 'admin', on: true }); });
 		const admin = await signedIn(adminId, { existing: true });
 		const toggle = async (id: string) => expect((await exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle presence' } })).frame.result).toEqual({});
 		// Away throughout, with a seen from long ago; back briefly while presence is off;
@@ -2083,7 +2085,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		const old = Date.now() - 2 * DAY;
 		for (const userId of [awayId, briefId]) {
 			await register(userId);
-			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: old, now: Date.now() }); });
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.reads.settleSeen({ userId, at: old, now: Date.now() }); });
 		}
 		const shy = await signedIn(shyId);
 		await choose(shy, 'invisible');
@@ -2136,16 +2138,16 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		const userId = unique('rollback');
 		await register(userId);
 		const result = await runInDurableObject(stub(), (instance) => {
-			const store = (instance as unknown as Runtime).store as Store & Record<string, any>;
+			const store = (instance as unknown as Runtime).store;
 			const now = Date.now();
 			const old = now - 3 * SEEN_WRITE_GRANULARITY_MS;
-			store.settleSeen({ userId, at: old, now });
-			const seenOf = () => store.roomMembers(['general'], DEFAULT_LIMITS.roomListMembersPerRoom, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
+			store.reads.settleSeen({ userId, at: old, now });
+			const seenOf = () => store.rooms.members(['general'], DEFAULT_LIMITS.roomListMembersPerRoom, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
 			expect(seenOf()).toBe(old);
-			const spy = vi.spyOn(store, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
-			expect(() => store.setStatus({ userId, choice: 'invisible', seenAt: now, now })).toThrow('status write failed');
+			const spy = vi.spyOn(sqliteOf(store) as unknown as { writeUserStatus(): void }, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
+			expect(() => store.accounts.setStatus({ userId, choice: 'invisible', seenAt: now, now })).toThrow('status write failed');
 			spy.mockRestore();
-			return { old, listed: seenOf(), stored: store.getIdentity(userId)?.seen };
+			return { old, listed: seenOf(), stored: store.accounts.get(userId)?.seen };
 		});
 		// Rolled back with the status: neither stored nor listed.
 		expect(result.stored).toBe(result.old);

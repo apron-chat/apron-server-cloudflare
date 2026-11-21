@@ -1,9 +1,10 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ACCOUNT_USAGE_POLICY, DEFAULT_LIMITS } from '../src/budget';
-import type { Store } from '../src/store';
+import { type Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
+import { sqliteIn } from './helpers/store';
 
 let nextIp = 1;
 const stub = () => env.DEMO.getByName('public-demo-v1');
@@ -25,10 +26,10 @@ afterEach(() => setAdminToken(undefined));
 async function signedIn(userId: string): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as {
-			store: { registerIdentity(input: Record<string, unknown>): unknown };
+			store: { accounts: { register(input: Record<string, unknown>): unknown } };
 			issueSession(userId: string, origin: string, now: number): Promise<string>;
 		};
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -271,15 +272,12 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect((await command(dave, 'status', '/status')).frame.result).toEqual({});
 
 		await runInDurableObject(stub(), (instance) => {
-			const { store } = instance as unknown as { store: {
-				getIdentity(id: string): { rooms: string[] } | null; getCredential(id: string): { userId: string } | null;
-				identityExists(id: string): boolean; userIdTaken(id: string): boolean;
-			} };
-			expect(store.getIdentity(toId)?.rooms).toContain('general');
-			expect(store.getCredential(`cred-${fromId}`)?.userId).toBe(toId);
-			expect(store.identityExists(fromId)).toBe(false);
+			const { store } = instance as unknown as { store: Store };
+			expect(store.accounts.get(toId)?.rooms).toContain('general');
+			expect(store.credentials.get(`cred-${fromId}`)?.userId).toBe(toId);
+			expect(store.accounts.exists(fromId)).toBe(false);
 			// The old user_id is retired, never reissued.
-			expect(store.userIdTaken(fromId)).toBe(true);
+			expect(store.accounts.idTaken(fromId)).toBe(true);
 		});
 		await runInDurableObject(stub(), (_instance, state) => {
 			const froms = state.storage.sql.exec<{ record_json: string }>("SELECT record_json FROM records WHERE kind = 'message' AND json_extract(record_json, '$.message_id') = ?", earlier)
@@ -472,7 +470,7 @@ it('/invite-device add mints up to five tokens, each with its own id, that sign 
 it('/invite-device closes what used a replaced token even when clearing pushes fails', async () => {
 	const owner = await signedIn(unique('owner'));
 	let phone: Peer | undefined;
-	type Patchable = { store: { clearPushSubscriptions: (...args: unknown[]) => void } };
+	type Patchable = { clearPushSubscriptions: (...args: unknown[]) => void };
 	try {
 		const token = (await command(owner, 'device-phone', '/invite-device add phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
 		phone = await connect(null);
@@ -480,7 +478,7 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token })).result.you).toBeDefined();
 		// As when the day's budget refuses the push clear's reservation.
 		await runInDurableObject(stub(), (instance) => {
-			const store = (instance as unknown as Patchable).store;
+			const store = sqliteIn(instance) as unknown as Patchable;
 			store.clearPushSubscriptions = () => { throw new Error('budget refused'); };
 		});
 		expect((await command(owner, 'device-phone-again', '/invite-device add phone')).frame.error).toBeDefined();
@@ -488,8 +486,8 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 		expect(owner.closed()).toBeUndefined();
 	} finally {
 		await runInDurableObject(stub(), (instance) => {
-			const store = (instance as unknown as Patchable).store;
-			delete (store as Partial<Patchable['store']>).clearPushSubscriptions;
+			const store = sqliteIn(instance) as unknown as Partial<Patchable>;
+			delete store.clearPushSubscriptions;
 		});
 		phone?.close(); owner.close();
 	}
@@ -564,7 +562,7 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		// Nothing they signed in with works any more, but the new token does.
 		for (const old of [legacyToken, session]) expect((await signIn(old)).reply.error.message).toBe('Session expired; sign in with your passkey');
 		expect((await signIn(device)).reply.error.code).toBe(-32001);
-		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.passkeys(userId))).toEqual([]);
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.credentials.passkeys(userId))).toEqual([]);
 		const onFresh = await signIn(fresh);
 		expect(onFresh.reply.result.you.user_id).toBe(userId);
 		expect((await command(onFresh.peer, 'list', '/invite-device list')).notice!.params.body.text).toContain('no device tokens');
@@ -601,7 +599,7 @@ it('/invite-device refuses a user renamed while the command was on its way', asy
 		// The store has the new user_id, but the connection does not yet: the
 		// state /rename leaves while it moves the user's tokens.
 		await runInDurableObject(stub(), (instance) => {
-			(instance as unknown as { store: Store }).store.renameIdentity({ from: userId, to: unique('renamed'), now: Date.now() });
+			(instance as unknown as { store: Store }).store.accounts.rename({ from: userId, to: unique('renamed'), now: Date.now() });
 		});
 		const refused = await command(owner, 'device', '/invite-device add laptop');
 		expect(refused.frame.error.message).toBe('Your account changed; reconnect and try again');
@@ -613,7 +611,7 @@ it('/invite-device refuses a user renamed while the command was on its way', asy
 /** Registers a passkey user straight into the store without connecting them. */
 async function registered(userId: string): Promise<void> {
 	await runInDurableObject(stub(), (instance) => {
-		(instance as unknown as { store: { registerIdentity(input: Record<string, unknown>): unknown } }).store.registerIdentity({
+		(instance as unknown as { store: { accounts: { register(input: Record<string, unknown>): unknown } } }).store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -714,7 +712,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect((await until(bob, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params).toEqual({ you: { user_id: bobId, ext: { permissions: { add_members: true } } } });
 		// Back on (the default, so the override is forgotten), Bob adds Carol,
 		// but his bot may not add anyone.
-		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('addmember'))).toBeUndefined();
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.server.toggle('addmember'))).toBeUndefined();
 		expect((await request(bob, 'add-carol-on', 'room_join', { room_id: roomId, user_id: carolId })).result).toEqual({});
 
 		// Only registered users can be added, by a string user_id. (Each
@@ -770,7 +768,7 @@ it('a room\'s creator may remove anyone from it, across saves and /rename, until
 	const carol = await signedIn(carolId);
 	const danId = unique('dan');
 	const dan = await signedIn(danId);
-	const creatorOf = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.roomCreator(roomId));
+	const creatorOf = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.rooms.creator(roomId));
 	try {
 		const roomId = (await request(bob, unique('thread'), 'room_set', { parent_room_id: 'general', title: 'Bob\'s' })).result.room_id;
 		expect(await creatorOf(roomId)).toBe(bobId);
@@ -812,7 +810,7 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 	const bob = await signedIn(bobId);
 	const carolId = unique('carol');
 	const carol = await signedIn(carolId);
-	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.getRoom(roomId) !== null);
+	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.rooms.get(roomId) !== null);
 	// A second session Bob keeps on another device.
 	const token = await runInDurableObject(stub(), (instance) =>
 		(instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession(bobId, 'http://localhost:5173', Date.now()));
@@ -847,7 +845,7 @@ it('removes a thread when the last one in it leaves, with any messages in it', a
 	const threadCount = () => runInDurableObject(stub(), (_instance, state) =>
 		Number(state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'thread_count'").one().value));
 	// Asked of the store: a request for a room that is gone is invalid_params, and repeated errors close the socket.
-	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.getRoom(roomId) !== null);
+	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.rooms.get(roomId) !== null);
 	const thread = async (title: string) => (await request(bob, unique('thread'), 'room_set', { parent_room_id: 'general', title })).result.room_id as string;
 	try {
 		await guest.next();
@@ -875,7 +873,7 @@ it('removes a thread when the last one in it leaves, with any messages in it', a
 		expect((await request(bob, 'move-gone', 'message', { message_id: message, room_id: 'general', body: { text: 'hello' } })).error.code).toBe(-32602);
 		expect((await request(guest, 'react-gone', 'reactions', { message_id: message, emojis: ['👍'] })).error.code).toBe(-32602);
 		expect((await request(guest, 'reply-gone', 'message', { body: { text: 're' }, reply_to: { message_id: message } })).error.code).toBe(-32602);
-		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.messageAuthor(message))).toBeNull();
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.messages.author(message))).toBeNull();
 
 		// A registered member who is not connected keeps it; the creator
 		// removing them, from outside it, empties it.
@@ -994,13 +992,13 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>, ed
 it('a passkey ceremony verifying while /invite-purge runs signs nobody in and adds no passkey', async () => {
 	const userId = unique('raced');
 	const user = await signedIn(userId);
-	type Patchable = { store: Store & { updateCredentialCounter: (...args: unknown[]) => void } };
+	type Patchable = { updateCredentialCounter: (...args: unknown[]) => void; resetAuth(input: { userId: string }): number };
 	try {
 		const added = await registerPasskey(user, 'add');
 		expect(added.finished.result.you.user_id).toBe(userId);
 		// The purge's store change lands while the login's proof is being checked.
 		await runInDurableObject(stub(), (instance) => {
-			const store = (instance as unknown as Patchable).store;
+			const store = sqliteIn(instance) as unknown as Patchable;
 			const original = store.updateCredentialCounter.bind(store);
 			store.updateCredentialCounter = (...args: unknown[]) => {
 				store.resetAuth({ userId });
@@ -1009,17 +1007,17 @@ it('a passkey ceremony verifying while /invite-purge runs signs nobody in and ad
 		});
 		expect((await passkeyLogin(added.passkey)).error.message).toBe('This passkey is no longer on the account');
 		await runInDurableObject(stub(), (instance) => {
-			delete (instance as unknown as { store: Partial<Patchable['store']> }).store.updateCredentialCounter;
+			delete (sqliteIn(instance) as unknown as Partial<Patchable>).updateCredentialCounter;
 		});
 
 		// An addition begun before the purge cleared the handle is refused at its finish.
 		const passkey = await softPasskey('http://localhost:5173');
 		const begun = await request(user, 'again-begin', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' });
 		const credential = await passkey.register(begun.result.public_key);
-		await runInDurableObject(stub(), (instance) => { (instance as unknown as Patchable).store.resetAuth({ userId }); });
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as { store: Store }).store.credentials.resetAuth({ userId }); });
 		const refused = await request(user, 'again-finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', challenge_id: begun.result.challenge_id, credential });
 		expect(refused.error.message).toBe('Your account changed; reconnect and try again');
-		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as Patchable).store.passkeys(userId))).toEqual([]);
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.credentials.passkeys(userId))).toEqual([]);
 	} finally { user.close(); }
 });
 
@@ -1138,7 +1136,7 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		const identities = () => runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM identities').one().n);
 		const before = await identities();
 		await runInDurableObject(stub(), (instance) => {
-			const store = (instance as unknown as { store: Record<string, unknown> }).store;
+			const store = sqliteIn(instance) as unknown as Record<string, unknown>;
 			const original = store.withMeterAsync as (...args: unknown[]) => Promise<unknown>;
 			store.withMeterAsync = (kind: unknown, cost: { reads?: number; writes?: number }, ...rest: unknown[]) => {
 				if (cost.reads === 1 && cost.writes === 3) {
@@ -1491,7 +1489,7 @@ it('an admin creates a top-level room that others find with room_list and join, 
 		expect(thread).toEqual(expect.any(String));
 		await request(guest, 'leave', 'room_leave', { room_id: roomId });
 		await request(admin, 'leave', 'room_leave', { room_id: roomId });
-		const exists = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.getRoom(roomId) !== null);
+		const exists = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.rooms.get(roomId) !== null);
 		expect(exists).toBe(true);
 	} finally { admin.close(); guest.close(); }
 });

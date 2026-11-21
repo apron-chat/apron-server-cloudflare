@@ -1,7 +1,8 @@
 /*
- * The Durable Object's Store as the history component's ports: adapters,
- * not reimplementations. Each takes only the Store methods it uses (a
- * narrow structural port, so this module does not load the Store):
+ * The SQLite store as the history component's ports (src/history/tier.ts):
+ * adapters, not reimplementations, behind the History part
+ * (store.history.head/restore/export). Each takes only the SqliteStore
+ * methods it uses (a narrow structural port):
  *
  * - storeHead: the head the chain runs (HistoryHead). Its trimming is
  *   the Store's own cleanup (Store.runCleanup), which removes records only
@@ -11,12 +12,12 @@
  * - storeRestore: what an import writes through (RestorePort).
  * - storeExport: the rooms and users an export carries (ExportPort).
  *
- * The chain's state is state.ts over Store.historyStatePort().
+ * The chain's state is state.ts over SqliteStore.historyStatePort() (store.history.state()).
  */
 
 import { type ArchivedRoom, type ArchivedUser, MAX_LISTING_MEMBERS, type RoomListing } from "@apron/archive";
-import { type ChatRecord, type HistoryQuery, type QueuedRewrite, type RecordRange, type TierStats, toRange } from "./records";
-import type { ExportPort, HistoryHead, RestoreContext, RestorePort, RestoreResult } from "./tier";
+import { type ChatRecord, type HistoryQuery, type QueuedRewrite, type RecordRange, type TierStats, toRange } from "../history/records";
+import type { ExportPort, HistoryHead, RestoreContext, RestorePort, RestoreResult } from "../history/tier";
 
 /** What the head needs of the Store. */
 export interface HeadStore {

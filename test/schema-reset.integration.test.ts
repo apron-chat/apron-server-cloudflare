@@ -1,9 +1,12 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
-import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, Store, UPGRADABLE_SCHEMA_VERSION, defaultStoreConfig } from '../src/store';
+import { MAX_CARRIED_PASSKEYS } from '../src/store/limits';
+import { SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSION } from '../src/store/schema';
+import { type Store, defaultStoreConfig, openStore } from '../src/store';
 import { toSchema10, toSchema9 } from './helpers/schema9';
 import { messagesOf, pushSubscriptionsOf } from './helpers/store';
+import { sqliteOf } from "../src/store/open";
 
 type Runtime = { store: Store };
 
@@ -14,16 +17,16 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 		const day = new Date().toISOString().slice(0, 10);
 		const before = await runInDurableObject(stub, async (instance, state) => {
 			const { store } = instance as unknown as Runtime;
-			store.registerIdentity({
+			store.accounts.register({
 				userId: 'user_before_reset', name: 'Before', userHandle: 'handle', now: Date.now(), ipKey: 'reset-ip',
 				credential: { credentialId: 'cred-before', userId: 'user_before_reset', publicKey: 'AAAA', counter: 0 },
 			});
-			store.mutate({
+			store.messages.mutate({
 				userId: 'user_before_reset', ipKey: 'reset-ip', requestId: 'before', method: 'message', now: Date.now(),
 				identity: { user_id: 'user_before_reset' }, params: { room_id: 'general', body: { text: 'discarded' } },
 			});
 			// A second passkey user who left `general`, and a bot (no passkey).
-			store.registerIdentity({
+			store.accounts.register({
 				userId: 'user_left_general', name: 'Leaver', userHandle: 'handle-2', now: Date.now(), ipKey: 'reset-ip-3', rooms: [],
 				credential: { credentialId: 'cred-left', userId: 'user_left_general', publicKey: 'BBBB', counter: 7 },
 			});
@@ -49,24 +52,24 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			// Passkeys and their identities survive the wipe; the bot does not.
 			expect(sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM identities').one().n).toBe(2);
 			expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'identity_count'").one().value).toBe('2');
-			expect(store.getCredential('cred-before')).toMatchObject({ credentialId: 'cred-before', userId: 'user_before_reset', publicKey: 'AAAA', counter: 0 });
-			expect(store.getCredential('cred-left')).toMatchObject({ userId: 'user_left_general', publicKey: 'BBBB', counter: 7 });
-			expect(store.getIdentity('bot_x')).toBeNull();
-			expect(store.getCredential('cred-admin')).toBeNull();
-			expect(store.getIdentity('admin')).toBeNull();
+			expect(store.credentials.get('cred-before')).toMatchObject({ credentialId: 'cred-before', userId: 'user_before_reset', publicKey: 'AAAA', counter: 0 });
+			expect(store.credentials.get('cred-left')).toMatchObject({ userId: 'user_left_general', publicKey: 'BBBB', counter: 7 });
+			expect(store.accounts.get('bot_x')).toBeNull();
+			expect(store.credentials.get('cred-admin')).toBeNull();
+			expect(store.accounts.get('admin')).toBeNull();
 			// Users whose passkeys were carried keep their roles, but not their ext.
-			expect(store.getIdentity('user_before_reset')?.roles).toEqual(['admin', 'friend']);
-			expect(store.getIdentity('user_left_general')?.roles).toEqual([]);
+			expect(store.accounts.get('user_before_reset')?.roles).toEqual(['admin', 'friend']);
+			expect(store.accounts.get('user_left_general')?.roles).toEqual([]);
 			expect(sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM message_state').one().n).toBe(0);
 			expect((await state.storage.list({ prefix: 'session:' })).size).toBe(0);
-			const general = store.getRoomState();
+			const general = sqliteOf(store).getRoomState();
 			expect(general).toEqual({ room_id: 'general', log_id: general.log_id, title: 'General', latest_log_id: general.log_id, history_log_id: general.log_id });
-			expect(store.listRooms()).toEqual([general]);
-			expect(store.getIdentity('user_before_reset')).toEqual({
+			expect(store.rooms.list()).toEqual([general]);
+			expect(store.accounts.get('user_before_reset')).toEqual({
 				userId: 'user_before_reset', name: 'Before', userHandle: 'handle', createdMs: expect.any(Number), credentialCount: 1, rooms: ['general'],
 				roles: ['admin', 'friend'],
 			});
-			expect(store.getIdentity('user_left_general')?.rooms).toEqual([]);
+			expect(store.accounts.get('user_left_general')?.rooms).toEqual([]);
 			// The accounting latch does not survive, so the fresh store is usable.
 			const budget = sql.exec<{ reads_reserved: number; writes_reserved: number }>(
 				'SELECT reads_reserved, writes_reserved FROM resource_budgets WHERE day = ?', day,
@@ -75,8 +78,8 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			// and the rows the passkey carry read and wrote.
 			expect(budget.reads_reserved).toBeGreaterThan(before.reads_reserved + BOOTSTRAP_ROW_RESERVATION);
 			expect(budget.writes_reserved).toBeGreaterThan(before.writes_reserved + BOOTSTRAP_ROW_RESERVATION);
-			expect(store.accountingStatus().unsafe).toBe(false);
-			const posted = store.mutate({
+			expect(store.ops.accountingStatus().unsafe).toBe(false);
+			const posted = store.messages.mutate({
 				userId: 'guest_after', ipKey: 'reset-ip-2', requestId: 'after', method: 'message', now: Date.now(),
 				identity: { user_id: 'guest_after' }, params: { room_id: 'general', body: { text: 'fresh' } },
 			});
@@ -86,8 +89,8 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 		// A later wake keeps the fresh schema without resetting again.
 		await evictDurableObject(stub);
 		await runInDurableObject(stub, (instance) => {
-			expect((instance as unknown as Runtime).store.getRoomState().latest_log_id).not.toBe(undefined);
-			expect((instance as unknown as Runtime).store.requiresReset()).toBe(false);
+			expect(sqliteOf((instance as unknown as Runtime).store).getRoomState().latest_log_id).not.toBe(undefined);
+			expect((instance as unknown as Runtime).store.lifecycle.requiresReset()).toBe(false);
 		});
 	});
 }
@@ -107,10 +110,10 @@ it(`carries at most ${MAX_CARRIED_PASSKEYS} passkeys across a reset, most recent
 	await runInDurableObject(stub, (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		expect(state.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM credentials').one().n).toBe(MAX_CARRIED_PASSKEYS);
-		expect(store.getCredential('cred_0')).toBeNull();
-		expect(store.getCredential('cred_1')?.userId).toBe('user_1');
-		expect(store.getCredential(`cred_${MAX_CARRIED_PASSKEYS}`)?.userId).toBe(`user_${MAX_CARRIED_PASSKEYS}`);
-		expect(store.getIdentity('user_0')).toBeNull();
+		expect(store.credentials.get('cred_0')).toBeNull();
+		expect(store.credentials.get('cred_1')?.userId).toBe('user_1');
+		expect(store.credentials.get(`cred_${MAX_CARRIED_PASSKEYS}`)?.userId).toBe(`user_${MAX_CARRIED_PASSKEYS}`);
+		expect(store.accounts.get('user_0')).toBeNull();
 	});
 });
 
@@ -144,12 +147,12 @@ it('adds seen to a schema 9 store from code before it, charged, as it rebuilds t
 	const before = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		store.registerIdentity({
+		store.accounts.register({
 			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
 			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
 		});
-		store.setStatus({ userId: 'kept_user', choice: 'dnd', now });
-		const head = store.getRoomState().latest_log_id;
+		store.accounts.setStatus({ userId: 'kept_user', choice: 'dnd', now });
+		const head = sqliteOf(store).getRoomState().latest_log_id;
 		// Last: the current code never runs against these tables.
 		withoutSeen(sql);
 		// The probe's error without the column, as the store matches it.
@@ -165,7 +168,7 @@ it('adds seen to a schema 9 store from code before it, charged, as it rebuilds t
 	const added = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
+		expect(store.lifecycle.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		expect(identityColumns(sql).slice(-2)).toEqual(['ext_json', 'seen_ms']);
@@ -178,13 +181,13 @@ it('adds seen to a schema 9 store from code before it, charged, as it rebuilds t
 		expect(writesReserved(sql) - before.writes).toBeLessThanOrEqual(4);
 		// None recorded yet: no seen.
 		expect(sql.exec<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = 'kept_user'").one().seen_ms).toBe(0);
-		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
-		expect(store.getIdentity('kept_user')).not.toHaveProperty('seen');
-		expect(store.getRoomState().latest_log_id).toBe(before.head);
-		store.settleSeen({ userId: 'kept_user', at: now, now });
+		expect(store.reads.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
+		expect(store.accounts.get('kept_user')).not.toHaveProperty('seen');
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(before.head);
+		store.reads.settleSeen({ userId: 'kept_user', at: now, now });
 		// A sign-in reads it with the identity row, not with the status state.
-		expect(store.getIdentity('kept_user')?.seen).toBe(now);
-		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
+		expect(store.accounts.get('kept_user')?.seen).toBe(now);
+		expect(store.reads.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
 		return { writes: writesReserved(sql) };
 	});
 
@@ -193,17 +196,17 @@ it('adds seen to a schema 9 store from code before it, charged, as it rebuilds t
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
-		expect(store.storageAccounting().writes).toBe(0);
+		expect(store.lifecycle.requiresReset()).toBe(false);
+		expect(sqliteOf(store).storageAccounting().writes).toBe(0);
 		// A wake's own reads stay within the eight-row handover allowance of its
 		// first reservation, and it writes nothing.
-		const woken = new Store(state, defaultStoreConfig());
-		woken.initialize();
-		expect(woken.storageAccounting().writes).toBe(0);
-		expect(woken.storageAccounting().reads).toBeLessThanOrEqual(8);
+		const woken = openStore(state, defaultStoreConfig());
+		woken.lifecycle.initialize();
+		expect(sqliteOf(woken).storageAccounting().writes).toBe(0);
+		expect(sqliteOf(woken).storageAccounting().reads).toBeLessThanOrEqual(8);
 		expect(writesReserved(sql)).toBe(added.writes);
 		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
-		expect(store.getIdentity('kept_user')?.seen).toBe(now);
+		expect(store.accounts.get('kept_user')?.seen).toBe(now);
 	});
 });
 
@@ -214,7 +217,7 @@ function rowsOf(sql: SqlStorage, table: string, columns: string[]): unknown[] {
 
 /** A message's latest text in its room's history: its last record there. */
 function latestText(store: Store, messageId: string, now: number): string | undefined {
-	return messagesOf(store.history({ roomId: 'general', after: 0n, now })).filter((message) => message.message_id === messageId).pop()?.body?.text;
+	return messagesOf(sqliteOf(store).history({ roomId: 'general', after: 0n, now })).filter((message) => message.message_id === messageId).pop()?.body?.text;
 }
 
 const SHARED_COLUMNS: Record<string, string[]> = {
@@ -239,29 +242,29 @@ it('upgrades a schema 9 store to the current schema in place: every row kept, re
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
 		for (const userId of ['ada', 'bob']) {
-			store.registerIdentity({
+			store.accounts.register({
 				userId, name: userId, userHandle: `handle-${userId}`, now, ipKey: `ip-${userId}`,
 				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 			});
 		}
-		const post = (userId: string, requestId: string, params: Record<string, unknown>) => store.mutate({
+		const post = (userId: string, requestId: string, params: Record<string, unknown>) => store.messages.mutate({
 			userId, ipKey: `ip-${userId}`, requestId, method: 'message', now, identity: { user_id: userId }, params: { room_id: 'general', ...params },
 		});
 		const first = post('ada', 'first', { body: { text: 'first' } });
 		post('bob', 'second', { body: { text: 'second' } });
 		post('ada', 'edit', { message_id: first.result.message_id, body: { text: 'first, edited' } });
-		store.mutate({
+		store.messages.mutate({
 			userId: 'bob', ipKey: 'ip-bob', requestId: 'react', method: 'reactions', now, identity: { user_id: 'bob' },
 			params: { message_id: first.result.message_id, emojis: ['👍'] },
 		});
-		store.setStatus({ userId: 'bob', choice: 'dnd', now });
+		store.accounts.setStatus({ userId: 'bob', choice: 'dnd', now });
 		toSchema9(sql);
 		// Filler: the uncharged rebuild must copy them all.
 		for (let index = 0; index < 2_000; index++) {
 			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", `filler_${index}`, `hf${index}`, `F${index}`, now, now);
 		}
 		const rows = Object.fromEntries(Object.entries(SHARED_COLUMNS).map(([table, columns]) => [table, rowsOf(sql, table, columns)]));
-		return { rows, page: messagesOf(store.history({ roomId: 'general', after: 0n, now })), writes: writesReserved(sql), reads: readsReserved(sql), messageId: String(first.result.message_id) };
+		return { rows, page: messagesOf(sqliteOf(store).history({ roomId: 'general', after: 0n, now })), writes: writesReserved(sql), reads: readsReserved(sql), messageId: String(first.result.message_id) };
 	});
 	expect(before.rows.message_state).toHaveLength(2);
 	expect(before.rows.reaction_state).toHaveLength(1);
@@ -270,7 +273,7 @@ it('upgrades a schema 9 store to the current schema in place: every row kept, re
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
+		expect(store.lifecycle.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		// The day's budget row moves by the wake's own charge (below); every other row is as it was.
@@ -290,11 +293,11 @@ it('upgrades a schema 9 store to the current schema in place: every row kept, re
 		expect(writesReserved(sql) - before.writes).toBeLessThanOrEqual(4);
 		expect(readsReserved(sql) - before.reads).toBeLessThan(64);
 		// The store reads the same: history, the edited message's current snapshot, reactions, status.
-		expect(messagesOf(store.history({ roomId: 'general', after: 0n, now }))).toEqual(before.page);
+		expect(messagesOf(sqliteOf(store).history({ roomId: 'general', after: 0n, now }))).toEqual(before.page);
 		expect(latestText(store, before.messageId, now)).toBe('first, edited');
-		expect(store.statusInputs('bob')).toEqual({ choice: 'dnd', roomMutes: [] });
+		expect(store.reads.statusInputs('bob')).toEqual({ choice: 'dnd', roomMutes: [] });
 		// And it writes: an edit of the upgraded message, and a new post.
-		store.mutate({
+		store.messages.mutate({
 			userId: 'ada', ipKey: 'ip-ada', requestId: 'after', method: 'message', now, identity: { user_id: 'ada' },
 			params: { room_id: 'general', message_id: before.messageId, body: { text: 'edited again' } },
 		});
@@ -308,7 +311,7 @@ it('builds the joined wake index for a schema 9 store from code before it, with 
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		store.registerIdentity({
+		store.accounts.register({
 			userId: 'kept_mod', name: 'Mod', userHandle: 'handle-kept_mod', now, ipKey: 'ip-kept_mod',
 			credential: { credentialId: 'cred-kept_mod', userId: 'kept_mod', publicKey: 'AAAA', counter: 0 },
 		});
@@ -324,11 +327,11 @@ it('builds the joined wake index for a schema 9 store from code before it, with 
 	const added = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
+		expect(store.lifecycle.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_joined_idx'").one().sql).toMatch(/WHERE \(wake & 8\) != 0$/);
 		// The registration made before is in it.
-		expect(store.joinedWakers(now)).toEqual(['kept_mod']);
+		expect(store.push.joinedWakers(now)).toEqual(['kept_mod']);
 		return { writes: writesReserved(sql) };
 	});
 
@@ -336,10 +339,10 @@ it('builds the joined wake index for a schema 9 store from code before it, with 
 	await evictDurableObject(stub);
 	await runInDurableObject(stub, async (_instance, state) => {
 		const sql = state.storage.sql;
-		const woken = new Store(state, defaultStoreConfig());
-		woken.initialize();
-		expect(woken.storageAccounting().writes).toBe(0);
-		expect(woken.storageAccounting().reads).toBeLessThanOrEqual(8);
+		const woken = openStore(state, defaultStoreConfig());
+		woken.lifecycle.initialize();
+		expect(sqliteOf(woken).storageAccounting().writes).toBe(0);
+		expect(sqliteOf(woken).storageAccounting().reads).toBeLessThanOrEqual(8);
 		expect(writesReserved(sql)).toBe(added.writes);
 	});
 });
@@ -350,15 +353,15 @@ it('upgrades a schema 10 store to 11 in place: the unread indexes and column go,
 	const before = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		store.registerIdentity({
+		store.accounts.register({
 			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
 			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
 		});
-		const posted = store.mutate({
+		const posted = store.messages.mutate({
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		store.mutate({
+		store.messages.mutate({
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'react', method: 'reactions', now,
 			identity: { user_id: 'kept_user' }, params: { message_id: posted.result.message_id, emojis: ['👍'] },
 		});
@@ -375,7 +378,7 @@ it('upgrades a schema 10 store to 11 in place: the unread indexes and column go,
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
+		expect(store.lifecycle.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		expect(sql.exec("SELECT name FROM sqlite_master WHERE name IN ('message_state_latest_idx', 'reaction_state_log_idx', 'push_subscriptions_user_idx', 'push_subscriptions_waking_idx')").toArray()).toEqual([]);
@@ -396,15 +399,15 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 	const before = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		store.registerIdentity({
+		store.accounts.register({
 			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
 			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
 		});
-		store.mutate({
+		store.messages.mutate({
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		const head = store.getRoomState().latest_log_id;
+		const head = sqliteOf(store).getRoomState().latest_log_id;
 		// Last: the current code never runs against schema 8's tables.
 		toSchema8(sql);
 		sql.exec(`UPDATE principal_limits SET post_events_json = ? WHERE scope = 'post'`, JSON.stringify([now]));
@@ -423,7 +426,7 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
+		expect(store.lifecycle.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const columns = (table: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) ORDER BY cid", table).toArray().map((row) => row.name);
@@ -438,10 +441,10 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 		expect(budget.history_reserved).toBe(0);
 		expect(budget.writes_reserved).toBeGreaterThan(before.writes);
 		expect(budget.writes_reserved - before.writes).toBeLessThan(64);
-		expect(store.getRoomState().latest_log_id).toBe(before.head);
-		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(before.head);
+		expect(store.accounts.get('kept_user')?.name).toBe('Kept');
 		// The upgraded limiters work: a page is charged to the new bucket.
-		store.history({ roomId: 'general', limit: 1, now: Date.now(), userId: 'kept_user', ipKey: 'ip-kept_user' });
+		sqliteOf(store).history({ roomId: 'general', limit: 1, now: Date.now(), userId: 'kept_user', ipKey: 'ip-kept_user' });
 		expect(sql.exec<{ level: number }>("SELECT level FROM principal_limits WHERE scope = 'history' AND principal_key = 'user:kept_user'").one().level).toBe(1);
 	});
 });
@@ -452,15 +455,15 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 	const head = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		store.registerIdentity({
+		store.accounts.register({
 			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
 			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
 		});
-		store.mutate({
+		store.messages.mutate({
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		const head = store.getRoomState().latest_log_id;
+		const head = sqliteOf(store).getRoomState().latest_log_id;
 		// Last: schema 7 has schema 8's limiter rows, no push registrations, wake times, user status or room mutes, nor user ext.
 		toSchema8(sql);
 		sql.exec('ALTER TABLE identities DROP COLUMN ext_json');
@@ -477,7 +480,7 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
-		expect(store.requiresReset()).toBe(false);
+		expect(store.lifecycle.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
@@ -487,12 +490,12 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('user_status') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'status', 'mute_until_ms']);
 		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('room_mutes') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'room_id', 'mute_until_ms']);
 		expect(sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mutes'").toArray()).toEqual([]);
-		expect(store.getRoomState().latest_log_id).toBe(head);
-		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(head);
+		expect(store.accounts.get('kept_user')?.name).toBe('Kept');
 		expect(pushSubscriptionsOf(state, 'kept_user')).toEqual([]);
-		expect(store.statusInputs('kept_user')).toEqual({ choice: 'online', roomMutes: [] });
+		expect(store.reads.statusInputs('kept_user')).toEqual({ choice: 'online', roomMutes: [] });
 		// Identities gain an empty ext.
 		expect(sql.exec<{ ext_json: string }>("SELECT ext_json FROM identities WHERE user_id = 'kept_user'").one().ext_json).toBe('');
-		expect(store.getIdentity('kept_user')).not.toHaveProperty('ext');
+		expect(store.accounts.get('kept_user')).not.toHaveProperty('ext');
 	});
 });

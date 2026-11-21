@@ -1,7 +1,10 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
-import { BREAKER_ALERT_ONLY, BREAKER_MS, DEGRADED, OPERATION_PAUSED, Store, StoreError, type OverrunNotice, type StoreConfig } from '../src/store';
+import { BREAKER_ALERT_ONLY, BREAKER_MS, DEGRADED, OPERATION_PAUSED } from '../src/store/accounting';
+import { type OverrunNotice, type Store, type StoreConfig, StoreError, openStore } from '../src/store';
+import { SqliteStore } from '../src/store/sqlite-store';
+import { sqliteOf } from "../src/store/open";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -10,7 +13,7 @@ afterEach(() => { vi.restoreAllMocks(); });
  * and lists every room, as `topLevelRoomIds` did before #67. Its name on the
  * stack (`leakyListing`) is what an overrun and a breaker are named after.
  */
-class LeakyStore extends Store {
+class LeakyStore extends SqliteStore {
 	leakyListing(now: number): number {
 		const reserved = (this as unknown as { reserved: (cost: object, maintenance: boolean, now: number, fn: () => number) => number }).reserved;
 		return reserved.call(this, { reads: 0 }, false, now, () => this.listRooms(now).length);
@@ -151,11 +154,11 @@ it('opens the breaker at once when one overrun exceeds a hundredth of the day, a
 it('charges rows found past an overrun already noted, and counts it once', async () => {
 	await runInDurableObject(env.DEMO.getByName('tier-incremental'), (_instance, state) => {
 		const now = Date.now() + 3_000;
-		const store = new Store(state, {}, { now: () => now });
-		store.initialize();
+		const store = openStore(state, {}, { now: () => now });
+		store.lifecycle.initialize();
 		seedThreads(state, now);
 		// As runCleanup does: one reservation checked after each of two transactions.
-		const internals = store as unknown as {
+		const internals = sqliteOf(store) as unknown as {
 			observed: { reads: number; writes: number };
 			reserveCost(cost: object, maintenance: boolean, now: number): object;
 			assertReservation(reserved: object, reads: number, writes: number): void;
@@ -163,16 +166,16 @@ it('charges rows found past an overrun already noted, and counts it once', async
 		const before = foregroundReads(state);
 		const start = { reads: internals.observed.reads, writes: internals.observed.writes };
 		const reservation = internals.reserveCost({ reads: 0 }, false, now);
-		store.listRooms(now);
+		store.rooms.list(now);
 		internals.assertReservation(reservation, start.reads, start.writes);
 		const afterFirst = foregroundReads(state);
-		store.listRooms(now);
+		store.rooms.list(now);
 		internals.assertReservation(reservation, start.reads, start.writes);
 		const afterSecond = foregroundReads(state);
 		expect(afterFirst - before).toBeGreaterThanOrEqual(100);
 		// The second listing's rows are charged too, not lost to the first count.
 		expect(afterSecond - afterFirst).toBeGreaterThanOrEqual(100);
-		expect(store.accountingGuard(now).overruns).toBe(1);
+		expect(store.ops.accountingGuard(now).overruns).toBe(1);
 	});
 });
 
@@ -199,14 +202,14 @@ it('keeps an overrun charge for later when storage fails while charging it, with
 it('retires the permanent overrun stop of earlier versions on wake', async () => {
 	const stub = env.DEMO.getByName('tier-legacy-stop');
 	await runInDurableObject(stub, (_instance, state) => {
-		new Store(state, {}).initialize();
+		openStore(state, {}).lifecycle.initialize();
 		state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
 	});
 	await evictDurableObject(stub);
 	await runInDurableObject(stub, (_instance, state) => {
-		const store = new Store(state, {});
-		store.initialize();
-		expect(() => store.getRoomState()).not.toThrow();
+		const store = openStore(state, {});
+		store.lifecycle.initialize();
+		expect(() => sqliteOf(store).getRoomState()).not.toThrow();
 		expect(state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'accounting_unsafe'").one().value).toBe('0');
 	});
 });
@@ -214,9 +217,9 @@ it('retires the permanent overrun stop of earlier versions on wake', async () =>
 it('degrades at 70% of a daily ceiling: live text, uploads and older history are refused, chat is not', async () => {
 	await runInDurableObject(env.DEMO.getByName('tier-degrade'), (_instance, state) => {
 		const now = Date.now() + 3_000;
-		const store = new Store(state, { uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }, { now: () => now });
-		store.initialize();
-		const user = store.registerIdentity({
+		const store = openStore(state, { uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }, { now: () => now });
+		store.lifecycle.initialize();
+		const user = store.accounts.register({
 			userId: 'degrade_user', name: 'Degrade', userHandle: 'handle-degrade', now, ipKey: 'ip-degrade',
 			credential: { credentialId: 'cred-degrade', userId: 'degrade_user', publicKey: 'AAAA', counter: 0 },
 		});
@@ -224,21 +227,21 @@ it('degrades at 70% of a daily ceiling: live text, uploads and older history are
 		const day = new Date(now).toISOString().slice(0, 10);
 		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = ? WHERE day = ?', Math.ceil(DEFAULT_LIMITS.foregroundWritesPerDay * 0.75), day);
 		// A new instance reads the row back, as after a wake.
-		const busy = new Store(state, { uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }, { now: () => now });
-		busy.initialize();
-		busy.getRoomState();
-		expect(busy.budgetShares(now)?.writes).toBeGreaterThanOrEqual(0.7);
-		const upload = refusal(() => busy.startAvatarUpload({ userId: 'degrade_user', now }));
+		const busy = openStore(state, { uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }, { now: () => now });
+		busy.lifecycle.initialize();
+		sqliteOf(busy).getRoomState();
+		expect(busy.ops.budgetShares(now)?.writes).toBeGreaterThanOrEqual(0.7);
+		const upload = refusal(() => busy.uploads.startAvatar({ userId: 'degrade_user', now }));
 		expect(upload.data?.reason).toBe(DEGRADED);
 		// A page more than a page back from the head is older history.
-		const older = refusal(() => busy.history({ roomId: 'general', before: '1', limit: 1, now, userId: 'degrade_user', ipKey: 'ip-degrade' }));
+		const older = refusal(() => sqliteOf(busy).history({ roomId: 'general', before: '1', limit: 1, now, userId: 'degrade_user', ipKey: 'ip-degrade' }));
 		expect(older.data?.reason).toBe(DEGRADED);
 		// The latest page still loads, asked for with no bound or with `before` the head (§4.3.5).
-		const latest = busy.history({ roomId: 'general', now, userId: 'degrade_user', ipKey: 'ip-degrade' });
-		expect(() => busy.history({ roomId: 'general', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
-		expect(() => busy.history({ roomId: 'general', before: '9007199254740990', now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		const latest = sqliteOf(busy).history({ roomId: 'general', now, userId: 'degrade_user', ipKey: 'ip-degrade' });
+		expect(() => sqliteOf(busy).history({ roomId: 'general', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		expect(() => sqliteOf(busy).history({ roomId: 'general', before: '9007199254740990', now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
 		// A window bounded by both stays off, as before.
-		expect(refusal(() => busy.history({ roomId: 'general', after: '1', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).data?.reason).toBe(DEGRADED);
+		expect(refusal(() => sqliteOf(busy).history({ roomId: 'general', after: '1', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).data?.reason).toBe(DEGRADED);
 	});
 });
 
@@ -253,16 +256,16 @@ it('announces every tier change and breaker to the admins, once', async () => {
 	await runInDurableObject(stub, async (instance, state) => {
 		const runtime = instance as unknown as Runtime;
 		const now = Date.now();
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId: 'tier_boss', name: 'Boss', userHandle: 'handle-tier-boss', now, ipKey: 'ip-tier-boss',
 			credential: { credentialId: 'cred-tier-boss', userId: 'tier_boss', publicKey: 'AAAA', counter: 0 },
 		});
-		runtime.store.setRole({ userId: 'tier_boss', role: 'admin', on: true });
+		runtime.store.accounts.setRole({ userId: 'tier_boss', role: 'admin', on: true });
 		const day = new Date(now).toISOString().slice(0, 10);
 		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = ? WHERE day = ?', Math.ceil(DEFAULT_LIMITS.foregroundWritesPerDay * 0.75), day);
 		// The row is read back into memory by a reservation, as any frame does.
-		(runtime.store as unknown as { ledger: { forget(): void } }).ledger.forget();
-		runtime.store.getRoomState();
+		(sqliteOf(runtime.store) as unknown as { ledger: { forget(): void } }).ledger.forget();
+		sqliteOf(runtime.store).getRoomState();
 		runtime.evaluateTier(now);
 		runtime.evaluateTier(now + 1);
 	});
@@ -278,15 +281,15 @@ it('announces every tier change and breaker to the admins, once', async () => {
 it('counts throttle trips by trigger over the last 24 hours', async () => {
 	await runInDurableObject(env.DEMO.getByName('tier-trips'), (_instance, state) => {
 		const clock = { now: Date.now() + 3_000 };
-		const store = new Store(state, {}, { now: () => clock.now });
-		store.initialize();
-		store.noteThrottleTrip('degraded', clock.now);
+		const store = openStore(state, {}, { now: () => clock.now });
+		store.lifecycle.initialize();
+		store.admission.noteThrottleTrip('degraded', clock.now);
 		clock.now += 2 * 60 * 60 * 1000;
-		store.noteThrottleTrip('degraded', clock.now);
-		store.noteThrottleTrip('daily_posting_limit_reached', clock.now);
-		expect(store.throttleTrips(clock.now)).toEqual([['degraded', 2], ['daily_posting_limit_reached', 1]]);
+		store.admission.noteThrottleTrip('degraded', clock.now);
+		store.admission.noteThrottleTrip('daily_posting_limit_reached', clock.now);
+		expect(store.admission.throttleTrips(clock.now)).toEqual([['degraded', 2], ['daily_posting_limit_reached', 1]]);
 		// The first hour's trip leaves the window a day later; the rest stay.
 		clock.now += 23 * 60 * 60 * 1000;
-		expect(store.throttleTrips(clock.now)).toEqual([['daily_posting_limit_reached', 1], ['degraded', 1]]);
+		expect(store.admission.throttleTrips(clock.now)).toEqual([['daily_posting_limit_reached', 1], ['degraded', 1]]);
 	});
 });

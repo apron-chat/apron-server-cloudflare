@@ -4,6 +4,8 @@ import { collectArchive, gzip, jsonlWriter, openArchive } from '@apron/archive';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
 import { type HistoryHolder, type HistorySchedule, isRefusal } from '../src/history/schedule';
 import { BackupStore, MAX_IMPORT_BYTES } from '../src/history/exports';
+import type { Store } from '../src/store';
+import { sqliteOf } from '../src/store/open';
 
 // `/history` end to end: a backup to the backup store (HISTORY_BLOB, local
 // R2 in the tests), and imports from it: a backup of this server's own,
@@ -81,7 +83,7 @@ it('backs history up to the backup store, and imports a foreign archive as a new
 		const page = (await request(admin, 'lobby', 'history', { room_id: 'lobby', limit: 10 })).result;
 		expect(page.messages.map((message: { body: { text: string }; from: { user_id: string } }) => `${message.from.user_id}: ${message.body.text}`)).toEqual(['zed: from afar 1', 'zed: from afar 2']);
 		// The placeholder is unclaimed, whatever roles the archive gave it.
-		const roles = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { getIdentity(id: string): { roles: string[] } | null } }).store.getIdentity('zed')?.roles);
+		const roles = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.accounts.get('zed')?.roles);
 		expect(roles).toEqual(['unclaimed']);
 
 		const status = await command(admin, 'status', '/history status');
@@ -122,7 +124,7 @@ type Runtime = {
 	noteD1Missing(now: number): Promise<void>;
 	runScheduledBackup(now: number): Promise<void>;
 	backupStore(): unknown;
-	store: { historyMetaNumber(key: string): number; setHistoryMeta(key: string, value: string | null): void; historyStatePort(): { setValue(key: string, value: string | null): void }; setHistoryImportJournal(value: string | null): void };
+	store: Store;
 };
 
 /** Runs `fn` on the runtime, then puts back what it changed of it. */
@@ -274,7 +276,7 @@ it('refuses /purge and /rename while an unfinished import\'s journal remains, wi
 		await runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime;
 			expect(runtime.historySchedule.holder).toBeUndefined();
-			runtime.store.setHistoryImportJournal(JSON.stringify({ archive: 'left-over', users: {}, ids: { mode: 'original', moved: [] }, rooms: [] }));
+			sqliteOf(runtime.store).setHistoryImportJournal(JSON.stringify({ archive: 'left-over', users: {}, ids: { mode: 'original', moved: [] }, rooms: [] }));
 		});
 		for (const text of ['/purge nobody-here', '/rename nobody-here someone-else']) {
 			const refused = await command(admin, `pending-${text.length}`, text);
@@ -284,7 +286,7 @@ it('refuses /purge and /rename while an unfinished import\'s journal remains, wi
 		// Each refusal gave its lease back.
 		await runInDurableObject(stub(), (instance) => expect((instance as unknown as Runtime).historySchedule.holder).toBeUndefined());
 	} finally {
-		await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.setHistoryImportJournal(null));
+		await runInDurableObject(stub(), (instance) => sqliteOf((instance as unknown as Runtime).store).setHistoryImportJournal(null));
 		admin.close();
 	}
 });
@@ -297,7 +299,7 @@ it('takes the D1 tier for off only once it holds history; then /history status s
 		const env = runtime.runtimeEnv;
 		const config = runtime.config;
 		const cached = runtime.d1Held;
-		const port = runtime.store.historyStatePort();
+		const port = runtime.store.history.state();
 		try {
 			runtime.runtimeEnv = { ...env, HISTORY_D1: undefined };
 			if (known) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'history:tier:recent'");
@@ -352,7 +354,7 @@ it('takes the D1 tier for off only once it holds history; then /history status s
 			expect(alerts.alerts).toEqual([expect.objectContaining({ kind: 'history_stall', from: 'hot', to: 'recent' })]);
 			// Bound again, the chain's first good copy clears the stall.
 			await runInDurableObject(stub(), (instance) => {
-				(instance as unknown as Runtime).store.historyStatePort().setValue('history:link:hot', null);
+				(instance as unknown as Runtime).store.history.state().setValue('history:link:hot', null);
 			});
 		});
 		// With no count to keep (LIMIT_HISTORY_D1_RECORDS 0), off as well, and the message says so.
@@ -377,18 +379,18 @@ it('backs up on BACKUP_EVERY\'s schedule only, keeping BACKUP_KEEP scheduled bac
 	await changed(withBackups({ everySeconds: 3_600, keep: 2 }), async () => {
 		await runInDurableObject(stub(), async (instance) => {
 			const runtime = instance as unknown as Runtime;
-			const last = runtime.store.historyMetaNumber('history:export:scheduled');
+			const last = runtime.store.history.metaNumber('history:export:scheduled');
 			try {
 				// Each run writes one, a second later each; within the interval, none.
 				const at = Date.now();
 				for (const offset of [0, 1_000, 2_000]) {
-					runtime.store.setHistoryMeta('history:export:scheduled', null);
+					runtime.store.history.setMeta('history:export:scheduled', null);
 					vi.useFakeTimers({ now: at + offset, toFake: ['Date'] });
 					try { await runtime.runScheduledBackup(at + offset); } finally { vi.useRealTimers(); }
 				}
 				await runtime.runScheduledBackup(at + 60_000);
 			} finally {
-				runtime.store.setHistoryMeta('history:export:scheduled', last ? String(last) : null);
+				runtime.store.history.setMeta('history:export:scheduled', last ? String(last) : null);
 			}
 		});
 	});

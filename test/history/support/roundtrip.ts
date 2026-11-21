@@ -17,12 +17,12 @@ import { type ChatRecord, type CollectedArchive, type CompareIdMap, IdMap, type 
 import { importArchive } from "../../../src/history/archive/import";
 import { type BackupStore, type BackupResult, type BackupSettings, writeBackup } from "../../../src/history/exports";
 import type { HistoryChain } from "../../../src/history/chain";
-import { storeExport, storeRestore } from "../../../src/history/store-head";
+import type { Store } from "../../../src/store";
 import type { PublicRecord } from "../../../src/history/records";
 
 /** The runtime's parts a trip drives (private members, reached as the tests reach them elsewhere). */
 type Runtime = {
-	store: Parameters<typeof storeRestore>[0];
+	store: Store;
 	archiveChain(): HistoryChain;
 	backupStore(): BackupStore;
 	archiveHeader(): { server: string; media: string[] };
@@ -60,7 +60,7 @@ export async function importInto(name: string, key: string): Promise<ImportRepor
 		const runtime = instance as unknown as Runtime;
 		const opened = await runtime.backupStore().open(key, MAX_IMPORT_BYTES);
 		if (!opened) throw new Error(`no object ${key}`);
-		return importArchive(runtime.archiveChain(), storeRestore(runtime.store), opened.archive, {
+		return importArchive(runtime.archiveChain(), runtime.store.history.restore(), opened.archive, {
 			clock: { now: Date.now }, server: runtime.archiveHeader().server,
 			provenance: opened.provenance, users: "auto", ids: "original",
 		});
@@ -78,7 +78,7 @@ export async function exportFrom(name: string, keep: string, options: { maxMembe
 	const result = await runInDurableObject(env.DEMO.getByName(name), (instance) => {
 		const runtime = instance as unknown as Runtime;
 		if (options.maxMembers === undefined) return runtime.writeBackup(runtime.backupStore(), "manual");
-		return writeBackup(runtime.archiveChain(), storeExport(runtime.store as unknown as Parameters<typeof storeExport>[0]), runtime.backupStore(), runtime.config.backups, "manual", {
+		return writeBackup(runtime.archiveChain(), runtime.store.history.export(), runtime.backupStore(), runtime.config.backups, "manual", {
 			server: runtime.config.rpId, clock: { now: Date.now }, header: runtime.archiveHeader(), prepare: (records) => runtime.exportRecords(records), maxMembers: options.maxMembers,
 		});
 	});
@@ -107,11 +107,8 @@ export interface RoundTrip {
  */
 export async function normalizeIn(name: string, records: readonly ChatRecord[]): Promise<Array<ChatRecord | null>> {
 	return runInDurableObject(env.DEMO.getByName(name), (instance) => {
-		const runtime = instance as unknown as { store: { content: { record(record: ChatRecord): { ok: true; value: ChatRecord } | { ok: false } } } };
-		return records.map((record) => {
-			const verdict = runtime.store.content.record(withBareUsers(record));
-			return verdict.ok ? verdict.value : null;
-		});
+		const restore = (instance as unknown as Runtime).store.history.restore();
+		return records.map((record) => restore.normalize(withBareUsers(record)));
 	});
 }
 

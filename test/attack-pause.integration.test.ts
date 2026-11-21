@@ -2,7 +2,9 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import worker, { resetEntrySamples, sampleEntry } from '../src/index';
 import { BURN_POLICY } from '../src/burn';
-import { BREAKER_MS } from '../src/store';
+import { BREAKER_MS } from '../src/store/accounting';
+import type { Store } from '../src/store';
+import { sqliteOf } from "../src/store/open";
 
 afterEach(() => { vi.restoreAllMocks(); resetEntrySamples(); });
 
@@ -23,7 +25,7 @@ type Runtime = {
 	notifyAdmins(text: string): Promise<void>;
 	attackPauseRecord?: { until: number; count: number; trigger: string } | null;
 	burnCheckedAt: number;
-	store: { attackPause(): string; accountingGuard(now: number): { breakers: Record<string, number> } };
+	store: Store;
 	evaluateTier(now: number): void;
 };
 
@@ -54,7 +56,7 @@ it('pauses on a flood of refused entry requests: closes every socket, refuses ev
 	// Once the hold has passed, it admits again; the next pause that day holds twice as long.
 	await runInDurableObject(stub, (instance) => {
 		const runtime = instance as unknown as Runtime;
-		expect(JSON.parse(runtime.store.attackPause())).toMatchObject({ count: 1, trigger: 'flood' });
+		expect(JSON.parse(runtime.store.admission.attackPause())).toMatchObject({ count: 1, trigger: 'flood' });
 		runtime.attackPauseRecord = { ...runtime.attackPauseRecord!, until: Date.now() - 1 };
 	});
 	const reopened = await open(stub);
@@ -100,7 +102,7 @@ it('never pauses the server for breakers, however many are open: each refuses on
 		const runtime = instance as unknown as Runtime;
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async () => {});
 		const until = Date.now() + BREAKER_MS;
-		vi.spyOn(runtime.store, 'accountingGuard').mockReturnValue({ day: '', overruns: 9, breakers: { a: until, b: until, c: until, d: until } } as never);
+		vi.spyOn(sqliteOf(runtime.store), 'accountingGuard').mockReturnValue({ day: '', overruns: 9, breakers: { a: until, b: until, c: until, d: until } } as never);
 		runtime.evaluateTier(Date.now());
 		expect(runtime.attackPauseRecord ?? null).toBeNull();
 	});

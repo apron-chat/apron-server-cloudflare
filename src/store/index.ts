@@ -1,28 +1,46 @@
-// Transitional (stage a): everything the old src/store.ts exported, from its new homes.
-export { SqliteStore as Store } from "./sqlite-store";
-export { ADMIN_USER_ID } from "../user-ids";
-export { StoreError } from "../store-error";
-export { MAX_TERMINAL_OUTPUT_JSON_BYTES } from "../content/output-ref";
-export {
-  ROOM_ID, MAX_PASSKEYS_PER_USER, DEFAULT_JOINED_ROOMS, PRIVATE_ROOM_PREFIX, isPrivateRoomId, MAX_READ_RECEIPT_MEMBERS, UNCLAIMED_ROLE,
-  MODERATOR_ROLES, BOT_MODERATOR_ROLES, BOT_NAME_PATTERN, BOT_NAME_RULE, ROOM_CREATOR_ROLES, MAX_CREATED_ROOMS, MAX_LISTED_USER_ROOMS,
-  MAX_ROLES_PER_USER, ROLE_PATTERN, MAX_PUSH_URL_BYTES, PUSH_ID_PATTERN, WAKE_SCOPES, JOINED_WAKE_ROLES, EMOJI_ROLES, MUTE_FOREVER,
-  MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, seenStands, muteValue, nextRoomMuteEnd,
-} from "../domain";
-export { LIVE_ORPHAN_GRACE_MS, liveDeadline, liveHolds, terminalOutput } from "../live-text";
-export { mergeExt } from "../content/user";
-export { DEGRADE_SHARE, EXHAUSTED_SHARE } from "../budget";
-export { SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSION } from "./schema";
-export { defaultStoreConfig, type StoreConfig, type StoreLiveTextConfig } from "./config";
-export {
-  isPendingHistory, type LiveEntry, type PendingHistory, type LiveFinish, type TerminalStored, type StoredServerMetadata, type EmojiEntry,
-  type EmojiEdit, type EmojiDraft, type UploadFinish, type UploadWrite, type Identity, type MessageSnapshot, type RoomRecord, type Broadcast,
-  type StoreMutationInput, type StoreMutationResult, type StoreHistoryResult, type AccountingGuard, type OverrunNotice, type StatusInputRecord,
-  type PushCandidate, type PushSubscriptionRecord, type ClaimedPush, type RoomNotesCheck,
+/*
+ * The store: all authoritative state of the Durable Object, behind the
+ * one surface code outside src/store imports (this module).
+ *
+ * - openStore(ctx, config) opens it over the Durable Object's SQLite.
+ * - A Store is its parts (parts.ts), one plain noun each: accounts,
+ *   credentials, rooms, messages, reads, server, admission, meter, ops,
+ *   lifecycle and history, always; push, uploads and liveText only where
+ *   the deploy configures that feature. A caller depends on the parts it
+ *   uses, and a part's methods are named for what they do there
+ *   (`accounts.get`, `rooms.list`, `push.claim`).
+ * - The implementation is SqliteStore (sqlite-store.ts), with its schema
+ *   (schema.ts), `_meta` keys (meta.ts), caps (limits.ts), accounting
+ *   policy (accounting.ts), rows (rows.ts) and configuration (config.ts).
+ *   Each part is a small object delegating to it (sqlite-parts.ts); the
+ *   history ports are adapters over it (history.ts). All of these are
+ *   internal: only tests of SqliteStore's internals import them.
+ * - Domain rules the store applies (roles, name and ID patterns,
+ *   user-facing caps, mutes) are not the store's: they live in
+ *   src/domain.ts, src/live-text.ts and src/content/.
+ *
+ * Store methods are synchronous with respect to SQLite: a Durable Object
+ * is single threaded, but requests interleave at every await, so callers
+ * can make the reply/broadcast gate wait for a complete mutation before
+ * exposing its result.
+ */
+
+export { openStore } from "./open";
+export type {
+  Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Store, Uploads,
+} from "./parts";
+export type {
+  AccountingGuard, Broadcast, ClaimedPush, EmojiDraft, EmojiEdit, EmojiEntry, Identity, LiveEntry, LiveFinish, MessageSnapshot, OverrunNotice,
+  PendingHistory, PendingUpload, PushCandidate, PushClaim, PushSubscriptionRecord, RoomMember, RoomNotesCheck, RoomRecord, StatusInputRecord,
+  StoreCleanupResult, StoredServerMetadata, StoreHistoryQuery, StoreHistoryResult, StoreMutationInput, StoreMutationResult, TerminalStored,
+  UploadFinish, UploadWrite,
 } from "./types";
-export { newTerminalOutputKey } from "./rows";
-export {
-  MOVE_REACTION_SETS_PER_POST, HISTORY_SCAN_BATCH, RESTORE_RECORDS_BATCH, RESTORE_ENTRIES_BATCH, RESTORE_ENTRIES_SINGLE, RESTORE_USERS_BATCH,
-  RETIRED_SWEEP_BATCH, MAX_CARRIED_PASSKEYS, UPLOAD_WRITE_GRACE_MS, UPLOAD_SWEEP_BATCH,
-} from "./limits";
-export { STORAGE_UNAVAILABLE, OPERATION_PAUSED, TRIP_WINDOW_MS, BREAKER_OVERRUNS, BREAKER_WINDOW_MS, BREAKER_MS, DEGRADED, BREAKER_ALERT_ONLY } from "./accounting";
+export { isPendingHistory } from "./types";
+export { defaultStoreConfig, type StoreConfig } from "./config";
+export { StoreError } from "../store-error";
+/** A refusal's `reason` while storage is unavailable (accounting closed on a storage failure). */
+export { STORAGE_UNAVAILABLE } from "./accounting";
+/** How many retired IDs one accounts.dueRetiredIds returns at most: as many means more are due. */
+export { RETIRED_SWEEP_BATCH } from "./limits";
+/** How many uploads one uploads.cleanup sweeps at most, and how long past its write expiry a pending upload is kept. */
+export { UPLOAD_SWEEP_BATCH, UPLOAD_WRITE_GRACE_MS } from "./limits";

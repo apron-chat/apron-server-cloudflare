@@ -2,7 +2,7 @@
 
 import { outputRef } from "../content/output-ref";
 import type { StoreLiveTextConfig } from "./config";
-import type { ClaimedPush, Identity, LiveEntry, PushSubscriptionRecord, SqlCursorLike } from "./types";
+import type { ClaimedPush, RoomMember, UploadPurpose, Identity, LiveEntry, PushSubscriptionRecord, SqlCursorLike } from "./types";
 import type { RawLimitRow } from "../limiter-cache";
 import type { Bucket } from "../limiter";
 import { MAX_ROLES_PER_USER, ROLE_PATTERN } from "../domain";
@@ -30,21 +30,7 @@ export function terminalOutputBytes(record: unknown): number {
   return embeds.reduce<number>((total, embed) => total + (outputRef(embed)?.bytes ?? -16) + 16, 0);
 }
 
-/** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
-export interface PendingUpload {
-  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar, `e/<id>` for a custom emoji or the server's avatar. */
-  key: string;
-  purpose: UploadPurpose;
-  embedId: string;
-  maxBytes: number;
-  writeExpiresMs: number;
-}
 
-/**
- * What an upload is for: an attached `file`, a user's `avatar`, a custom
- * `emoji`, or the server's own avatar (`server`, `/server avatar`).
- */
-export type UploadPurpose = "file" | "avatar" | "emoji" | "server";
 
 /** A live text's `url` (§4.8.5), which its embed carries once its write starts. */
 export function liveUrl(live: Pick<StoreLiveTextConfig, "publicOrigin">, entry: Pick<LiveEntry, "id">): string {
@@ -89,49 +75,7 @@ export interface MembershipRecord {
 
 export type RecordKind = "room" | "message" | "reactions" | "membership";
 
-export interface StoreHistoryQuery {
-  /** One room's log (§4.3.1); omitted, the log of `roomIds`. */
-  roomId?: string;
-  /**
-   * Without `roomId`, the log of these rooms together (§4.3): the rooms whose
-   * deliveries the requesting connection receives. Unknown ones, and private
-   * ones the requester is not in, are left out. Omitted, the default room.
-   */
-  roomIds?: readonly string[];
-  after?: string | bigint;
-  before?: string | bigint;
-  limit?: number;
-  now?: number;
-  /** Request identity for history quota accounting. */
-  userId?: string;
-  ipKey?: string;
-  /**
-   * A guest: charged to its address alone, which bounds every guest there,
-   * so a crowd of guests writes no limiter row each.
-   */
-  guest?: boolean;
-  maxBytes?: number;
-}
 
-export interface StoreCleanupResult {
-  /** The internal server-wide retention floor F after this run. */
-  history_floor: string;
-  /** F before this run; rooms' history_log_id changed when these differ. */
-  previous_floor: string;
-  /** The server-wide log head. */
-  latest_id: string;
-  deleted_records: number;
-  deleted_messages: number;
-  deleted_reactions: number;
-  /** Membership rows of removed thread rooms purged by this run. */
-  deleted_memberships: number;
-  deleted_requests: number;
-  deleted_limiters: number;
-  /** Thread rooms whose entire log expired; announce them as removed. */
-  removed_rooms: string[];
-  next_due_ms: number;
-  did_work: boolean;
-}
 
 export interface RawLogState {
   last_log_id: number;
@@ -301,19 +245,6 @@ export function emojiObjectKey(json: string): string {
   return `e/c/${createHash("sha256").update(json).digest("hex")}.json`;
 }
 
-/**
- * A registered room member as listings carry it, with the `status` they
- * chose and their `seen` (absent when none is recorded) when asked for.
- */
-export interface RoomMember {
-  user_id: string;
-  name: string;
-  avatar?: string;
-  roles: string[];
-  ext?: Record<string, unknown>;
-  choice?: StatusChoice;
-  seen?: number;
-}
 
 /** One `roomMembers` row, with the chosen status and `seen` when asked for. */
 export interface RawMemberRow {
@@ -368,12 +299,6 @@ export function pushRecord(row: RawPushRow, userId: string): PushSubscriptionRec
   return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}) };
 }
 
-/** What a message's wake claimed (Store.claimPushes). */
-export interface PushClaim {
-  subscriptions: ClaimedPush[];
-  /** Subscriptions left out by the daily server or sender allowance. */
-  skipped: number;
-}
 
 export function numericId(value: string, field = "id"): number {
   if (typeof value !== "string" || !/^\d+$/.test(value)) {

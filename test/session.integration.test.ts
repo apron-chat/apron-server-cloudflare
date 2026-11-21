@@ -2,6 +2,9 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, greeting, reply, request, until, type Frame, type Peer } from './helpers/socket';
+import type { Store } from '../src/store';
+import { sqliteOf } from '../src/store/open';
+import { sqliteIn } from './helpers/store';
 
 let nextIp = 40;
 
@@ -26,8 +29,8 @@ async function sweepSessions(target: ReturnType<typeof env.DEMO.getByName>, now:
  */
 async function registerIdentity(userId: string, ipKey = 'session-test-ip', rooms?: string[]): Promise<string[]> {
 	return runInDurableObject(stub(), async (instance) => {
-		const runtime = instance as unknown as { store: { registerIdentity(input: Record<string, unknown>): { rooms: string[] } } };
-		return runtime.store.registerIdentity({
+		const runtime = instance as unknown as { store: { accounts: { register(input: Record<string, unknown>): { rooms: string[] } } } };
+		return runtime.store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 }, ...(rooms ? { rooms } : {}),
 		}).rooms;
@@ -180,7 +183,7 @@ it('denies a session token whose identity no longer exists without recreating it
 	expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 	peer.close();
 	const after = await runInDurableObject(stub(), async (instance, state) => ({
-		identity: (instance as unknown as { store: { getIdentity(id: string): unknown } }).store.getIdentity('user_session_gone'),
+		identity: (instance as unknown as { store: Store }).store.accounts.get('user_session_gone'),
 		session: [...(await state.storage.list<StoredSessionTest>({ prefix: 'session:' })).values()].some((session) => session.userId === 'user_session_gone'),
 	}));
 	expect(after).toEqual({ identity: null, session: false });
@@ -231,7 +234,7 @@ it('stops session cleanup safely when the maintenance budget is exhausted', asyn
 		);
 		// The object was initialized before the direct SQL fixture update; force
 		// the Store to reload the durable budget row on the next reservation.
-		const store = (instance as unknown as { store: Record<string, unknown> }).store;
+		const store = sqliteIn(instance) as unknown as Record<string, unknown>;
 		store.budgetCache = null;
 		store.budgetCacheDay = null;
 		store.budgetHandoverPending = true;
@@ -248,26 +251,20 @@ it('stops session cleanup safely when the maintenance budget is exhausted', asyn
 it('keeps concurrent async reservations isolated from unrelated SQL work', async () => {
 	const target = isolatedStub();
 	await runInDurableObject(target, async (instance) => {
-		const store = (instance as unknown as {
-			store: {
-				withMeterAsync<T>(kind: 'foreground' | 'maintenance', cost: { reads: number; writes: number }, fn: () => Promise<T>): Promise<T>;
-				getRoomState(): unknown;
-				accountingStatus(): { unsafe: boolean };
-			};
-		}).store;
+		const store = (instance as unknown as { store: Store }).store;
 		await Promise.all([
-			store.withMeterAsync('foreground', { reads: 1, writes: 1 }, async () => {
+			store.meter.foreground({ reads: 1, writes: 1 }, async () => {
 				await Promise.resolve();
-				store.getRoomState();
+				sqliteOf(store).getRoomState();
 				return 'foreground';
 			}),
-			store.withMeterAsync('maintenance', { reads: 1, writes: 1 }, async () => {
+			store.meter.maintenance({ reads: 1, writes: 1 }, async () => {
 				await Promise.resolve();
-				store.getRoomState();
+				sqliteOf(store).getRoomState();
 				return 'maintenance';
 			}),
 		]);
-		expect(store.accountingStatus().unsafe).toBe(false);
+		expect(store.ops.accountingStatus().unsafe).toBe(false);
 	});
 });
 

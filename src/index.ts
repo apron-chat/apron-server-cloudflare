@@ -7,7 +7,6 @@ import { MAX_LISTING_MEMBERS } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
 import { type D1Off, detailLines, statusLines } from "./history/status";
-import { storeExport, storeRestore } from "./history/store-head";
 import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./content/output-ref";
 import { type BackupKind, BackupStore, MAX_IMPORT_BYTES, MAX_IMPORT_RECORDS, importableWarning, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
@@ -58,12 +57,16 @@ import {
 } from "./protocol";
 import {
 	RETIRED_SWEEP_BATCH,
-	Store,
+	openStore,
+	type Accounts,
+	type Lifecycle,
+	type LiveText,
+	type Push,
+	type Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
 	isPendingHistory,
-	newTerminalOutputKey,
 	type Broadcast,
 	type TerminalStored,
 	type ClaimedPush,
@@ -2799,17 +2802,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// bound: D1 (HISTORY_D1), then the cold tier (HISTORY_BLOB).
 		// The layout first: the Store is tiered exactly when the chain has tiers below it.
 		const layout = historyLayout(env, this.config.limits);
-		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered: layoutTiered(layout) });
+		this.store = openStore(ctx, { ...asStoreConfig(this.config), tiered: layoutTiered(layout) });
 		this.history = buildHistoryChain({
-			layout, limits: this.config.limits, store: this.store, clock: { now: nowMs },
+			layout, limits: this.config.limits, store: this.store.history, clock: { now: nowMs },
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
-			chunkIndex: (tier) => this.store.chunkIndex(tier),
+			chunkIndex: (tier) => this.store.history.chunkIndex(tier),
 			server: this.config.rpId,
 			serverUrl: this.archiveHeader().server,
 		});
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
-		this.store.onOverrun = (notice) => {
+		this.store.ops.onOverrun = (notice) => {
 			// The day's first, and an essential operation's at most once an hour (it never pauses).
 			const essential = notice.essential && !notice.maintenance && this.claimTrip("server", `overrun:${notice.operation}`, nowMs());
 			if (notice.firstToday || essential) {
@@ -2819,11 +2822,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.evaluateTier(nowMs());
 		};
 		// With what overran: the log line saying so may be sampled away.
-		this.store.onAccounting = (change, message) => recordMetric(this.runtimeEnv.METRICS, "accounting", message ? [change, message] : [change]);
-		this.store.actor = () => ACTOR.getStore()?.();
+		this.store.ops.onAccounting = (change, message) => recordMetric(this.runtimeEnv.METRICS, "accounting", message ? [change, message] : [change]);
+		this.store.ops.actor = () => ACTOR.getStore()?.();
 		this.accountUsage = new AccountUsageMonitor({
 			env,
-			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
+			persist: (snapshot, now) => this.store.ops.persistAccountUsageSnapshot(snapshot, now),
 			waitUntil: (promise) => ctx.waitUntil(this.stalls.track("analytics", "", promise)),
 			onStop: () => {
 				for (const peer of this.ctx.getWebSockets()) {
@@ -2839,19 +2842,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// webSocketMessage; the time of the last answer tells a live peer from
 		// one that vanished without a close frame (see isStale).
 		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING_REQUEST, PING_RESPONSE));
-		if (this.store.requiresReset()) {
+		if (this.store.lifecycle.requiresReset()) {
 			// Stored data from another schema version is wiped, not migrated. The
 			// input gate holds every event until the fresh schema exists.
 			void ctx.blockConcurrencyWhile(async () => {
-				await this.store.resetStorage();
-				this.accountUsage.restore(this.store.accountUsageSnapshot());
+				await this.store.lifecycle.resetStorage();
+				this.accountUsage.restore(this.store.ops.accountUsageSnapshot());
 				this.attackPauseRecord = null;
 				console.warn(JSON.stringify({ event: "storage_schema_reset" }));
 			});
 		} else {
-			this.store.initialize();
-			this.accountUsage.restore(this.store.accountUsageSnapshot());
-			try { this.attackPauseRecord = parseAttackPause(this.store.attackPause()); } catch { /* read at the first event instead */ }
+			this.store.lifecycle.initialize();
+			this.accountUsage.restore(this.store.ops.accountUsageSnapshot());
+			try { this.attackPauseRecord = parseAttackPause(this.store.admission.attackPause()); } catch { /* read at the first event instead */ }
 		}
 	}
 
@@ -2950,11 +2953,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return responseError(429, "Demo capacity reached", 60_000);
 			}
 			if (status) {
-				this.store.checkConnectionBudget(nowMs());
+				this.store.admission.checkConnectionBudget(nowMs());
 				// This is advisory; the real upgrade still checks all admission gates.
 				return Response.json({ available: true });
 			}
-			this.store.reserveConnection({ ipKey, now: nowMs() });
+			this.store.admission.reserveConnection({ ipKey, now: nowMs() });
 			if (idle) this.closeIdleGuest(idle);
 		} catch (error) {
 			// A long refusal of a connection is a trip too; with no socket yet, it is only counted.
@@ -3222,7 +3225,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async runAlarm(): Promise<void> {
 		this.alarmKnown = false;
 		// Light or full, the alarm that fired is gone once this returns.
-		this.store.alarmFired();
+		this.store.lifecycle.alarmFired();
 		const now = nowMs();
 		this.noteBurn("alarm");
 		this.sweepPresence(now);
@@ -3251,7 +3254,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			} catch { /* retried on the next alarm */ }
 		}
 		try {
-			for (const userId of this.store.idleBots({ now, before: now - BOT_IDLE_MS, limit: 4, intervalMs: BOT_SWEEP_INTERVAL_MS, graceMs: BOT_IDLE_MS }) ?? []) {
+			for (const userId of this.store.accounts.idleBots({ now, before: now - BOT_IDLE_MS, limit: 4, intervalMs: BOT_SWEEP_INTERVAL_MS, graceMs: BOT_IDLE_MS }) ?? []) {
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
@@ -3260,9 +3263,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Records about to leave this SQLite are copied to the tier below first.
 		if (this.history) await this.runHistory(now);
 		await this.runScheduledBackup(now);
-		let result: ReturnType<Store["runCleanup"]> | undefined;
+		let result: ReturnType<Lifecycle["runCleanup"]> | undefined;
 		try {
-			result = this.store.runCleanup(now, { copyWaitMs: this.copyWaitMs() });
+			result = this.store.lifecycle.runCleanup(now, { copyWaitMs: this.copyWaitMs() });
 		} catch {
 			// A metered maintenance failure is deferred. Do not spin an alarm loop.
 			// The floor may already be durable even if a physical deletion failed,
@@ -3273,7 +3276,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.config.uploads) {
 			try {
 				await this.runMutation(async () => {
-					const expired = this.store.expirePendingUploads(now);
+					const expired = this.store.uploads.expirePending(now);
 					await this.broadcastRecords(expired.broadcasts);
 					this.deleteMedia(expired.deletedUploads);
 					this.deadlines.uploads.set(expired.next);
@@ -3281,7 +3284,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				});
 				// A full batch may have left more behind: sweep again shortly rather
 				// than a cleanup interval later, so released bytes do not pile up.
-				const swept = this.store.cleanupUploads(now);
+				const swept = this.store.uploads.cleanup(now);
 				// Expired files and avatars go from R2 too, not only by its lifecycle rules.
 				this.deleteMedia(swept.deleted);
 				if (swept.count >= UPLOAD_SWEEP_BATCH) {
@@ -3305,7 +3308,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!result || result.history_floor !== result.previous_floor) {
 			try {
 				// Only rooms whose history_log_id moved need a new record.
-				const rooms = this.store.listRooms(nowMs(), {
+				const rooms = this.store.rooms.list(nowMs(), {
 					maintenance: true,
 					withPrivate: true,
 					...(result ? { changedSinceFloor: Number(result.previous_floor) } : {}),
@@ -3354,10 +3357,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmWorkDue(now: number): boolean {
 		// History upkeep: a cycle that asked to go on, or a `/purge` or
 		// `/rename` the tiers below have yet to apply, read once a wake.
-		if (this.history && this.historySchedule.workDue(now, () => this.store.historyRewrites(now).length > 0)) return true;
+		if (this.history && this.historySchedule.workDue(now, () => this.store.history.rewrites(now).length > 0)) return true;
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
-				const stored = this.store.nextUploadDeadline(now);
+				const stored = this.store.uploads.nextDeadline(now);
 				if (stored !== undefined) this.deadlines.uploads.soonest(stored);
 				this.uploadDeadlineRead = true;
 			} catch {
@@ -3368,7 +3371,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Live texts that a lost instance left open, read once (recoverLiveTexts), or one past its deadline.
 		if (this.config.liveText && !this.liveRecovered) {
 			try {
-				if (this.store.openLiveTexts(now).length > 0) return true;
+				if (this.store.liveText.open(now).length > 0) return true;
 				this.liveRecovered = true;
 			} catch {
 				return true;
@@ -3376,7 +3379,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (this.deadlines.live.passed(now)) return true;
 		if (this.deadlines.maintenance.passed(now)) return true;
-		return this.store.cleanupDue(now);
+		return this.store.lifecycle.cleanupDue(now);
 	}
 
 	private storeResponseError(error: unknown): Response {
@@ -3499,7 +3502,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** What admins set with `/server`, or nothing while it cannot be read. */
 	private storedServerMetadata(): StoredServerMetadata {
 		try {
-			return this.store.serverMetadata(nowMs());
+			return this.store.server.metadata(nowMs());
 		} catch {
 			return {};
 		}
@@ -3534,7 +3537,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private emojiCatalogUrl(): string | undefined {
 		if (!this.config.uploads) return undefined;
 		try {
-			return this.store.emojiCatalog(nowMs())?.url;
+			return this.store.server.emojiCatalog(nowMs())?.url;
 		} catch {
 			return undefined;
 		}
@@ -3552,7 +3555,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private generalDescription(): string | undefined {
 		try {
-			return this.store.getRoom(ROOM_ID, nowMs())?.description;
+			return this.store.rooms.get(ROOM_ID, nowMs())?.description;
 		} catch {
 			return undefined;
 		}
@@ -3666,7 +3669,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private recordTrip(trigger: string, now: number, details: { method?: string; user?: string; retryAfter: number }): void {
 		console.warn(JSON.stringify({ event: "throttle_tripped", trigger, ...details }));
 		recordMetric(this.runtimeEnv.METRICS, "throttle", [trigger, details.method ?? ""], 1);
-		try { this.store.noteThrottleTrip(trigger, now); } catch { /* the log and metric still hold it */ }
+		try { this.store.admission.noteThrottleTrip(trigger, now); } catch { /* the log and metric still hold it */ }
 	}
 
 	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string, detail = ""): void {
@@ -3752,7 +3755,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A sign-in that failed after holding deliveries sends them after its error.
 		this.releaseDeliveries(socket);
 		// A refusal at the storage watermark starts cleanup at once: its alarm may be sooner than the one set.
-		if (!this.alarmKnown || this.store.takeAlarmChange()) await this.rescheduleAlarm();
+		if (!this.alarmKnown || this.store.lifecycle.takeAlarmChange()) await this.rescheduleAlarm();
 	}
 
 	/** Counts one frame against the server-wide minute; the seconds to wait when it is full. */
@@ -3782,10 +3785,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				latest.frameLease = { day, remaining: lease - 1 };
 			} else {
 				const count = this.config.limits.frameLease;
-				const reserve = () => this.store.reserveFrames({ ipKey: attachment.ipKey, now, count });
+				const reserve = () => this.store.admission.reserveFrames({ ipKey: attachment.ipKey, now, count });
 				// An admin's frames are charged but never refused, so `/status`
 				// still answers on a day whose budgets or frames are spent.
-				if (latest.tier === "registered" && latest.roles?.includes("admin")) this.store.alert(reserve);
+				if (latest.tier === "registered" && latest.roles?.includes("admin")) this.store.ops.alert(reserve);
 				else reserve();
 				latest.frameLease = { day, remaining: count - 1 };
 			}
@@ -3884,7 +3887,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private nextGuestNumber(): number {
 		if (this.guestNext >= this.guestLimit) {
-			const block = this.store.reserveGuestNumbers(this.config.limits.guestNumberBlock, nowMs());
+			const block = this.store.admission.reserveGuestNumbers(this.config.limits.guestNumberBlock, nowMs());
 			this.guestNext = block.first;
 			this.guestLimit = block.limit;
 		}
@@ -3915,7 +3918,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 			}
 		}
-		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
+		this.store.admission.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
 		const params = request.params;
 		const scheme = requiredString(params, "scheme");
 		if (scheme === "guest") {
@@ -3977,19 +3980,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
 			const name = action === "register" && !adding ? this.requestedName(params) : undefined;
 			// Adding: the account's passkeys are excluded, and its user handle reused.
-			const stored = adding ? this.store.getIdentity(attachment.userId!) : null;
+			const stored = adding ? this.store.accounts.get(attachment.userId!) : null;
 			if (adding && !stored) throw { name: "denied", message: "Only a registered user can add a passkey" } satisfies ProtocolError;
-			const existing = adding ? this.store.credentialIdsForUser(attachment.userId!) : [];
+			const existing = adding ? this.store.credentials.idsForUser(attachment.userId!) : [];
 			if (existing.length >= MAX_PASSKEYS_PER_USER) throw { name: "denied", message: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys` } satisfies ProtocolError;
 			// An account without a handle yet (an invited user) gets one now, so
 			// concurrent ceremonies for it share it.
-			const shared = !stored ? null : stored.userHandle || this.store.ensureUserHandle(stored.userId, bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))), nowMs());
+			const shared = !stored ? null : stored.userHandle || this.store.credentials.ensureHandle(stored.userId, bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))), nowMs());
 			const handle = shared && /^[A-Za-z0-9_-]{16,64}$/.test(shared) && shared.length % 4 !== 1 ? shared : undefined;
 			const result: Record<string, unknown> = {};
 			if (local) {
 				const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, existing, attachment.connId, {
 					...(name !== undefined ? { name } : {}),
-					userIdTaken: (userId) => this.store.userIdTaken(userId),
+					userIdTaken: (userId) => this.store.accounts.idTaken(userId),
 					...(adding ? { adds: handle ? { userHandle: handle } : {} } : {}),
 				});
 				if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
@@ -4068,9 +4071,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private passkeySignIn(socket: WebSocketConnection, attachment: ConnectionAttachment): PasskeySignIn {
 		const signIn: PasskeySignIn = { roles: [], repository: undefined as unknown as CredentialRepository };
 		signIn.repository = {
-			getCredential: (credentialId) => this.store.getCredential(credentialId),
+			getCredential: (credentialId) => this.store.credentials.get(credentialId),
 			getIdentity: (userId) => {
-				const identity = this.store.getIdentity(userId);
+				const identity = this.store.accounts.get(userId);
 				signIn.avatar = identity?.avatar;
 				signIn.roles = identity?.roles ?? [];
 				signIn.ext = identity?.ext;
@@ -4083,22 +4086,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// `/invite-purge` may have cleared the account's user handle (and
 					// closed this connection) while the ceremony was verifying; the
 					// handle it began under must not come back with a new passkey.
-					if (connectionAttachment(socket)?.closing || !this.store.getIdentity(input.userId)?.userHandle) {
+					if (connectionAttachment(socket)?.closing || !this.store.accounts.get(input.userId)?.userHandle) {
 						throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
 					}
-					const added = this.store.addCredential({ userId: input.userId, userHandle: input.userHandle, credential: input.credential, now: input.now, ipKey: input.ipKey });
+					const added = this.store.credentials.add({ userId: input.userId, userHandle: input.userHandle, credential: input.credential, now: input.now, ipKey: input.ipKey });
 					return { user_id: added.userId, name: added.name };
 				}
 				signIn.handle = input.userHandle;
 				// A guest registering on its connection keeps the rooms it had joined.
-				const identity = this.store.registerIdentity({ ...input, ...(attachment.tier === "anonymous" && attachment.rooms ? { rooms: attachment.rooms } : {}) });
+				const identity = this.store.accounts.register({ ...input, ...(attachment.tier === "anonymous" && attachment.rooms ? { rooms: attachment.rooms } : {}) });
 				// Each starting room's logged join goes to the room's other members
 				// before anything else can commit (§4.2.2), and to this connection
 				// after its `auth` result (§3.2).
 				for (const record of identity.broadcasts) this.broadcastHeld(socket, record);
 				return { user_id: identity.userId, name: identity.name, tier: "registered" };
 			},
-			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
+			updateCredentialCounter: (credentialId, counter) => this.store.credentials.updateCounter(credentialId, counter),
 		};
 		return signIn;
 	}
@@ -4141,7 +4144,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A passkey `/invite-purge` removed while the ceremony was verifying
 		// signs nobody in; with no await from here, a later purge finds this
 		// connection signed in and closes it.
-		if (finished.credential && !this.store.getCredential(finished.credential.credentialId)) {
+		if (finished.credential && !this.store.credentials.get(finished.credential.credentialId)) {
 			throw { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		}
 		const previous = this.guestBefore(socket, attachment);
@@ -4192,7 +4195,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sweepSignIn reads. Keys are SHA-256s of the secrets, as sessions' are.
 	 */
 	private async putSignInRecord<T extends { expiresMs: number }>(key: string, value: T): Promise<void> {
-		await this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+		await this.store.meter.foreground({ writes: 2 }, async () => {
 			await this.ctx.storage.put<SignInExpiryEntry>(signInExpiryKey(value.expiresMs, key), { v: 1, key, expiresMs: value.expiresMs });
 			await this.ctx.storage.put(key, value);
 		});
@@ -4205,7 +4208,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * refused by the caller. Its expiry entry is the sweep's to delete.
 	 */
 	private async takeSignInRecord<T extends { expiresMs: number }>(key: string): Promise<T | undefined> {
-		return await this.store.withMeterAsync("foreground", { reads: 1, writes: 1 }, async () => {
+		return await this.store.meter.foreground({ reads: 1, writes: 1 }, async () => {
 			const value = await this.ctx.storage.get<T>(key);
 			if (value === undefined) return undefined;
 			return await this.ctx.storage.delete(key) ? value : undefined;
@@ -4228,11 +4231,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** An addition's handle, still good, and the account it names, which may still take a passkey; else undefined. */
-	private async readRequestHandle(handle: string, now: number): Promise<{ record: StoredRequestHandle; identity: NonNullable<ReturnType<Store["getIdentity"]>> } | undefined> {
+	private async readRequestHandle(handle: string, now: number): Promise<{ record: StoredRequestHandle; identity: NonNullable<ReturnType<Accounts["get"]>> } | undefined> {
 		const key = REQUEST_HANDLE_KEY_PREFIX + await sha256Hex(handle);
-		const record = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredRequestHandle>(key));
+		const record = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredRequestHandle>(key));
 		if (record?.v !== 1 || typeof record.userId !== "string" || !(record.expiresMs > now)) return undefined;
-		const identity = this.store.getIdentity(record.userId);
+		const identity = this.store.accounts.get(record.userId);
 		// The account must still be one that adds passkeys (§4.10): not a bot or
 		// `admin`, and still under its user handle, which `/invite-purge` changes.
 		if (!identity || identity.userId === ADMIN_USER_ID || (identity.roles ?? []).includes("bot") || isBotId(identity.userId)) return undefined;
@@ -4260,7 +4263,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const invalid = { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
 		if (code.length > MAX_SESSION_TOKEN_CHARS) throw invalid;
 		const key = SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code);
-		return await this.store.withMeterAsync("foreground", { reads: 1, writes: 1 }, async () => {
+		return await this.store.meter.foreground({ reads: 1, writes: 1 }, async () => {
 			const record = await this.ctx.storage.get<StoredSignInCode>(key);
 			if (record === undefined) throw invalid;
 			const valid = record.v === 1 && record.page === page && record.expiresMs > nowMs() && record.resource === origin &&
@@ -4281,7 +4284,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async redeemPasskeyCode(code: StoredSignInCode, repository: CredentialRepository, ipKey: string, requestedName?: string): Promise<{ identity: { user_id: string; name?: string }; credential?: StoredCredential }> {
 		const gone = { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		if (code.action === "login") {
-			const credential = code.credentialId ? this.store.getCredential(code.credentialId) : null;
+			const credential = code.credentialId ? this.store.credentials.get(code.credentialId) : null;
 			if (!credential || credential.userId !== code.userId) throw gone;
 			const identity = await repository.getIdentity!(code.userId);
 			if (!identity) throw gone;
@@ -4291,7 +4294,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!created) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
 		// A new account takes the name its redeemer asks for, else the page's.
 		const name = code.adds ? created.name : requestedName ?? created.name;
-		const userId = code.adds || (name === created.name && !this.store.userIdTaken(code.userId)) ? code.userId : candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
+		const userId = code.adds || (name === created.name && !this.store.accounts.idTaken(code.userId)) ? code.userId : candidateUserIdFor(name, (candidate) => this.store.accounts.idTaken(candidate));
 		const identity = await repository.registerCredential({
 			userId, name, userHandle: created.userHandle, credential: { ...created.credential, userId }, ipKey, now: nowMs(),
 			...(code.adds ? { adds: true } : {}),
@@ -4327,7 +4330,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const code = await this.takeSignInCode(params, "authorize", origin, (record) => {
 			if (attachment.tier !== "registered" && attachment.tier !== "anonymous") return;
 			same = attachment.tier === "registered" && record.action === "login" && record.userId === attachment.userId &&
-				!!record.credentialId && this.store.getCredential(record.credentialId)?.userId === record.userId;
+				!!record.credentialId && this.store.credentials.get(record.credentialId)?.userId === record.userId;
 			// A guest is not an account yet: a new account's code makes it one,
 			// as a passkey registration on a guest connection does (§4.10).
 			if (!same && !(attachment.tier === "anonymous" && record.action === "register")) {
@@ -4438,19 +4441,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return pageJson(400, { error: "The name for the new account is too long. Start again from the app with a shorter one." });
 		}
 		const now = nowMs();
-		this.store.reserveAuthAttempt({ ipKey, now });
+		this.store.admission.reserveAuthAttempt({ ipKey, now });
 		let adds: { userId: string; name: string; userHandle?: string; existing: string[] } | undefined;
 		if (value.request) {
 			const found = await this.readRequestHandle(value.request, now);
 			if (!found) return pageJson(400, { error: "This link to add a passkey has expired. Start again from the app." });
-			const existing = this.store.credentialIdsForUser(found.identity.userId);
+			const existing = this.store.credentials.idsForUser(found.identity.userId);
 			if (existing.length >= MAX_PASSKEYS_PER_USER) return pageJson(400, { error: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys.` });
 			adds = { userId: found.identity.userId, name: found.identity.name || found.identity.userId, existing, ...(found.record.userHandle ? { userHandle: found.record.userHandle } : {}) };
 		}
 		const begun = await this.webAuthn.begin(action, origin, now,
 			adds ? { user_id: adds.userId, name: adds.name, tier: "registered" } : undefined, adds?.existing ?? [], undefined, {
 				...(value.name !== undefined ? { name: value.name } : {}),
-				userIdTaken: (userId) => this.store.userIdTaken(userId),
+				userIdTaken: (userId) => this.store.accounts.idTaken(userId),
 				...(adds ? { adds: adds.userHandle ? { userHandle: adds.userHandle } : {} } : {}),
 			}, { page: true });
 		const ceremony: StoredPageCeremony = {
@@ -4477,7 +4480,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const challengeId = typeof body.challenge_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(body.challenge_id) ? body.challenge_id : undefined;
 		if (!challengeId) return pageJson(400, { error: "The request was not understood." });
 		const now = nowMs();
-		this.store.reserveAuthAttempt({ ipKey, now });
+		this.store.admission.reserveAuthAttempt({ ipKey, now });
 		const ceremony = await this.takeSignInRecord<StoredPageCeremony>(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(challengeId));
 		if (ceremony?.v !== 1 || !(ceremony.expiresMs > now) || ceremony.challenge.challengeId !== challengeId || ceremony.request.resource !== origin) {
 			return pageJson(400, { error: "This passkey request expired. Try again." });
@@ -4491,18 +4494,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let created: { userId: string; name: string; userHandle: string; credential: StoredCredential } | undefined;
 		const repository: CredentialRepository = {
-			getCredential: (credentialId) => this.store.getCredential(credentialId),
+			getCredential: (credentialId) => this.store.credentials.get(credentialId),
 			getIdentity: (userId) => {
-				const identity = this.store.getIdentity(userId);
+				const identity = this.store.accounts.get(userId);
 				return identity ? { user_id: identity.userId, name: identity.name } : null;
 			},
 			// Kept with the code, not written: the account, or the addition, is the redeemer's.
 			registerCredential: (input) => {
-				if (this.store.getCredential(input.credential.credentialId)) throw new AuthError("credential is already registered");
+				if (this.store.credentials.get(input.credential.credentialId)) throw new AuthError("credential is already registered");
 				created = { userId: input.userId, name: input.name, userHandle: input.userHandle, credential: input.credential };
 				return { user_id: input.userId, name: input.name };
 			},
-			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
+			updateCredentialCounter: (credentialId, counter) => this.store.credentials.updateCounter(credentialId, counter),
 		};
 		let finished: Awaited<ReturnType<WebAuthnService["finish"]>>;
 		try {
@@ -4544,7 +4547,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async pendingCredential(credentialId: string): Promise<boolean> {
 		const key = PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(credentialId);
-		const record = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredPendingCredential>(key));
+		const record = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredPendingCredential>(key));
 		if (record === undefined) return false;
 		return !(record?.v === 1 && typeof record.expiresMs === "number" && record.expiresMs <= nowMs());
 	}
@@ -4579,23 +4582,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 		params.client_id = clientId;
 		const resource = form.getAll("resource");
 		if (resource.length > 1 || (resource.length === 1 && resource[0] !== origin)) return tokenError(400, "invalid_target");
-		this.store.reserveAuthAttempt({ ipKey, now: nowMs() });
+		this.store.admission.reserveAuthAttempt({ ipKey, now: nowMs() });
 		const code = await this.takeSignInCode(params, "authorize", origin);
 		let handle: string | undefined;
 		const repository: CredentialRepository = {
-			getCredential: (credentialId) => this.store.getCredential(credentialId),
+			getCredential: (credentialId) => this.store.credentials.get(credentialId),
 			getIdentity: (userId) => {
-				const identity = this.store.getIdentity(userId);
+				const identity = this.store.accounts.get(userId);
 				handle = identity?.userHandle;
 				return identity ? { user_id: identity.userId, name: identity.name } : null;
 			},
 			registerCredential: (input) => {
 				handle = input.userHandle;
-				const identity = this.store.registerIdentity(input);
+				const identity = this.store.accounts.register(input);
 				for (const record of identity.broadcasts) this.broadcastRecord(record);
 				return { user_id: identity.userId, name: identity.name };
 			},
-			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
+			updateCredentialCounter: (credentialId, counter) => this.store.credentials.updateCounter(credentialId, counter),
 		};
 		const finished = await this.redeemPasskeyCode(code, repository, ipKey);
 		const token = await this.issueSession(finished.identity.user_id, undefined, nowMs(), handle);
@@ -4606,9 +4609,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Drops expired sign-in records (codes, their pending passkeys, page ceremonies, addition handles) from their expiry index; whether a full batch was processed. */
 	private async sweepSignIn(now: number): Promise<boolean> {
 		const end = `${SIGN_IN_EXPIRY_PREFIX}${Math.max(0, Math.trunc(now)).toString().padStart(16, "0")}￿`;
-		const dueProbe = await this.store.withMeterAsync("maintenance", { reads: 1 }, () => this.ctx.storage.list<SignInExpiryEntry>({ prefix: SIGN_IN_EXPIRY_PREFIX, end, limit: 1 }), now);
+		const dueProbe = await this.store.meter.maintenance({ reads: 1 }, () => this.ctx.storage.list<SignInExpiryEntry>({ prefix: SIGN_IN_EXPIRY_PREFIX, end, limit: 1 }), now);
 		if (dueProbe.size === 0) return false;
-		return await this.store.withMeterAsync("maintenance", { reads: SESSION_CLEANUP_BATCH + 1, writes: 2 * SESSION_CLEANUP_BATCH }, async () => {
+		return await this.store.meter.maintenance({ reads: SESSION_CLEANUP_BATCH + 1, writes: 2 * SESSION_CLEANUP_BATCH }, async () => {
 			const indexed = await this.ctx.storage.list<SignInExpiryEntry>({ prefix: SIGN_IN_EXPIRY_PREFIX, end, limit: SESSION_CLEANUP_BATCH });
 			// A record is written once and never renewed, so its entry's time is its own: both go.
 			const keys = [...indexed].flatMap(([indexKey, entry]) => entry?.v === 1 && typeof entry.key === "string" && SIGN_IN_RECORD_KEY.test(entry.key) ? [indexKey, entry.key] : [indexKey]);
@@ -4666,7 +4669,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * ones stored with the identity.
 	 */
 	private registeredRooms(socket: WebSocketConnection, userId: string): string[] {
-		return this.liveRoomsOf(userId, socket) ?? this.store.getIdentity(userId)?.rooms ?? [...DEFAULT_JOINED_ROOMS];
+		return this.liveRoomsOf(userId, socket) ?? this.store.accounts.get(userId)?.rooms ?? [...DEFAULT_JOINED_ROOMS];
 	}
 
 	/**
@@ -4747,16 +4750,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const token = requiredString(request.params, "token");
 		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 		const key = await sessionKey(token);
-		const session = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredSession>(key));
+		const session = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredSession>(key));
 		const now = nowMs();
 		const expired = { name: "denied", message: "Session expired; sign in with your passkey" } satisfies ProtocolError;
 		if (!session || session.v !== 1 || (bearer ? session.origin !== undefined : session.origin !== origin) || session.expiresMs <= now) {
 			if (session && session.expiresMs <= now) {
-				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(key));
+				await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.delete(key));
 			}
 			throw expired;
 		}
-		const identity = this.store.getIdentity(session.userId);
+		const identity = this.store.accounts.get(session.userId);
 		const lifetimeMs = this.config.limits.sessionTtlSeconds * 1_000;
 		// A session carries the user handle it was issued under, which
 		// `/invite-purge` clears, and an account later created under a freed
@@ -4769,9 +4772,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const reset = !identity ? false : !legacy
 			? session.handle !== identity.userHandle
 			: (identity.createdMs ?? 0) >= SESSION_HANDLES_SINCE ||
-				!!await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredAuthReset>(AUTH_RESET_KEY_PREFIX + identity.userId));
+				!!await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredAuthReset>(AUTH_RESET_KEY_PREFIX + identity.userId));
 		if (!identity || reset) {
-			await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(key));
+			await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.delete(key));
 			throw expired;
 		}
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
@@ -4779,11 +4782,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (legacy && identity.userHandle && session.expiresMs - now >= lifetimeMs / 2) {
 			// Carries its handle from now on, renewed or not.
 			try {
-				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredSession>(key, { ...session, handle: identity.userHandle }));
+				await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.put<StoredSession>(key, { ...session, handle: identity.userHandle }));
 			} catch { /* checked the old way next time */ }
 		}
 		if (session.expiresMs - now < lifetimeMs / 2) {
-			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
+			await this.store.meter.foreground({ writes: 3 }, async () => {
 				// The index is advisory. Writing it first means a crash cannot leave a
 				// live session without an expiry entry; a stale entry is harmless.
 				await this.ctx.storage.put<SessionExpiryEntry>(sessionExpiryKey(renewed.expiresMs, key), {
@@ -4819,10 +4822,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = BOT_TOKEN_KEY_PREFIX + await sha256Hex(token);
-			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredBotToken>(key));
+			const stored = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredBotToken>(key));
 			const invalid = { name: "denied", message: "Bot token is not valid; its owner can get a new one with /invite-bot" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || !isBotId(stored.botId)) throw invalid;
-			const identity = this.store.getIdentity(stored.botId);
+			const identity = this.store.accounts.get(stored.botId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
 		});
@@ -4837,10 +4840,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
-			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredInviteToken>(key));
+			const stored = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredInviteToken>(key));
 			const invalid = { name: "denied", message: "This invite token is not valid; ask an admin for a new one" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string") throw invalid;
-			const identity = this.store.getIdentity(stored.userId);
+			const identity = this.store.accounts.get(stored.userId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
 		});
@@ -4857,7 +4860,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
-			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredDeviceToken>(key));
+			const stored = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredDeviceToken>(key));
 			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string" || typeof stored.device !== "string") throw invalid;
 			// A token unused as long as an account may idle is forgotten, as an
@@ -4869,14 +4872,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.forgetDeviceToken(stored.userId, key);
 				throw { name: "denied", message: "This device token expired after going unused; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
 			}
-			const identity = this.store.getIdentity(stored.userId);
+			const identity = this.store.accounts.get(stored.userId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
 			// When it was last used, at most once a UTC day, for `/invite-device list`.
 			if (stored.usedMs === undefined || utcDay(stored.usedMs) !== utcDay(now)) {
 				// Best effort: the sign-in has been answered, and a budget refusal only leaves the day unrecorded.
 				try {
-					await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredDeviceToken>(key, { ...stored, usedMs: now }));
+					await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.put<StoredDeviceToken>(key, { ...stored, usedMs: now }));
 				} catch { /* unrecorded */ }
 			}
 		});
@@ -4894,9 +4897,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// On first use, the admin's logged join reaches this connection after
 			// its `auth` result (§3.2); signInKeyless releases it.
 			this.holdDeliveries(socket);
-			const created = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now: nowMs(), ipKey: attachment.ipKey });
+			const created = this.store.accounts.ensureAdmin({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now: nowMs(), ipKey: attachment.ipKey });
 			for (const record of created.broadcasts) this.broadcastHeld(socket, record);
-			const identity = this.store.getIdentity(ADMIN_USER_ID);
+			const identity = this.store.accounts.get(ADMIN_USER_ID);
 			if (!identity) throw { name: "internal_error", message: "Admin user is missing" } satisfies ProtocolError;
 			await this.signInKeyless(socket, attachment, request, identity);
 		});
@@ -4913,11 +4916,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, rooms: string[], credential: string | undefined): void {
 		// The identity was read before the sign-in awaited storage; a `/purge` or
 		// `/rename` meanwhile must not leave this connection signed in as it.
-		if (!this.store.identityExists(identity.userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
+		if (!this.store.accounts.exists(identity.userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
 		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
-		this.store.noteActive(identity.userId, nowMs());
+		this.store.accounts.noteActive(identity.userId, nowMs());
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
 		attachment.roles = identity.roles;
@@ -4975,7 +4978,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// user's token, or pruning a dead invite) is reserved before the
 			// account exists, so an exhausted budget cannot strand an account
 			// without its token or an invite not counted down.
-			const userId = await this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			const userId = await this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 				const invite = await this.ctx.storage.get<StoredJoinInvite>(key);
 				if (!invite || invite.v !== 1 || !(invite.remaining > 0) || invite.expiresMs <= nowMs()) {
 					// A used-up or expired invite is dropped when it is next tried.
@@ -4984,12 +4987,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				// A connection gone before the sign-up spends no use.
 				if (!open()) return null;
-				const userId = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
+				const userId = candidateUserIdFor(name, (candidate) => this.store.accounts.idTaken(candidate));
 				// The new user's logged joins reach this connection after its
 				// `auth` result (§3.2); signInKeyless releases them.
 				this.holdDeliveries(socket);
 				await this.runMutation(async () => {
-					const created = this.store.createInvitedIdentity({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
+					const created = this.store.accounts.createInvited({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
 					for (const record of created.broadcasts) this.broadcastHeld(socket, record);
 				});
 				// One put of three keys, with no await between creation and it: the
@@ -5003,7 +5006,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return userId;
 			});
 			if (userId === null) return;
-			const identity = this.store.getIdentity(userId);
+			const identity = this.store.accounts.get(userId);
 			if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
 			// A reply lost after this point costs one use: the user exists, with a
 			// token nobody received, until an admin /purges them.
@@ -5024,7 +5027,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const token = JOIN_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const expiresMs = nowMs() + JOIN_INVITE_TTL_MS;
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+		await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 			const previous = await this.ctx.storage.get<StoredBot>(JOIN_INVITE_KEY);
 			// Revoke first: a failure between the writes leaves no invite, never two.
 			if (previous?.v === 1 && typeof previous.tokenKey === "string") await this.ctx.storage.delete(previous.tokenKey);
@@ -5049,7 +5052,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.withSessionLock(async () => {
 			const token = BOT_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 			const key = BOT_TOKEN_KEY_PREFIX + await sha256Hex(token);
-			await this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			await this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 				const previous = await this.ctx.storage.get<StoredBot>(BOT_KEY_PREFIX + botId);
 				// Revoke first: a failure between the writes leaves no token, never two.
 				if (previous?.v === 1 && typeof previous.tokenKey === "string") await this.ctx.storage.delete(previous.tokenKey);
@@ -5071,11 +5074,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private async issueSessionLocked(userId: string, origin: string | undefined, now: number, given: string | undefined): Promise<string> {
 		// Every session carries its account's handle (a caller that has none at hand gets the stored one).
-		const handle = given ?? this.store.getIdentity(userId)?.userHandle;
+		const handle = given ?? this.store.accounts.get(userId)?.userHandle;
 		const token = `${origin === undefined ? SESSION_TOKEN_PREFIX : ""}${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 		const key = await sessionKey(token);
 		const expiresMs = now + this.config.limits.sessionTtlSeconds * 1_000;
-		await this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+		await this.store.meter.foreground({ writes: 2 }, async () => {
 			await this.ctx.storage.put<SessionExpiryEntry>(sessionExpiryKey(expiresMs, key), { v: 1, sessionKey: key, expiresMs });
 			await this.ctx.storage.put<StoredSession>(key, { v: 1, userId, ...(origin !== undefined ? { origin } : {}), expiresMs, ...(handle ? { handle } : {}) });
 		});
@@ -5091,14 +5094,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Socket deadline alarms can be frequent. Probe the bounded expiry index
 		// before reserving a full batch; this is the only maintenance work
 		// performed until an expiry is actually due.
-		const dueProbe = await this.store.withMeterAsync("maintenance", { reads: 1 }, () => this.ctx.storage.list<SessionExpiryEntry>({
+		const dueProbe = await this.store.meter.maintenance({ reads: 1 }, () => this.ctx.storage.list<SessionExpiryEntry>({
 			prefix: SESSION_EXPIRY_PREFIX,
 			end: `${SESSION_EXPIRY_PREFIX}${Math.max(0, Math.trunc(now)).toString().padStart(16, "0")}\uffff`,
 			limit: 1,
 		}), now);
 		if (dueProbe.size === 0) return false;
 		// Up to B index rows + B session reads; writes cover 2B expiry deletes.
-		return await this.store.withMeterAsync("maintenance", {
+		return await this.store.meter.maintenance({
 			reads: 2 * SESSION_CLEANUP_BATCH + 2,
 			writes: 2 * SESSION_CLEANUP_BATCH,
 		}, async () => {
@@ -5178,7 +5181,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.historyInFlight += 1;
 		writeAttachment(socket, attachment);
 		try {
-			const found = this.store.historyAcrossTiers({
+			const found = this.store.messages.historyAcrossTiers({
 				...(roomId !== undefined ? { roomId } : { roomIds: attachment.rooms ?? [] }),
 				after,
 				before,
@@ -5370,7 +5373,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (status !== undefined && this.config.push) this.changeChoice(socket, attachment, statusChoice(status));
 		const removeAvatar = avatar === "" && attachment.tier === "registered" && !!this.config.uploads;
 		if (removeAvatar) {
-			const cleared = this.store.clearAvatar({ userId: identity.user_id, now: nowMs() });
+			const cleared = this.store.uploads.clearAvatar({ userId: identity.user_id, now: nowMs() });
 			this.deleteMedia(cleared.deletedUploads);
 			// Announced as its empty value (§3.3), before the result.
 			if (cleared.changed) this.announceAvatar(identity.user_id, "");
@@ -5381,7 +5384,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		await this.runMutation(async () => {
-			const result = this.store.commitMutation({
+			const result = this.store.messages.commit({
 				userId: identity.user_id, ipKey: attachment.ipKey,
 				requestId: request.id, method: "me", now: nowMs(),
 				params: request.params, identity,
@@ -5442,7 +5445,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A new live text first ends any a lost instance left open (recoverLiveTexts).
 		if (method === "message" && this.config.liveText && hasLiveEmbed(request.params)) await this.recoverLiveTexts();
 		await this.runMutation(async () => {
-			const result = this.store.mutate(input);
+			const result = this.store.messages.mutate(input);
 			// A deduplicated retry carries no records and is never rebroadcast.
 			// The broadcast comes before the result on the sender's connection (§1).
 			await this.broadcastRecords(result.broadcasts);
@@ -5513,7 +5516,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const describedBefore = request.params.room_id === ROOM_ID ? this.serverMetadata().description : undefined;
 			let result: StoreMutationResult | undefined;
 			try {
-				result = this.store.mutate({
+				result = this.store.messages.mutate({
 					userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
 					requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
 				});
@@ -5563,7 +5566,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.assertMayWrite(attachment);
 		const roomId = requiredString(request.params, "room_id");
 		const target = optionalUserId(request.params);
-		const known = this.store.getRoom(roomId, nowMs());
+		const known = this.store.rooms.get(roomId, nowMs());
 		this.noteRoom(roomId, known !== null);
 		// Only a private room's members see it: to anyone else, joining it or
 		// adding someone to it is a join of a room that does not exist.
@@ -5584,7 +5587,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (identity.tier !== "registered") {
 			// A guest's join counts as a post (§6), charged before it changes anything.
-			this.store.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
+			this.store.rooms.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
 			this.setRooms(identity.user_id, [...current, roomId]);
 			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
 			this.announceJoiner(identity.user_id, roomId);
@@ -5592,7 +5595,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		await this.runMutation(async () => {
-			const change = this.store.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: true, now: nowMs() });
+			const change = this.store.rooms.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: true, now: nowMs() });
 			this.setRooms(identity.user_id, change.rooms);
 			// The room's other members get the membership; the joiner's connections
 			// get it with the room and its members (§4.2.2).
@@ -5618,7 +5621,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
 		if (owner && adding && this.addMemberOn(true)) return;
 		if (adding && thread && mayMoveAny(attachment)) return;
-		if (owner && !adding && this.store.roomCreator(roomId, nowMs()) === attachment.userId) return;
+		if (owner && !adding && this.store.rooms.creator(roomId, nowMs()) === attachment.userId) return;
 		throw { name: "denied", message: adding ? "Only an admin, a threader in a thread, or a bot's owner, can add someone else here" : "Only an admin, the room's creator, or a bot's owner, can remove someone else" } satisfies ProtocolError;
 	}
 
@@ -5639,11 +5642,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// `addmember` is on. A bot may not.
 		if (!room.private) this.assertMayManage(attachment, userId, room.room_id, true, room.parent_room_id !== undefined);
 		else if (attachment.tier !== "registered" || hasRole(attachment, "bot")) throw { name: "denied", message: "Only a signed-in member who is not a bot can add someone to a private room" } satisfies ProtocolError;
-		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
+		if (!this.store.accounts.exists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
 		const totals = new Map<string, number>();
 		const before = this.membersOf([room.room_id], totals);
 		await this.runMutation(async () => {
-			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId: room.room_id, join: true, now: nowMs(), actorId: attachment.userId });
+			const change = this.store.rooms.changeMembership({ userId, ipKey: attachment.ipKey, roomId: room.room_id, join: true, now: nowMs(), actorId: attachment.userId });
 			if (change.changed) {
 				this.setRooms(userId, change.rooms);
 				if (change.membership) this.broadcastRecord(change.membership, userId);
@@ -5679,7 +5682,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.roomExists(roomId) || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		if (target !== undefined && target !== identity.user_id) {
 			this.assertMayManage(attachment, target, roomId, false);
-			if (!this.store.identityExists(target) && !this.connectionsOf(target).length) {
+			if (!this.store.accounts.exists(target) && !this.connectionsOf(target).length) {
 				throw { name: "invalid_params", message: `No user has the user_id ${target}`.slice(0, 200) } satisfies ProtocolError;
 			}
 			await this.removeMember(attachment, roomId, target);
@@ -5693,7 +5696,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (identity.tier !== "registered") {
 			// A guest's leave counts as a post (§6), charged before it changes anything.
-			this.store.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
+			this.store.rooms.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
 			this.setRooms(identity.user_id, current.filter((id) => id !== roomId));
 			this.sendToUser(identity.user_id, roomUpdate("left", { room_id: roomId }));
 			this.removeIfEmpty(roomId);
@@ -5701,7 +5704,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		await this.runMutation(async () => {
-			const change = this.store.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: false, now: nowMs() });
+			const change = this.store.rooms.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: false, now: nowMs() });
 			// The room's other members get the membership; the leaver's connections
 			// get it with `left` (§4.2.2).
 			if (change.membership) this.broadcastRecord(change.membership, identity.user_id);
@@ -5813,7 +5816,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private receiptsRoom(roomId: string, now: number): boolean {
 		try {
-			const count = this.store.roomMemberCount(roomId, now);
+			const count = this.store.rooms.memberCount(roomId, now);
 			return count !== undefined && count <= MAX_READ_RECEIPT_MEMBERS;
 		} catch {
 			return false;
@@ -5835,7 +5838,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (socket) writeAttachment(socket, attachment);
 		if (!cursors.length || attachment.tier !== "registered" || !attachment.userId) return;
 		try {
-			this.store.saveReadCursors({ userId: attachment.userId, cursors, now });
+			this.store.reads.saveCursors({ userId: attachment.userId, cursors, now });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "read_cursors_dropped", count: cursors.length, error: error instanceof Error ? error.message : String(error) }));
 		}
@@ -5854,7 +5857,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.tier !== "registered" || !identity || !roomIds.length || !this.activityOn(true)) return;
 		let cursors: Map<string, string>;
 		try {
-			cursors = this.store.readCursors(identity.user_id, nowMs());
+			cursors = this.store.reads.cursors(identity.user_id, nowMs());
 		} catch {
 			return;
 		}
@@ -5885,7 +5888,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!roomIds.length) return;
 		let kept: Map<string, Array<[string, string]>>;
 		try {
-			kept = this.store.roomReadCursors(roomIds, userId, nowMs());
+			kept = this.store.reads.roomCursors(roomIds, userId, nowMs());
 		} catch {
 			return;
 		}
@@ -5999,7 +6002,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// spends nothing.
 		const wait = this.statusChanges.retry(userId, now);
 		if (wait !== undefined) throw { name: "retry_after", message: "Mute changes limited", data: { retry_after: wait } } satisfies ProtocolError;
-		const result = roomId === null ? this.store.setMute({ userId, untilMs, now }) : this.store.setRoomMute({ userId, roomId, untilMs, now });
+		const result = roomId === null ? this.store.accounts.setMute({ userId, untilMs, now }) : this.store.reads.setRoomMute({ userId, roomId, untilMs, now });
 		if ("refused" in result && result.refused) {
 			throw { name: "denied", message: `At most ${MAX_ROOM_MUTES_PER_USER} rooms can be muted; unmute one first` } satisfies ProtocolError;
 		}
@@ -6044,7 +6047,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.config.push) return undefined;
 		const unreadClaims = this.unreadClaims;
 		try {
-			return { ...this.store.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}), unreadClaims };
+			return { ...this.store.reads.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}), unreadClaims };
 		} catch (error) {
 			const failure = errorToProtocol(error);
 			console.warn(JSON.stringify({ event: "status_inputs_failed", reason: failure.message }));
@@ -6148,7 +6151,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const settled = choice === "invisible" ? this.seenOnInvisible(userId, registered, now) : undefined;
 		let seen = settled?.seen;
 		if (registered) {
-			const result = this.store.setStatus({ userId, choice, now, ...(settled?.settle ? { seenAt: now } : {}) });
+			const result = this.store.accounts.setStatus({ userId, choice, now, ...(settled?.settle ? { seenAt: now } : {}) });
 			if (settled?.settle && result.seen !== undefined) seen = result.seen;
 		}
 		this.statusChanges.take(userId, now);
@@ -6564,7 +6567,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (decided.settle) {
 			try {
 				// Undefined for a user with no identity row (purged meanwhile), who is listed nowhere.
-				seen = this.store.settleSeen({ userId, at: now, now }) ?? now;
+				seen = this.store.reads.settleSeen({ userId, at: now, now }) ?? now;
 			} catch (error) {
 				console.warn(JSON.stringify({ event: "seen_write_failed", reason: errorToProtocol(error).message }));
 				return known;
@@ -6776,7 +6779,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const roomNext = Math.min(...states.map(({ state }) => state.roomMuteNext ?? Number.POSITIVE_INFINITY));
 		if (roomNext <= now) {
 			try {
-				const expired = this.store.expireRoomMutes(userId, now);
+				const expired = this.store.reads.expireRoomMutes(userId, now);
 				for (const roomId of expired.expired) frames.push(statusFrame(roomId, false));
 				this.cacheStatusState(userId, (state) => {
 					if (expired.next !== undefined) state.roomMuteNext = expired.next;
@@ -7005,7 +7008,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
-		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
+		this.store.push.register({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -7026,7 +7029,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// As registration stores it; an unparsable url was never registered.
 		let url = sent;
 		try { url = new URL(sent).href; } catch { /* removes nothing */ }
-		this.store.removePushSubscription({ userId: attachment.userId!, url, now: nowMs() });
+		this.store.push.remove({ userId: attachment.userId!, url, now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -7073,7 +7076,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const replyTo = message.reply_to?.message_id;
 		if (replyTo !== undefined) {
 			try {
-				consider(this.store.messageAuthor(replyTo, now), WAKE_SCOPES.replies);
+				consider(this.store.messages.author(replyTo, now), WAKE_SCOPES.replies);
 			} catch (error) {
 				console.warn(JSON.stringify({ event: "push_reply_lookup_failed", reason: errorToProtocol(error).message }));
 			}
@@ -7084,7 +7087,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// wakes only members there, for whatever reason they were considered.
 		if (isPrivateRoomId(message.room_id)) {
 			try {
-				for (const member of this.store.roomMembers([message.room_id], MAX_PUSH_CANDIDATES, now).get(message.room_id) ?? []) consider(member.user_id, WAKE_SCOPES.private);
+				for (const member of this.store.rooms.members([message.room_id], MAX_PUSH_CANDIDATES, now).get(message.room_id) ?? []) consider(member.user_id, WAKE_SCOPES.private);
 			} catch (error) {
 				console.warn(JSON.stringify({ event: "push_members_lookup_failed", reason: errorToProtocol(error).message }));
 			}
@@ -7092,7 +7095,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Moderators may wake for every message in a room they joined (`joined`, §4.9.4,
 		// JOINED_WAKE_ROLES); claimPushes checks the role and the membership.
 		try {
-			for (const userId of this.store.joinedWakers(now)) consider(userId, WAKE_SCOPES.joined);
+			for (const userId of this.store.push.joinedWakers(now)) consider(userId, WAKE_SCOPES.joined);
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_joined_lookup_failed", reason: errorToProtocol(error).message }));
 		}
@@ -7248,7 +7251,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.config.push || state.tier !== "registered" || !userId) return;
 		if (!state.unreadOwed && !this.connectionsOf(userId).some((peer) => connectionAttachment(peer)?.unreadOwed)) return;
 		try {
-			this.store.clearPushUnread(userId, nowMs());
+			this.store.push.clearUnread(userId, nowMs());
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_unread_clear_failed", reason: errorToProtocol(error).message }));
 			return;
@@ -7318,7 +7321,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** A held wake's message as it is now (one metered lookup), or null when gone, deleted, or unreadable. */
 	private heldMessage(messageId: string, now: number): MessageSnapshot | null {
 		try {
-			const message = this.store.pushedMessage(messageId, now);
+			const message = this.store.push.message(messageId, now);
 			return message && !message.deleted ? message : null;
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_held_lookup_failed", reason: errorToProtocol(error).message }));
@@ -7336,7 +7339,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * charge), so callers keep the one they had.
 	 */
 	private currentTier(now: number): { tier: ServerTier | null; reasons: string[]; breakers: Record<string, number> } {
-		const breakers = this.store.accountingGuard(now).breakers;
+		const breakers = this.store.ops.accountingGuard(now).breakers;
 		const paused = this.pausedUntil(now);
 		const record = this.attackPauseRecord;
 		if (paused && record) {
@@ -7349,7 +7352,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const lead = this.config.billCap ? "Cloudflare bill cap reached" : "Cloudflare usage reached";
 			return { tier: "account_stop", reasons: [`${lead}: ${reached.length ? reached.join(", ") : "a stop line"}`], breakers };
 		}
-		const shares = this.store.budgetShares(now);
+		const shares = this.store.ops.budgetShares(now);
 		if (!shares) return { tier: null, reasons: [], breakers };
 		const named: Array<[string, number]> = [["foreground SQL reads", shares.reads], ["foreground SQL writes", shares.writes], ["frames", shares.frames]];
 		const highest = Math.max(...named.map(([, share]) => share));
@@ -7380,7 +7383,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			state = this.currentTier(now);
 			if (!this.announcedTier) {
-				const raw = this.store.announcedTier(now);
+				const raw = this.store.ops.announcedTier(now);
 				let parsed: { tier?: unknown; breakers?: unknown } = {};
 				try { parsed = raw ? JSON.parse(raw) : {}; } catch { /* a bad record starts from open */ }
 				const tier = typeof parsed.tier === "string" && parsed.tier in TIER_LABEL ? parsed.tier as ServerTier : "open";
@@ -7401,7 +7404,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const operation of before.breakers) if (!open.includes(operation)) notices.push({ kind: "breaker", operation, open: false });
 		if (!notices.length) return;
 		this.announcedTier = { tier, breakers: open };
-		try { this.store.setAnnouncedTier(JSON.stringify(this.announcedTier), now); } catch { /* told again after a wake, rather than not at all */ }
+		try { this.store.ops.setAnnouncedTier(JSON.stringify(this.announcedTier), now); } catch { /* told again after a wake, rather than not at all */ }
 		if (tier !== before.tier) recordMetric(this.runtimeEnv.METRICS, "tier", [tier, before.tier]);
 		for (const notice of notices) this.announce(notice);
 	}
@@ -7411,7 +7414,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.config.attackPause) return 0;
 		if (this.attackPauseRecord === undefined) {
 			try {
-				this.attackPauseRecord = parseAttackPause(this.store.attackPause());
+				this.attackPauseRecord = parseAttackPause(this.store.admission.attackPause());
 			} catch {
 				// Unreadable: not paused, and read again at the next event.
 				return 0;
@@ -7435,7 +7438,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const check = now - this.databaseSizeCheckedAt >= DATABASE_SIZE_METRIC_MS;
 		const record = full && now - this.databaseSizeRecordedAt >= DATABASE_SIZE_METRIC_MS;
 		if (!check && !record) return;
-		const size = this.store.databaseSize();
+		const size = this.store.ops.databaseSize();
 		if (size === null) return;
 		if (record) {
 			this.databaseSizeRecordedAt = now;
@@ -7458,14 +7461,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			const highWaterBytes = this.config.limits.databaseHighWaterBytes;
 			const rearmBytes = Math.floor(highWaterBytes * STORAGE_REARM_SHARE);
-			this.storageAlerted ??= this.store.storageAlerted();
+			this.storageAlerted ??= this.store.ops.storageAlerted();
 			if (!this.storageAlerted && size >= highWaterBytes * STORAGE_ALERT_SHARE) {
 				this.storageAlerted = true;
-				try { this.store.setStorageAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
+				try { this.store.ops.setStorageAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
 				console.warn(JSON.stringify({ event: "storage_alert", bytes: size, high_water_bytes: highWaterBytes }));
 				this.announce({ kind: "storage", bytes: size, highWaterBytes, rearmBytes });
 			} else if (this.storageAlerted && size < rearmBytes) {
-				this.store.setStorageAlerted(false, now);
+				this.store.ops.setStorageAlerted(false, now);
 				this.storageAlerted = false;
 			}
 		} catch (error) {
@@ -7486,22 +7489,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private maybeAlertRoomNotes(now: number, committed: boolean): void {
 		try {
-			const check = this.store.takeRoomNotesCheck();
+			const check = this.store.ops.takeRoomNotesCheck();
 			if (!check) return;
 			// The store's limits, which the check applied (asStoreConfig sets them from the plan).
-			const limits = this.store.config;
+			const limits = this.store.ops.config;
 			const rearmBytes = Math.floor(limits.roomMetadataTotalBytes * ROOM_NOTES_REARM_SHARE);
-			this.roomNotesAlerted ??= this.store.roomNotesAlerted();
+			this.roomNotesAlerted ??= this.store.ops.roomNotesAlerted();
 			if (check.full && !this.roomNotesAlerted) {
 				this.roomNotesAlerted = true;
-				try { this.store.setRoomNotesAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
+				try { this.store.ops.setRoomNotesAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
 				console.warn(JSON.stringify({ event: "room_notes_alert", bytes: check.total, limit_bytes: limits.roomMetadataTotalBytes }));
 				this.announce({
 					kind: "room_notes", totalBytes: check.total, limitBytes: limits.roomMetadataTotalBytes, ceilingBytes: MAX_ROOM_METADATA_TOTAL_LIMIT,
 					minBytes: limits.roomMetadataMinBytes, rearmBytes, rooms: check.rooms ?? [],
 				});
 			} else if (committed && !check.full && this.roomNotesAlerted && check.total < rearmBytes) {
-				this.store.setRoomNotesAlerted(false, now);
+				this.store.ops.setRoomNotesAlerted(false, now);
 				this.roomNotesAlerted = false;
 			}
 		} catch (error) {
@@ -7560,7 +7563,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const hold = attackHoldMs(count);
 		const record: AttackPause = { day, count, until: now + hold, trigger, summary };
 		this.attackPauseRecord = record;
-		try { this.store.setAttackPause(JSON.stringify(record), now); } catch { /* held in memory for this instance */ }
+		try { this.store.admission.setAttackPause(JSON.stringify(record), now); } catch { /* held in memory for this instance */ }
 		console.warn(JSON.stringify({ event: "attack_paused", trigger, summary, count, until: new Date(record.until).toISOString() }));
 		recordMetric(this.runtimeEnv.METRICS, "attack", [trigger, summary], hold / 60_000);
 		for (const peer of this.ctx.getWebSockets()) {
@@ -7616,16 +7619,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			try {
 				const now = nowMs();
-				const admins = this.store.alert(() => {
-					const ensured = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now, ipKey: ALERT_IP_KEY });
+				const admins = this.store.ops.alert(() => {
+					const ensured = this.store.accounts.ensureAdmin({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now, ipKey: ALERT_IP_KEY });
 					for (const record of ensured.broadcasts) this.broadcastRecord(record);
-					return this.store.usersWithRole("admin", MAX_ALERT_ADMINS, now).filter((userId) => userId !== ADMIN_USER_ID);
+					return this.store.accounts.withRole("admin", MAX_ALERT_ADMINS, now).filter((userId) => userId !== ADMIN_USER_ID);
 				});
 				// The notice first, so a push's shortened text still shows it.
 				const mentioned = admins.length ? `${text}\n\n${admins.map((userId) => `@${userId}`).join(" ")}` : text;
 				const body = { text: mentioned, format: "markdown", ...(admins.length ? { mentions: admins } : {}) };
-				const pushed = this.store.alert(() => {
-					const result = this.store.mutate({
+				const pushed = this.store.ops.alert(() => {
+					const result = this.store.messages.mutate({
 						userId: ADMIN_USER_ID, tier: "registered", ipKey: ALERT_IP_KEY, method: "message", now, system: true,
 						params: { room_id: ROOM_ID, body }, identity: { user_id: ADMIN_USER_ID, name: ADMIN_USER_NAME, tier: "registered" },
 					});
@@ -7654,12 +7657,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
-		let claimed: ReturnType<Store["claimPushes"]>;
+		let claimed: ReturnType<Push["claim"]>;
 		try {
 			// PUSH_HOSTS as configured now: a registration made under a wider list
 			// is passed over before it takes a wake or a push.
 			const hosts = this.config.pushHosts;
-			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now, alert });
+			claimed = this.store.push.claim({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now, alert });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return true;
@@ -7712,7 +7715,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (count) recordMetric(this.runtimeEnv.METRICS, "push", [outcome], count);
 		}
 		try {
-			if (gone.length) this.store.forgetPushSubscriptions(gone, nowMs());
+			if (gone.length) this.store.push.forgetSubscriptions(gone, nowMs());
 		} catch { /* a failed delete is retried by nothing: the next push tries again */ }
 	}
 
@@ -7768,15 +7771,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let candidates: RoomRecord[];
 		if (roomId !== undefined) {
-			const room = this.store.getRoom(roomId, now);
+			const room = this.store.rooms.get(roomId, now);
 			this.noteRoom(roomId, room !== null);
 			// A private room the user is not in is as unknown as one that does not exist.
 			if (!room || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 			candidates = [room];
 		} else {
 			// The public rooms, and the private ones the user is in: nobody else sees those.
-			const rooms = this.store.listRooms(now);
-			if (identity.tier === "registered") rooms.push(...this.store.privateRoomsOf(identity.user_id, now));
+			const rooms = this.store.rooms.list(now);
+			if (identity.tier === "registered") rooms.push(...this.store.rooms.privateOf(identity.user_id, now));
 			for (const room of rooms) this.noteRoom(room.room_id, true);
 			if (parent !== undefined && !rooms.some((room) => room.room_id === parent)) throw { name: "invalid_params", message: "Unknown parent_room_id" } satisfies ProtocolError;
 			candidates = rooms.filter((room) => parent === undefined ? true : room.parent_room_id === parent);
@@ -8055,11 +8058,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.toggles.has(feature)) {
 			if (feature === "presence") {
 				// With when it was last turned on (seenFloor), in the same read.
-				const read = this.store.presenceToggle(nowMs());
+				const read = this.store.reads.presenceToggle(nowMs());
 				this.presenceSince = read.since ?? 0;
 				this.toggles.set(feature, read.on);
 			} else {
-				this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+				this.toggles.set(feature, this.store.server.toggle(feature, nowMs()));
 			}
 		}
 		return this.toggles.get(feature);
@@ -8133,7 +8136,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Presence turned on: every user's shown status changes from `""`, so
 		// each one shown `offline` from now has been since now (seenFloor).
 		const since = chosen === "presence" && on ? now : undefined;
-		this.store.setToggle(chosen, override, now, since);
+		this.store.server.setToggle(chosen, override, now, since);
 		this.toggles.set(chosen, override);
 		if (since !== undefined) this.presenceSince = since;
 		// Registered users' `add_members` follows the toggle, but admins' and
@@ -8193,7 +8196,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private passkeysCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: PasskeysArgs): void {
 		const userId = attachment.userId!;
-		const passkeys = this.store.passkeys(userId, nowMs());
+		const passkeys = this.store.credentials.passkeys(userId, nowMs());
 		const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 		if (args.remove === undefined) {
 			this.sendNotice(socket, roomId, passkeys.length
@@ -8204,11 +8207,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const chosen = passkeys[args.remove - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
-		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw passkeysUsage();
+		if (!this.store.credentials.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw passkeysUsage();
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.
-		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
+		if (this.config.push) this.store.push.clearSubscriptions(userId, nowMs());
 		const text = `Removed the passkey \`${chosen.credentialId.slice(0, 8)}…\` from your account.`;
 		for (const peer of this.connectionsOf(userId, socket)) {
 			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
@@ -8244,7 +8247,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.recoverLiveTexts();
 		let entry: LiveEntry | undefined;
 		await this.runMutation(async () => {
-			entry = this.store.startLiveCommand({
+			entry = this.store.liveText.start({
 				userId: identity.user_id, ipKey: attachment.ipKey, identity: { user_id: identity.user_id, ...(attachment.name ? { name: attachment.name } : {}) },
 				kind, roomId, now: nowMs(),
 				// A non-empty opening ends in a paragraph break, so the streamed text starts a new paragraph.
@@ -8266,7 +8269,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * started streaming leaves no alarm for a deadline it no longer has.
 	 */
 	private async refreshLiveDeadline(): Promise<void> {
-		const entries = this.store.openLiveTexts(nowMs());
+		const entries = this.store.liveText.open(nowMs());
 		const next = entries.length ? Math.min(...entries.map(liveDeadline)) : undefined;
 		if (!this.deadlines.live.set(next)) return;
 		await this.rescheduleAlarm();
@@ -8297,7 +8300,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Read inside the mutation: a write claimed before it is streaming by now (liveWrite).
 			const streaming = new Set<string>();
 			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
-			const expired = this.store.expireLiveTexts(streaming, now);
+			const expired = this.store.liveText.expire(streaming, now);
 			await this.broadcastRecords(expired.broadcasts);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
@@ -8320,7 +8323,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private forgetEndedLive(key: string): void {
 		let open: ReadonlySet<string>;
 		try {
-			open = new Set(this.store.openLiveTexts(nowMs()).map((entry) => entry.key));
+			open = new Set(this.store.liveText.open(nowMs()).map((entry) => entry.key));
 		} catch {
 			return; // Unknown: the alarm's expiry ends them if their text went.
 		}
@@ -8338,12 +8341,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Ends the live texts of purged users: their messages are gone, so nothing is published. */
 	private async endLiveOf(userIds: readonly string[]): Promise<void> {
 		if (!this.config.liveText) return;
-		const entries = this.store.openLiveTexts(nowMs()).filter((entry) => userIds.includes(entry.owner));
+		const entries = this.store.liveText.open(nowMs()).filter((entry) => userIds.includes(entry.owner));
 		for (const entry of entries) {
 			const session = this.liveSessions.get(entry.id);
 			if (session?.phase === "streaming") session.stop.abort("removed");
 			else {
-				await this.runMutation(async () => { this.store.finishLiveText(entry.key, null, nowMs()); });
+				await this.runMutation(async () => { this.store.liveText.finish(entry.key, null, nowMs()); });
 				this.stopLiveText(entry.key, "removed");
 			}
 		}
@@ -8403,7 +8406,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const { policy, viewerUrl, publicOrigin } = this.config.liveText!;
 		let session = this.liveSessions.get(id);
 		if (!session) {
-			const entry = this.store.openLiveTexts(nowMs()).find((candidate) => candidate.id === id);
+			const entry = this.store.liveText.open(nowMs()).find((candidate) => candidate.id === id);
 			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveRefused(liveAnswer(404, "This live text has ended, or never existed"), "ended");
 			session = { phase: "waiting", entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
@@ -8439,11 +8442,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * kept once (endLiveText) and answers the writer.
 	 */
 	private async liveWrite(key: string, body: ReadableStream<Uint8Array>): Promise<Response> {
-		let claimed: ReturnType<Store["claimLiveText"]> = null;
+		let claimed: ReturnType<LiveText["claim"]> = null;
 		let streaming: Extract<LiveSession, { phase: "streaming" }> | undefined;
 		await this.runMutation(async () => {
 			try {
-				claimed = this.store.claimLiveText(key, nowMs());
+				claimed = this.store.liveText.claim(key, nowMs());
 			} catch (error) {
 				// A refused claim may end the text (Store.claimLiveText): its waiting readers go with it.
 				this.forgetEndedLive(key);
@@ -8468,12 +8471,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await body.cancel().catch(() => undefined);
 			return liveAnswer(409, "This write_url was already used or has expired");
 		}
-		const { entry, message } = claimed as NonNullable<ReturnType<Store["claimLiveText"]>>;
+		const { entry, message } = claimed as NonNullable<ReturnType<LiveText["claim"]>>;
 		// A command's message is new now: it wakes as a posted one does (§4.9).
 		if (message) {
 			this.dropWakes(entry.owner, message.room_id);
 			this.dropHeld(entry.owner, message.room_id);
-			if (this.store.identityExists(entry.owner)) this.wakeFor(message);
+			if (this.store.accounts.exists(entry.owner)) this.wakeFor(message);
 		}
 		const session = streaming as Extract<LiveSession, { phase: "streaming" }>;
 		const buffer = session.buffer;
@@ -8525,7 +8528,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let used = false;
 		try {
 			await this.runMutation(async () => {
-				const finished = this.store.finishLiveText(entry.key, kept, nowMs(), stored);
+				const finished = this.store.liveText.finish(entry.key, kept, nowMs(), stored);
 				used = !!finished.stored;
 				await this.broadcastRecords(finished.broadcasts);
 				published = !!finished.entry;
@@ -8569,7 +8572,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.config.uploads || !media) return undefined;
 		const output = terminalOutput(keepLast(kept, limit));
 		if (!output) return undefined;
-		const key = newTerminalOutputKey();
+		const key = this.store.uploads.terminalOutputKey();
 		try {
 			await this.stalls.track("r2", "put", media.put(key, output, {
 				httpMetadata: { contentType: "text/plain; charset=utf-8", cacheControl: "public, max-age=604800, immutable" },
@@ -8584,7 +8587,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		let started = false;
 		await this.runMutation(async () => {
-			const upload = this.store.startAvatarUpload({ userId: attachment.userId!, now: nowMs() });
+			const upload = this.store.uploads.startAvatar({ userId: attachment.userId!, now: nowMs() });
 			this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 			started = this.afterUploads({ uploads: [upload] });
 		});
@@ -8605,7 +8608,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (action === "add") {
 			let started = false;
 			await this.runMutation(async () => {
-				const upload = this.store.startEmojiUpload({ userId: attachment.userId!, key, now: nowMs() });
+				const upload = this.store.uploads.startEmoji({ userId: attachment.userId!, key, now: nowMs() });
 				this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 				started = this.afterUploads({ uploads: [upload] });
 			});
@@ -8614,7 +8617,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let outcome: "removed" | "unknown" | "failed" = "unknown";
 		await this.runMutation(async () => {
-			const draft = this.store.emojiDraft({ remove: key }, nowMs());
+			const draft = this.store.server.emojiDraft({ remove: key }, nowMs());
 			if (draft) outcome = await this.publishEmoji(draft) ? "removed" : "failed";
 		});
 		if (outcome === "unknown") throw { name: "invalid_params", message: `${key} is not a custom emoji here` } satisfies ProtocolError;
@@ -8647,7 +8650,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (args.upload) {
 				let started = false;
 				await this.runMutation(async () => {
-					const upload = this.store.startServerAvatarUpload({ userId: attachment.userId!, now: nowMs() });
+					const upload = this.store.uploads.startServerAvatar({ userId: attachment.userId!, now: nowMs() });
 					this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
 					started = this.afterUploads({ uploads: [upload] });
 				});
@@ -8656,7 +8659,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			let cleared: { changed: boolean; deletedUploads: string[] } = { changed: false, deletedUploads: [] };
 			await this.runMutation(async () => {
-				cleared = this.store.clearServerAvatar(nowMs());
+				cleared = this.store.server.clearAvatar(nowMs());
 			});
 			this.deleteMedia(cleared.deletedUploads);
 			if (cleared.changed) this.announceServer();
@@ -8669,7 +8672,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const next = args.value;
 		if (next !== before) {
 			await this.runMutation(async () => {
-				this.store.setServerText(chosen, next, nowMs());
+				this.store.server.setText(chosen, next, nowMs());
 			});
 			this.announceServer();
 		}
@@ -8726,7 +8729,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// A draft that no longer applies leaves its JSON in R2: the catalog it
 		// was made from cannot change meanwhile, so it does not happen.
-		const committed = this.store.commitEmoji(draft, nowMs());
+		const committed = this.store.server.commitEmoji(draft, nowMs());
 		if (!committed.applied) return false;
 		this.deleteMedia(committed.deletedUploads);
 		this.announceServer();
@@ -8801,14 +8804,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
-		if (!this.store.identityExists(userId) && !this.connectionsOf(userId).length) {
+		if (!this.store.accounts.exists(userId) && !this.connectionsOf(userId).length) {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
 		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
 		// The rooms they are in, stored or on their connections, read before
 		// those close: a thread the purge leaves nobody in is removed after it.
 		const rooms = new Set<string>();
-		for (const id of userIds) for (const roomId of [...(this.liveRoomsOf(id) ?? []), ...(this.store.getIdentity(id)?.rooms ?? [])]) rooms.add(roomId);
+		for (const id of userIds) for (const roomId of [...(this.liveRoomsOf(id) ?? []), ...(this.store.accounts.get(id)?.rooms ?? [])]) rooms.add(roomId);
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);
@@ -8817,7 +8820,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let purged = { messages: 0, reactions: 0, deletedUploads: [] as string[] };
 		await this.runMutation(async () => {
-			purged = this.store.purgeUsers({ userIds, now: nowMs() });
+			purged = this.store.accounts.purge({ userIds, now: nowMs() });
 		});
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
@@ -8860,10 +8863,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (state.tier === "registered") signedIn.add(state.userId);
 		}
 		this.idlePruneAt = now + 3_600_000;
-		for (const userId of signedIn) this.store.noteActive(userId, now);
+		for (const userId of signedIn) this.store.accounts.noteActive(userId, now);
 		try {
 			// One synchronous transaction: nothing interleaves with it.
-			const result = this.store.pruneIdleIdentities(now, connected);
+			const result = this.store.accounts.pruneIdle(now, connected);
 			if (result.more) {
 				this.idlePruneAt = now;
 				this.maintenanceSoon(now);
@@ -8874,11 +8877,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.upkeepDay === day) return;
 		let done = true;
 		try {
-			const due = this.store.dueRetiredUserIds(now);
+			const due = this.store.accounts.dueRetiredIds(now);
 			if (due.length) {
 				// Revoke first: a failure leaves the ids retired, retried next time.
 				await this.forgetTokens([...due, ...due.filter((userId) => !isBotId(userId)).map((userId) => BOT_ID_PREFIX + userId)], "maintenance");
-				this.store.freeRetiredUserIds(due, now);
+				this.store.accounts.freeRetiredIds(due, now);
 			}
 			if (due.length >= RETIRED_SWEEP_BATCH) {
 				done = false;
@@ -8886,7 +8889,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.maintenanceSoon(now);
 			}
 		} catch { done = false; }
-		try { this.store.clearExpiredMutes(now); } catch { done = false; }
+		try { this.store.accounts.clearExpiredMutes(now); } catch { done = false; }
 		if (done) this.upkeepDay = day;
 	}
 
@@ -8919,7 +8922,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (holder.kind === "rewrite") {
 			let pending: boolean;
 			try {
-				pending = this.store.historyImportJournal() !== undefined;
+				pending = this.store.history.importJournal() !== undefined;
 			} catch (error) {
 				lease.release();
 				throw error;
@@ -8942,7 +8945,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
 	private async forgetDeviceToken(userId: string, tokenKey: string): Promise<void> {
 		try {
-			await this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
+			await this.store.meter.foreground({ reads: 1, writes: 2 }, async () => {
 				await this.ctx.storage.delete(tokenKey);
 				const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
 				const kept = devices.filter((device) => device.tokenKey !== tokenKey);
@@ -8956,7 +8959,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Revokes bot, invite and device tokens, so purged users cannot sign in again; upkeep charges it as maintenance. */
 	private async forgetTokens(userIds: readonly string[], kind: "foreground" | "maintenance" = "foreground"): Promise<void> {
 		if (!userIds.length) return;
-		await this.withSessionLock(() => this.store.withMeterAsync(kind, { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
+		await this.withSessionLock(() => this.store.meter[kind]({ reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
 			for (const userId of userIds) {
 				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
 					const stored = await this.ctx.storage.get<StoredBot>(pointer);
@@ -8983,13 +8986,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async inviteToken(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: IssuableUserId): Promise<void> {
 		assertAdmin(cap);
 		await this.runMutation(async () => {
-			const created = this.store.createInvitedIdentity({ userId, name: userId, now: nowMs(), ipKey: attachment.ipKey });
+			const created = this.store.accounts.createInvited({ userId, name: userId, now: nowMs(), ipKey: attachment.ipKey });
 			// The new user's logged join of `general` goes to its members (§4.2.2).
 			for (const record of created.broadcasts) this.broadcastRecord(record);
 		});
 		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+		await this.withSessionLock(() => this.store.meter.foreground({ writes: 2 }, async () => {
 			await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
 		}));
@@ -9016,18 +9019,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only" } satisfies ProtocolError;
 		if (isBotId(userId)) throw { name: "denied", message: "A bot signs in with its token only; its owner replaces it with /invite-bot" } satisfies ProtocolError;
-		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+		if (!this.store.accounts.exists(userId)) throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		let passkeys = 0;
 		try {
 			await this.withSessionLock(async () => {
 				// A `/rename` or `/purge` may have run since the command began.
-				if (!this.store.identityExists(userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
+				if (!this.store.accounts.exists(userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
 				const now = nowMs();
 				// The tokens first: a failure after them leaves no way in but the
 				// passkeys, which the admin's next try removes.
-				await this.store.withMeterAsync("foreground", { reads: 2, writes: MAX_DEVICE_TOKENS + 5 }, async () => {
+				await this.store.meter.foreground({ reads: 2, writes: MAX_DEVICE_TOKENS + 5 }, async () => {
 					const invite = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + userId);
 					const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
 					const revoked = [...(invite?.v === 1 && typeof invite.tokenKey === "string" ? [invite.tokenKey] : []), ...devices.map((device) => device.tokenKey)];
@@ -9039,7 +9042,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
 				});
 				// Clearing the user handle ends the passkey sessions issued under it.
-				passkeys = this.store.resetAuth({ userId, now });
+				passkeys = this.store.credentials.resetAuth({ userId, now });
 			});
 		} finally {
 			// Whatever got done, nothing signed in before stays connected.
@@ -9048,7 +9051,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (state) this.closePolicy(peer, state, 1008, "Signed out by an admin");
 			}
 		}
-		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
+		if (this.config.push) this.store.push.clearSubscriptions(userId, nowMs());
 		this.sendNotice(socket, roomId, [
 			`Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had. This new token signs in as them; it does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately.`,
 			"```\n" + token + "\n```",
@@ -9070,7 +9073,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
 	private async moveInviteToken(from: string, to: string): Promise<void> {
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+		await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 			const pointer = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + from);
 			if (pointer?.v !== 1 || typeof pointer.tokenKey !== "string") return;
 			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to });
@@ -9081,7 +9084,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** After `/rename`, points the user's device tokens, if any, at the new `user_id`. */
 	private async moveDeviceTokens(from: string, to: string): Promise<void> {
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1 + MAX_DEVICE_TOKENS, writes: MAX_DEVICE_TOKENS + 2 }, async () => {
+		await this.withSessionLock(() => this.store.meter.foreground({ reads: 1 + MAX_DEVICE_TOKENS, writes: MAX_DEVICE_TOKENS + 2 }, async () => {
 			const pointer = await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + from);
 			const devices = storedDevices(pointer);
 			if (!devices.length) return;
@@ -9127,7 +9130,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const user = state && !state.closing ? this.current(state) : null;
 			if (user) return { user, rooms: this.liveRoomsOf(userId) ?? state!.rooms ?? [] };
 		}
-		const stored = this.store.getIdentity(userId);
+		const stored = this.store.accounts.get(userId);
 		if (!stored) return null;
 		return {
 			user: { user_id: userId, ...(stored.name ? { name: stored.name } : {}), ...(stored.avatar ? { avatar: stored.avatar } : {}), roles: stored.roles },
@@ -9160,7 +9163,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** The chain exports and imports go through: the history chain, or SQLite alone. */
 	private archiveChain(): HistoryChain {
-		return archiveChain(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs } });
+		return archiveChain(this.history, { store: this.store.history, limits: this.config.limits, clock: { now: nowMs } });
 	}
 
 	/** Where `/history export` writes backups and `/history import` reads them: the history blob store (HISTORY_BLOB), through HISTORY_CODECS. */
@@ -9172,7 +9175,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(backups: BackupStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
-		return writeBackup(this.archiveChain(), storeExport(this.store), backups, this.config.backups, kind, {
+		return writeBackup(this.archiveChain(), this.store.history.export(), backups, this.config.backups, kind, {
 			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
@@ -9233,7 +9236,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// Read twice as a stream, bounded stored and decoded (a small file may decode to a great deal), and by its records (MAX_IMPORT_RECORDS).
 					const opened = await backups.source(key, MAX_IMPORT_BYTES);
 					if (!opened) throw new Error(`No backup ${key}`);
-					report = await importArchive(this.archiveChain(), storeRestore(this.store), opened.source, {
+					report = await importArchive(this.archiveChain(), this.store.history.restore(), opened.source, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
 						// Only an authenticating codec, read to the end, makes a file this server's own.
 						provenance: opened.provenance,
@@ -9248,7 +9251,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				done(importNotice(report));
 				if (!report.dryRun && report.roomsAdded.length) {
-					try { this.announceUpdated(this.store.listRooms(nowMs(), { withPrivate: true })); } catch { /* listed on the next room_list */ }
+					try { this.announceUpdated(this.store.rooms.list(nowMs(), { withPrivate: true })); } catch { /* listed on the next room_list */ }
 				}
 				return;
 			}
@@ -9264,7 +9267,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const everySeconds = this.config.backups.everySeconds;
 		if (everySeconds === undefined || this.historySchedule.holder !== undefined) return;
 		try {
-			const last = this.store.historyMetaNumber(META_SCHEDULED_BACKUP, now);
+			const last = this.store.history.metaNumber(META_SCHEDULED_BACKUP, now);
 			if (now < last + everySeconds * 1_000) return;
 			const blobs = blobStoreOf(this.runtimeEnv);
 			const store = blobs && new BackupStore(blobs, HISTORY_CODECS);
@@ -9278,7 +9281,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			}
 			// Noted first: a failing backup waits its interval rather than retrying on every alarm.
-			this.store.setHistoryMeta(META_SCHEDULED_BACKUP, String(now), now);
+			this.store.history.setMeta(META_SCHEDULED_BACKUP, String(now), now);
 			const result = await this.underHistoryLease({ kind: "job", job: "backup" }, () => this.writeBackup(store, "scheduled"));
 			console.log(JSON.stringify({ event: "history_export", key: result.key, records: result.records, decoded_bytes: result.decodedBytes, deleted: result.deleted.length }));
 			if (result.records > MAX_IMPORT_RECORDS || result.decodedBytes > MAX_IMPORT_BYTES) {
@@ -9323,7 +9326,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private role(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: UserIdArg, role?: string): void {
 		assertAdmin(cap);
 		if (role === undefined) {
-			const identity = userId.startsWith("guest_") ? null : this.store.getIdentity(userId);
+			const identity = userId.startsWith("guest_") ? null : this.store.accounts.get(userId);
 			if (!identity) throw { name: "invalid_params", message: `No registered user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 			const who = `**${identity.name || userId}** (\`${userId}\`)`;
 			this.sendNotice(socket, roomId, identity.roles.length ? `${who} has the roles ${identity.roles.map((role) => `\`${role}\``).join(", ")}.` : `${who} has no roles.`);
@@ -9347,7 +9350,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private changeRole(cap: AdminCapability, userId: string, role: string, on?: boolean): { changed: boolean; on: boolean; who: string } {
 		assertAdmin(cap);
-		const result = this.store.setRole({ userId, role, on, now: nowMs() });
+		const result = this.store.accounts.setRole({ userId, role, on, now: nowMs() });
 		const who = `**${result.name || userId}** (\`${userId}\`)`;
 		if (result.changed) {
 			for (const peer of this.connectionsOf(userId)) {
@@ -9389,7 +9392,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * remover's connection, or for the idle bot sweep a limiter key alone.
 	 */
 	private async removeMember(attachment: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<boolean> {
-		if (!this.store.identityExists(userId)) {
+		if (!this.store.accounts.exists(userId)) {
 			// A guest's rooms live in its connections only.
 			const rooms = this.liveRoomsOf(userId);
 			if (!rooms?.includes(roomId)) return false;
@@ -9400,7 +9403,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let changed = false;
 		await this.runMutation(async () => {
-			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: false, now: nowMs(), actorId: attachment.userId });
+			const change = this.store.rooms.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: false, now: nowMs(), actorId: attachment.userId });
 			if (!change.changed) return;
 			changed = true;
 			if (change.membership) this.broadcastRecord(change.membership, userId);
@@ -9417,7 +9420,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		if (now - (this.botActiveAt.get(userId) ?? 0) < BOT_ACTIVE_WRITE_MS) return;
 		try {
-			this.store.markBotActive(userId, now);
+			this.store.accounts.markBotActive(userId, now);
 			this.botActiveAt.set(userId, now);
 		} catch { /* the next sign-in or post tries again */ }
 	}
@@ -9433,9 +9436,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Signed out after a week without signing in or posting");
 		}
-		for (const roomId of this.store.getIdentity(userId)?.rooms ?? []) await this.removeMember({ ipKey: BOT_SWEEP_KEY }, roomId, userId);
+		for (const roomId of this.store.accounts.get(userId)?.rooms ?? []) await this.removeMember({ ipKey: BOT_SWEEP_KEY }, roomId, userId);
 		await this.forgetTokens([userId]);
-		this.store.markBotSignedOut(userId);
+		this.store.accounts.markBotSignedOut(userId);
 		console.log(JSON.stringify({ event: "idle_bot_signed_out", user_id: userId }));
 	}
 
@@ -9451,7 +9454,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async rename(cap: AdminCapability, _lease: RewriteLease, socket: WebSocketConnection, request: RequestFrame, roomId: string, from: UserIdArg, to: IssuableUserId): Promise<void> {
 		assertAdmin(cap);
-		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		const renamed = this.store.accounts.rename({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
 		this.moveUserState(from, to);
 		if (this.history) this.historySoon();
@@ -9520,8 +9523,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read alongside the usage refresh; left out where it is not configured.
 		const active = activeUsersConfigured(this.runtimeEnv) ? this.activeUsersStatus(now) : undefined;
 		await this.accountUsage.refresh(now, true);
-		const { budget, identities, databaseBytes, counts } = this.store.status(now);
-		const pruned = this.store.idlePruned(now);
+		const { budget, identities, databaseBytes, counts } = this.store.ops.status(now);
+		const pruned = this.store.accounts.idlePruned(now);
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
 		const share = (used: number, limit: number) => `${count(used)} / ${count(limit)} (${limit > 0 ? Math.round((100 * used) / limit) : 0}%)`;
@@ -9531,13 +9534,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Why the server refuses work, first: the tier, its reasons, and every
 		// stop that is not a quota (Store.accountingGuard).
 		const tier = this.currentTier(now);
-		const guard = this.store.accountingGuard(now);
+		const guard = this.store.ops.accountingGuard(now);
 		const shown = tier.tier ?? this.announcedTier?.tier ?? "open";
 		lines.push(`**State: ${TIER_LABEL[shown]}**${tier.reasons.length ? `: ${tier.reasons.join("; ")}` : ""}`);
-		if (this.store.accountingStatus().uncertain) lines.push("- **Storage failing**: a budget write failed; work is refused until one succeeds");
+		if (this.store.ops.accountingStatus().uncertain) lines.push("- **Storage failing**: a budget write failed; work is refused until one succeeds");
 		for (const [operation, until] of Object.entries(guard.breakers)) lines.push(`- **Paused action** \`${operation}\` until ${utc(until)}: it overran its storage reservation 3 times within an hour, or once by far`);
 		lines.push(`- Storage overruns today: ${guard.overruns} (each charged and logged)`);
-		const trips = this.store.throttleTrips(now);
+		const trips = this.store.admission.throttleTrips(now);
 		lines.push(`- Throttles tripped in the last 24 hours: ${trips.length ? trips.map(([trigger, times]) => `\`${trigger}\` ${times}`).join(", ") : "none"}`);
 		if (!this.config.admission) lines.push("- `ADMISSION` is false: new connections are refused");
 		lines.push("");
@@ -9612,7 +9615,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Connection admissions: ${share(counts.admissions, limits.connectionAdmissionsPerDay)}`,
 			`- Posts: ${share(counts.posts, limits.globalPostsPerDay)}`,
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
-			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
+			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.push.sentToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredAccounts)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			...(active ? [await active] : []),
 			...this.roomCountLines(now),
@@ -9631,7 +9634,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private roomCountLines(now: number): string[] {
 		const limits = this.config.limits;
-		const rooms = this.store.roomCounts(now);
+		const rooms = this.store.rooms.counts(now);
 		const window = limits.roomCreationWindowSeconds > 0 ? ` started in ${Math.round(limits.roomCreationWindowSeconds / 86_400)} days` : "";
 		const older = (n: number) => (n ? `, ${n.toLocaleString("en-US")} older` : "");
 		return [
@@ -9648,7 +9651,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async historyStatus(now: number): Promise<string[]> {
 		const d1Off = await this.d1Missing();
-		return statusLines({ limits: this.config.limits, hotRecords: () => this.store.hotRecords(now), ...(this.history ? { chain: this.history } : {}), ...(d1Off ? { d1Off } : {}) });
+		return statusLines({ limits: this.config.limits, hotRecords: () => this.store.history.hotRecords(now), ...(this.history ? { chain: this.history } : {}), ...(d1Off ? { d1Off } : {}) });
 	}
 
 	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */
@@ -9706,11 +9709,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const pointerKey = DEVICES_KEY_PREFIX + userId;
 		const now = nowMs();
-		const { id, previous } = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+		const { id, previous } = await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 			// A `/rename` or `/purge` of the user may have run since this command
 			// began; a token for the old `user_id` would never sign in, and the
 			// connections it replaces would not be found under it.
-			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
+			if (!this.store.accounts.exists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
 			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
 			let id = requested;
 			for (let n = 1; id === undefined; n++) {
@@ -9759,8 +9762,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
 		checkDeviceId(id);
 		const pointerKey = DEVICES_KEY_PREFIX + userId;
-		const removed = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
-			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
+		const removed = await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 2 }, async () => {
+			if (!this.store.accounts.exists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
 			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
 			const previous = devices.find((device) => device.name === id);
 			if (!previous) {
@@ -9787,7 +9790,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async listDevices(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string): Promise<void> {
 		const userId = attachment.userId!;
-		const listed = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1 + MAX_DEVICE_TOKENS }, async () => {
+		const listed = await this.withSessionLock(() => this.store.meter.foreground({ reads: 1 + MAX_DEVICE_TOKENS }, async () => {
 			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
 			const tokens = devices.length ? await this.ctx.storage.get<StoredDeviceToken>(devices.map((device) => device.tokenKey)) : new Map<string, StoredDeviceToken>();
 			return devices.map((device) => ({ id: device.name, token: tokens.get(device.tokenKey) }));
@@ -9817,7 +9820,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			if (state?.credential && keys.includes(state.credential)) this.closePolicy(peer, state, 1008, reason);
 		}
-		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
+		if (this.config.push) this.store.push.clearSubscriptions(userId, nowMs());
 	}
 
 	/**
@@ -9831,9 +9834,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const ownerId = attachment.userId!;
 		const botId = BOT_ID_PREFIX + ownerId;
 		const name = botName(attachment.name || ownerId, this.config.limits);
-		let bot!: ReturnType<Store["registerBot"]>;
+		let bot!: ReturnType<Accounts["registerBot"]>;
 		await this.runMutation(async () => {
-			bot = this.store.registerBot({ ownerId, botId, name, now: nowMs(), ipKey: attachment.ipKey });
+			bot = this.store.accounts.registerBot({ ownerId, botId, name, now: nowMs(), ipKey: attachment.ipKey });
 			// A new bot's logged join of `general` goes to its members (§4.2.2).
 			for (const record of bot.broadcasts) this.broadcastRecord(record);
 		});
@@ -9845,10 +9848,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");
 		}
-		if (this.config.push) this.store.clearPushSubscriptions(botId, nowMs());
+		if (this.config.push) this.store.push.clearSubscriptions(botId, nowMs());
 		// Those who share a room with the bot see its new name (§3.3).
 		if (bot.renamed) {
-			const stored = this.store.getIdentity(botId);
+			const stored = this.store.accounts.get(botId);
 			this.announceUser(socket, { user_id: botId, name, roles: stored?.roles ?? ["bot"] }, stored?.rooms ?? []);
 		}
 		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint ?? "this server's WebSocket URL";
@@ -9890,7 +9893,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private membersOf(roomIds: readonly string[], totals?: Map<string, number>, lister?: WebSocketConnection): Map<string, PublicUser[]> {
 		const counts = new Map<string, number>();
 		const mode = this.presenceMode();
-		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembersPerRoom, nowMs(), counts, mode);
+		const stored = this.store.rooms.members(roomIds, this.config.limits.roomListMembersPerRoom, nowMs(), counts, mode);
 		const connected = this.connectedMembers();
 		const members = new Map<string, PublicUser[]>();
 		const statuses = new Map<string, StoredStatus>();
@@ -9925,7 +9928,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connected one, guests included. Undefined when they aren't a member.
 	 */
 	private memberOf(roomId: string, userId: string, lister?: WebSocketConnection): PublicUser | undefined {
-		const stored = this.store.roomMember(roomId, userId, nowMs(), this.presenceMode());
+		const stored = this.store.rooms.member(roomId, userId, nowMs(), this.presenceMode());
 		const statuses = new Map<string, StoredStatus>();
 		let member: PublicUser | undefined;
 		if (stored) {
@@ -10134,7 +10137,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return !!state && !state.closing && !!state.rooms?.includes(roomId);
 		})) return;
 		try {
-			if (this.store.removeEmptyThread(roomId, nowMs())) this.noteRoom(roomId, false);
+			if (this.store.rooms.removeEmptyThread(roomId, nowMs())) this.noteRoom(roomId, false);
 		} catch { /* kept until its log expires */ }
 	}
 
@@ -10171,7 +10174,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** The top-level rooms' IDs: `general` and those an admin or mod created, read once (Store.topLevelRoomIds). */
 	private topLevelRoomIds(now: number): readonly string[] {
-		return this.topLevelRooms ??= this.store.topLevelRoomIds(now);
+		return this.topLevelRooms ??= this.store.rooms.topLevelIds(now);
 	}
 
 	private noteRoom(roomId: string, exists: boolean): void {
@@ -10196,7 +10199,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private roomExists(roomId: string): boolean {
 		const known = this.knownRooms.get(roomId);
 		if (known !== undefined) return known;
-		const exists = this.store.getRoom(roomId, nowMs()) !== null;
+		const exists = this.store.rooms.get(roomId, nowMs()) !== null;
 		this.noteRoom(roomId, exists);
 		return exists;
 	}
@@ -10318,11 +10321,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const media = this.runtimeEnv.MEDIA;
 		if (!this.config.uploads || !media) return;
 		this.ctx.waitUntil((async () => {
-			const key = this.store.avatarRefreshDue(userId, nowMs());
+			const key = this.store.uploads.avatarRefreshDue(userId, nowMs());
 			if (!key) return;
 			const object = await this.stalls.track("r2", "get", media.get(key));
 			if (!object) {
-				const cleared = this.store.clearAvatar({ userId, now: nowMs() });
+				const cleared = this.store.uploads.clearAvatar({ userId, now: nowMs() });
 				// This runs at sign-in: telling others of an invisible user's
 				// avatar would tell them the user just connected (§4.5). Their
 				// own connections still get `you`; others see the removal in
@@ -10332,7 +10335,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			}
 			await this.stalls.track("r2", "put", (async () => media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata }))());
-			this.store.renewAvatar({ userId, key, now: nowMs() });
+			this.store.uploads.renewAvatar({ userId, key, now: nowMs() });
 		})().catch(() => undefined));
 	}
 
@@ -10358,7 +10361,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		const connected = connections.length ? connectionAttachment(connections[0]) : null;
-		const stored = connected ? null : this.store.getIdentity(userId);
+		const stored = connected ? null : this.store.accounts.get(userId);
 		const name = connected?.name ?? stored?.name;
 		const rooms = this.liveRoomsOf(userId) ?? stored?.rooms ?? [];
 		const roles = connected?.roles ?? stored?.roles ?? [];
@@ -10371,7 +10374,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
 		this.stalls.event(() => this.awakeSnapshot());
-		return !!this.config.uploads && this.asUploadOwner(key, () => this.store.claimUpload(key, nowMs()));
+		return !!this.config.uploads && this.asUploadOwner(key, () => this.store.uploads.claim(key, nowMs()));
 	}
 
 	/**
@@ -10381,7 +10384,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private asUploadOwner<T>(key: string, fn: () => T): T {
 		let owner: string | undefined;
-		try { owner = this.store.uploadOwner(key, nowMs()); } catch { /* fn meets the same refusal */ }
+		try { owner = this.store.uploads.owner(key, nowMs()); } catch { /* fn meets the same refusal */ }
 		return ACTOR.run(() => (owner && !owner.startsWith("~") ? [`user:${owner}`] : []), fn);
 	}
 
@@ -10401,7 +10404,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
 		await this.asUploadOwner(write.key, () => this.runMutation(async () => {
-			finished = this.store.finishUpload(write, nowMs());
+			finished = this.store.uploads.finish(write, nowMs());
 			await this.broadcastRecords(finished.broadcasts);
 		}));
 		this.deleteMedia(finished.deletedUploads);
@@ -10423,12 +10426,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let released: string[] = [];
 		let serverAvatar: string | undefined;
 		await this.runMutation(async () => {
-			const draft = this.store.emojiDraft({ add: write }, nowMs());
+			const draft = this.store.server.emojiDraft({ add: write }, nowMs());
 			accepted = !!draft && await this.publishEmoji(draft);
 			if (accepted) return;
 			// Without a draft, the write may be the server's avatar's: the store
 			// finishes that one, and fails a custom emoji's as above.
-			const finished = this.store.finishUpload(draft ? { key: write.key, ok: false } : write, nowMs());
+			const finished = this.store.uploads.finish(draft ? { key: write.key, ok: false } : write, nowMs());
 			accepted = finished.accepted;
 			serverAvatar = finished.serverAvatar;
 			released = finished.deletedUploads;
@@ -10597,7 +10600,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const due of Object.values(this.deadlines)) consider(due.at);
 			// The end of an attack pause, so the change back is announced then, not at the next event.
 			consider(this.pausedUntil(nowMs()) || undefined);
-			await this.store.scheduleAlarm(deadline, nowMs());
+			await this.store.lifecycle.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;
 		});
 		this.alarmTail = task;

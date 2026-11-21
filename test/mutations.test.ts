@@ -1,7 +1,11 @@
 import { expect, it } from "vitest";
-import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { ADMIN_USER_ID } from "../src/user-ids";
+import { MAX_CREATED_ROOMS } from "../src/domain";
+import { MOVE_REACTION_SETS_PER_POST } from "../src/store/limits";
+import { type Store, type StoreConfig, StoreError, type StoreMutationInput, type StoreMutationResult, openStore } from "../src/store";
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from "../src/budget";
 import { BY_AGE, errorCode, expectRetryAfter, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { sqliteOf } from "../src/store/open";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
 const ROOMY: Partial<StoreConfig> = {
@@ -29,7 +33,7 @@ function op(clock: TestClock, userId: string, requestId: string, method: string,
 }
 
 const post = (store: Store, clock: TestClock, userId: string, requestId: string, params: Record<string, unknown>) =>
-	store.mutate(op(clock, userId, requestId, "message", { room_id: "general", ...params }));
+	store.messages.mutate(op(clock, userId, requestId, "message", { room_id: "general", ...params }));
 
 function logOf(result: StoreMutationResult): number {
 	const logId = result.broadcasts[0]?.params.log_id ?? result.room?.log_id;
@@ -38,29 +42,29 @@ function logOf(result: StoreMutationResult): number {
 }
 
 function thread(store: Store, clock: TestClock, requestId: string, params: Record<string, unknown> = {}): string {
-	const created = store.mutate(op(clock, "alice", requestId, "room_set", { parent_room_id: "general", title: "Thread", ...params }));
+	const created = store.messages.mutate(op(clock, "alice", requestId, "room_set", { parent_room_id: "general", title: "Thread", ...params }));
 	return String(created.result.room_id);
 }
 
 it("allocates one strictly increasing log sequence across rooms, record kinds, and clocks", async () => {
 	await withStore("sequence", (store, clock) => {
-		const general = store.getRoomState();
+		const general = sqliteOf(store).getRoomState();
 		const first = post(store, clock, "alice", "s1", { body: { text: "one" } });
 		expect(first.message?.message_id).toBe(first.message?.log_id);
-		const roomResult = store.mutate(op(clock, "alice", "s2", "room_set", { parent_room_id: "general", title: "Side" }));
+		const roomResult = store.messages.mutate(op(clock, "alice", "s2", "room_set", { parent_room_id: "general", title: "Side" }));
 		const threadId = String(roomResult.result.room_id);
 		// This server uses a room's creation log_id as its room_id.
 		expect(roomResult.room?.log_id).toBe(threadId);
-		const inThread = store.mutate(op(clock, "alice", "s3", "message", { room_id: threadId, body: { text: "two" } }));
-		const reacted = store.mutate(op(clock, "bob", "s4", "reactions", { message_id: first.result.message_id, emojis: ["👍"] }));
+		const inThread = store.messages.mutate(op(clock, "alice", "s3", "message", { room_id: threadId, body: { text: "two" } }));
+		const reacted = store.messages.mutate(op(clock, "bob", "s4", "reactions", { message_id: first.result.message_id, emojis: ["👍"] }));
 		clock.value -= 10_000;
 		const backward = post(store, clock, "alice", "s5", { body: { text: "three" } });
 
 		const logs = [Number(general.log_id), logOf(first), logOf(roomResult), logOf(inThread), logOf(reacted), logOf(backward)];
 		for (let index = 1; index < logs.length; index += 1) expect(logs[index]).toBeGreaterThan(logs[index - 1]);
-		expect(store.logBounds().latest_log_id).toBe(String(logs.at(-1)));
-		expect(store.getRoomState().latest_log_id).toBe(String(logs.at(-1)));
-		expect(store.getRoomState(threadId).latest_log_id).toBe(String(logOf(inThread)));
+		expect(sqliteOf(store).logBounds().latest_log_id).toBe(String(logs.at(-1)));
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(String(logs.at(-1)));
+		expect(sqliteOf(store).getRoomState(threadId).latest_log_id).toBe(String(logOf(inThread)));
 		// Message IDs are globally unique: equal to the creation log_id.
 		expect(inThread.message?.message_id).toBe(String(logOf(inThread)));
 	});
@@ -157,11 +161,11 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 		expect(errorCode(() => post(store, clock, "alice", "log-id", { body: { text: "x" }, log_id: "1" }))).toBe("invalid_params");
 		expect(errorCode(() => post(store, clock, "alice", "bad-ext", { body: { text: "x" }, ext: ["not", "object"] }))).toBe("invalid_params");
 		// Without room_id a message goes to the default room (§3.5).
-		expect(store.mutate(op(clock, "alice", "no-room", "message", { body: { text: "x" } })).message?.room_id).toBe("general");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-room-type", "message", { room_id: 7, body: { text: "x" } })))).toBe("invalid_params");
+		expect(store.messages.mutate(op(clock, "alice", "no-room", "message", { body: { text: "x" } })).message?.room_id).toBe("general");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "bad-room-type", "message", { room_id: 7, body: { text: "x" } })))).toBe("invalid_params");
 		// An empty save is refused by local policy; delete instead.
 		expect(errorCode(() => post(store, clock, "alice", "empty-save", { message_id: messageId, body: { text: "" } }))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-room", "message", { room_id: "private", body: { text: "x" } })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "bad-room", "message", { room_id: "private", body: { text: "x" } })))).toBe("invalid_params");
 
 		const deleted = post(store, clock, "alice", "m3", { message_id: messageId, deleted: true, body: { text: "ignored" }, ext: { keep: true } });
 		expect(deleted.message?.deleted).toBe(true);
@@ -211,12 +215,12 @@ it("lets mentioned users save only the text that the sender shares (ext:editors)
 
 		// A moderator's move keeps edited_by: the text is still Bob's.
 		const threadId = thread(store, clock, "e-thread");
-		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
-		store.mutate(op(clock, "mia", "e-move", "message", {
+		store.accounts.createInvited({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.messages.mutate(op(clock, "mia", "e-move", "message", {
 			message_id: messageId, room_id: threadId, body: saved.message!.body, reply_to: saved.message!.reply_to,
 		}));
-		const moved = store.mutate(op(clock, "mia", "e-back", "message", {
+		const moved = store.messages.mutate(op(clock, "mia", "e-back", "message", {
 			message_id: messageId, room_id: "general", body: saved.message!.body, reply_to: saved.message!.reply_to,
 		}));
 		expect(moved.message?.ext).toEqual({ editors: { ...grant, edited_by: "bob" }, irc: "x" });
@@ -274,14 +278,14 @@ it("merges ext one level deep on message saves and room_set (§4.13)", async () 
 
 		// room_set merges the same way, and checks the merged fields' size.
 		const roomId = thread(store, clock, "r1", { ext: { demo: { color: "blue" }, other: 1 } });
-		const saved = store.mutate(op(clock, "alice", "r2", "room_set", { room_id: roomId, title: "T", ext: { other: "", more: true } }));
+		const saved = store.messages.mutate(op(clock, "alice", "r2", "room_set", { room_id: roomId, title: "T", ext: { other: "", more: true } }));
 		expect(saved.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
-		const keptRoom = store.mutate(op(clock, "alice", "r3", "room_set", { room_id: roomId, title: "T" }));
+		const keptRoom = store.messages.mutate(op(clock, "alice", "r3", "room_set", { room_id: roomId, title: "T" }));
 		expect(keptRoom.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
 		const big = "y".repeat(Math.ceil(DEFAULT_LIMITS.roomMetadataBytes * 0.6));
-		store.mutate(op(clock, "alice", "r4", "room_set", { room_id: roomId, title: "T", ext: { big } }));
-		expect(errorCode(() => store.mutate(op(clock, "alice", "r5", "room_set", { room_id: roomId, title: "T", ext: { bigger: big } })))).toBe("too_large");
-		const emptied = store.mutate(op(clock, "alice", "r6", "room_set", { room_id: roomId, title: "T", ext: { demo: {}, more: "", big: "" } }));
+		store.messages.mutate(op(clock, "alice", "r4", "room_set", { room_id: roomId, title: "T", ext: { big } }));
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "r5", "room_set", { room_id: roomId, title: "T", ext: { bigger: big } })))).toBe("too_large");
+		const emptied = store.messages.mutate(op(clock, "alice", "r6", "room_set", { room_id: roomId, title: "T", ext: { demo: {}, more: "", big: "" } }));
 		expect(emptied.room).not.toHaveProperty("ext");
 	});
 });
@@ -297,7 +301,7 @@ it("validates bare reply_to references across rooms", async () => {
 		expect(errorCode(() => post(store, clock, "alice", "self", { message_id: rootId, body: { text: "self" }, reply_to: { message_id: rootId } }))).toBe("invalid_params");
 
 		// The target may live in another room; the server keeps only the ID.
-		const reply = store.mutate(op(clock, "bob", "reply", "message", {
+		const reply = store.messages.mutate(op(clock, "bob", "reply", "message", {
 			room_id: threadId,
 			body: { text: "in thread" },
 			reply_to: { message_id: rootId, body: { text: "client copy" } },
@@ -306,7 +310,7 @@ it("validates bare reply_to references across rooms", async () => {
 		expect(reply.message?.room_id).toBe(threadId);
 
 		// Saves replace every client field: omitting reply_to removes it.
-		const cleared = store.mutate(op(clock, "bob", "clear-reply", "message", {
+		const cleared = store.messages.mutate(op(clock, "bob", "clear-reply", "message", {
 			message_id: reply.result.message_id, room_id: threadId, body: { text: "no reply" },
 		}));
 		expect(cleared.message?.reply_to).toBeUndefined();
@@ -320,7 +324,7 @@ it("keeps an unchanged reply reference editable after its target expires", async
 		clock.value += 60 * 60 * 1_000;
 		const reply = post(store, clock, "alice", "reply", { body: { text: "reply" }, reply_to: { message_id: targetId } });
 		clock.value += RETENTION_MS - 30 * 60 * 1_000;
-		store.runCleanup(clock.value);
+		store.lifecycle.runCleanup(clock.value);
 		expect(errorCode(() => post(store, clock, "alice", "new-reply", { body: { text: "late" }, reply_to: { message_id: targetId } }))).toBe("invalid_params");
 		const edited = post(store, clock, "alice", "edit", { message_id: reply.result.message_id, body: { text: "edited" }, reply_to: { message_id: targetId } });
 		expect(edited.message?.reply_to).toEqual({ message_id: targetId });
@@ -329,16 +333,16 @@ it("keeps an unchanged reply reference editable after its target expires", async
 
 it("creates only thread rooms and replaces their client fields on save", async () => {
 	await withStore("rooms", (store, clock) => {
-		expect(errorCode(() => store.mutate(op(clock, "alice", "top", "room_set", { title: "Top level" })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "orphan", "room_set", { parent_room_id: "missing", title: "x" })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-title", "room_set", { parent_room_id: "general", title: 7 })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-description", "room_set", { parent_room_id: "general", description: { text: "x" } })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(DEFAULT_LIMITS.roomMetadataBytes) })))).toBe("too_large");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "top", "room_set", { title: "Top level" })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "orphan", "room_set", { parent_room_id: "missing", title: "x" })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "bad-title", "room_set", { parent_room_id: "general", title: 7 })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "bad-description", "room_set", { parent_room_id: "general", description: { text: "x" } })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(DEFAULT_LIMITS.roomMetadataBytes) })))).toBe("too_large");
 		// A private room is never a thread, and only a registered user starts one (§4.2.4).
-		expect(errorCode(() => store.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-private", "room_set", { parent_room_id: "general", private: "yes" })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "bad-private", "room_set", { parent_room_id: "general", private: "yes" })))).toBe("invalid_params");
 
-		const created = store.mutate(op(clock, "bob", "create", "room_set", {
+		const created = store.messages.mutate(op(clock, "bob", "create", "room_set", {
 			parent_room_id: "general", title: "Deploy", description: "Deploy chatter: *incidents* too", private: false, ext: { demo: { color: "blue" } },
 		}));
 		const roomId = String(created.result.room_id);
@@ -351,12 +355,12 @@ it("creates only thread rooms and replaces their client fields on save", async (
 			ext: { demo: { color: "blue" } },
 			latest_log_id: roomId, history_log_id: roomId,
 		});
-		expect(errorCode(() => store.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
 
 		// Any participant may save a thread's metadata; omitted fields are
 		// cleared but `ext`, which merges (§4.13), the server supplies a title,
 		// and parent_room_id and private are fixed.
-		const saved = store.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
+		const saved = store.messages.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
 		expect(saved.result).toEqual({ room_id: roomId });
 		expect(saved.created).toBe(false);
 		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Thread" });
@@ -367,15 +371,15 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(saved.room?.latest_log_id).toBe(saved.room?.log_id);
 		expect(saved.room?.history_log_id).toBe(roomId);
 
-		expect(errorCode(() => store.mutate(op(clock, "alice", "general", "room_set", { room_id: "general", title: "Renamed" })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "unknown", "room_set", { room_id: "404", title: "x" })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "general", "room_set", { room_id: "general", title: "Renamed" })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "unknown", "room_set", { room_id: "404", title: "x" })))).toBe("invalid_params");
 
 		// Room records are logged in their own room.
-		const history = store.historyPage({ roomId, after: "0", limit: 50, now: clock.value });
+		const history = sqliteOf(store).historyPage({ roomId, after: "0", limit: 50, now: clock.value });
 		expect(history.rooms?.map((room) => room.log_id)).toEqual([roomId, saved.room?.log_id]);
 		expect(history.rooms?.[0]).toMatchObject({ title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(history.messages).toBeUndefined();
-		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general", roomId]);
+		expect(store.rooms.list().map((room) => room.room_id)).toEqual(["general", roomId]);
 	});
 });
 
@@ -396,7 +400,7 @@ it("denies thread creation beyond the thread ceiling", async () => {
 it("caps the live threads one registered user created; removed and expired ones stop counting", async () => {
 	await withStore("thread-per-user", (store, clock) => {
 		for (const userId of ["alice", "bob"]) {
-			store.registerIdentity({
+			store.accounts.register({
 				userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
 				credential: { credentialId: `cred-${userId}`, userId, publicKey: "AAAA", counter: 0 },
 			});
@@ -408,17 +412,17 @@ it("caps the live threads one registered user created; removed and expired ones 
 		expect((error as StoreError).code).toBe("denied");
 		expect((error as StoreError).message).toMatch(/at most 2 threads/);
 		// Each user has their own allowance, and a guest's threads (no creator) count only against the ceiling.
-		store.mutate(op(clock, "bob", "bobs", "room_set", { parent_room_id: "general", title: "Bob's" }));
-		for (const n of [1, 2, 3]) store.mutate(op(clock, "guest_1", `guest-${n}`, "room_set", { parent_room_id: "general", title: "Guest's" }));
+		store.messages.mutate(op(clock, "bob", "bobs", "room_set", { parent_room_id: "general", title: "Bob's" }));
+		for (const n of [1, 2, 3]) store.messages.mutate(op(clock, "guest_1", `guest-${n}`, "room_set", { parent_room_id: "general", title: "Guest's" }));
 		// A thread removed when its last member leaves stops counting.
-		store.changeMembership({ userId: "alice", ipKey: "ip-alice", roomId: first, join: false, now: clock.value });
-		expect(store.removeEmptyThread(first, clock.value)).toBe(true);
+		store.rooms.changeMembership({ userId: "alice", ipKey: "ip-alice", roomId: first, join: false, now: clock.value });
+		expect(store.rooms.removeEmptyThread(first, clock.value)).toBe(true);
 		thread(store, clock, "after-removal");
 		expect(errorCode(() => thread(store, clock, "full-again"))).toBe("denied");
 		// So do threads whose history expired, once cleanup removes them.
 		clock.value += 25 * 60 * 60_000;
-		for (let run = 0; run < 8 && store.listRooms().length > 1; run += 1) clock.value = Math.max(clock.value, store.runCleanup(clock.value).next_due_ms) + 1;
-		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general"]);
+		for (let run = 0; run < 8 && store.rooms.list().length > 1; run += 1) clock.value = Math.max(clock.value, store.lifecycle.runCleanup(clock.value).next_due_ms) + 1;
+		expect(store.rooms.list().map((room) => room.room_id)).toEqual(["general"]);
 		thread(store, clock, "after-expiry-1");
 		thread(store, clock, "after-expiry-2");
 		expect(errorCode(() => thread(store, clock, "after-expiry-3"))).toBe("denied");
@@ -427,13 +431,13 @@ it("caps the live threads one registered user created; removed and expired ones 
 
 it("charges a move one more post per MOVE_REACTION_SETS_PER_POST reaction sets it re-logs, refusing it whole past a limit", async () => {
 	await withStore("move-charge", (store, clock, state) => {
-		store.registerIdentity({
+		store.accounts.register({
 			userId: "alice", name: "Alice", userHandle: "handle-alice", now: clock.value, ipKey: "ip-alice",
 			credential: { credentialId: "cred-alice", userId: "alice", publicKey: "AAAA", counter: 0 },
 		});
-		const posted = () => store.limiterDay("post", "user:alice", clock.value).posts_day;
+		const posted = () => sqliteOf(store).limiterDay("post", "user:alice", clock.value).posts_day;
 		const reactedBy = (messageId: string, count: number) => {
-			for (let n = 0; n < count; n += 1) store.mutate(op(clock, `guest_${messageId}_${n}`, `react-${messageId}-${n}`, "reactions", { message_id: messageId, emojis: ["👍"] }));
+			for (let n = 0; n < count; n += 1) store.messages.mutate(op(clock, `guest_${messageId}_${n}`, `react-${messageId}-${n}`, "reactions", { message_id: messageId, emojis: ["👍"] }));
 		};
 		const few = String(post(store, clock, "alice", "few", { body: { text: "a few reactors" } }).result.message_id);
 		const many = String(post(store, clock, "alice", "many", { body: { text: "many reactors" } }).result.message_id);
@@ -448,12 +452,12 @@ it("charges a move one more post per MOVE_REACTION_SETS_PER_POST reaction sets i
 		post(store, clock, "alice", "move-many", { message_id: many, room_id: threadId, body: { text: "many reactors" } });
 		expect(posted()).toBe(7);
 		// Moving it back would take Alice past her 9 a minute: refused whole, it stays where it is.
-		const head = store.logBounds().latest_log_id;
+		const head = sqliteOf(store).logBounds().latest_log_id;
 		let error: unknown;
 		try { post(store, clock, "alice", "move-back", { message_id: many, room_id: "general", body: { text: "many reactors" } }); } catch (caught) { error = caught; }
 		expectRetryAfter(error);
 		expect(posted()).toBe(7);
-		expect(store.logBounds().latest_log_id).toBe(head);
+		expect(sqliteOf(store).logBounds().latest_log_id).toBe(head);
 		// A minute later it moves.
 		clock.value += 60_001;
 		post(store, clock, "alice", "move-back-later", { message_id: many, room_id: "general", body: { text: "many reactors" } });
@@ -465,8 +469,8 @@ it("moves a message into both rooms' logs and re-logs its reactions in the desti
 	await withStore("moves", (store, clock) => {
 		const original = post(store, clock, "alice", "original", { body: { text: "misplaced" } });
 		const messageId = String(original.result.message_id);
-		store.mutate(op(clock, "alice", "react-a", "reactions", { message_id: messageId, emojis: ["👍"] }));
-		store.mutate(op(clock, "bob", "react-b", "reactions", { message_id: messageId, emojis: ["🎉", "👀"] }));
+		store.messages.mutate(op(clock, "alice", "react-a", "reactions", { message_id: messageId, emojis: ["👍"] }));
+		store.messages.mutate(op(clock, "bob", "react-b", "reactions", { message_id: messageId, emojis: ["🎉", "👀"] }));
 		const threadId = thread(store, clock, "thread");
 
 		expect(errorCode(() => post(store, clock, "bob", "steal", { message_id: messageId, room_id: threadId, body: { text: "x" } }))).toBe("denied");
@@ -488,22 +492,22 @@ it("moves a message into both rooms' logs and re-logs its reactions in the desti
 
 		// The move belongs to the source and destination logs; earlier history
 		// of the message stays in the source room.
-		const source = store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
+		const source = sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
 		expect(messagesOf(source).map((entry) => [entry.log_id, entry.room_id])).toEqual([
 			[messageId, "general"],
 			[snapshot.log_id, threadId],
 		]);
 		expect(source.reactions?.map((record) => record.room_id)).toEqual(["general", "general"]);
-		const destination = store.historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value });
+		const destination = sqliteOf(store).historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value });
 		expect(destination.rooms?.map((room) => room.room_id)).toEqual([threadId]);
 		expect(messagesOf(destination).map((entry) => entry.log_id)).toEqual([snapshot.log_id]);
 		expect(destination.reactions?.map((record) => record.log_id)).toEqual([reactions.log_id]);
-		expect(store.getRoomState().latest_log_id).toBe(snapshot.log_id);
-		expect(store.getRoomState(threadId).latest_log_id).toBe(reactions.log_id);
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(snapshot.log_id);
+		expect(sqliteOf(store).getRoomState(threadId).latest_log_id).toBe(reactions.log_id);
 
 		// A later reaction is logged in the message's current room, and a move
 		// without reactions logs only the snapshot.
-		const later = store.mutate(op(clock, "bob", "react-later", "reactions", { message_id: messageId, emojis: [] }));
+		const later = store.messages.mutate(op(clock, "bob", "react-later", "reactions", { message_id: messageId, emojis: [] }));
 		expect(later.broadcasts[0].params.room_id).toBe(threadId);
 		const plain = post(store, clock, "bob", "plain", { body: { text: "no reactions" } });
 		const plainMove = post(store, clock, "bob", "plain-move", { message_id: plain.result.message_id, room_id: threadId, body: { text: "moved" } });
@@ -516,7 +520,7 @@ it("sets, clears, collapses, and deduplicates reactions", async () => {
 		const target = post(store, clock, "alice", "target", { body: { text: "react to me" } });
 		const messageId = String(target.result.message_id);
 
-		const set = store.mutate(op(clock, "bob", "r1", "reactions", { message_id: messageId, emojis: ["👍", "🎉", "👍"] }));
+		const set = store.messages.mutate(op(clock, "bob", "r1", "reactions", { message_id: messageId, emojis: ["👍", "🎉", "👍"] }));
 		expect(set.result).toEqual({});
 		expect(set.broadcasts).toEqual([{
 			method: "reactions",
@@ -527,30 +531,30 @@ it("sets, clears, collapses, and deduplicates reactions", async () => {
 			rooms: ["general"],
 		}]);
 
-		const retry = store.mutate(op(clock, "bob", "r1", "reactions", { emojis: ["👍", "🎉", "👍"], message_id: messageId }));
+		const retry = store.messages.mutate(op(clock, "bob", "r1", "reactions", { emojis: ["👍", "🎉", "👍"], message_id: messageId }));
 		expect(retry.deduplicated).toBe(true);
 		expect(retry.broadcasts).toEqual([]);
-		expect(errorCode(() => store.mutate(op(clock, "bob", "r1", "reactions", { message_id: messageId, emojis: [] })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "r1", "reactions", { message_id: messageId, emojis: [] })))).toBe("invalid_params");
 
 		// A reordered identical set is not a change and produces no record.
-		const unchanged = store.mutate(op(clock, "bob", "r2", "reactions", { message_id: messageId, emojis: ["🎉", "👍"] }));
+		const unchanged = store.messages.mutate(op(clock, "bob", "r2", "reactions", { message_id: messageId, emojis: ["🎉", "👍"] }));
 		expect(unchanged.result).toEqual({});
 		expect(unchanged.broadcasts).toEqual([]);
 
-		const cleared = store.mutate(op(clock, "bob", "r3", "reactions", { message_id: messageId, emojis: [] }));
+		const cleared = store.messages.mutate(op(clock, "bob", "r3", "reactions", { message_id: messageId, emojis: [] }));
 		expect(cleared.broadcasts[0].params.reactions).toEqual([{ from: { user_id: "bob", name: "Bob" }, emojis: [] }]);
-		expect(store.mutate(op(clock, "bob", "r4", "reactions", { message_id: messageId, emojis: [] })).broadcasts).toEqual([]);
+		expect(store.messages.mutate(op(clock, "bob", "r4", "reactions", { message_id: messageId, emojis: [] })).broadcasts).toEqual([]);
 
-		expect(errorCode(() => store.mutate(op(clock, "bob", "unknown", "reactions", { message_id: "404", emojis: ["👍"] })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "not-array", "reactions", { message_id: messageId, emojis: "👍" })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "not-string", "reactions", { message_id: messageId, emojis: [1] })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "empty", "reactions", { message_id: messageId, emojis: [""] })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "long", "reactions", { message_id: messageId, emojis: ["x".repeat(65)] })))).toBe("too_large");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "many", "reactions", {
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "unknown", "reactions", { message_id: "404", emojis: ["👍"] })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "not-array", "reactions", { message_id: messageId, emojis: "👍" })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "not-string", "reactions", { message_id: messageId, emojis: [1] })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "empty", "reactions", { message_id: messageId, emojis: [""] })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "long", "reactions", { message_id: messageId, emojis: ["x".repeat(65)] })))).toBe("too_large");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "many", "reactions", {
 			message_id: messageId, emojis: Array.from({ length: 9 }, (_, index) => `e${index}`),
 		})))).toBe("denied");
 
-		const history = store.historyPage({ roomId: "general", after: target.message!.log_id, limit: 50, now: clock.value });
+		const history = sqliteOf(store).historyPage({ roomId: "general", after: target.message!.log_id, limit: 50, now: clock.value });
 		expect(messagesOf(history).map((entry) => entry.message_id)).toEqual([messageId]);
 		expect(history.reactions?.map((record) => record.reactions[0].emojis)).toEqual([["👍", "🎉"], []]);
 	});
@@ -561,15 +565,15 @@ it("stores emoji sequences fully qualified, takes entries that differ only in U+
 		const target = post(store, clock, "alice", "target", { body: { text: "react to me" } });
 		const messageId = String(target.result.message_id);
 		// ❤ is text-default: stored as ❤️, once, whichever form came first.
-		const heart = store.mutate(op(clock, "bob", "h1", "reactions", { message_id: messageId, emojis: ["\u2764", "\u2764\uFE0F", "🏳\u200D🌈", "👍🏽"] }));
+		const heart = store.messages.mutate(op(clock, "bob", "h1", "reactions", { message_id: messageId, emojis: ["\u2764", "\u2764\uFE0F", "🏳\u200D🌈", "👍🏽"] }));
 		expect(heart.broadcasts[0].params.reactions).toEqual([{ from: { user_id: "bob", name: "Bob" }, emojis: ["\u2764\uFE0F", "🏳️‍🌈", "👍🏽"] }]);
 		// The same set in other forms is no change.
-		const same = store.mutate(op(clock, "bob", "h2", "reactions", { message_id: messageId, emojis: ["👍🏽", "🏳️‍🌈", "\u2764"] }));
+		const same = store.messages.mutate(op(clock, "bob", "h2", "reactions", { message_id: messageId, emojis: ["👍🏽", "🏳️‍🌈", "\u2764"] }));
 		expect(same.broadcasts).toEqual([]);
 		// A key must be a custom emoji the catalog has (ext:emoji); this store has none.
-		expect(errorCode(() => store.mutate(op(clock, "bob", "key", "reactions", { message_id: messageId, emojis: [":partyparrot:"] })))).toBe("invalid_params");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "key", "reactions", { message_id: messageId, emojis: [":partyparrot:"] })))).toBe("invalid_params");
 		// Text that is not a key, such as a lone colon word, is kept as written.
-		const colon = store.mutate(op(clock, "bob", "colon", "reactions", { message_id: messageId, emojis: [":party"] }));
+		const colon = store.messages.mutate(op(clock, "bob", "colon", "reactions", { message_id: messageId, emojis: [":party"] }));
 		expect((colon.broadcasts[0].params.reactions as Array<{ emojis: string[] }>)[0].emojis).toEqual([":party"]);
 	});
 });
@@ -578,58 +582,58 @@ it("rejects new reactions on tombstones and caps reacting users per message", as
 	await withStore("reaction-policy", (store, clock) => {
 		const target = post(store, clock, "alice", "target", { body: { text: "popular" } });
 		const messageId = String(target.result.message_id);
-		store.mutate(op(clock, "alice", "a", "reactions", { message_id: messageId, emojis: ["👍"] }));
-		store.mutate(op(clock, "bob", "b", "reactions", { message_id: messageId, emojis: ["👍"] }));
+		store.messages.mutate(op(clock, "alice", "a", "reactions", { message_id: messageId, emojis: ["👍"] }));
+		store.messages.mutate(op(clock, "bob", "b", "reactions", { message_id: messageId, emojis: ["👍"] }));
 		// A well-formed request the cap refuses is denied (§1.1).
-		expect(errorCode(() => store.mutate(op(clock, "carol", "c", "reactions", { message_id: messageId, emojis: ["👍"] })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "carol", "c", "reactions", { message_id: messageId, emojis: ["👍"] })))).toBe("denied");
 		// Existing reactors may still change their own set.
-		expect(store.mutate(op(clock, "bob", "b2", "reactions", { message_id: messageId, emojis: ["🎉"] })).broadcasts).toHaveLength(1);
+		expect(store.messages.mutate(op(clock, "bob", "b2", "reactions", { message_id: messageId, emojis: ["🎉"] })).broadcasts).toHaveLength(1);
 
 		post(store, clock, "alice", "delete", { message_id: messageId, deleted: true });
-		expect(errorCode(() => store.mutate(op(clock, "bob", "b3", "reactions", { message_id: messageId, emojis: ["👀"] })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "b3", "reactions", { message_id: messageId, emojis: ["👀"] })))).toBe("denied");
 		// Clearing a set on a tombstone is still allowed.
-		expect(store.mutate(op(clock, "bob", "b4", "reactions", { message_id: messageId, emojis: [] })).broadcasts).toHaveLength(1);
+		expect(store.messages.mutate(op(clock, "bob", "b4", "reactions", { message_id: messageId, emojis: [] })).broadcasts).toHaveLength(1);
 	}, { ...ROOMY, reactionUsersPerMessage: 2 });
 });
 
 it("charges reactions and room changes against posting quotas and keeps accepted retries", async () => {
 	await withStore("quota", (store, clock) => {
 		const target = post(store, clock, "alice", "target", { body: { text: "one" } });
-		const reaction = store.mutate(op(clock, "alice", "react", "reactions", { message_id: target.result.message_id, emojis: ["👍"] }));
+		const reaction = store.messages.mutate(op(clock, "alice", "react", "reactions", { message_id: target.result.message_id, emojis: ["👍"] }));
 		expect(reaction.broadcasts).toHaveLength(1);
-		const created = store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "Quota" }));
+		const created = store.messages.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "Quota" }));
 		const limited = (fn: () => unknown) => {
 			try { fn(); expect.unreachable(); }
 			catch (error) { expectRetryAfter(error); }
 		};
-		limited(() => store.mutate(op(clock, "alice", "react-2", "reactions", { message_id: target.result.message_id, emojis: [] })));
-		limited(() => store.mutate(op(clock, "alice", "room-2", "room_set", { room_id: created.result.room_id, title: "Renamed" })));
+		limited(() => store.messages.mutate(op(clock, "alice", "react-2", "reactions", { message_id: target.result.message_id, emojis: [] })));
+		limited(() => store.messages.mutate(op(clock, "alice", "room-2", "room_set", { room_id: created.result.room_id, title: "Renamed" })));
 		limited(() => post(store, clock, "alice", "post-2", { body: { text: "two" } }));
 		// Accepted retries return their original result without a new charge.
-		expect(store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "Quota" })).result).toEqual(created.result);
-		expect(store.mutate(op(clock, "alice", "react", "reactions", { message_id: target.result.message_id, emojis: ["👍"] })).deduplicated).toBe(true);
+		expect(store.messages.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "Quota" })).result).toEqual(created.result);
+		expect(store.messages.mutate(op(clock, "alice", "react", "reactions", { message_id: target.result.message_id, emojis: ["👍"] })).deduplicated).toBe(true);
 		clock.value += 61_000;
-		expect(store.mutate(op(clock, "alice", "react-3", "reactions", { message_id: target.result.message_id, emojis: [] })).broadcasts).toHaveLength(1);
+		expect(store.messages.mutate(op(clock, "alice", "react-3", "reactions", { message_id: target.result.message_id, emojis: [] })).broadcasts).toHaveLength(1);
 	}, { guestPostsPerMinute: 3 });
 });
 
 it("rolls back failed writes atomically while keeping their resource reservation spent", async () => {
 	await withStore("rollback", (store, clock, state) => {
-		const before = store.getRoomState();
-		const budgetBefore = store.budget(clock.value);
+		const before = sqliteOf(store).getRoomState();
+		const budgetBefore = sqliteOf(store).budget(clock.value);
 		// SQLite itself raises after the transition insert, inside transactionSync.
 		// This exercises real rollback rather than substituting a fake database.
 		state.storage.sql.exec(`CREATE TRIGGER fail_snapshot BEFORE INSERT ON message_state
 			BEGIN SELECT RAISE(ABORT, 'injected snapshot failure'); END`);
 		const attempt = () => post(store, clock, "alice", "retry-after-failed-commit", { body: { text: "atomic message" } });
 		expect(attempt).toThrow("injected snapshot failure");
-		expect(store.getRoomState().latest_log_id).toBe(before.latest_log_id);
+		expect(sqliteOf(store).getRoomState().latest_log_id).toBe(before.latest_log_id);
 		// Only the seeded general room record exists; nothing from the failed write.
 		expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM records").one().n).toBe(1);
 		for (const table of ["message_state", "accepted_requests", "principal_limits"]) {
 			expect(state.storage.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).one().n).toBe(0);
 		}
-		expect(store.budget(clock.value).writes).toBeGreaterThan(budgetBefore.writes);
+		expect(sqliteOf(store).budget(clock.value).writes).toBeGreaterThan(budgetBefore.writes);
 
 		// The failed request was never accepted, so the same request ID commits.
 		state.storage.sql.exec("DROP TRIGGER fail_snapshot");
@@ -648,8 +652,8 @@ it("deduplicates canonical retries before quotas, survives restart, and expires 
 		const first = post(store, clock, "alice", "same", params);
 		// A fresh Store over the same native SQLite binding exercises the
 		// constructor/restart path without an in-memory fake database.
-		const restarted = new Store(state, DEDUP_CONFIG, clock.clock);
-		restarted.initialize();
+		const restarted = openStore(state, DEDUP_CONFIG, clock.clock);
+		restarted.lifecycle.initialize();
 		const retry = post(restarted, clock, "alice", "same", {
 			body: { extension: { a: 2, z: 1 }, text: "once", format: "plain" },
 		});
@@ -657,7 +661,7 @@ it("deduplicates canonical retries before quotas, survives restart, and expires 
 		expect(retry.broadcasts).toEqual([]);
 		expect(retry.result).toEqual(first.result);
 		expect(errorCode(() => post(restarted, clock, "alice", "same", { body: { format: "plain", text: "different" } }))).toBe("invalid_params");
-		expect(errorCode(() => restarted.mutate(op(clock, "alice", "same", "reactions", params)))).toBe("invalid_params");
+		expect(errorCode(() => restarted.messages.mutate(op(clock, "alice", "same", "reactions", params)))).toBe("invalid_params");
 		expect(errorCode(() => post(restarted, clock, "alice", "new-request", { body: { format: "plain", text: "blocked" } }))).toBe("retry_after");
 
 		clock.value += RETENTION_MS + 1;
@@ -673,36 +677,36 @@ it("bounds every room's client fields past the minimum together, refusing only a
 	await withStore("room-fields-total", (store, clock, state) => {
 		const bytes = (fields: Record<string, unknown>) => new TextEncoder().encode(JSON.stringify(fields)).length;
 		const excess = (fields: Record<string, unknown>) => Math.max(0, bytes(fields) - floor);
-		const { title, description, ext } = store.getRoomState() as unknown as Record<string, unknown>;
+		const { title, description, ext } = sqliteOf(store).getRoomState() as unknown as Record<string, unknown>;
 		const general = excess({ ...(title !== undefined ? { title } : {}), ...(description !== undefined ? { description } : {}), ...(ext !== undefined ? { ext } : {}) });
 		// Quotes, a newline and a non-ASCII letter are counted as JSON.stringify writes them, and a creator not at all.
-		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.createInvited({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
 		const note = (length: number) => `"é"\n${"x".repeat(length - 6)}`;
 		const fields = (length: number) => ({ title: "Notes", description: note(length) });
-		const first = String(store.mutate(op(clock, "mia", "first", "room_set", { parent_room_id: "general", ...fields(900) })).result.room_id);
+		const first = String(store.messages.mutate(op(clock, "mia", "first", "room_set", { parent_room_id: "general", ...fields(900) })).result.room_id);
 		const config = (total: number) => ({ ...ROOMY, roomMetadataBytes: per, roomMetadataMinBytes: floor, roomMetadataTotalBytes: total });
-		const limited = new Store(state, config(general + excess(fields(900)) + excess(fields(800))), clock.clock);
-		limited.initialize();
-		expect(errorCode(() => limited.mutate(op(clock, "alice", "over", "room_set", { parent_room_id: "general", ...fields(801) })))).toBe("too_large");
-		const second = String(limited.mutate(op(clock, "alice", "exact", "room_set", { parent_room_id: "general", ...fields(800) })).result.room_id);
+		const limited = openStore(state, config(general + excess(fields(900)) + excess(fields(800))), clock.clock);
+		limited.lifecycle.initialize();
+		expect(errorCode(() => limited.messages.mutate(op(clock, "alice", "over", "room_set", { parent_room_id: "general", ...fields(801) })))).toBe("too_large");
+		const second = String(limited.messages.mutate(op(clock, "alice", "exact", "room_set", { parent_room_id: "general", ...fields(800) })).result.room_id);
 		// At the total: rooms within the minimum are still created, and kept at or under it.
 		expect(bytes(fields(100))).toBeLessThanOrEqual(floor);
-		const short = String(limited.mutate(op(clock, "alice", "short", "room_set", { parent_room_id: "general", ...fields(100) })).result.room_id);
-		expect(limited.mutate(op(clock, "alice", "short-grow", "room_set", { room_id: short, ...fields(floor - 40) })).room?.description).toBe(note(floor - 40));
-		expect(errorCode(() => limited.mutate(op(clock, "alice", "short-past", "room_set", { room_id: short, ...fields(floor) })))).toBe("too_large");
+		const short = String(limited.messages.mutate(op(clock, "alice", "short", "room_set", { parent_room_id: "general", ...fields(100) })).result.room_id);
+		expect(limited.messages.mutate(op(clock, "alice", "short-grow", "room_set", { room_id: short, ...fields(floor - 40) })).room?.description).toBe(note(floor - 40));
+		expect(errorCode(() => limited.messages.mutate(op(clock, "alice", "short-past", "room_set", { room_id: short, ...fields(floor) })))).toBe("too_large");
 		// Growing a long room is refused; a save of the same size or smaller is not.
-		expect(errorCode(() => limited.mutate(op(clock, "mia", "grow", "room_set", { room_id: first, ...fields(901) })))).toBe("too_large");
-		expect(limited.mutate(op(clock, "mia", "same", "room_set", { room_id: first, title: "Notez", description: note(900) })).room?.title).toBe("Notez");
-		limited.mutate(op(clock, "mia", "shrink", "room_set", { room_id: first, ...fields(500) }));
-		expect(limited.mutate(op(clock, "alice", "grow-into", "room_set", { room_id: second, ...fields(950) })).room?.description).toBe(note(950));
+		expect(errorCode(() => limited.messages.mutate(op(clock, "mia", "grow", "room_set", { room_id: first, ...fields(901) })))).toBe("too_large");
+		expect(limited.messages.mutate(op(clock, "mia", "same", "room_set", { room_id: first, title: "Notez", description: note(900) })).room?.title).toBe("Notez");
+		limited.messages.mutate(op(clock, "mia", "shrink", "room_set", { room_id: first, ...fields(500) }));
+		expect(limited.messages.mutate(op(clock, "alice", "grow-into", "room_set", { room_id: second, ...fields(950) })).room?.description).toBe(note(950));
 
 		// Under a lowered total, rooms past it still shrink, or save at their size, and short rooms are still made.
-		const lowered = new Store(state, config(1), clock.clock);
-		lowered.initialize();
-		expect(errorCode(() => lowered.mutate(op(clock, "alice", "grow-low", "room_set", { room_id: second, ...fields(951) })))).toBe("too_large");
-		expect(lowered.mutate(op(clock, "alice", "shrink-low", "room_set", { room_id: second, ...fields(400) })).room?.description).toBe(note(400));
-		expect(errorCode(() => lowered.mutate(op(clock, "alice", "new-low", "room_set", { parent_room_id: "general", ...fields(400) })))).toBe("too_large");
-		expect(lowered.mutate(op(clock, "alice", "short-low", "room_set", { parent_room_id: "general", title: "T" })).room?.title).toBe("T");
+		const lowered = openStore(state, config(1), clock.clock);
+		lowered.lifecycle.initialize();
+		expect(errorCode(() => lowered.messages.mutate(op(clock, "alice", "grow-low", "room_set", { room_id: second, ...fields(951) })))).toBe("too_large");
+		expect(lowered.messages.mutate(op(clock, "alice", "shrink-low", "room_set", { room_id: second, ...fields(400) })).room?.description).toBe(note(400));
+		expect(errorCode(() => lowered.messages.mutate(op(clock, "alice", "new-low", "room_set", { parent_room_id: "general", ...fields(400) })))).toBe("too_large");
+		expect(lowered.messages.mutate(op(clock, "alice", "short-low", "room_set", { parent_room_id: "general", title: "T" })).room?.title).toBe("T");
 	});
 });
 
@@ -713,17 +717,17 @@ it("answers count limits with denied and size limits with too_large (§1.1)", as
 		expect(errorCode(() => post(store, clock, "alice", "mention", { body: { text: "x", mentions: ["u".repeat(257)] } }))).toBe("too_large");
 		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(DEFAULT_LIMITS.maxTextBytes + 1) } }))).toBe("too_large");
 		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(DEFAULT_LIMITS.maxSnapshotBytes + 1) } }))).toBe("too_large");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(DEFAULT_LIMITS.roomMetadataBytes + 1) } })))).toBe("too_large");
+		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(DEFAULT_LIMITS.roomMetadataBytes + 1) } })))).toBe("too_large");
 	});
 });
 
 it("lets an admin or a mod move someone else's message into a thread and back, but not change it", async () => {
 	await withStore("mover-roles", (store, clock) => {
-		const invite = (userId: string) => store.createInvitedIdentity({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
+		const invite = (userId: string) => store.accounts.createInvited({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
 		for (const userId of ["mia", "ada", "rob"]) invite(userId);
-		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
-		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
-		store.setRole({ userId: "rob", role: "helper", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "rob", role: "helper", on: true, now: clock.value });
 		const first = post(store, clock, "alice", "first", { body: { text: "start" }, ext: { irc: { nick: "ada_" } } });
 		const firstId = String(first.result.message_id);
 		const reply = post(store, clock, "alice", "reply", { body: { text: "more", format: "markdown" }, reply_to: { message_id: firstId } });
@@ -737,55 +741,55 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		});
 
 		// Another role, or none, is not enough.
-		expect(errorCode(() => store.mutate(op(clock, "rob", "rob-move", "message", resubmit(first.message, threadId))))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "bob-move", "message", resubmit(first.message, threadId))))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "rob", "rob-move", "message", resubmit(first.message, threadId))))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bob", "bob-move", "message", resubmit(first.message, threadId))))).toBe("denied");
 
 		// A mod moves it into the thread; it stays the author's, content and all.
-		const moved = store.mutate(op(clock, "mia", "mia-move", "message", resubmit(first.message, threadId)));
+		const moved = store.messages.mutate(op(clock, "mia", "mia-move", "message", resubmit(first.message, threadId)));
 		expect(moved.message).toMatchObject({
 			message_id: firstId, room_id: threadId, prev_room_id: "general",
 			from: { user_id: "alice", name: "Alice" }, body: first.message!.body, ext: { irc: { nick: "ada_" } },
 		});
 		expect(moved.broadcasts[0].rooms).toEqual(["general", threadId]);
-		const movedReply = store.mutate(op(clock, "mia", "mia-move-reply", "message", resubmit(reply.message, threadId)));
+		const movedReply = store.messages.mutate(op(clock, "mia", "mia-move-reply", "message", resubmit(reply.message, threadId)));
 		expect(movedReply.message).toMatchObject({ room_id: threadId, reply_to: { message_id: firstId }, body: reply.message!.body });
 
 		// Out of the thread, back to the room it came from.
-		const back = store.mutate(op(clock, "mia", "mia-unthread", "message", resubmit(moved.message, "general")));
+		const back = store.messages.mutate(op(clock, "mia", "mia-unthread", "message", resubmit(moved.message, "general")));
 		expect(back.message).toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
-		expect(messagesOf(store.historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value })).map((entry) => entry.room_id))
+		expect(messagesOf(sqliteOf(store).historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value })).map((entry) => entry.room_id))
 			.toEqual([threadId, threadId, "general"]);
 
 		// A mover may only move: not edit in place, not edit while moving, not touch ext or reply_to, not delete.
 		const current = back.message!;
-		expect(errorCode(() => store.mutate(op(clock, "mia", "edit-in-place", "message", { ...resubmit(current, "general"), body: { text: "mod edit" } })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "mia", "edit-while-moving", "message", { ...resubmit(current, threadId), body: { text: "mod edit" } })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "mia", "ext-while-moving", "message", { ...resubmit(current, threadId), ext: { mod: true } })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "mia", "reply-while-moving", "message", { ...resubmit(current, threadId), reply_to: { message_id: replyId } })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "mia", "delete-while-moving", "message", { ...resubmit(current, threadId), deleted: true })))).toBe("denied");
-		expect(store.historyPage({ roomId: "general", after: back.message!.log_id, limit: 50, now: clock.value }).messages?.at(-1)?.log_id).toBe(back.message!.log_id);
+		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "edit-in-place", "message", { ...resubmit(current, "general"), body: { text: "mod edit" } })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "edit-while-moving", "message", { ...resubmit(current, threadId), body: { text: "mod edit" } })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "ext-while-moving", "message", { ...resubmit(current, threadId), ext: { mod: true } })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "reply-while-moving", "message", { ...resubmit(current, threadId), reply_to: { message_id: replyId } })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "delete-while-moving", "message", { ...resubmit(current, threadId), deleted: true })))).toBe("denied");
+		expect(sqliteOf(store).historyPage({ roomId: "general", after: back.message!.log_id, limit: 50, now: clock.value }).messages?.at(-1)?.log_id).toBe(back.message!.log_id);
 
 		// An admin moves a tombstone, and the author can still edit what was moved for them.
 		const deleted = post(store, clock, "alice", "delete-reply", { message_id: replyId, room_id: threadId, deleted: true });
-		expect(store.mutate(op(clock, "ada", "ada-move", "message", resubmit(deleted.message, "general"))).message).toMatchObject({ room_id: "general", deleted: true });
+		expect(store.messages.mutate(op(clock, "ada", "ada-move", "message", resubmit(deleted.message, "general"))).message).toMatchObject({ room_id: "general", deleted: true });
 		expect(post(store, clock, "alice", "author-edit", { message_id: firstId, body: { text: "still mine" } }).message?.body?.text).toBe("still mine");
 
 		// A role taken away takes the permission with it.
-		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
-		expect(errorCode(() => store.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
+		store.accounts.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
+		expect(errorCode(() => store.messages.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
 	});
 });
 
 it("keeps the ids of removed users a move logs again retired until the move expires", async () => {
 	await withStore("relog-retired", (store, clock, state) => {
-		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.accounts.createInvited({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
 		const original = post(store, clock, "alice", "original", { body: { text: "misplaced" } });
-		store.mutate(op(clock, "bob", "react", "reactions", { message_id: original.result.message_id, emojis: ["👍"] }));
+		store.messages.mutate(op(clock, "bob", "react", "reactions", { message_id: original.result.message_id, emojis: ["👍"] }));
 		const threadId = thread(store, clock, "thread");
 		// As if alice and bob had since been removed, and carol too, long ago.
 		state.storage.sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:alice', '1000'), ('purged:bob', '1000'), ('purged:carol', '1000')");
-		const moved = store.mutate(op(clock, "mia", "move", "message", { message_id: original.result.message_id, room_id: threadId, body: original.message!.body }));
+		const moved = store.messages.mutate(op(clock, "mia", "move", "message", { message_id: original.result.message_id, room_id: threadId, body: original.message!.body }));
 		const reactionsLog = String(moved.broadcasts[1].params.log_id);
 		const marker = (userId: string) => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = ?", `purged:${userId}`).one().value;
 		// The author and the reactor are named again by the move's records; carol is not.
@@ -798,115 +802,115 @@ it("drops an output_ref a client sends: only the server refers to stored termina
 		const posted = post(store, clock, "alice", "forged", { body: { text: "x", embeds: [{ kind: "x", output_ref: { key: "f/AAAAAAAAAAAAAAAAAAAAAA", bytes: 1e12 } }] } });
 		expect(posted.message!.body!.embeds).toEqual([expect.objectContaining({ kind: "x" })]);
 		expect((posted.message!.body!.embeds as Array<Record<string, unknown>>)[0].output_ref).toBeUndefined();
-		const page = store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
+		const page = sqliteOf(store).historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
 		expect(JSON.stringify(page)).not.toContain("output_ref");
 	});
 });
 
 it("lets a threader move anyone's messages in and out of threads, create threads and save any thread's title and description", async () => {
 	await withStore("threader-role", (store, clock) => {
-		store.createInvitedIdentity({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		store.accounts.createInvited({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
 		const first = post(store, clock, "alice", "first", { body: { text: "start" } });
 		const second = post(store, clock, "bob", "second", { body: { text: "more" } });
 		const resubmit = (message: StoreMutationResult["message"], roomId: string) => ({ message_id: message!.message_id, room_id: roomId, body: message!.body });
 
 		// A thread of the threader's own, and someone else's thread retitled and described.
-		const created = store.mutate(op(clock, "tia", "tia-thread", "room_set", { parent_room_id: "general", title: "Tidy" }));
+		const created = store.messages.mutate(op(clock, "tia", "tia-thread", "room_set", { parent_room_id: "general", title: "Tidy" }));
 		const threadId = String(created.result.room_id);
 		const othersId = thread(store, clock, "alice-thread");
-		expect(store.mutate(op(clock, "tia", "tia-save", "room_set", { room_id: othersId, title: "Renamed", description: "What it's about" })).room)
+		expect(store.messages.mutate(op(clock, "tia", "tia-save", "room_set", { room_id: othersId, title: "Renamed", description: "What it's about" })).room)
 			.toMatchObject({ room_id: othersId, title: "Renamed", description: "What it's about" });
 
 		// Anyone's messages into the thread and back out, still theirs.
-		const moved = store.mutate(op(clock, "tia", "in-1", "message", resubmit(first.message, threadId)));
+		const moved = store.messages.mutate(op(clock, "tia", "in-1", "message", resubmit(first.message, threadId)));
 		expect(moved.message).toMatchObject({ room_id: threadId, prev_room_id: "general", from: { user_id: "alice" }, body: first.message!.body });
-		expect(store.mutate(op(clock, "tia", "in-2", "message", resubmit(second.message, threadId))).message)
+		expect(store.messages.mutate(op(clock, "tia", "in-2", "message", resubmit(second.message, threadId))).message)
 			.toMatchObject({ room_id: threadId, from: { user_id: "bob" } });
-		expect(store.mutate(op(clock, "tia", "out-1", "message", resubmit(moved.message, "general"))).message)
+		expect(store.messages.mutate(op(clock, "tia", "out-1", "message", resubmit(moved.message, "general"))).message)
 			.toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
 
 		// Moving only: no edits to someone else's message.
-		expect(errorCode(() => store.mutate(op(clock, "tia", "edit", "message", { ...resubmit(second.message, threadId), body: { text: "threader edit" } })))).toBe("denied");
-		expect(errorCode(() => store.mutate(op(clock, "tia", "delete", "message", { message_id: second.message!.message_id, room_id: threadId, deleted: true })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "tia", "edit", "message", { ...resubmit(second.message, threadId), body: { text: "threader edit" } })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "tia", "delete", "message", { message_id: second.message!.message_id, room_id: threadId, deleted: true })))).toBe("denied");
 
 		// Without the role, no moves.
-		store.setRole({ userId: "tia", role: "threader", on: false, now: clock.value });
-		expect(errorCode(() => store.mutate(op(clock, "tia", "after", "message", resubmit(second.message, "general"))))).toBe("denied");
+		store.accounts.setRole({ userId: "tia", role: "threader", on: false, now: clock.value });
+		expect(errorCode(() => store.messages.mutate(op(clock, "tia", "after", "message", resubmit(second.message, "general"))))).toBe("denied");
 	});
 });
 
 it("lets an owner's bot move anyone's messages with threader, but not with mod or admin", async () => {
 	await withStore("bot-threader", (store, clock) => {
-		store.createInvitedIdentity({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
-		store.registerBot({ ownerId: "owner", botId: "bot_owner", name: "Bot of owner", now: clock.value, ipKey: "ip-test" });
+		store.accounts.createInvited({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
+		store.accounts.registerBot({ ownerId: "owner", botId: "bot_owner", name: "Bot of owner", now: clock.value, ipKey: "ip-test" });
 		const posted = post(store, clock, "alice", "start", { body: { text: "start" } }).message!;
 		const threadId = thread(store, clock, "side");
-		const move = (requestId: string, roomId: string) => store.mutate(op(clock, "bot_owner", requestId, "message", { message_id: posted.message_id, room_id: roomId, body: posted.body }));
+		const move = (requestId: string, roomId: string) => store.messages.mutate(op(clock, "bot_owner", requestId, "message", { message_id: posted.message_id, room_id: roomId, body: posted.body }));
 
 		// `mod` is a label on an owner's bot.
-		store.setRole({ userId: "bot_owner", role: "mod", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "bot_owner", role: "mod", on: true, now: clock.value });
 		expect(errorCode(() => move("as-mod", threadId))).toBe("denied");
 
 		// `threader` moves anyone's message, still theirs, and changes nothing else.
-		store.setRole({ userId: "bot_owner", role: "threader", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "bot_owner", role: "threader", on: true, now: clock.value });
 		expect(move("in", threadId).message).toMatchObject({ room_id: threadId, prev_room_id: "general", from: { user_id: "alice" }, body: posted.body });
-		expect(errorCode(() => store.mutate(op(clock, "bot_owner", "edit", "message", { message_id: posted.message_id, room_id: "general", body: { text: "bot edit" } })))).toBe("denied");
+		expect(errorCode(() => store.messages.mutate(op(clock, "bot_owner", "edit", "message", { message_id: posted.message_id, room_id: "general", body: { text: "bot edit" } })))).toBe("denied");
 		expect(move("out", "general").message).toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
 
-		store.setRole({ userId: "bot_owner", role: "threader", on: false, now: clock.value });
+		store.accounts.setRole({ userId: "bot_owner", role: "threader", on: false, now: clock.value });
 		expect(errorCode(() => move("after", threadId))).toBe("denied");
 	});
 });
 
 it("keeps a creator who may remove members for threads and private rooms only, and lets no bot own a bot", async () => {
 	await withStore("room-creator-scope", (store, clock) => {
-		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
-		const create = (requestId: string, params: Record<string, unknown>) => String(store.mutate(op(clock, "mia", requestId, "room_set", params)).result.room_id);
+		store.accounts.createInvited({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		const create = (requestId: string, params: Record<string, unknown>) => String(store.messages.mutate(op(clock, "mia", requestId, "room_set", params)).result.room_id);
 		// A mod's top-level room has no creator who may remove members; their thread and private room do.
-		expect(store.roomCreator(create("top", { title: "Random" }))).toBeUndefined();
-		expect(store.roomCreator(create("side", { parent_room_id: "general", title: "Side" }))).toBe("mia");
-		expect(store.roomCreator(create("dm", { private: true }))).toBe("mia");
-		expect(store.roomCreator("general")).toBeUndefined();
+		expect(store.rooms.creator(create("top", { title: "Random" }))).toBeUndefined();
+		expect(store.rooms.creator(create("side", { parent_room_id: "general", title: "Side" }))).toBe("mia");
+		expect(store.rooms.creator(create("dm", { private: true }))).toBe("mia");
+		expect(store.rooms.creator("general")).toBeUndefined();
 
 		// A user made a bot with /role owns no bot of its own.
-		store.createInvitedIdentity({ userId: "script", name: "script", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "script", role: "bot", on: true, now: clock.value });
-		expect(errorCode(() => store.registerBot({ ownerId: "script", botId: "bot_script", name: "Bot of script", now: clock.value, ipKey: "ip-test" }))).toBe("denied");
-		store.registerBot({ ownerId: "mia", botId: "bot_mia", name: "Bot of mia", now: clock.value, ipKey: "ip-test" });
-		expect(errorCode(() => store.registerBot({ ownerId: "bot_mia", botId: "bot_bot_mia", name: "Bot of bot", now: clock.value, ipKey: "ip-test" }))).toBe("denied");
+		store.accounts.createInvited({ userId: "script", name: "script", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "script", role: "bot", on: true, now: clock.value });
+		expect(errorCode(() => store.accounts.registerBot({ ownerId: "script", botId: "bot_script", name: "Bot of script", now: clock.value, ipKey: "ip-test" }))).toBe("denied");
+		store.accounts.registerBot({ ownerId: "mia", botId: "bot_mia", name: "Bot of mia", now: clock.value, ipKey: "ip-test" });
+		expect(errorCode(() => store.accounts.registerBot({ ownerId: "bot_mia", botId: "bot_bot_mia", name: "Bot of bot", now: clock.value, ipKey: "ip-test" }))).toBe("denied");
 	});
 });
 
 it("lets a bot rename itself only to a name with \"bot\" in it, in any case", async () => {
 	await withStore("bot-name", (store, clock) => {
-		store.createInvitedIdentity({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
-		store.registerBot({ ownerId: "owner", botId: "bot_owner", name: "Bot of owner", now: clock.value, ipKey: "ip-test" });
-		store.createInvitedIdentity({ userId: "script", name: "script", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "script", role: "bot", on: true, now: clock.value });
-		const rename = (userId: string, requestId: string, name: string) => store.mutate(op(clock, userId, requestId, "me", { name }));
+		store.accounts.createInvited({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
+		store.accounts.registerBot({ ownerId: "owner", botId: "bot_owner", name: "Bot of owner", now: clock.value, ipKey: "ip-test" });
+		store.accounts.createInvited({ userId: "script", name: "script", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "script", role: "bot", on: true, now: clock.value });
+		const rename = (userId: string, requestId: string, name: string) => store.messages.mutate(op(clock, userId, requestId, "me", { name }));
 		for (const userId of ["bot_owner", "script"]) {
 			for (const name of ["Threader", ""]) expect(errorCode(() => rename(userId, `${userId}-no-${name}`, name))).toBe("denied");
 			rename(userId, `${userId}-yes`, "Threader BOT");
-			expect(store.getIdentity(userId)?.name).toBe("Threader BOT");
+			expect(store.accounts.get(userId)?.name).toBe("Threader BOT");
 		}
 		// Anyone else names themselves freely.
 		rename("owner", "owner-rename", "Owner");
-		expect(store.getIdentity("owner")?.name).toBe("Owner");
+		expect(store.accounts.get("owner")?.name).toBe("Owner");
 	});
 });
 
 it("lets every moderator role, the built-in admin included, move anyone's message with embeds, an upload and ext, thread to thread", async () => {
 	await withStore("move-any-content", (store, clock) => {
-		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
-		store.createInvitedIdentity({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
-		store.createInvitedIdentity({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
-		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
-		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
-		store.ensureAdminUser({ userId: ADMIN_USER_ID, name: "Admin", now: clock.value, ipKey: "ip-test" });
-		store.registerIdentity({
+		store.accounts.createInvited({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.createInvited({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
+		store.accounts.createInvited({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.accounts.ensureAdmin({ userId: ADMIN_USER_ID, name: "Admin", now: clock.value, ipKey: "ip-test" });
+		store.accounts.register({
 			userId: "rita", name: "rita", userHandle: "handle-rita", now: clock.value, ipKey: "ip-test",
 			credential: { credentialId: "cred-rita", userId: "rita", publicKey: "AAAA", counter: 0 },
 		});
@@ -915,8 +919,8 @@ it("lets every moderator role, the built-in admin included, move anyone's messag
 			ext: { irc: { nick: "rita_" } },
 		});
 		const key = (created.result.embeds as Array<{ write: { key: string } }>)[0].write.key;
-		expect(store.claimUpload(key, clock.value)).toBe(true);
-		const finished = store.finishUpload({ key, ok: true, bytes: 64, contentType: "image/png", width: 1, height: 1 }, clock.value);
+		expect(store.uploads.claim(key, clock.value)).toBe(true);
+		const finished = store.uploads.finish({ key, ok: true, bytes: 64, contentType: "image/png", width: 1, height: 1 }, clock.value);
 		const guest = post(store, clock, "guest_7", "guest", { body: { text: "a guest's" } });
 		const first = thread(store, clock, "first");
 		const second = thread(store, clock, "second");
@@ -926,24 +930,24 @@ it("lets every moderator role, the built-in admin included, move anyone's messag
 		for (const mover of ["tia", "mia", "ada", ADMIN_USER_ID]) {
 			let current = finished.broadcasts[0].params;
 			for (const roomId of [first, second, "general"]) {
-				current = store.mutate(op(clock, mover, `${mover}-${roomId}`, "message", resubmit(current, roomId))).message as unknown as Record<string, unknown>;
+				current = store.messages.mutate(op(clock, mover, `${mover}-${roomId}`, "message", resubmit(current, roomId))).message as unknown as Record<string, unknown>;
 				expect(current).toMatchObject({ room_id: roomId, from: { user_id: "rita" }, body: finished.broadcasts[0].params.body, ext: { irc: { nick: "rita_" } } });
 			}
-			const moved = store.mutate(op(clock, mover, `${mover}-guest-in`, "message", resubmit(guest.message as unknown as Record<string, unknown>, first))).message!;
+			const moved = store.messages.mutate(op(clock, mover, `${mover}-guest-in`, "message", resubmit(guest.message as unknown as Record<string, unknown>, first))).message!;
 			expect(moved).toMatchObject({ room_id: first, from: { user_id: "guest_7" } });
-			store.mutate(op(clock, mover, `${mover}-guest-out`, "message", resubmit(moved as unknown as Record<string, unknown>, "general")));
+			store.messages.mutate(op(clock, mover, `${mover}-guest-out`, "message", resubmit(moved as unknown as Record<string, unknown>, "general")));
 		}
 	}, { ...ROOMY, uploads: { ...UPLOAD_POLICY!, mediaOrigin: "https://media.test" } });
 });
 
 it("lets an admin or a mod create and edit top-level rooms, which hold threads and count against the thread ceiling", async () => {
 	await withStore("room-creators", (store, clock) => {
-		const invite = (userId: string) => store.createInvitedIdentity({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
+		const invite = (userId: string) => store.accounts.createInvited({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
 		for (const userId of ["mia", "ada", "tia", "reg"]) invite(userId);
-		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
-		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
-		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
-		const create = (userId: string, requestId: string, params: Record<string, unknown> = {}) => store.mutate(op(clock, userId, requestId, "room_set", params));
+		store.accounts.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.accounts.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		const create = (userId: string, requestId: string, params: Record<string, unknown> = {}) => store.messages.mutate(op(clock, userId, requestId, "room_set", params));
 
 		// A guest, a registered user, and a threader create threads, not rooms.
 		for (const userId of ["alice", "reg", "tia"]) expect(errorCode(() => create(userId, `${userId}-room`, { title: "Mine" }))).toBe("denied");
@@ -956,39 +960,39 @@ it("lets an admin or a mod create and edit top-level rooms, which hold threads a
 		expect(made.membership?.params).toMatchObject({ room_id: made.room!.room_id });
 		const roomId = String(made.result.room_id);
 		expect(create("ada", "ada-room").room).toMatchObject({ title: "Room" });
-		expect(store.topLevelRoomIds()).toEqual(["general", roomId, expect.any(String)]);
+		expect(store.rooms.topLevelIds()).toEqual(["general", roomId, expect.any(String)]);
 
 		// Anyone may start a thread in it; only an admin or mod may edit it, and only an admin general.
 		const threadId = String(create("alice", "alice-thread", { parent_room_id: roomId, title: "Side" }).result.room_id);
-		expect(store.getRoom(threadId)?.parent_room_id).toBe(roomId);
+		expect(store.rooms.get(threadId)?.parent_room_id).toBe(roomId);
 		expect(errorCode(() => create("alice", "nested", { parent_room_id: threadId }))).toBe("denied");
 		for (const userId of ["alice", "reg", "tia"]) expect(errorCode(() => create(userId, `${userId}-edit`, { room_id: roomId, title: "Taken" }))).toBe("denied");
 		expect(create("ada", "ada-edit", { room_id: roomId, title: "Random chat" }).room).toMatchObject({ room_id: roomId, title: "Random chat" });
 		for (const userId of ["alice", "reg", "tia", "mia"]) expect(errorCode(() => create(userId, `${userId}-general`, { room_id: "general", title: "Taken" }))).toBe("denied");
 		expect(create("ada", "general-edit", { room_id: "general", title: "Lobby", description: "Say hi" }).room)
 			.toMatchObject({ room_id: "general", title: "Lobby", description: "Say hi" });
-		expect(store.getRoom("general")).toMatchObject({ title: "Lobby", description: "Say hi" });
+		expect(store.rooms.get("general")).toMatchObject({ title: "Lobby", description: "Say hi" });
 		// A blank title falls back to general's own.
 		expect(create("ada", "general-reset", { room_id: "general", title: " " }).room).toMatchObject({ title: "General" });
 
 		// A role taken away takes the permission with it.
-		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
+		store.accounts.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
 		expect(errorCode(() => create("mia", "mia-after", { title: "Again" }))).toBe("denied");
 		expect(errorCode(() => create("mia", "mia-edit-after", { room_id: roomId, title: "Again" }))).toBe("denied");
 	});
 	// Rooms and threads share the ceiling, and rooms have their own cap within it.
 	await withStore("room-ceiling", (store, clock) => {
-		store.createInvitedIdentity({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
-		store.mutate(op(clock, "ada", "room", "room_set", { title: "Only" }));
+		store.accounts.createInvited({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.messages.mutate(op(clock, "ada", "room", "room_set", { title: "Only" }));
 		expect(errorCode(() => thread(store, clock, "thread"))).toBe("denied");
 	}, { ...ROOMY, maxThreads: 1 });
 	await withStore("room-cap", (store, clock) => {
-		store.createInvitedIdentity({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
-		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
-		for (let index = 0; index < MAX_CREATED_ROOMS; index += 1) store.mutate(op(clock, "ada", `room-${index}`, "room_set", { title: `Room ${index}` }));
+		store.accounts.createInvited({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
+		store.accounts.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		for (let index = 0; index < MAX_CREATED_ROOMS; index += 1) store.messages.mutate(op(clock, "ada", `room-${index}`, "room_set", { title: `Room ${index}` }));
 		try {
-			store.mutate(op(clock, "ada", "one-more", "room_set", { title: "One more" }));
+			store.messages.mutate(op(clock, "ada", "one-more", "room_set", { title: "One more" }));
 			expect.unreachable();
 		} catch (error) {
 			expect((error as StoreError).message).toBe("room_limit");
