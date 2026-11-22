@@ -14,6 +14,7 @@ import { GUEST_NUMBER_BLOCK_COST, MAX_SAFE_ID } from "./limits";
 import { META_ATTACK_PAUSE, META_GUEST_NUMBER_MARK, META_THROTTLE_TRIPS } from "./meta";
 import { bucketOf, bucketRow, dayCount, dayFor, integerColumn } from "./rows";
 import type { Tier } from "./types";
+import { WAITING_TIER } from "../domain";
 import type { Sql, StoreCore } from "./core";
 
 /** Admission control over the store's core: the Admission part's implementation, and the charges the commit path makes. */
@@ -98,7 +99,9 @@ export class AdmissionModule {
    * `me` request, which the `write` row does not list.
    */
   chargePosting(sql: Sql, input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number; uncategorized?: boolean }): void {
-    const { userId, tier, ipKey, now } = input;
+    const { userId, ipKey, now } = input;
+    // A waiting account posts under the guests' limits until welcomed in (restrictedViewer).
+    const tier: Tier = input.tier === "registered" && sql.lobbyRoom() !== null && sql.identityRow(userId)?.tier === WAITING_TIER ? "anonymous" : input.tier;
     const weight = Math.max(1, input.weight ?? 1);
     const trusted = tier === "registered" && sql.holdsAnyRole(userId);
     const perUser = trusted

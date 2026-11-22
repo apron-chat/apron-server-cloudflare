@@ -54,6 +54,8 @@ declare global {
 		TERMINAL_VIEWER_URL?: string;
 		ACTIVITY?: string;
 		GUEST_POSTING?: string;
+		ACCESS?: string;
+		LOBBY_ROOM?: string;
 		PRESENCE?: string;
 		APRON_ADMIN_TOKEN?: string;
 		ENVIRONMENT?: string;
@@ -110,6 +112,8 @@ declare global {
 			TERMINAL_VIEWER_URL?: string;
 			ACTIVITY?: string;
 			GUEST_POSTING?: string;
+			ACCESS?: string;
+			LOBBY_ROOM?: string;
 			PRESENCE?: string;
 			APRON_ADMIN_TOKEN?: string;
 			ENVIRONMENT?: string;

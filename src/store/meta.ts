@@ -101,6 +101,25 @@ export const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_rec
  */
 export const META_TOGGLE_PREFIX = "toggle:";
 /**
+ * `_meta` key naming the lobby rooms (ensureLobbyRoom), a JSON list (or,
+ * as first written, one id), kept once made or adopted, whatever the mode
+ * or LOBBY_ROOM later: each stays outside the created-room caps
+ * (room_limit and the thread ceiling) for good. At most MAX_LOBBY_ROOMS.
+ */
+export const META_LOBBY_ROOM = "lobby_room";
+
+/** The lobby rooms kept in `_meta` (META_LOBBY_ROOM): a JSON list, or one id as first written. */
+export function parseLobbyRooms(value: string, max: number): string[] {
+  if (!value) return [];
+  if (!value.startsWith("[")) return [value];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && id.length > 0).slice(0, max) : [];
+  } catch {
+    return [];
+  }
+}
+/**
  * `_meta` key: when an admin last turned presence on with `/toggle`
  * (epoch milliseconds), when the status others see of every user changed
  * from `""` and so, for each user then shown `offline`, when that began

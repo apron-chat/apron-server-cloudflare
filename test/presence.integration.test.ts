@@ -470,8 +470,8 @@ describe('the status a user chooses (§4.5)', () => {
 			expect(told(await drain(observer), visitorId)).toEqual(['offline']);
 			// Never stored, a guest listed only because connected would show it is: left out.
 			expect((await listing(observer)).has(visitorId)).toBe(false);
-			// Guests still may not rename themselves.
-			expect((await request(visitor, 'rename', 'me', { name: 'Visitor', status: 'online' })).error.code).toBe(-32001);
+			// A guest's name is kept on its connection too, and leaves its status as it was.
+			expect((await request(visitor, 'rename', 'me', { name: 'Visitor' })).result.you).toMatchObject({ name: 'Visitor', status: 'invisible' });
 			expect((await request(visitor, 'check', 'me', {})).result.you.status).toBe('invisible');
 		} finally { observer.close(); visitor.close(); }
 	});
@@ -1287,22 +1287,29 @@ describe('a guest connection signing in (§3.3)', () => {
 		return { ...visitor, frames };
 	}
 
-	it('links the guest to a new account with old: passkey registration and invite sign-up', async () => {
+	it('makes a new account from a guest connection a new user: no old link, the account arrives and the guest departs', async () => {
 		const watcherId = unique('watcher');
 		const watcher = await signedIn(watcherId);
 		const peers: Peer[] = [watcher];
 		try {
-			// Passkey registration: the same person under a new user_id.
+			// Passkey registration: a separate user, decoupled from the guest (shazow/apron#137).
 			const registering = await toldGuest(watcher);
 			peers.push(registering.peer);
 			const { finished } = await registerPasskey(registering.peer, 'new-account');
 			const accountId = finished.frame.result.you.user_id;
-			const linked = links(await drain(watcher));
-			expect(linked).toHaveLength(1);
-			expect(linked[0].params.old.user_id).toBe(registering.userId);
-			expect(linked[0].params.new.user_id).toBe(accountId);
+			const after = await drain(watcher);
+			expect(links(after)).toEqual([]);
+			// The account arrives: its logged join, its profile, and its status.
+			expect(after.some((frame) => frame.method === 'room_update' && frame.params.memberships?.some((record: { members: Array<{ user: { user_id: string }; joined: boolean }> }) => record.members[0].user.user_id === accountId && record.members[0].joined))).toBe(true);
+			expect(after.some((frame) => frame.method === 'user' && frame.params.new?.user_id === accountId && frame.params.new.roles !== undefined)).toBe(true);
+			expect(told(after, accountId)).toEqual(['online']);
+			// The guest departs like a guest that disconnects: offline, after the grace.
+			expect(told(after, registering.userId)).toEqual([]);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(told(await drain(watcher), registering.userId)).toEqual(['offline']);
+			expect((await listing(watcher)).has(registering.userId)).toBe(false);
 
-			// Sign-up invite: a new account too.
+			// Sign-up invite: the same.
 			await forgetAnnouncements();
 			const joining = await toldGuest(watcher);
 			peers.push(joining.peer);
@@ -1311,10 +1318,11 @@ describe('a guest connection signing in (§3.3)', () => {
 			await runInDurableObject(stub(), (_instance, state) => state.storage.put(inviteKey, { v: 1, remaining: 1, expiresMs: Date.now() + 3_600_000 }));
 			const joined = await request(joining.peer, 'join', 'auth', { scheme: 'token', token: invite, name: 'Joiner' });
 			expect(joined.error, JSON.stringify(joined.error)).toBeUndefined();
-			const joinedLinks = links(await drain(watcher));
-			expect(joinedLinks).toHaveLength(1);
-			expect(joinedLinks[0].params.old.user_id).toBe(joining.userId);
-			expect(joinedLinks[0].params.new.user_id).toBe(joined.result.you.user_id);
+			const joinedAfter = await drain(watcher);
+			expect(links(joinedAfter)).toEqual([]);
+			expect(joinedAfter.some((frame) => frame.method === 'user' && frame.params.new?.user_id === joined.result.you.user_id && frame.params.new.name === 'Joiner')).toBe(true);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(told(await drain(watcher), joining.userId)).toEqual(['offline']);
 		} finally { for (const peer of peers) peer.close(); }
 	}, 20_000);
 

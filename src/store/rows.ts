@@ -249,6 +249,7 @@ export function emojiObjectKey(json: string): string {
 /** One `roomMembers` row, with the chosen status and `seen` when asked for. */
 export interface RawMemberRow {
   user_id: string;
+  tier?: string | null;
   name: string | null;
   avatar_url: string | null;
   avatar_expires_ms: number | null;

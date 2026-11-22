@@ -27,7 +27,7 @@ export class RoomCapsModule {
 
   /** Rows the rooms table holds (`general`, the public rooms counted by thread_count, the private ones): what a scan of every room reads. */
   roomRowCount(sql: Sql): number {
-    return 1 + sql.metaNumber("thread_count") + sql.metaNumber("private_count");
+    return 1 + sql.lobbyRoomIds().length + sql.metaNumber("thread_count") + sql.metaNumber("private_count");
   }
 
   /**
@@ -40,7 +40,13 @@ export class RoomCapsModule {
     const cutoff = this.creationCutoff(now);
     const count = (query: string, ...bindings: unknown[]) => integerColumn(sql.rows<{ count: number }>(query, ...bindings)[0]?.count);
     if (kind === "private") return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(2)} AND created_log_id >= ?`, cutoff);
-    return count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(0)} AND created_log_id >= ? AND room_id != ?`, cutoff, ROOM_ID) +
+    // `general` and every lobby room are outside the caps (the one plain
+    // comparison where the object never had a lobby).
+    const lobbies = sql.lobbyRoomIds();
+    const topLevel = lobbies.length
+      ? count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(0)} AND created_log_id >= ? AND room_id NOT IN (SELECT value FROM json_each(?))`, cutoff, JSON.stringify([ROOM_ID, ...lobbies]))
+      : count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(0)} AND created_log_id >= ? AND room_id != ?`, cutoff, ROOM_ID);
+    return topLevel +
       count(`SELECT COUNT(*) AS count FROM rooms WHERE ${roomKind(1)} AND created_log_id >= ?`, cutoff);
   }
 

@@ -477,8 +477,8 @@ it('rejects operations guests may not perform', async () => {
 		await authenticate(peer);
 		await authenticate(other);
 		expect((await request(peer, 'top-level', 'room_set', { title: 'Top level' })).error.code).toBe(-32001);
-		// Guests keep their assigned name.
-		expect((await request(peer, 'rename', 'me', { name: 'Ada' })).error.code).toBe(-32001);
+		// Guests may name themselves (test/guest-names.integration.test.ts).
+		expect((await request(peer, 'rename', 'me', { name: 'Ada' })).result.you.name).toBe('Ada');
 		expect((await request(other, 'unknown-history', 'history', { room_id: 'missing' })).error.code).toBe(-32602);
 		expect((await request(other, 'join-missing', 'room_join', { room_id: 'missing' })).error.code).toBe(-32602);
 		expect((await request(peer, 'leave-missing', 'room_leave', { room_id: 'missing' })).error.code).toBe(-32602);

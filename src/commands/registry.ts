@@ -14,7 +14,7 @@
  * say what it acted on.
  */
 import type { ProtocolError } from "../protocol";
-import type { AuditDetails, AuditSink } from "./audit";
+import { auditField, type AdminOutcome, type AuditDetails, type AuditSink } from "./audit";
 import { type AdminCapability, assertAdmin, assertRoles, authorizeAdmin, authorizeRoles, holdsRole, isAdmin, isOwner, type CommandIdentity, type RoleCapability } from "./capability";
 
 /** Who may run a command: anyone, registered users (bots included), owners (registered users but bots), or admins. */
@@ -143,6 +143,12 @@ export interface AdminSpec<C extends ScopeBase, Args> extends SpecBase<C, Args> 
 export interface RoleSpec<C extends ScopeBase, Args> extends SpecBase<C, Args> {
 	roles: readonly string[];
 	run(ctx: C & { readonly grant: RoleCapability }, args: Args): Promise<void> | void;
+	/**
+	 * With it, each run is audited as an admin command is, one `admin_action`
+	 * event (refused, failed or ok), saying what it acted on: for a
+	 * moderation command such as `/lobby`.
+	 */
+	audit?(args: Args): AuditDetails;
 }
 
 /** A command anyone in its audience runs with no capability. */
@@ -184,6 +190,8 @@ export interface Command<C extends ScopeBase> {
 	readonly roles?: readonly string[];
 	readonly usageErrors: "reply" | "violation";
 	readonly posting: boolean;
+	/** Whether a role-gated command's runs are audited (RoleSpec.audit); admin commands always are. */
+	readonly audited?: boolean;
 	available(runtime: C["runtime"]): boolean;
 	/** Its forms as listed, with their hints for `runtime`: those offered to `identity`, or every one without it. */
 	forms(runtime: C["runtime"], identity?: CommandIdentity): ListedForm[];
@@ -280,6 +288,7 @@ function seal<C extends ScopeBase, Args>(
 		.map((form) => listedForm(spec.name, group, form, runtime));
 	return Object.freeze({
 		name: spec.name, formNames: Object.freeze(spec.forms.map((form) => formName(spec.name, form))), audience, ...(roles ? { roles } : {}), usageErrors: spec.usageErrors, posting,
+		...(audience === "owners" && audit ? { audited: true } : {}),
 		available: (runtime: C["runtime"]) => spec.available?.(runtime) ?? true,
 		forms,
 		usage: (runtime: C["runtime"]) => formsUsage(forms(runtime)),
@@ -311,7 +320,7 @@ function helpersFor<C extends ScopeBase>(): CommandHelpers<C> {
 			return seal(gated, "owners", gated.roles, false, (args) => (ctx, grants) => {
 				assertRoles(grants.roles, gated.roles);
 				return gated.run({ ...ctx, grant: grants.roles }, args);
-			});
+			}, gated.audit);
 		},
 		registeredCommand: (spec) => seal(spec, "registered", undefined, false, (args) => (ctx) => spec.run(ctx, args)),
 		publicCommand: (spec) => seal(spec, "everyone", undefined, spec.posting === true, (args) => (ctx) => spec.run(ctx, args)),
@@ -454,11 +463,35 @@ export async function dispatchCommand<C extends ScopeBase>(
 		host.fail({ name: "invalid_params", message: message.slice(0, 200) });
 		return;
 	}
-	const grants = authorize(command, identity, host);
+	// A role-gated command with an audit is recorded as an admin command is (RoleSpec.audit).
+	const at = host.now;
+	const record = (outcome: AdminOutcome, details: AuditDetails, reason?: string): void => {
+		if (!command.audited) return;
+		const target = auditField(details.target);
+		const action = auditField(details.action);
+		try {
+			host.audit.record({
+				event: "admin_action", actor: identity.userId ?? "", command: command.name,
+				...(target !== undefined ? { target } : {}), ...(action !== undefined ? { action } : {}),
+				outcome, ...(reason !== undefined ? { reason } : {}), at,
+			});
+		} catch { /* the command's outcome stands */ }
+	};
+	let grants: Grants;
+	try {
+		grants = authorize(command, identity, host);
+	} catch (error) {
+		record("refused", {}, host.protocolOf(error).name);
+		throw error;
+	}
+	const settle = (outcome: "ok" | "failed", details: AuditDetails, reason?: string): void => {
+		grants.admin?.settle(outcome, details, reason);
+		record(outcome, details, reason);
+	};
 	let details: AuditDetails = {};
 	// Live text starts with its own commands, or in a message (§4.8.3).
 	if (hasLiveEmbed(body)) {
-		grants.admin?.settle("failed", details, "invalid_params");
+		settle("failed", details, "invalid_params");
 		throw { name: "invalid_params", message: "A terminal or append embed goes in a message; or use /embed-terminal or /embed-append" } satisfies ProtocolError;
 	}
 	// A `posting` command is refused to a sender who may not post, as its handler would.
@@ -476,12 +509,12 @@ export async function dispatchCommand<C extends ScopeBase>(
 		await prepared.run(ctx, grants);
 	} catch (error) {
 		const protocol = host.protocolOf(error);
-		grants.admin?.settle("failed", details, protocol.name);
+		settle("failed", details, protocol.name);
 		if (command.usageErrors === "reply" && protocol.name === "invalid_params") {
 			host.fail(protocol);
 			return;
 		}
 		throw error;
 	}
-	grants.admin?.settle("ok", details);
+	settle("ok", details);
 }

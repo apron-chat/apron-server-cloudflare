@@ -31,8 +31,19 @@ export interface RuntimeConfig {
 	admission: boolean;
 	/** Advertise and relay typing (cap `activity`); `ACTIVITY` overrides the plan's default. */
 	activityEnabled: boolean;
-	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
+	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. Only with `access` `public`. */
 	guestPosting: boolean;
+	/**
+	 * Who may see the server before an admin or mod lets them in (`ACCESS`,
+	 * default `public`): `public`, everyone, as guests or accounts;
+	 * `lobby`, newcomers (guests, and accounts they make themselves, which
+	 * wait) see only the lobby room (`lobbyRoom`) until welcomed with
+	 * `/welcome`; `private`, nobody but members, who join through invite
+	 * links (`/invite-code`, `/invite-token`).
+	 */
+	access: AccessMode;
+	/** The lobby room's `room_id` (`LOBBY_ROOM`, default `lobby`); used only with `access` `lobby`. */
+	lobbyRoom: string;
 	/**
 	 * User `status` shown to others (§4.5). `PRESENCE` overrides the plan's
 	 * default. It needs push, as capability `status` does.
@@ -151,6 +162,35 @@ export { hostListAllowed } from "./content/embeds.ts";
 import { hostListAllowed } from "./content/embeds.ts";
 
 /** Whether `PUSH_HOSTS` allows an endpoint host (lowercase, no trailing dot). */
+/** The server's access mode (`ACCESS`): see RuntimeConfig.access. */
+export type AccessMode = "public" | "lobby" | "private";
+
+/** The lobby room's default `room_id` (`LOBBY_ROOM`). */
+export const DEFAULT_LOBBY_ROOM = "lobby";
+
+/**
+ * A `LOBBY_ROOM`: 1 to 32 lowercase letters, digits, `_` or `-`, starting
+ * with a letter, so it can never be a thread's or created room's (decimal
+ * log IDs), `general`, or a private room's (`private_…`).
+ */
+const LOBBY_ROOM_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
+/** The access mode and lobby room from `ACCESS` and `LOBBY_ROOM`, validated (RuntimeConfig.access). */
+function loadAccess(env: EnvLike, guestPosting: string | undefined): { access: AccessMode; lobbyRoom: string } {
+	const raw = env.ACCESS === undefined || env.ACCESS === "" ? "public" : String(env.ACCESS).trim().toLowerCase();
+	if (raw !== "public" && raw !== "lobby" && raw !== "private") throw new ConfigError("ACCESS must be public, lobby or private");
+	const lobbyRoom = env.LOBBY_ROOM === undefined || env.LOBBY_ROOM === "" ? DEFAULT_LOBBY_ROOM : String(env.LOBBY_ROOM).trim();
+	if (!LOBBY_ROOM_PATTERN.test(lobbyRoom) || lobbyRoom === "general" || lobbyRoom.startsWith("private")) {
+		throw new ConfigError("LOBBY_ROOM must be 1 to 32 lowercase letters, digits, _ or -, starting with a letter, and not general or private…");
+	}
+	// Guest posting is the public mode's: in a lobby guests post in the lobby
+	// only, and a private server has no guests, so it would mean nothing.
+	if (raw !== "public" && guestPosting !== undefined && guestPosting !== "") {
+		throw new ConfigError(`GUEST_POSTING applies only with ACCESS=public; unset it for ACCESS=${raw}`);
+	}
+	return { access: raw, lobbyRoom };
+}
+
 export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string): boolean {
 	return hostListAllowed(hosts, host);
 }
@@ -271,6 +311,8 @@ type EnvLike = {
 	ADMISSION?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
+	ACCESS?: string;
+	LOBBY_ROOM?: string;
 	PRESENCE?: string;
 	PASSKEY_PAGE?: string;
 	SIGNAL_UNKNOWN_PASSKEYS?: string;
@@ -643,7 +685,8 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	// answers when it serves RP_ID's host (handleRelatedOrigins).
 	const admission = parseSwitch(env.ADMISSION, "ADMISSION", true);
 	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
-	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
+	const { access, lobbyRoom } = loadAccess(env, env.GUEST_POSTING === undefined ? undefined : String(env.GUEST_POSTING));
+	const guestPosting = access === "public" && parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
 	const passkeyPage = parseSwitch(env.PASSKEY_PAGE, "PASSKEY_PAGE", true);
 	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", false);
@@ -684,6 +727,8 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		admission,
 		activityEnabled,
 		guestPosting,
+		access,
+		lobbyRoom,
 		presence,
 		passkeyPage,
 		signalUnknownPasskeys,
