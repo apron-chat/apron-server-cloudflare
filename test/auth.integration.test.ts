@@ -2,7 +2,8 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { userIdSlug, WebAuthnService, type ChallengeRecord, type CredentialRepository } from '../src/auth';
 import { loadConfig } from '../src/config';
-import { MAX_PASSKEYS_PER_USER, Store } from '../src/store';
+import { MAX_PASSKEYS_PER_USER } from '../src/domain';
+import { type Store, openStore } from '../src/store';
 
 const encode = (text: string) => new TextEncoder().encode(text);
 const join = (...parts: Uint8Array[]): Uint8Array<ArrayBuffer> => {
@@ -38,16 +39,16 @@ function derSignature(raw: Uint8Array): Uint8Array<ArrayBuffer> {
 it('verifies signed ceremonies against SQLite identities and rejects challenge, origin, RP, UV, signature and duplicate failures', async () => {
 	await runInDurableObject(env.DEMO.getByName('auth-cryptographic-fixtures'), async (_instance, state) => {
 		const now = Date.now() + 1_000;
-		const store = new Store(state, {}, { now: () => now });
+		const store = openStore(state, {}, { now: () => now });
 		const service = new WebAuthnService(loadConfig({
 			ALLOWED_ORIGINS: 'https://chat.example.test', RP_ORIGINS: 'https://chat.example.test',
 			RP_ID: 'example.test',
 		}));
 		const repository: CredentialRepository = {
-			getCredential: id => store.getCredential(id),
-			getIdentity: id => { const row = store.getIdentity(id); return row ? { user_id: row.userId, name: row.name } : null; },
-			registerCredential: input => { const row = store.registerIdentity(input); return { user_id: row.userId, name: row.name }; },
-			updateCredentialCounter: (id, counter) => store.updateCredentialCounter(id, counter),
+			getCredential: id => store.credentials.get(id),
+			getIdentity: id => { const row = store.accounts.get(id); return row ? { user_id: row.userId, name: row.name } : null; },
+			registerCredential: input => { const row = store.accounts.register(input); return { user_id: row.userId, name: row.name }; },
+			updateCredentialCounter: (id, counter) => store.credentials.updateCounter(id, counter),
 		};
 		const key = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']) as CryptoKeyPair;
 		const publicKey = await crypto.subtle.exportKey('jwk', key.publicKey);
@@ -76,7 +77,7 @@ it('verifies signed ceremonies against SQLite identities and rejects challenge, 
 		expect(registered.identity.tier).toBe('registered');
 		expect(registered.identity.user_id).not.toBe('guest_original');
 		expect(registered.identity.user_id).toMatch(/^u_[A-Za-z0-9_-]{22}$/);
-		expect(store.getIdentity(registered.identity.user_id)?.userHandle).toBe(begun.challenge.userHandle);
+		expect(store.accounts.get(registered.identity.user_id)?.userHandle).toBe(begun.challenge.userHandle);
 		const duplicate = await service.begin('register', 'https://chat.example.test', now);
 		await expect(service.finish(duplicate.challenge, duplicate.challenge.challengeId, await registration(duplicate.challenge), repository, { now, ipKey: 'fixture-ip' })).rejects.toThrow();
 
@@ -103,19 +104,19 @@ it('verifies signed ceremonies against SQLite identities and rejects challenge, 
 		await expect(finish({ response: 'x'.repeat(16_385) })).rejects.toThrow('too large');
 		const accepted = await finish(await assertion());
 		expect(accepted.identity.user_id).toBe(registered.identity.user_id);
-		expect(store.getCredential(b64(credentialId))?.counter).toBe(1);
+		expect(store.credentials.get(b64(credentialId))?.counter).toBe(1);
 
 		// A requested name seeds the id, `<slug>_<4 digits>`, skipping taken ones.
-		const named = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { name: 'Foo', userIdTaken: id => store.identityExists(id) });
+		const named = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { name: 'Foo', userIdTaken: id => store.accounts.exists(id) });
 		expect(named.challenge.userId).toMatch(/^foo_\d{4}$/);
 		expect(named.challenge.userName).toBe('Foo');
-		expect(store.identityExists(registered.identity.user_id)).toBe(true);
+		expect(store.accounts.exists(registered.identity.user_id)).toBe(true);
 		const tried: string[] = [];
 		const crowded = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { name: 'Foo', userIdTaken: id => { tried.push(id); return true; } });
 		expect(tried).toHaveLength(8);
 		expect(crowded.challenge.userId).toMatch(/^u_/);
 		// Without a name, and no guest's to keep, a new account is a "Member" (not "Guest", which names guests).
-		const unnamed = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { userIdTaken: id => store.identityExists(id) });
+		const unnamed = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { userIdTaken: id => store.accounts.exists(id) });
 		expect(unnamed.challenge.userName).toBe('Member');
 		expect(unnamed.challenge.userId).toMatch(/^member_\d{4}$/);
 
@@ -143,25 +144,25 @@ it('derives user_id slugs from requested names', () => {
 it(`adds passkeys to a registered identity, at most ${MAX_PASSKEYS_PER_USER}, never a bot or one already registered`, async () => {
 	await runInDurableObject(env.DEMO.getByName('auth-add-passkeys'), async (_instance, state) => {
 		const now = Date.now() + 1_000;
-		const store = new Store(state, { registrationsPerIpDay: 100 }, { now: () => now });
+		const store = openStore(state, { registrationsPerIpDay: 100 }, { now: () => now });
 		const credential = (id: string) => ({ credentialId: id, userId: 'keeper', publicKey: 'AAAA', counter: 0 });
-		store.registerIdentity({ userId: 'keeper', name: 'Keeper', userHandle: 'keeper-handle', now, ipKey: 'ip', credential: credential('key-0') });
+		store.accounts.register({ userId: 'keeper', name: 'Keeper', userHandle: 'keeper-handle', now, ipKey: 'ip', credential: credential('key-0') });
 		for (let index = 1; index < MAX_PASSKEYS_PER_USER; index += 1) {
-			expect(store.addCredential({ userId: 'keeper', userHandle: 'ignored', now, ipKey: 'ip', credential: credential(`key-${index}`) })).toEqual({ userId: 'keeper', name: 'Keeper' });
+			expect(store.credentials.add({ userId: 'keeper', userHandle: 'ignored', now, ipKey: 'ip', credential: credential(`key-${index}`) })).toEqual({ userId: 'keeper', name: 'Keeper' });
 		}
-		expect(store.getIdentity('keeper')).toMatchObject({ credentialCount: MAX_PASSKEYS_PER_USER, userHandle: 'keeper-handle' });
-		expect(store.getCredential('key-3')?.userId).toBe('keeper');
+		expect(store.accounts.get('keeper')).toMatchObject({ credentialCount: MAX_PASSKEYS_PER_USER, userHandle: 'keeper-handle' });
+		expect(store.credentials.get('key-3')?.userId).toBe('keeper');
 		const code = (fn: () => unknown) => { try { fn(); return 'ok'; } catch (error) { return (error as { code?: string }).code; } };
-		expect(code(() => store.addCredential({ userId: 'keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-extra') }))).toBe('denied');
-		store.registerIdentity({ userId: 'other', name: 'Other', userHandle: 'other-handle', now, ipKey: 'ip', credential: { ...credential('other-0'), userId: 'other' } });
-		expect(code(() => store.addCredential({ userId: 'other', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-1') }))).toBe('denied');
+		expect(code(() => store.credentials.add({ userId: 'keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-extra') }))).toBe('denied');
+		store.accounts.register({ userId: 'other', name: 'Other', userHandle: 'other-handle', now, ipKey: 'ip', credential: { ...credential('other-0'), userId: 'other' } });
+		expect(code(() => store.credentials.add({ userId: 'other', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-1') }))).toBe('denied');
 		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_keeper', '', 'Bot', 'bot', 1, 1)");
-		expect(code(() => store.addCredential({ userId: 'bot_keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('bot-key') }))).toBe('denied');
+		expect(code(() => store.credentials.add({ userId: 'bot_keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('bot-key') }))).toBe('denied');
 		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', '', 'Admin', 'registered', 1, 1)");
-		expect(code(() => store.addCredential({ userId: 'admin', userHandle: 'x', now, ipKey: 'ip', credential: credential('admin-key') }))).toBe('denied');
+		expect(code(() => store.credentials.add({ userId: 'admin', userHandle: 'x', now, ipKey: 'ip', credential: credential('admin-key') }))).toBe('denied');
 		// An identity without a passkey (an invited user) takes the handle of its first.
 		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('invited', '', 'Invited', 'registered', 1, 1)");
-		store.addCredential({ userId: 'invited', userHandle: 'invited-handle', now, ipKey: 'ip', credential: credential('invited-key') });
-		expect(store.getIdentity('invited')).toMatchObject({ credentialCount: 1, userHandle: 'invited-handle' });
+		store.credentials.add({ userId: 'invited', userHandle: 'invited-handle', now, ipKey: 'ip', credential: credential('invited-key') });
+		expect(store.accounts.get('invited')).toMatchObject({ credentialCount: 1, userHandle: 'invited-handle' });
 	});
 });

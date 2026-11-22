@@ -39,8 +39,8 @@ export interface BudgetCost {
   maintenance?: boolean;
   /** The excess already noted and charged (Store.assertReservation), so a later check adds only rows past it. */
   overrun?: { reads: number; writes: number };
-  /** Where the reservation was made: the stack an overrun or breaker is named from (Store.operationName). */
-  site?: Error;
+  /** The operation the reservation is for, which an overrun or breaker is named after (SqliteStore.reserveCost). */
+  operation?: string;
 }
 
 export interface BudgetSnapshot extends BudgetCost {
@@ -253,6 +253,31 @@ export class BudgetLedger {
     const day = dayFor(at);
     if (!this.cached || this.cachedDay !== day) return;
     this.check(this.reservationCost({ reads: 64, writes: 32, admissions: 1 }, day), false, at);
+  }
+
+  /**
+   * Refuses as reserve would refuse `input` at `at`, with no SQL and nothing
+   * reserved: against the cached row, or, on a day after the cached one
+   * (past a UTC midnight), against the new day's row as reserve would make
+   * it, empty, with the handover reserve would add. Returns whether it could
+   * answer: with no row cached (no reservation since a wake, a start or a
+   * forget) it can't without reading one, and returns false, so the caller
+   * reserves for real instead.
+   */
+  checkReservation(input: CostEstimate, at: number, maintenance: boolean): boolean {
+    const day = dayFor(at);
+    if (!this.cached || !this.cachedDay || day < this.cachedDay) return false;
+    if (day === this.cachedDay) {
+      this.check(this.reservationCost(input, day), maintenance, at);
+      return true;
+    }
+    const cost = this.reservationCost(input, day);
+    if (!this.handoverPending) {
+      cost.reads += 8;
+      cost.writes += 8;
+    }
+    this.check(cost, maintenance, at, { day, ...Object.fromEntries(BUDGET_COLUMNS.map((column) => [column, 0])) } as RawBudgetRow);
+    return true;
   }
 
   /**
@@ -475,8 +500,7 @@ export class BudgetLedger {
     return cost;
   }
 
-  private check(cost: BudgetCost, maintenance: boolean, at: number): void {
-    const row = this.cached!;
+  private check(cost: BudgetCost, maintenance: boolean, at: number, row: RawBudgetRow = this.cached!): void {
     const limits = this.limits;
     if (cost.history > 0 && row.history_reserved + cost.history > limits.historyRequestsPerDay) {
       // A refusal like any other: no SQL, and the SQL budget stays for everything else.

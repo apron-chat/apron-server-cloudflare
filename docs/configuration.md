@@ -824,7 +824,7 @@ What grows with the rooms kept, and its bounds:
   `src/budget.ts`); a maintenance listing the 400 most recently
   active private rooms. An older thread is still listed by its `room_id`
   (`room_list` with `room_id`) and read by `history`, and an export names
-  every room (`Store.allRooms`, read in pages).
+  every room (`SqliteStore.allRooms`, read in pages).
 - A registered user may be a member of at most 1,000 rooms
   (`MAX_MEMBERSHIPS_PER_USER`, in `src/budget.ts`): a join past it, or
   creating a room, which joins its creator, is `denied` ("A user may be in at
@@ -1265,7 +1265,7 @@ implementation and recalibrating its resource model.
 ### Server tiers
 
 The server refuses work in tiers, each scoped and timed by what fires it,
-and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
+and each lifting by itself (`src/store/sqlite-store.ts`, `ApronDemoServer.currentTier`):
 
 | Tier | Fires on | Does | Lifts |
 | --- | --- | --- | --- |
@@ -1354,7 +1354,7 @@ guest who is reading, and never for an address whose own guest was evicted
 in the last 10 minutes, so evictions cannot cascade.
 
 **Account upkeep.** The alarm removes registered accounts inactive for
-`idleAccountSeconds` (30 days; `Store.pruneIdleIdentities`), least recently
+`idleAccountSeconds` (30 days; `SqliteStore.pruneIdleIdentities`), least recently
 active first, 100 a run and at most 10 runs a UTC day, so a backlog spreads
 over days. It removes none until activity has been recorded for that long
 (`idle_activity_since` in `_meta`, set by its first run): sign-ins were not
@@ -1395,7 +1395,9 @@ operation within an hour, or one past a hundredth of a day's SQL ceilings
 (an estimate that wrong may be unbounded), open its *breaker*: that one
 operation gets `retry_after` (`data.reason` `operation_paused`) for an hour
 (`BREAKER_MS`), announced as it opens and closes; everything else works.
-An operation is named by the Store method that made its reservation.
+An operation is named by the `SqliteStore` method that made its reservation
+(`src/store/sqlite-store.ts`), by its own name: `getIdentity` for the
+store's `accounts.get`.
 Maintenance work, operator alerts, admin commands and the operations every
 request passes through (frames, admission, room lookup) are never refused
 by a breaker; their overruns are still charged, logged and told. Nor are
@@ -1476,7 +1478,7 @@ under [Budget guard](#budget-guard)), naming the public rooms holding the
 most past the minimum, so they know which to shorten. All three are set in the `[vars]` of `wrangler.toml` and
 `wrangler.production.toml` (`LIMIT_ROOM_METADATA_BYTES`, `LIMIT_ROOM_METADATA_MIN_BYTES`,
 `LIMIT_ROOM_METADATA_TOTAL_BYTES`). A user's `ext` is at most 512 bytes serialized
-(`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
+(`MAX_USER_EXT_BYTES` in `src/content/user.ts`, not configurable: every connection
 of the user carries it in its attachment). The `anonymous*` variables
 configure the guest tier (the `guest` auth scheme).
 

@@ -1,10 +1,11 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { Store } from '../src/store';
+import type { LiveText, Store } from '../src/store';
 import { connect, request } from './helpers/socket';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { recordMetric } from '../src/metrics';
 import { StallMeter } from '../src/stalls';
+import { sqliteOf } from "../src/store/open";
 
 type Runtime = { store: Store };
 
@@ -17,11 +18,11 @@ it('tells the admins of the day\'s first overrun, and the server stays open', as
 	await runInDurableObject(stub, (instance, state) => {
 		const store = (instance as unknown as Runtime).store;
 		const now = Date.now();
-		store.registerIdentity({
+		store.accounts.register({
 			userId: bossId, name: 'Boss', userHandle: `handle-${bossId}`, now, ipKey: `ip-${bossId}`,
 			credential: { credentialId: `cred-${bossId}`, userId: bossId, publicKey: 'AAAA', counter: 0 },
 		});
-		store.setRole({ userId: bossId, role: 'admin', on: true });
+		store.accounts.setRole({ userId: bossId, role: 'admin', on: true });
 		state.storage.transactionSync(() => {
 			for (let index = 1; index <= 100; index += 1) {
 				state.storage.sql.exec(
@@ -32,14 +33,14 @@ it('tells the admins of the day\'s first overrun, and the server stays open', as
 			}
 		});
 		// Reserving nothing for a read of many rooms overruns: observed, charged, and the work finishes.
-		expect(store.withMeter('foreground', { reads: 0, writes: 0 }, () => store.listRooms(now), now)).toHaveLength(101);
-		expect(store.accountingStatus().unsafe).toBe(false);
+		expect(sqliteOf(store).withMeter('foreground', { reads: 0, writes: 0 }, () => store.rooms.list(now), now)).toHaveLength(101);
+		expect(store.ops.accountingStatus().unsafe).toBe(false);
 	});
 
 	// The notice runs once the operation has unwound.
 	await vi.waitFor(() => expect(warn.mock.calls.map(([line]) => String(line))).toContainEqual(expect.stringContaining('"admins_notified"')));
 	await runInDurableObject(stub, (instance, state) => {
-		expect((instance as unknown as Runtime).store.accountingStatus().unsafe).toBe(false);
+		expect((instance as unknown as Runtime).store.ops.accountingStatus().unsafe).toBe(false);
 		const [latest] = state.storage.sql.exec<{ record_json: string }>("SELECT record_json FROM records WHERE room_id = 'general' ORDER BY log_id DESC LIMIT 1").toArray();
 		const record = JSON.parse(latest.record_json) as { from: { user_id: string }; body: { text: string; mentions: string[] } };
 		expect(record.from.user_id).toBe('admin');
@@ -59,8 +60,8 @@ it('answers a status probe with storage unavailable while budget writes fail, an
 		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
 			BEFORE UPDATE OF reads_reserved ON resource_budgets
 			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
-		(instance as unknown as Runtime).store.getRoomState();
-		expect((instance as unknown as Runtime).store.accountingStatus().uncertain).toBe(true);
+		sqliteOf((instance as unknown as Runtime).store).getRoomState();
+		expect((instance as unknown as Runtime).store.ops.accountingStatus().uncertain).toBe(true);
 	});
 	const refused = await probe();
 	expect(refused.status).toBe(503);
@@ -77,9 +78,9 @@ it('posts the alert though registration is closed and the admin user does not ex
 	const stub = env.DEMO.getByName('alert-registration-closed');
 	const warn = vi.spyOn(console, 'warn');
 	await runInDurableObject(stub, async (instance, state) => {
-		const store = (instance as unknown as Runtime).store as unknown as Store & { config: { registeredAccounts: number } };
+		const store = (instance as unknown as Runtime).store;
 		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM identities WHERE user_id = 'admin'").one().count).toBe(0);
-		store.config.registeredAccounts = 0;
+		store.ops.config.registeredAccounts = 0;
 		const writeDataPoint = vi.fn();
 		(instance as unknown as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv.METRICS = { writeDataPoint };
 		await (instance as unknown as { notifyAdmins(text: string): Promise<void> }).notifyAdmins('**Budget stop is on.**');
@@ -101,18 +102,18 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 		runtime.runtimeEnv.METRICS = { writeDataPoint };
 		// An alarm with nothing but status work, then one with cleanup due.
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
-		runtime.store.forgetCleanupDue();
+		sqliteOf(runtime.store).forgetCleanupDue();
 		await runtime.alarm();
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
-		runtime.store.forgetCleanupDue();
+		sqliteOf(runtime.store).forgetCleanupDue();
 		await runtime.alarm();
 		// A budget write that fails closes accounting as uncertain; it reopens once writes work.
 		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
 			BEFORE UPDATE OF reads_reserved ON resource_budgets
 			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
-		runtime.store.getRoomState();
+		sqliteOf(runtime.store).getRoomState();
 		state.storage.sql.exec('DROP TRIGGER fail_budget_reservation');
-		runtime.store.getRoomState();
+		sqliteOf(runtime.store).getRoomState();
 		delete runtime.runtimeEnv.METRICS;
 		return writeDataPoint.mock.calls.map(([point]) => (point as { blobs: string[] }).blobs);
 	});
@@ -141,7 +142,7 @@ it('counts a slow alarm in METRICS with what it waited on, and an instance kept 
 			runtime.runtimeEnv.METRICS = { writeDataPoint };
 			// The usage reading takes 7 seconds of a full alarm.
 			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
-			runtime.store.forgetCleanupDue();
+			sqliteOf(runtime.store).forgetCleanupDue();
 			vi.spyOn(runtime.accountUsage, 'refresh').mockImplementation(async () => { await Promise.resolve(); offset += 7_000; });
 			await runtime.alarm();
 			// An instance 16 minutes old reports itself awake at its next event.
@@ -180,8 +181,8 @@ it('runs the full alarm for a live text past its deadline, or open texts a lost 
 	await runInDurableObject(env.DEMO.getByName('live-deadline-alarm'), async (instance, state) => {
 		const runtime = instance as unknown as LiveRuntime;
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
-		runtime.store.forgetCleanupDue();
-		const expire = vi.spyOn(runtime.store, 'expireLiveTexts');
+		sqliteOf(runtime.store).forgetCleanupDue();
+		const expire = vi.spyOn(sqliteOf(runtime.store).live, 'expireLiveTexts');
 		// No open text to recover: a light alarm.
 		await runtime.alarm();
 		expect(expire).not.toHaveBeenCalled();
@@ -193,10 +194,10 @@ it('runs the full alarm for a live text past its deadline, or open texts a lost 
 	await runInDurableObject(env.DEMO.getByName('live-lost-alarm'), async (instance, state) => {
 		const runtime = instance as unknown as LiveRuntime;
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
-		runtime.store.forgetCleanupDue();
+		sqliteOf(runtime.store).forgetCleanupDue();
 		// Open in storage, from an instance that was evicted or redeployed.
-		vi.spyOn(runtime.store, 'openLiveTexts').mockReturnValue([{} as ReturnType<Store['openLiveTexts']>[number]]);
-		const expire = vi.spyOn(runtime.store, 'expireLiveTexts').mockReturnValue({ broadcasts: [], ended: [], next: undefined } as unknown as ReturnType<Store['expireLiveTexts']>);
+		vi.spyOn(sqliteOf(runtime.store).live, 'openLiveTexts').mockReturnValue([{} as ReturnType<LiveText['open']>[number]]);
+		const expire = vi.spyOn(sqliteOf(runtime.store).live, 'expireLiveTexts').mockReturnValue({ broadcasts: [], ended: [], next: undefined } as unknown as ReturnType<LiveText['expire']>);
 		await runtime.alarm();
 		expect(expire).toHaveBeenCalledTimes(1);
 	});
@@ -206,10 +207,10 @@ it('runs the full alarm for an upload deadline stored before a wake, which the i
 	await runInDurableObject(env.DEMO.getByName('upload-deadline-wake'), async (instance, state) => {
 		const runtime = instance as unknown as Runtime & { alarm(): Promise<void> };
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
-		runtime.store.forgetCleanupDue();
+		sqliteOf(runtime.store).forgetCleanupDue();
 		// Claimed by an earlier instance: only storage knows its deadline.
-		const stored = vi.spyOn(runtime.store, 'nextUploadDeadline').mockReturnValue(Date.now() - 1);
-		const expire = vi.spyOn(runtime.store, 'expirePendingUploads');
+		const stored = vi.spyOn(sqliteOf(runtime.store).uploads, 'nextUploadDeadline').mockReturnValue(Date.now() - 1);
+		const expire = vi.spyOn(sqliteOf(runtime.store).uploads, 'expirePendingUploads');
 		await runtime.alarm();
 		expect(stored).toHaveBeenCalledTimes(1);
 		expect(expire).toHaveBeenCalledTimes(1);
@@ -231,7 +232,7 @@ it('tells the admins once when the database passes half its high-water mark, and
 	const high = DEFAULT_LIMITS.databaseHighWaterBytes;
 	await runInDurableObject(env.DEMO.getByName('storage-alert'), async (instance) => {
 		const runtime = instance as unknown as Sized;
-		vi.spyOn(runtime.store, 'databaseSize').mockImplementation(() => size);
+		vi.spyOn(sqliteOf(runtime.store), 'databaseSize').mockImplementation(() => size);
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
 		// One hourly reading at `bytes`.
 		const reading = async (bytes: number) => {
@@ -275,16 +276,16 @@ it('tells the admins once when long room descriptions fill their total, naming t
 		const store = runtime.store;
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
 		// Small limits, so a few rooms fill the total.
-		Object.assign(store.config, { roomMetadataBytes: 1_000, roomMetadataMinBytes: 200, roomMetadataTotalBytes: 1_800 });
+		Object.assign(store.ops.config, { roomMetadataBytes: 1_000, roomMetadataMinBytes: 200, roomMetadataTotalBytes: 1_800 });
 		const now = Date.now();
-		store.createInvitedIdentity({ userId: 'mia', name: 'mia', now, ipKey: 'ip-test' });
+		store.accounts.createInvited({ userId: 'mia', name: 'mia', now, ipKey: 'ip-test' });
 		let request = 0;
 		// A room_set as handleRoomSet makes it, then the alert check it runs either way; the error code, if any.
 		const save = async (params: Record<string, unknown>): Promise<string> => {
 			let outcome = 'ok';
 			let committed = false;
 			try {
-				const result = store.mutate({ userId: 'mia', ipKey: 'ip-test', requestId: `r${++request}`, method: 'room_set', now: Date.now(), params, identity: { user_id: 'mia', name: 'mia' } });
+				const result = store.messages.mutate({ userId: 'mia', ipKey: 'ip-test', requestId: `r${++request}`, method: 'room_set', now: Date.now(), params, identity: { user_id: 'mia', name: 'mia' } });
 				outcome = String(result.result.room_id);
 				committed = true;
 			} catch (error) {
@@ -316,7 +317,7 @@ it('tells the admins once when long room descriptions fill their total, naming t
 		// Shrinking checks nothing; the next save that grows a room sees the total under 75%, which arms it again.
 		await save({ room_id: big, title: 'Big', description: text(100) });
 		expect(await save({ room_id: mid, title: 'Mid', description: text(650) })).toBe(mid);
-		expect(store.roomNotesAlerted()).toBe(false);
+		expect(store.ops.roomNotesAlerted()).toBe(false);
 		expect(await save({ room_id: big, title: 'Big', description: text(900) })).toBe('too_large');
 		expect(told).toHaveLength(2);
 	});
@@ -333,11 +334,11 @@ it('tells the admins when a room_set over a WebSocket is refused for the room no
 	let saved: Record<string, number> = {};
 	const token = await runInDurableObject(stub, async (instance) => {
 		const runtime = instance as unknown as Live;
-		const { roomMetadataBytes, roomMetadataMinBytes, roomMetadataTotalBytes } = runtime.store.config;
+		const { roomMetadataBytes, roomMetadataMinBytes, roomMetadataTotalBytes } = runtime.store.ops.config;
 		saved = { roomMetadataBytes, roomMetadataMinBytes, roomMetadataTotalBytes };
-		Object.assign(runtime.store.config, { roomMetadataBytes: 1_000, roomMetadataMinBytes: 200, roomMetadataTotalBytes: 300 });
+		Object.assign(runtime.store.ops.config, { roomMetadataBytes: 1_000, roomMetadataMinBytes: 200, roomMetadataTotalBytes: 300 });
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId: 'noter', name: 'Noter', userHandle: 'handle-noter', now: Date.now(), ipKey: 'ip-noter',
 			credential: { credentialId: 'cred-noter', userId: 'noter', publicKey: 'AAAA', counter: 0 },
 		});
@@ -356,6 +357,6 @@ it('tells the admins when a room_set over a WebSocket is refused for the room no
 		expect(told[0]).toContain('`Fits`');
 	} finally {
 		peer.close();
-		await runInDurableObject(stub, (instance) => { Object.assign((instance as unknown as Live).store.config, saved); });
+		await runInDurableObject(stub, (instance) => { Object.assign((instance as unknown as Live).store.ops.config, saved); });
 	}
 });

@@ -1,6 +1,9 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
-import { Store, StoreError, WAKE_SCOPES, type StoreConfig } from "../../src/store";
+import { type Store, type StoreConfig, StoreError, openStore } from "../../src/store";
+import { WAKE_SCOPES } from "../../src/domain";
+import { sqliteOf } from "../../src/store/open";
+import type { SqliteStore } from "../../src/store/sqlite-store";
 
 /** A history page's messages; the array is omitted when empty (§4.3). */
 export function messagesOf(page: { messages?: Array<{ log_id: string; message_id: string; room_id?: string; body?: Record<string, unknown> & { text?: string } }> }) {
@@ -34,8 +37,8 @@ export async function withStore<T>(
 	const stub = env.DEMO.getByName(`${name}-${crypto.randomUUID()}`);
 	return runInDurableObject(stub, async (_instance, state) => {
 		const clock = makeClock();
-		const store = new Store(state, config, clock.clock);
-		store.initialize();
+		const store = openStore(state, config, clock.clock);
+		store.lifecycle.initialize();
 		return fn(store, clock, state);
 	});
 }
@@ -67,4 +70,9 @@ export function pushSubscriptionsOf(state: DurableObjectState, userId: string): 
 		url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}),
 		wake: (Object.keys(WAKE_SCOPES) as Array<keyof typeof WAKE_SCOPES>).filter((scope) => (Number(row.wake) & WAKE_SCOPES[scope]) !== 0),
 	}));
+}
+
+/** The SqliteStore under a Durable Object's store (ApronDemoServer's `store`), for tests that reach into its internals. */
+export function sqliteIn(instance: unknown): SqliteStore {
+	return sqliteOf((instance as { store: Store }).store);
 }

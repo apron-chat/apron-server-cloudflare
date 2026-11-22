@@ -1,0 +1,303 @@
+{
+	"version": "4091af1-dirty",
+	"commit": "4091af1b5eb0c54b3d226ae2f727176c47f7c30a",
+	"heldAlarms": 0,
+	"steps": [
+		{
+			"step": "object.wake (construct, schema ready)",
+			"reads": 52,
+			"writes": 68,
+			"reservedReads": 512,
+			"reservedWrites": 512
+		},
+		{
+			"step": "guest.connect (server greeting, welcome)",
+			"reads": 42,
+			"writes": 24,
+			"reservedReads": 224,
+			"reservedWrites": 124
+		},
+		{
+			"step": "guest.auth",
+			"reads": 16,
+			"writes": 16,
+			"reservedReads": 132,
+			"reservedWrites": 72
+		},
+		{
+			"step": "guest.reconnect (close, connect, auth)",
+			"reads": 13,
+			"writes": 9,
+			"reservedReads": 224,
+			"reservedWrites": 104
+		},
+		{
+			"step": "passkey.register (guest becomes an account)",
+			"reads": 48,
+			"writes": 30,
+			"reservedReads": 1966,
+			"reservedWrites": 206
+		},
+		{
+			"step": "passkey.register (new connection)",
+			"reads": 68,
+			"writes": 47,
+			"reservedReads": 2138,
+			"reservedWrites": 278
+		},
+		{
+			"step": "passkey.login (new connection)",
+			"reads": 51,
+			"writes": 34,
+			"reservedReads": 2028,
+			"reservedWrites": 222
+		},
+		{
+			"step": "token.resume (new connection)",
+			"reads": 44,
+			"writes": 29,
+			"reservedReads": 1941,
+			"reservedWrites": 164
+		},
+		{
+			"step": "room_list (all)",
+			"reads": 7,
+			"writes": 3,
+			"reservedReads": 3539,
+			"reservedWrites": 24
+		},
+		{
+			"step": "message.post (warm-up: first post of the day)",
+			"reads": 21,
+			"writes": 24,
+			"reservedReads": 472,
+			"reservedWrites": 208
+		},
+		{
+			"step": "message.post x10",
+			"reads": 118,
+			"writes": 122,
+			"reservedReads": 4784,
+			"reservedWrites": 2104,
+			"n": 10
+		},
+		{
+			"step": "message.post (second user, first post)",
+			"reads": 19,
+			"writes": 21,
+			"reservedReads": 472,
+			"reservedWrites": 208
+		},
+		{
+			"step": "message.reply (reply_to)",
+			"reads": 18,
+			"writes": 12,
+			"reservedReads": 488,
+			"reservedWrites": 216
+		},
+		{
+			"step": "message.edit",
+			"reads": 12,
+			"writes": 10,
+			"reservedReads": 368,
+			"reservedWrites": 360
+		},
+		{
+			"step": "reactions.add",
+			"reads": 13,
+			"writes": 10,
+			"reservedReads": 296,
+			"reservedWrites": 120
+		},
+		{
+			"step": "reactions.remove",
+			"reads": 13,
+			"writes": 10,
+			"reservedReads": 296,
+			"reservedWrites": 120
+		},
+		{
+			"step": "message.delete",
+			"reads": 14,
+			"writes": 14,
+			"reservedReads": 368,
+			"reservedWrites": 360
+		},
+		{
+			"step": "room_set (create thread)",
+			"reads": 16,
+			"writes": 17,
+			"reservedReads": 4472,
+			"reservedWrites": 120
+		},
+		{
+			"step": "message.post (in thread)",
+			"reads": 11,
+			"writes": 11,
+			"reservedReads": 472,
+			"reservedWrites": 208
+		},
+		{
+			"step": "room_join (thread)",
+			"reads": 27,
+			"writes": 14,
+			"reservedReads": 3244,
+			"reservedWrites": 88
+		},
+		{
+			"step": "room_leave (thread)",
+			"reads": 15,
+			"writes": 8,
+			"reservedReads": 1492,
+			"reservedWrites": 72
+		},
+		{
+			"step": "room_join (thread, again)",
+			"reads": 25,
+			"writes": 10,
+			"reservedReads": 3244,
+			"reservedWrites": 88
+		},
+		{
+			"step": "message.post x40 (fill a history page)",
+			"reads": 476,
+			"writes": 496,
+			"reservedReads": 19136,
+			"reservedWrites": 8416,
+			"n": 40
+		},
+		{
+			"step": "history (general, limit 50)",
+			"reads": 65,
+			"writes": 15,
+			"reservedReads": 328,
+			"reservedWrites": 64
+		},
+		{
+			"step": "history (thread, limit 50)",
+			"reads": 8,
+			"writes": 1,
+			"reservedReads": 264,
+			"reservedWrites": 40
+		},
+		{
+			"step": "room_list (joined)",
+			"reads": 8,
+			"writes": 3,
+			"reservedReads": 3539,
+			"reservedWrites": 24
+		},
+		{
+			"step": "room_list (general, members)",
+			"reads": 9,
+			"writes": 3,
+			"reservedReads": 1562,
+			"reservedWrites": 24
+		},
+		{
+			"step": "activity.read_cursor (first: written)",
+			"reads": 2,
+			"writes": 2,
+			"reservedReads": 20,
+			"reservedWrites": 20
+		},
+		{
+			"step": "activity.read_cursor (again: held)",
+			"reads": 4,
+			"writes": 4,
+			"reservedReads": 64,
+			"reservedWrites": 24
+		},
+		{
+			"step": "activity.typing",
+			"reads": 0,
+			"writes": 0,
+			"reservedReads": 0,
+			"reservedWrites": 0
+		},
+		{
+			"step": "me.status (dnd)",
+			"reads": 3,
+			"writes": 2,
+			"reservedReads": 24,
+			"reservedWrites": 24
+		},
+		{
+			"step": "me.status (online)",
+			"reads": 4,
+			"writes": 2,
+			"reservedReads": 24,
+			"reservedWrites": 24
+		},
+		{
+			"step": "me.name",
+			"reads": 9,
+			"writes": 6,
+			"reservedReads": 296,
+			"reservedWrites": 120
+		},
+		{
+			"step": "command (/help)",
+			"reads": 0,
+			"writes": 0,
+			"reservedReads": 0,
+			"reservedWrites": 0
+		},
+		{
+			"step": "room_set (create private room)",
+			"reads": 17,
+			"writes": 21,
+			"reservedReads": 5340,
+			"reservedWrites": 120
+		},
+		{
+			"step": "room_join (add a member to the private room)",
+			"reads": 32,
+			"writes": 11,
+			"reservedReads": 4676,
+			"reservedWrites": 96
+		},
+		{
+			"step": "message.post (in private room)",
+			"reads": 17,
+			"writes": 12,
+			"reservedReads": 556,
+			"reservedWrites": 216
+		},
+		{
+			"step": "idle (1.5 s, all connections open)",
+			"reads": 0,
+			"writes": 0,
+			"reservedReads": 0,
+			"reservedWrites": 0
+		},
+		{
+			"step": "alarm (as scheduled)",
+			"reads": 14,
+			"writes": 4,
+			"reservedReads": 64,
+			"reservedWrites": 36
+		},
+		{
+			"step": "alarm (full: maintenance due)",
+			"reads": 60,
+			"writes": 28,
+			"reservedReads": 321854,
+			"reservedWrites": 6598
+		},
+		{
+			"step": "alarm (again: nothing due)",
+			"reads": 4,
+			"writes": 1,
+			"reservedReads": 24,
+			"reservedWrites": 12
+		},
+		{
+			"step": "disconnect (all connections close)",
+			"reads": 6,
+			"writes": 6,
+			"reservedReads": 52,
+			"reservedWrites": 52
+		}
+	]
+}

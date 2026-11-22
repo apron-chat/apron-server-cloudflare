@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
-import type { Store } from '../src/store';
+import { type Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -24,7 +24,7 @@ afterAll(async () => { await runtime((server) => { server.config = { ...server.c
 
 async function register(userId: string): Promise<void> {
 	await runtime(({ store }) => {
-		store.registerIdentity({
+		store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -47,7 +47,7 @@ async function drain(peer: Peer): Promise<Frame[]> {
 }
 
 const reads = (frames: Frame[]) => frames.filter((frame) => frame.method === 'activity' && frame.params.read_message_id !== undefined).map((frame) => frame.params);
-const kept = (userId: string) => runtime(({ store }) => Object.fromEntries(store.readCursors(userId)));
+const kept = (userId: string) => runtime(({ store }) => Object.fromEntries(store.reads.cursors(userId)));
 const attachments = (userId: string) => runtime(({ ctx }) => ctx.getWebSockets()
 	.map((ws) => ws.deserializeAttachment() as Attachment)
 	.filter((attachment) => attachment.userId === userId));
@@ -269,14 +269,14 @@ it('moves cursors with /rename and deletes them with /purge', async () => {
 	const renamed = unique('renamed');
 	await register(ada);
 	await runtime(({ store }) => {
-		const message = store.mutate({
+		const message = store.messages.mutate({
 			userId: ada, ipKey: `ip-${ada}`, requestId: 'one', method: 'message', now: Date.now(), identity: { user_id: ada }, params: { room_id: 'general', body: { text: 'one' } },
 		});
-		store.saveReadCursors({ userId: ada, cursors: [['general', String(message.result.message_id)]] });
-		store.renameIdentity({ from: ada, to: renamed });
-		expect(Object.keys(Object.fromEntries(store.readCursors(renamed)))).toEqual(['general']);
-		expect(store.readCursors(ada).size).toBe(0);
-		store.purgeUsers({ userIds: [renamed] });
-		expect(store.readCursors(renamed).size).toBe(0);
+		store.reads.saveCursors({ userId: ada, cursors: [['general', String(message.result.message_id)]] });
+		store.accounts.rename({ from: ada, to: renamed });
+		expect(Object.keys(Object.fromEntries(store.reads.cursors(renamed)))).toEqual(['general']);
+		expect(store.reads.cursors(ada).size).toBe(0);
+		store.accounts.purge({ userIds: [renamed] });
+		expect(store.reads.cursors(renamed).size).toBe(0);
 	});
 });

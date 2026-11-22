@@ -5,6 +5,7 @@ import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { recordMetric } from '../src/metrics';
 import { RefusalMeter } from '../src/refusals';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
+import { sqliteIn } from './helpers/store';
 
 let nextIp = 1;
 
@@ -84,7 +85,7 @@ async function configure(update: (config: ServerInternals['config']) => void): P
  */
 async function guestPostsPerMinute(value: number): Promise<number> {
 	return runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => {
-		const store = (instance as unknown as { store: { config: { guestPostsPerMinute: number } } }).store;
+		const store = (instance as unknown as { store: { ops: { config: { guestPostsPerMinute: number } } } }).store.ops;
 		const previous = store.config.guestPostsPerMinute;
 		store.config.guestPostsPerMinute = value;
 		return previous;
@@ -1129,7 +1130,7 @@ it('links message snapshots to the previous one with prev_log_id, and never reac
 
 it('reserves frames in blocks per connection, never granting a block twice', async () => {
 	const budget = () => runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) =>
-		(instance as unknown as { store: { budget(): { frames: number; writes: number } } }).store.budget());
+		sqliteIn(instance).budget());
 	const peer = await connect();
 	try {
 		await peer.next(); // server announcement

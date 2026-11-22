@@ -1,8 +1,9 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Store } from '../src/store';
+import { type Store } from '../src/store';
 import { terminalOg } from '../src/content/embeds';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
+import { sqliteOf } from "../src/store/open";
 
 // vitest.config.ts sets LIVE_TEXT_MAX_SECONDS 2, LIVE_TEXT_MODERATOR_MAX_SECONDS 3
 // and LIVE_TEXT_WRITE_WINDOW_SECONDS 3, so texts end within the tests.
@@ -40,11 +41,11 @@ async function withLivePolicy<T>(change: Record<string, number>, fn: () => Promi
 async function signedIn(userId: string, roles: string[] = []): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as { store: Store; issueSession(userId: string, origin: string, now: number): Promise<string> };
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
-		for (const role of roles) runtime.store.setRole({ userId, role, now: Date.now() });
+		for (const role of roles) runtime.store.accounts.setRole({ userId, role, now: Date.now() });
 		return runtime.issueSession(userId, 'http://localhost:5173', Date.now());
 	});
 	const peer = await connect();
@@ -478,8 +479,9 @@ describe('live text end to end', () => {
 			let expiry: Promise<void> | undefined;
 			await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as { store: Store; expireLive(now: number): Promise<void> };
-				const claim = runtime.store.claimLiveText.bind(runtime.store);
-				vi.spyOn(runtime.store, 'claimLiveText').mockImplementationOnce((key, now) => {
+				const live = sqliteOf(runtime.store).live;
+				const claim = live.claimLiveText.bind(live);
+				vi.spyOn(live, 'claimLiveText').mockImplementationOnce((key, now) => {
 					const claimed = claim(key, now);
 					expiry = runtime.expireLive(Date.now());
 					return claimed;
@@ -509,7 +511,7 @@ describe('live text end to end', () => {
 				const runtime = instance as unknown as { store: Store; refreshLiveDeadline(): Promise<void>; stopLiveText(key: string, reason: string): void };
 				const refresh = runtime.refreshLiveDeadline.bind(runtime);
 				vi.spyOn(runtime, 'refreshLiveDeadline').mockImplementationOnce(async () => {
-					const live = runtime.store.openLiveTexts(Date.now()).find((entry) => entry.owner === userId)!;
+					const live = runtime.store.liveText!.open(Date.now()).find((entry) => entry.owner === userId)!;
 					runtime.stopLiveText(live.key, 'removed');
 					await refresh();
 				});

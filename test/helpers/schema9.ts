@@ -1,5 +1,5 @@
 /**
- * Schema 9 as code before schema 10 created it (src/store.ts at the last
+ * Schema 9 as code before schema 10 created it (src/store.ts, now src/store/, at the last
  * schema 9 release, verbatim): rowid tables, each text or composite key a
  * separate index, `records` indexed by commit time too, and `message_state`
  * holding each message's latest snapshot.

@@ -1,8 +1,9 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
-import { Store } from '../src/store';
+import { type Store, openStore } from '../src/store';
 import { connect as open, greeting } from './helpers/socket';
+import { sqliteOf } from "../src/store/open";
 
 type Runtime = {
 	store: Store;
@@ -72,16 +73,16 @@ describe('guest numbers', () => {
 		const stub = env.DEMO.getByName(`guest-numbers-${crypto.randomUUID()}`);
 		const firstRun = await runInDurableObject(stub, (instance, state) => {
 			const runtime = instance as unknown as Runtime;
-			const reserve = runtime.store.reserveGuestNumbers.bind(runtime.store);
+			const reserve = runtime.store.admission.reserveGuestNumbers;
 			let reservations = 0;
-			runtime.store.reserveGuestNumbers = (count, now) => { reservations += 1; return reserve(count, now); };
-			const before = runtime.store.storageAccounting();
+			runtime.store.admission.reserveGuestNumbers = (count, now) => { reservations += 1; return reserve(count, now); };
+			const before = sqliteOf(runtime.store).storageAccounting();
 			const first = runtime.nextGuestNumber();
-			const afterReservation = runtime.store.storageAccounting();
+			const afterReservation = sqliteOf(runtime.store).storageAccounting();
 			const rest = Array.from({ length: BLOCK - 1 }, () => runtime.nextGuestNumber());
-			const afterBlock = runtime.store.storageAccounting();
+			const afterBlock = sqliteOf(runtime.store).storageAccounting();
 			const next = runtime.nextGuestNumber();
-			const afterNext = runtime.store.storageAccounting();
+			const afterNext = sqliteOf(runtime.store).storageAccounting();
 			return {
 				numbers: [first, ...rest, next],
 				reservations,
@@ -120,17 +121,17 @@ describe('guest numbers', () => {
 	it('reserves blocks from the stored mark in any Store instance, and keeps the mark across a schema reset', async () => {
 		const stub = env.DEMO.getByName(`guest-number-store-${crypto.randomUUID()}`);
 		const result = await runInDurableObject(stub, async (_instance, state) => {
-			const store = new Store(state, {});
-			store.initialize();
-			const first = store.reserveGuestNumbers(5);
-			const second = store.reserveGuestNumbers(3);
-			const restarted = new Store(state, {});
-			restarted.initialize();
-			const third = restarted.reserveGuestNumbers(5);
+			const store = openStore(state, {});
+			store.lifecycle.initialize();
+			const first = store.admission.reserveGuestNumbers(5);
+			const second = store.admission.reserveGuestNumbers(3);
+			const restarted = openStore(state, {});
+			restarted.lifecycle.initialize();
+			const third = restarted.admission.reserveGuestNumbers(5);
 			let invalid: unknown;
-			try { restarted.reserveGuestNumbers(0); } catch (error) { invalid = error; }
-			await restarted.resetStorage();
-			const afterReset = restarted.reserveGuestNumbers(5);
+			try { restarted.admission.reserveGuestNumbers(0); } catch (error) { invalid = error; }
+			await restarted.lifecycle.resetStorage();
+			const afterReset = restarted.admission.reserveGuestNumbers(5);
 			return { first, second, third, invalid: (invalid as { code?: string })?.code, afterReset };
 		});
 		expect(result.first).toEqual({ first: 1, limit: 6 });

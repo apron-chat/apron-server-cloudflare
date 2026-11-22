@@ -1,3 +1,4 @@
+import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { BUDGET_COLUMNS, BudgetLedger, type LedgerLimits, type RawBudgetRow } from '../src/budget-ledger';
 import { StoreError } from '../src/store-error';
@@ -178,5 +179,59 @@ describe('budget ledger', () => {
 		ledger.reserve({ writes: 1 }, noon, noon, false, false);
 		expect(statements.filter((query) => query.startsWith('SELECT'))).toHaveLength(2);
 		expect(statements.filter((query) => query.startsWith('DELETE'))).toHaveLength(1);
+	});
+
+	it('refuses in checkReservation exactly when reserve would refuse, without SQL or a reservation', () => {
+		const DAY = 86_400_000;
+		const cost = fc.record({ reads: fc.integer({ min: 0, max: 260 }), writes: fc.integer({ min: 0, max: 260 }), history: fc.integer({ min: 0, max: 2 }) });
+		const prior = fc.array(fc.record({ cost, maintenance: fc.boolean(), at: fc.integer({ min: 0, max: DAY / 2 - 1 }) }), { maxLength: 6 });
+		const probe = fc.record({ cost, maintenance: fc.boolean(), days: fc.constantFrom(0, 0, 1, 2), offset: fc.integer({ min: 0, max: DAY / 2 - 1 }) });
+		/** Two ledgers driven alike: the same reservations (each refused one skipped alike), so their state is the same. */
+		const ledgerAfter = (history: Array<{ cost: { reads: number; writes: number; history: number }; maintenance: boolean; at: number }>) => {
+			const { ledgerHost, statements } = host();
+			const ledger = new BudgetLedger(ledgerHost, limits);
+			ledger.start('2026-09-21');
+			const start = Date.parse('2026-09-21T00:00:00Z');
+			for (const step of history) {
+				try {
+					const made = ledger.reserve(step.cost, start + step.at, start + step.at, step.maintenance, false);
+					ledger.refund(made, step.cost.reads, step.cost.writes);
+				} catch (error) {
+					if (!(error instanceof StoreError) || error.code !== 'retry_after') throw error;
+				}
+			}
+			return { ledger, statements, start };
+		};
+		const outcome = (fn: () => unknown): string => {
+			try { fn(); return 'accepted'; } catch (error) {
+				if (error instanceof StoreError && error.code === 'retry_after') return `refused: ${error.message}`;
+				throw error;
+			}
+		};
+		const warn = console.warn;
+		console.warn = () => {};
+		let answeredRuns = 0;
+		try {
+			fc.assert(fc.property(prior, probe, (history, probe) => {
+				const checked = ledgerAfter(history);
+				const reserved = ledgerAfter(history);
+				const at = checked.start + probe.days * DAY + DAY / 2 + probe.offset;
+				const before = checked.statements.length;
+				let answered = true;
+				const check = outcome(() => { answered = checked.ledger.checkReservation(probe.cost, at, probe.maintenance); });
+				// The check touches no SQL and leaves the ledger as it was.
+				expect(checked.statements.length).toBe(before);
+				const reserve = outcome(() => reserved.ledger.reserve(probe.cost, at, at, probe.maintenance, false));
+				// Where it answers (a row is cached: a reservation was accepted since the start) it agrees
+				// with reserve. Where it can't, it refuses nothing and says so (the store then reserves).
+				if (answered) expect(check).toBe(reserve);
+				else expect(check).toBe('accepted');
+				if (answered) answeredRuns++;
+			}), { numRuns: 400 });
+		} finally {
+			console.warn = warn;
+		}
+		// Most runs had a cached row, so the comparison above really ran.
+		expect(answeredRuns).toBeGreaterThan(200);
 	});
 });

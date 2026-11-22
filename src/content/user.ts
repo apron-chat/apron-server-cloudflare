@@ -7,7 +7,7 @@
  * are this server's policy.
  */
 
-import { utf8Bytes } from "./verdict.ts";
+import { cloneJson, isPlainObject, utf8Bytes } from "./verdict.ts";
 
 /**
  * Largest serialized `ext` a user keeps (protocol §4.13), after a write's
@@ -39,4 +39,26 @@ export function userExtFits(ext: Record<string, unknown> | undefined): boolean {
 /** A recorded user (§3.3): `user_id`, and `name` when it has a non-empty one. */
 export function recordedUser(userId: string, name: string | null | undefined): { user_id: string; name?: string } {
 	return { user_id: userId, ...(name ? { name } : {}) };
+}
+
+/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3, §4.13). */
+function emptyValue(value: unknown): boolean {
+	return value === "" || (Array.isArray(value) && value.length === 0) || (isPlainObject(value) && Object.keys(value).length === 0);
+}
+
+/**
+ * Merges a write's `ext` into the stored one, one level deep (protocol §4.13):
+ * each key the write carries replaces the stored value whole, a key whose
+ * value is empty (`""`, `[]`, `{}`) is removed, and keys it leaves out stay.
+ * `null` is an ordinary value. Without a write, or with `{}`, the stored
+ * `ext` is unchanged. Undefined when nothing is left. Built from entries, so
+ * a `"__proto__"` key is an ordinary own key, never a prototype.
+ */
+export function mergeExt(stored: unknown, write: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	const merged = new Map<string, unknown>(isPlainObject(stored) ? Object.entries(stored) : []);
+	for (const [key, value] of Object.entries(write ?? {})) {
+		if (emptyValue(value)) merged.delete(key);
+		else merged.set(key, value);
+	}
+	return merged.size ? cloneJson(Object.fromEntries(merged)) : undefined;
 }

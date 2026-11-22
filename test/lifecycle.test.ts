@@ -8,6 +8,7 @@ import {
 import { expect, it } from "vitest";
 import { DEFAULT_LIMITS } from "../src/budget";
 import { connect as open, greeting } from "./helpers/socket";
+import { sqliteIn } from "./helpers/store";
 
 let nextIpOctet = 1;
 
@@ -337,13 +338,13 @@ it("keeps what other events changed on a connection while a passkey ceremony awa
 
 it("records the database's size from a full alarm, at most once an hour, and never from a light one", async () => {
 	const stub = env.DEMO.getByName("public-demo-v1");
-	type Metered = { runtimeEnv: { METRICS?: unknown }; databaseSizeRecordedAt: number; store: { forgetCleanupDue(): void } };
+	type Metered = { runtimeEnv: { METRICS?: unknown }; databaseSizeRecordedAt: number };
 	const calls: Array<{ indexes: string[]; blobs: string[]; doubles: number[] }> = [];
 	const sizes = () => calls.filter((point) => point.indexes[0] === "db_bytes");
 	const alarmAt = async (cleanupMs: number) => {
 		await runInDurableObject(stub, async (instance, state) => {
 			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", cleanupMs);
-			(instance as unknown as Metered).store.forgetCleanupDue();
+			sqliteIn(instance).forgetCleanupDue();
 			if ((await state.storage.getAlarm()) === null) await state.storage.setAlarm(Date.now());
 		});
 		expect(await runDurableObjectAlarm(stub)).toBe(true);

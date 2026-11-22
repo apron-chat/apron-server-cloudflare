@@ -1,7 +1,8 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import type { Store } from '../src/store';
+import { type Store } from '../src/store';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
+import { sqliteOf } from "../src/store/open";
 
 let nextIp = 1;
 const stub = () => env.DEMO.getByName('public-demo-v1');
@@ -33,10 +34,10 @@ async function signedInAdmin(): Promise<Peer> {
 async function signedIn(userId: string): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as {
-			store: { registerIdentity(input: Record<string, unknown>): unknown };
+			store: { accounts: { register(input: Record<string, unknown>): unknown } };
 			issueSession(userId: string, origin: string, now: number): Promise<string>;
 		};
-		runtime.store.registerIdentity({
+		runtime.store.accounts.register({
 			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -83,7 +84,7 @@ const activeMs = (userId: string) => runInDurableObject(stub(), (_instance, stat
 async function sweep(due: number | null = 0): Promise<void> {
 	await runInDurableObject(stub(), async (instance, state) => {
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
-		(instance as unknown as Runtime).store.forgetCleanupDue();
+		sqliteOf((instance as unknown as Runtime).store).forgetCleanupDue();
 		if (due === null) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'bot_sweep_ms'");
 		else state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('bot_sweep_ms', ?)", String(due));
 		await (instance as unknown as Runtime).alarm();
@@ -91,7 +92,7 @@ async function sweep(due: number | null = 0): Promise<void> {
 }
 
 /** A user's rooms, or null when the account is gone. */
-const roomsOf = (userId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.getIdentity(userId)?.rooms ?? null);
+const roomsOf = (userId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.accounts.get(userId)?.rooms ?? null);
 
 it('signs out accounts whose only role is bot after a week without signing in or posting, keeping what they posted', async () => {
 	const admin = await signedInAdmin();
@@ -153,7 +154,7 @@ it('signs out accounts whose only role is bot after a week without signing in or
 		// A signed-out bot is not swept again.
 		await runInDurableObject(stub(), (instance, state) => {
 			state.storage.sql.exec("UPDATE _meta SET value = '0' WHERE key = 'bot_sweep_ms'");
-			expect((instance as unknown as Runtime).store.idleBots({ now: Date.now(), before: Date.now(), limit: 100, intervalMs: DAY, graceMs: DAY })).not.toContain(botId);
+			expect((instance as unknown as Runtime).store.accounts.idleBots({ now: Date.now(), before: Date.now(), limit: 100, intervalMs: DAY, graceMs: DAY })).not.toContain(botId);
 		});
 
 		// The next sweep is a day on; the owner can invite their bot again, and it joins rooms anew.

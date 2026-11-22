@@ -1,7 +1,8 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import type { Store } from '../src/store';
+import { type Store } from '../src/store';
 import { connect, exchange, request } from './helpers/socket';
+import { sqliteOf } from "../src/store/open";
 
 const stub = () => env.DEMO.getByName('public-demo-v1');
 type Runtime = { store: Store; config: Record<string, unknown>; issueSession(userId: string, origin: string, now: number): Promise<string>; alarmTail: Promise<void> };
@@ -13,7 +14,7 @@ it('schedules the alarm when a connection starts holding read cursors, from its 
 	// Read cursors travel in `activity` frames, which vitest.config.ts turns off.
 	await runtime((server) => { server.config = { ...server.config, activityEnabled: true }; });
 	const token = await runtime((server) => {
-		server.store.registerIdentity({
+		server.store.accounts.register({
 			userId, name: 'Reader', userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
@@ -30,7 +31,7 @@ it('schedules the alarm when a connection starts holding read cursors, from its 
 			await server.alarmTail;
 			const at = Date.now() + 3_600_000;
 			await state.storage.setAlarm(at);
-			Object.assign(server.store, { scheduledAlarmAt: at });
+			Object.assign(sqliteOf(server.store), { scheduledAlarmAt: at });
 			Object.assign(server, { alarmKnown: true });
 		});
 		// The first cursor is written; the second, within the minute, is held.

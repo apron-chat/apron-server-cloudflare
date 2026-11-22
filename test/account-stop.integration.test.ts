@@ -2,7 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { ACCOUNT_USAGE_POLICY, DEFAULT_LIMITS } from '../src/budget';
 import type { AccountUsageMonitor, AccountUsageSnapshot } from '../src/account-usage';
-import { Store } from '../src/store';
+import { type Store, openStore } from '../src/store';
 
 const headers = { Origin: 'http://localhost:5173', 'X-Apron-Trusted-IP-Key': 'c'.repeat(22) };
 
@@ -46,9 +46,9 @@ function stopSnapshot(now = Date.now()): AccountUsageSnapshot {
 it('keeps a saved account-usage stop across a wake, refusing new connections', async () => {
 	const stub = env.DEMO.getByName('account-usage-stop-wake');
 	await runInDurableObject(stub, (_instance, state) => {
-		const store = new Store(state, {});
-		store.initialize();
-		store.persistAccountUsageSnapshot(stopSnapshot());
+		const store = openStore(state, {});
+		store.lifecycle.initialize();
+		store.ops.persistAccountUsageSnapshot(stopSnapshot());
 	});
 	await evictDurableObject(stub);
 	const response = await stub.fetch('https://demo.test/ws', { headers: { ...headers, Upgrade: 'websocket' } });
@@ -105,7 +105,7 @@ it('keeps every socket open when the daily frame budget runs out, refusing reque
 	first.socket.send(JSON.stringify({ id: 'over-budget-again', method: 'auth', params: { scheme: 'guest' } }));
 	await vi.waitFor(() => expect(replies).toHaveLength(2));
 	await runInDurableObject(stub, (instance) => {
-		expect((instance as unknown as { store: Store }).store.throttleTrips()).toEqual(lasting ? [['frame_budget', 1]] : []);
+		expect((instance as unknown as { store: Store }).store.admission.throttleTrips()).toEqual(lasting ? [['frame_budget', 1]] : []);
 	});
 	expect(notices).toHaveLength(lasting ? 1 : 0);
 	expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"throttle_tripped"'))).toEqual(lasting ? [

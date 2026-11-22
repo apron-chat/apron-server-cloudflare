@@ -25,7 +25,7 @@ import { R2BlobStore } from "./storage/r2";
 import type { BlobStore } from "./storage/store";
 import { type ChainStatePort, chainStateStore } from "./state";
 import type { D1Off } from "./status";
-import { type HeadStore, storeHead } from "./store-head";
+import type { HistoryHead } from "./tier";
 
 /** The history limits (src/budget.ts Limits). */
 export interface HistoryLimits {
@@ -74,9 +74,16 @@ export interface BlobStoreChoice {
 	blobProvider?: string;
 }
 
-/** The Store as the chain needs it: the head's records and the chain's state. */
-export interface ChainStore extends HeadStore {
-	historyStatePort(): ChainStatePort;
+/**
+ * The store as the chain needs it: the head over its records, and where the
+ * chain keeps its state. The store implements it (store.history in
+ * src/store); this module does not load the store.
+ */
+export interface ChainStore {
+	/** The store as the chain's head, named `name`. */
+	head(name: string): HistoryHead;
+	/** The port the chain's state (state.ts) is kept through. */
+	state(): ChainStatePort;
 }
 
 /**
@@ -189,8 +196,8 @@ export function buildHistoryChain(options: BuildOptions): HistoryChain | undefin
 
 /** A chain of the Store's head and `stages`. */
 function headChain(options: Pick<BuildOptions, "store" | "limits" | "clock">, stages: ChainStage[]): HistoryChain {
-	const head = storeHead(HEAD_TIER, options.store);
-	return new HistoryChain({ head, headRetention: headRetention(options.limits), stages, state: chainStateStore(options.store.historyStatePort(), HEAD_TIER), clock: options.clock });
+	const head = options.store.head(HEAD_TIER);
+	return new HistoryChain({ head, headRetention: headRetention(options.limits), stages, state: chainStateStore(options.store.state(), HEAD_TIER), clock: options.clock });
 }
 
 /**

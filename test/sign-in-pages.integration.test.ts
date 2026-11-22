@@ -440,7 +440,7 @@ it('adds a passkey through the page only to the account whose connection began i
 		const added = await finish(owner, misplaced);
 		expect(added.result).toEqual({ you: expect.objectContaining({ user_id: userId }) });
 		expect((await finish(owner, misplaced)).error.code).toBe(-32001);
-		const credentials = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { credentialIdsForUser(id: string): string[] } }).store.credentialIdsForUser(userId));
+		const credentials = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { credentials: { idsForUser(id: string): string[] } } }).store.credentials.idsForUser(userId));
 		expect(credentials).toHaveLength(2);
 		expect(credentials).toContain(passkey.id);
 		// The new passkey signs in through the page, to that account.
@@ -459,7 +459,7 @@ it('tells the page of a passkey no account has, only when no code may still give
 	const login = async (passkey: Passkey) => ceremony((await client()).url(`${ORIGIN}/passkey?action=login`), passkey);
 	const unknown = { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true };
 	const generic = { error: "That passkey didn't work here. Try again, or use another passkey." };
-	type Server = { config: { signalUnknownPasskeys: boolean }; store: { getCredential(id: string): unknown }; pendingCredential(id: string): Promise<boolean> };
+	type Server = { config: { signalUnknownPasskeys: boolean }; store: { credentials: { get(id: string): unknown } }; pendingCredential(id: string): Promise<boolean> };
 
 	// A passkey made on the page whose code was never redeemed: pending while its code may be.
 	const orphan = await softPasskey(ORIGIN);
@@ -516,10 +516,10 @@ it('tells the page of a passkey no account has, only when no code may still give
 		try { return await login(stranger); } finally { await runInDurableObject(stub(), () => restore()); }
 	};
 	expect(await broken((server) => {
-		const store = server.store;
-		const original = store.getCredential;
-		store.getCredential = () => { throw new Error('storage unavailable'); };
-		return () => { store.getCredential = original; };
+		const credentials = server.store.credentials;
+		const original = credentials.get;
+		credentials.get = () => { throw new Error('storage unavailable'); };
+		return () => { credentials.get = original; };
 	})).toMatchObject({ status: 503, body: { error: 'Something went wrong. Try again.' } });
 	expect(await broken((server) => {
 		server.pendingCredential = async () => { throw new Error('storage unavailable'); };

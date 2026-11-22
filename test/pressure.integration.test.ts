@@ -1,6 +1,6 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { Store, defaultStoreConfig } from '../src/store';
+import { type Store, defaultStoreConfig, openStore } from '../src/store';
 import { PUSH_POLICY } from '../src/budget';
 import { expectRetryAfter } from './helpers/store';
 
@@ -68,8 +68,8 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 	const config = { ...defaultStoreConfig(), storageLowWaterBytes: 80 * MIB, storageHighWaterBytes: 96 * MIB, storageHardTargetBytes: 128 * MIB };
 	const result = await runInDurableObject(stub, async (_instance, state) => {
 		const sql = state.storage.sql as unknown as CalibrationSql;
-		const store = new Store(state, config, { now: () => Date.now() + 86_400_000 });
-		store.initialize();
+		const store = openStore(state, config, { now: () => Date.now() + 86_400_000 });
+		store.lifecycle.initialize();
 		sql.exec('CREATE TABLE pressure_calibration (id INTEGER PRIMARY KEY, snapshot_json TEXT NOT NULL)').toArray();
 		const payload = 's'.repeat(SNAPSHOT_BYTES);
 		const transactionSync = (callback: () => void) => state.storage.transactionSync(callback);
@@ -87,7 +87,7 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 
 		let pressureError: unknown;
 		try {
-			store.commitMutation(pressureMessage(Date.now() + 86_400_000, 'pressure-near-hard'));
+			store.messages.commit(pressureMessage(Date.now() + 86_400_000, 'pressure-near-hard'));
 		} catch (error) {
 			pressureError = error;
 		}
@@ -125,12 +125,12 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 	await evictDurableObject(stub);
 	const highRestart = await runInDurableObject(stub, async (_instance, state) => {
 		const sql = state.storage.sql as unknown as CalibrationSql;
-		const store = new Store(state, config, { now: () => Date.now() + 86_400_000 });
-		store.initialize();
+		const store = openStore(state, config, { now: () => Date.now() + 86_400_000 });
+		store.lifecycle.initialize();
 		const highSize = sql.databaseSize;
 		let error: unknown;
 		try {
-			store.commitMutation(pressureMessage(Date.now() + 86_400_000, 'pressure-high-restart'));
+			store.messages.commit(pressureMessage(Date.now() + 86_400_000, 'pressure-high-restart'));
 		} catch (candidate) {
 			error = candidate;
 		}
@@ -145,11 +145,11 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 
 	await evictDurableObject(stub);
 	const resumed = await runInDurableObject(stub, async (_instance, state) => {
-		const store = new Store(state, config, { now: () => Date.now() + 86_400_000 });
-		store.initialize();
-		const commit = store.commitMutation(pressureMessage(Date.now() + 86_400_000, 'pressure-low-resume'));
+		const store = openStore(state, config, { now: () => Date.now() + 86_400_000 });
+		store.lifecycle.initialize();
+		const commit = store.messages.commit(pressureMessage(Date.now() + 86_400_000, 'pressure-low-resume'));
 		expect(commit.result.message_id).toBeTruthy();
-		return { databaseSize: store.databaseSize(), status: store.accountingStatus() };
+		return { databaseSize: store.ops.databaseSize(), status: store.ops.accountingStatus() };
 	});
 	console.info('storage-pressure-low-resume', JSON.stringify(resumed));
 	expect(resumed.databaseSize).toBeLessThan(config.storageLowWaterBytes);
@@ -161,9 +161,9 @@ it('keeps the storage-pressure latch set by a refusal inside a transaction, whic
 	await runInDurableObject(stub, async (_instance, state) => {
 		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
 		const now = Date.now() + 86_400_000;
-		const store = new Store(state, config, { now: () => now });
-		store.initialize();
-		store.registerIdentity({
+		const store = openStore(state, config, { now: () => now });
+		store.lifecycle.initialize();
+		store.accounts.register({
 			userId: 'latch-user',
 			name: 'Latch user',
 			userHandle: 'latch-handle',
@@ -175,28 +175,28 @@ it('keeps the storage-pressure latch set by a refusal inside a transaction, whic
 		expect(latch() ?? '0').toBe('0');
 		// Every size is now past the high-water mark. Registering for push
 		// checks capacity inside its own transaction, which the refusal rolls back.
-		const size = store.databaseSize()!;
-		Object.assign(store.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
+		const size = store.ops.databaseSize()!;
+		Object.assign(store.ops.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
 		let error: unknown;
 		try {
-			store.registerPushSubscription({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+			store.push!.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		} catch (candidate) {
 			error = candidate;
 		}
 		expectRetryAfter(error);
 		expect(latch()).toBe('1');
 		// Between the marks the latch holds: growth stays refused.
-		Object.assign(store.config, { storageLowWaterBytes: 1, storageHighWaterBytes: size * 2 });
+		Object.assign(store.ops.config, { storageLowWaterBytes: 1, storageHighWaterBytes: size * 2 });
 		error = undefined;
 		try {
-			store.registerPushSubscription({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+			store.push!.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		} catch (candidate) {
 			error = candidate;
 		}
 		expectRetryAfter(error);
 		// Below the low-water mark it clears, and the registration goes through.
-		Object.assign(store.config, { storageLowWaterBytes: size * 2 });
-		store.registerPushSubscription({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+		Object.assign(store.ops.config, { storageLowWaterBytes: size * 2 });
+		store.push!.register({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		expect(latch()).toBe('0');
 	});
 });

@@ -1,5 +1,5 @@
 /*
- * Terminal output kept in R2 (store.ts storeTerminalOutput) is referred to
+ * Terminal output kept in R2 (ApronDemoServer.storeTerminalOutput) is referred to
  * from its message's embed by an internal `output_ref`, which never leaves
  * the server: before a record goes out its output is put back from R2
  * (withTerminalOutputs), or the reference is dropped (withoutOutputRefs).

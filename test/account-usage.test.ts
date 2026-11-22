@@ -3,7 +3,7 @@ import { ACCOUNT_USAGE_POLICY } from "../src/budget";
 import { AccountUsageMonitor, accountUsageSnapshotFromResult, accountUsageStops, exceededAllowances, fetchAccountUsage, snapshotBill } from "../src/account-usage";
 import { billCap } from "../src/pricing";
 import { env, runInDurableObject } from "cloudflare:test";
-import { Store } from "../src/store";
+import { type Store, openStore } from "../src/store";
 
 function result(overrides: Record<string, unknown> = {}) {
 	const base = {
@@ -214,12 +214,12 @@ describe("account usage snapshots", () => {
 	it("persists the snapshot in existing Durable Object metadata", async () => {
 		const snapshot = accountUsageSnapshotFromResult(result(), Date.parse("2026-09-21T12:00:00Z"));
 		await runInDurableObject(env.DEMO.getByName("account-usage-snapshot"), (_instance, state) => {
-			const store = new Store(state, {});
-			store.initialize();
-			store.persistAccountUsageSnapshot(snapshot);
-			const restarted = new Store(state, {});
-			restarted.initialize();
-			expect(restarted.accountUsageSnapshot()).toEqual(snapshot);
+			const store = openStore(state, {});
+			store.lifecycle.initialize();
+			store.ops.persistAccountUsageSnapshot(snapshot);
+			const restarted = openStore(state, {});
+			restarted.lifecycle.initialize();
+			expect(restarted.ops.accountUsageSnapshot()).toEqual(snapshot);
 		});
 	});
 });

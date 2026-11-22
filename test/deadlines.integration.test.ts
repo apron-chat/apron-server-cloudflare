@@ -1,5 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
+import type { Store } from '../src/store';
+import { sqliteOf } from "../src/store/open";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -123,10 +125,10 @@ it('schedules the alarm for the end of an attack pause, so the change back is to
 it('opens a connection with the deployment\'s defaults when the admins\' toggles cannot be read', async () => {
 	const stub = env.DEMO.getByName(`toggles-unread-${crypto.randomUUID()}`);
 	await runInDurableObject(stub, (instance) => {
-		const runtime = instance as unknown as { toggles: Map<string, unknown>; store: { toggle(): unknown; presenceToggle(): unknown } };
+		const runtime = instance as unknown as { toggles: Map<string, unknown>; store: Store };
 		runtime.toggles.clear();
-		vi.spyOn(runtime.store, 'toggle').mockImplementation(() => { throw new Error('storage unavailable'); });
-		vi.spyOn(runtime.store, 'presenceToggle').mockImplementation(() => { throw new Error('storage unavailable'); });
+		vi.spyOn(sqliteOf(runtime.store).uploads, 'toggle').mockImplementation(() => { throw new Error('storage unavailable'); });
+		vi.spyOn(sqliteOf(runtime.store).readState, 'presenceToggle').mockImplementation(() => { throw new Error('storage unavailable'); });
 	});
 	const peer = await open(stub);
 	const first = await new Promise<{ method?: string }>((resolve) => peer.socket.addEventListener('message', (event) => resolve(JSON.parse(String(event.data))), { once: true }));

@@ -609,7 +609,7 @@ export const MAX_REGISTRATIONS_PER_DAY = DEFAULT_LIMITS.registrationsPerDay;
 export const MAX_CLEANUP_BATCH = 100;
 // Each cleanup run reads this many index entries to find where the count
 // ends; past it, history would also outgrow the log scans /rename and /purge
-// budget for (store.ts, RETAINED_SCAN_CAP).
+// budget for (src/store/limits.ts, RETAINED_SCAN_CAP).
 export const MAX_RETENTION_RECORDS = 50_000;
 // Each history cycle reads this many D1 index entries to find where the D1
 // tier's own count ends (D1HistoryTier.floorFor).
@@ -620,9 +620,9 @@ export function thresholdRecords(limit: number, percent: number): number {
 	return limit > 0 ? Math.max(1, Math.floor((limit * percent) / 100)) : 0;
 }
 /**
- * The thread limit the fixed per-user sizes were calibrated at (store.ts:
+ * The thread limit the fixed per-user sizes were calibrated at (domain.ts:
  * MAX_USER_ROOMS, what a connection's attachment carries, and
- * MAX_PURGE_ROOMS). A `threads` limit above it scales what scales with the
+ * src/store/limits.ts: MAX_PURGE_ROOMS). A `threads` limit above it scales what scales with the
  * threads (listedThreadScale); one below it lists as this does, so lowering
  * the limit never shortens a listing.
  */
@@ -637,7 +637,7 @@ export const MAX_CREATED_ROOMS = 16;
 export function listedThreadScale(threads: number): number {
 	return Math.max(threads, CALIBRATED_THREAD_LIMIT);
 }
-/** Threads a listing names, the most recently active (store.ts, listRooms): twice the thread scale. */
+/** Threads a listing names, the most recently active (src/store, listRooms): twice the thread scale. */
 export function listedThreads(threads: number): number {
 	return 2 * listedThreadScale(threads);
 }
@@ -670,12 +670,12 @@ export function roomListingWorstBytes(limits: Pick<Limits, "threads" | "privateM
 export const MAX_ROOM_METADATA_LIMIT = 16 * 1024;
 export const MAX_ROOM_METADATA_TOTAL_LIMIT = MAX_HISTORY_RESPONSE_BYTES;
 // Private rooms share the rooms table with the threads, outside the ranges the
-// public scans read (store.ts, PUBLIC_ROOMS): the ceiling bounds the scans of
+// public scans read (src/store/schema.ts, PUBLIC_ROOMS): the ceiling bounds the scans of
 // the private range, and the per-user ceiling the rooms one user can be in.
 export const MAX_PRIVATE_ROOM_LIMIT = 200;
 export const MAX_PRIVATE_MEMBERSHIPS_PER_USER = 50;
 // The most rooms one registered user may be a member of, private ones
-// included (store.ts, MEMBERSHIP_LIMIT_MESSAGE). Rooms are kept as long as
+// included (src/store/limits.ts, MEMBERSHIP_LIMIT_MESSAGE). Rooms are kept as long as
 // their history, so without it the reads of a user's own rooms (their
 // listing, a purge or rename of them) would grow without bound.
 export const MAX_MEMBERSHIPS_PER_USER = 1_000;
@@ -771,3 +771,16 @@ export const ACCOUNT_USAGE_POLICY = Object.freeze({
 	stopRatio: 0.90,
 	...PLAN.account,
 });
+
+/**
+ * The share of a daily ceiling (foreground SQL reads or writes, frames) at
+ * which the server degrades: live text, uploads and older history are
+ * refused until UTC midnight, so what is left goes to chat (assertNotDegraded).
+ */
+export const DEGRADE_SHARE = 0.7;
+/**
+ * The share at which the server counts a ceiling as spent (the exhausted
+ * tier): the ledger refuses a reservation that would pass the ceiling, so a
+ * share stops short of 1 while work is already refused.
+ */
+export const EXHAUSTED_SHARE = 0.99;
