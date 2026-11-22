@@ -209,6 +209,28 @@ it('ext:command_list follows who may run each command: bots, guests, mods, and b
 	}
 });
 
+it('matches command and form names exactly: /KICK and /Help are unknown, /server Title no form', async () => {
+	const admin = await signedInAdmin();
+	const aliceId = unique('alice');
+	const alice = await signedIn(aliceId);
+	try {
+		for (const [id, text, name] of [['upper-kick', `/KICK ${aliceId}`, 'KICK'], ['title-kick', `/Kick @${aliceId}`, 'Kick'], ['help', '/Help', 'Help']] as const) {
+			const unknown = await command(admin, id, text);
+			expect(unknown.frame.error, text).toEqual({ code: -32602, message: `Unknown command /${name}; try /help` });
+			expect(unknown.notice, text).toBeUndefined();
+		}
+		// A form's words too: `/server Title` names no form, and changes nothing.
+		const title = await command(admin, 'server-title', '/server Title Mine');
+		expect(title.frame.error.code).toBe(-32602);
+		expect(title.frame.error.message).toMatch(/^Usage: \/server, /);
+		// The names as listed still work.
+		expect((await command(admin, 'help-lower', '/help')).frame.result).toEqual({});
+		const kicked = await command(admin, 'kick', `/kick ${aliceId}`);
+		expect(kicked.frame.result).toEqual({});
+		expect(kicked.notice!.params.body.text).toBe(`Removed \`${aliceId}\` from this room.`);
+	} finally { admin.close(); alice.close(); }
+});
+
 it('refuses a command that requires room_id when it comes without one, rather than run it in the default room', async () => {
 	const admin = await signedInAdmin();
 	const aliceId = unique('alice');

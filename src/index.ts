@@ -695,7 +695,8 @@ function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limit
 	// The text after the field is taken as typed, line breaks included.
 	const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
 	const value = rest.trim();
-	const chosen = field.toLowerCase();
+	// A form's word is matched exactly, as a command's name is: `/server Title` is no form.
+	const chosen = field;
 	const embeds = Array.isArray(body.embeds) ? body.embeds : [];
 	if (chosen !== "avatar" && embeds.length) throw usageError("Only /server avatar takes an attachment");
 	if (!chosen) return { field: "show" };

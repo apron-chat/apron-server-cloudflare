@@ -231,15 +231,15 @@ function checkForms(name: string, forms: readonly CommandForm<never>[]): void {
 
 /**
  * The form a command line names: the one with the most words that the
- * line's words after the name start with (in any case, as the name), else
- * the command's first form.
+ * line's words after the name start with, matched exactly as the name is,
+ * else the command's first form.
  */
 function formOf<R>(forms: readonly CommandForm<R>[], words: readonly string[]): CommandForm<R> {
 	let chosen: CommandForm<R> | undefined;
 	let most = -1;
 	for (const form of forms) {
 		const own = form.words ? form.words.split(" ") : [];
-		if (own.length > most && own.every((word, index) => words[index + 1]?.toLowerCase() === word)) {
+		if (own.length > most && own.every((word, index) => words[index + 1] === word)) {
 			chosen = form;
 			most = own.length;
 		}
@@ -423,7 +423,8 @@ function hasLiveEmbed(body: Readonly<Record<string, unknown>>): boolean {
 
 /**
  * Runs one command line from `identity`, in this order: look the command
- * up among those offered (an unknown one is an error to show, not a policy
+ * up among those offered, by its exact name (an unknown one, `/Kick`
+ * included, is an error to show, not a policy
  * violation, since people mistype); authorize (audience, roles, and for an
  * admin command, the capability); refuse a form that requires `room_id`
  * sent without one, an error to show like an unknown command; refuse a
@@ -438,7 +439,8 @@ export async function dispatchCommand<C extends ScopeBase>(
 ): Promise<void> {
 	const line = text.trim();
 	const words = line.startsWith("/") ? line.slice(1).split(/\s+/) : [""];
-	const name = words[0].toLowerCase();
+	// Names are case-sensitive (ext:command_list): `/Kick` is not `/kick`.
+	const name = words[0];
 	const command = table.find(name, ctx.runtime);
 	if (!command) {
 		const message = line.startsWith("/") ? `Unknown command /${name}; try /help` : "A command starts with /; try /help";
