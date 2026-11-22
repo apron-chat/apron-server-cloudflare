@@ -2,9 +2,25 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebAuthnService } from '../src/auth';
+import { LEGACY_PASSKEYS_REMOVE_AFTER } from '../src/legacy-passkeys';
 import { loadConfig, type RuntimeConfig } from '../src/config';
 import { connect as open, greeting, request, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
+
+// FIXME(2026-12-22): this fails from 2026-12-23 (UTC) on, on purpose, so the
+// migration does not outlive its 30 days. Don't move the date to make it
+// pass: remove the legacy passkey code as src/legacy-passkeys.ts says, which
+// deletes this file and this test with it.
+it(`is removed by ${LEGACY_PASSKEYS_REMOVE_AFTER}`, () => {
+	const due = Date.parse(`${LEGACY_PASSKEYS_REMOVE_AFTER}T00:00:00Z`) + 24 * 60 * 60 * 1_000;
+	expect(Number.isFinite(due)).toBe(true);
+	expect(Date.now() < due, [
+		`The legacy passkey migration (LEGACY_RP_ID) was due for removal after ${LEGACY_PASSKEYS_REMOVE_AFTER}.`,
+		'Clean up: delete src/legacy-passkeys.ts and this file, then',
+		'`grep -rn LEGACY_RP_ID src test docs SPEC.md wrangler*.toml worker-configuration.d.ts`',
+		'and remove each marked line, as the header of src/legacy-passkeys.ts says.',
+	].join(' ')).toBe(true);
+});
 
 // A server whose RP ID moved from a parent domain to its own host
 // (LEGACY_RP_ID): passkeys made for the old one still sign in, on the
