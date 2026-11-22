@@ -8313,7 +8313,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * write finishes (finishUpload).
 	 */
 	/**
-	 * `/embed-terminal [title]` and `/embed-append [markdown]` (live text,
+	 * `/embed-terminal [<title>]` and `/embed-append [<markdown>]` (live text,
 	 * §4.8.3): checks the policy, charges the post and the start, and answers
 	 * with the write's `{embeds: [{embed_id, kind, write_url}]}`, after a
 	 * `~private` notice with the URL in copy-paste recipes. Nothing is posted
