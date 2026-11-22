@@ -433,7 +433,10 @@ describe("export and import", () => {
 		expect(again.resumed).toBe(true);
 		expect(again.logIdRange).toEqual({ first: 100_000, last: 100_000 + many - 1 });
 		expect(target.head.all().filter((record) => record.room_id === "lobby")).toHaveLength(many);
-	});
+		// Importing 25,000 records twice takes about 3 s on its own, and more on a
+		// shared CI runner with the rest of the suite in parallel: past vitest's
+		// default 5 s on main's run of #113.
+	}, 30_000);
 
 	// The account cap the import is bounded by is the server's own: 2,500
 	// users import in bounded batches, and a failure partway is finished by
