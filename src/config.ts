@@ -331,12 +331,15 @@ function validOrigin(origin: string): boolean {
 	}
 }
 
-/** This server's host name (RuntimeConfig.serverHost): `PUBLIC_ORIGIN`'s, else `rpId`. */
+/**
+ * This server's host name (RuntimeConfig.serverHost): `PUBLIC_ORIGIN`'s,
+ * else `rpId`. A `PUBLIC_ORIGIN` that is not an exact origin is left to
+ * uploads and live text, which refuse it where they are configured, as
+ * before it named anything else.
+ */
 function loadServerHost(publicOrigin: string | undefined, rpId: string): string {
 	const origin = String(publicOrigin ?? "").trim();
-	if (!origin) return rpId;
-	if (!validOrigin(origin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
-	return new URL(origin).hostname;
+	return origin && validOrigin(origin) ? new URL(origin).hostname : rpId;
 }
 
 /** The environment variable spelling of a camelCase limit name. */

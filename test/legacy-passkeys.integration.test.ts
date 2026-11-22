@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { WebAuthnService } from '../src/auth';
 import { LEGACY_PASSKEYS_REMOVE_AFTER } from '../src/legacy-passkeys';
 import { loadConfig, type RuntimeConfig } from '../src/config';
-import { connect as open, greeting, request, type Peer } from './helpers/socket';
+import { connect as open, greeting, request, until, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 
 // FIXME(2026-12-22): this fails from 2026-12-23 (UTC) on, on purpose, so the
@@ -100,8 +100,8 @@ const finish = async (origin: string, challenge_id: string, credential: unknown)
 	return { status: response.status, body: await response.json() as { redirect?: string; upgrade?: string; added?: boolean; error?: string } };
 };
 
-/** An account made through the passkey page under the old RP ID, as it was before the move. */
-async function legacyAccount(): Promise<{ passkey: Passkey; userId: string }> {
+/** An account made through the passkey page under the old RP ID, as it was before the move; `keep` keeps its connection open. */
+async function legacyAccount(keep = false): Promise<{ passkey: Passkey; userId: string; peer: Peer }> {
 	const peer = await connect(OLD);
 	try {
 		await greeting(peer);
@@ -114,8 +114,22 @@ async function legacyAccount(): Promise<{ passkey: Passkey; userId: string }> {
 		const done = await finish(OLD, started.body.challenge_id, await passkey.register(started.body.public_key));
 		expect(done.status).toBe(200);
 		const signedIn = await request(peer, 'finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(app.code(done.body.redirect!)) });
-		return { passkey, userId: signedIn.result.you.user_id };
-	} finally { peer.close(); }
+		return { passkey, userId: signedIn.result.you.user_id, peer };
+	} finally { if (!keep) peer.close(); }
+}
+
+/** How many sign-in codes are stored. */
+const codes = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'signin-code:' })).size);
+const passkeysOf = (userId: string) => runInDurableObject(stub(), (instance) =>
+	(instance as unknown as { store: { credentials: { idsForUser(userId: string): string[] } } }).store.credentials.idsForUser(userId).sort());
+
+/** A legacy sign-in on the new host's page: the upgrade token it answers. */
+async function legacySignIn(passkey: Passkey, query: string): Promise<string> {
+	const legacy = await begin(NEW, { query, legacy: true });
+	expect(legacy.body.public_key.rpId).toBe('localhost');
+	const signedIn = await finish(NEW, legacy.body.challenge_id, await passkey.assert(legacy.body.public_key, nextCounter(passkey), { origin: NEW }));
+	expect(signedIn).toEqual({ status: 200, body: { upgrade: expect.stringMatching(/^up_[A-Za-z0-9_-]{43}$/) } });
+	return signedIn.body.upgrade!;
 }
 
 /** Redeems a page code on a new connection to `origin`; the account it signs in to. */
@@ -133,52 +147,71 @@ const loginQuery = async (origin: string) => {
 	return { app, query: app.url(`${origin}/passkey?action=login`).searchParams.toString(), url: app.url(`${origin}/passkey?action=login`) };
 };
 
-it('signs in on the passkey page with a passkey made for the legacy RP ID, then adds one for the new', async () => {
+it('signs in on the passkey page with a passkey made for the legacy RP ID, then adds one for the new, then issues the code', async () => {
+	const { passkey, userId, peer } = await legacyAccount(true);
+	try {
+		await rpIds('chat.localhost', 'localhost');
+
+		// The page offers the older passkey, and has the next screen ready.
+		const { app, query, url } = await loginQuery(NEW);
+		const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
+		expect(html).toContain('data-legacy="legacy">Use one made for localhost</button>');
+		expect(html).toContain('<div id="upgrade" hidden>');
+
+		// The usual sign-in is for the new RP ID; the legacy one, asked for, for the old,
+		// on the page's origin, the new host's, under both. It issues no code yet.
+		expect((await begin(NEW, { query })).body.public_key.rpId).toBe('chat.localhost');
+		const before = await codes();
+		const token = await legacySignIn(passkey, query);
+		expect(await codes()).toBe(before);
+
+		// The upgrade works only on the page and request it was offered on.
+		const other = await loginQuery(NEW);
+		expect(await begin(NEW, { query: other.query, upgrade: token })).toEqual({ status: 400, body: { error: 'This sign-in expired. Start again from the app.' } });
+
+		// The new passkey, for the new RP ID, excluding the old one, is added at once, the account's
+		// connections are told, and the sign-in's code goes back with it.
+		const upgraded = await begin(NEW, { query, upgrade: token });
+		expect(upgraded.status).toBe(200);
+		expect(upgraded.body.public_key.rp.id).toBe('chat.localhost');
+		expect(upgraded.body.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([passkey.id]);
+		const fresh = await softPasskey(NEW);
+		const added = await finish(NEW, upgraded.body.challenge_id, await fresh.register(upgraded.body.public_key));
+		expect(added).toEqual({ status: 200, body: { redirect: expect.stringMatching(/^com\.example\.myapp:\/signed-in\?code=/), added: true } });
+		expect(await passkeysOf(userId)).toEqual([passkey.id, fresh.id].sort());
+		const told = await until(peer, (frame) => frame.method === 'message' && frame.params?.from?.user_id === '~private');
+		expect(told.frame.params.body.text).toBe('A passkey was added to your account on the passkey page. If it wasn\'t you, remove it with `/passkeys`.');
+		expect(await redeem(NEW, added.body.redirect!, app)).toBe(userId);
+
+		// The token is used up.
+		expect((await begin(NEW, { query, upgrade: token })).status).toBe(400);
+		expect((await post(NEW, '/passkey/finish', { skip: true, upgrade: token })).status).toBe(400);
+
+		// And the new passkey signs in with the new RP ID, with no upgrade.
+		const next = await loginQuery(NEW);
+		const again = await begin(NEW, { query: next.query });
+		const done = await finish(NEW, again.body.challenge_id, await fresh.assert(again.body.public_key, nextCounter(fresh)));
+		expect(done).toEqual({ status: 200, body: { redirect: expect.any(String) } });
+		expect(await redeem(NEW, done.body.redirect!, next.app)).toBe(userId);
+	} finally { peer.close(); }
+});
+
+it('issues the sign-in code on "Not now", once', async () => {
 	const { passkey, userId } = await legacyAccount();
 	await rpIds('chat.localhost', 'localhost');
-
-	// The page offers the older passkey, and has the next screen ready.
-	const { app, query, url } = await loginQuery(NEW);
-	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
-	expect(html).toContain('data-legacy="legacy">Use one made for localhost</button>');
-	expect(html).toContain('<div id="upgrade" hidden>');
-
-	// The usual sign-in is for the new RP ID; the legacy one, asked for, for the old.
-	expect((await begin(NEW, { query })).body.public_key.rpId).toBe('chat.localhost');
-	const legacy = await begin(NEW, { query, legacy: true });
-	expect(legacy.status).toBe(200);
-	expect(legacy.body.public_key.rpId).toBe('localhost');
-	// The page's origin is the new host's, under both RP IDs.
-	const signedIn = await finish(NEW, legacy.body.challenge_id, await passkey.assert(legacy.body.public_key, nextCounter(passkey), { origin: NEW }));
-	expect(signedIn.status).toBe(200);
-	expect(signedIn.body).toEqual({ redirect: expect.stringMatching(/^com\.example\.myapp:\/signed-in\?/), upgrade: expect.stringMatching(/^rq_/) });
-
-	// The new passkey, for the new RP ID, excluding the old one, is added at once.
-	const upgraded = await begin(NEW, { query, upgrade: signedIn.body.upgrade });
-	expect(upgraded.status).toBe(200);
-	expect(upgraded.body.public_key.rp.id).toBe('chat.localhost');
-	expect(upgraded.body.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([passkey.id]);
-	const fresh = await softPasskey(NEW);
-	expect(await finish(NEW, upgraded.body.challenge_id, await fresh.register(upgraded.body.public_key))).toEqual({ status: 200, body: { added: true } });
-	await runInDurableObject(stub(), (instance) => {
-		const store = (instance as unknown as { store: { credentials: { idsForUser(userId: string): string[] } } }).store;
-		expect(store.credentials.idsForUser(userId).sort()).toEqual([passkey.id, fresh.id].sort());
-	});
-
-	// The code from the legacy sign-in still signs the client in.
-	expect(await redeem(NEW, signedIn.body.redirect!, app)).toBe(userId);
-
-	// And the new passkey signs in with the new RP ID.
-	const next = await loginQuery(NEW);
-	const again = await begin(NEW, { query: next.query });
-	const done = await finish(NEW, again.body.challenge_id, await fresh.assert(again.body.public_key, nextCounter(fresh)));
-	expect(done.status).toBe(200);
-	expect(done.body.upgrade).toBeUndefined();
-	expect(await redeem(NEW, done.body.redirect!, next.app)).toBe(userId);
+	const { app, query } = await loginQuery(NEW);
+	const token = await legacySignIn(passkey, query);
+	const skipped = await post(NEW, '/passkey/finish', { skip: true, upgrade: token });
+	expect(skipped.status).toBe(200);
+	const { redirect } = await skipped.json() as { redirect: string };
+	expect(await redeem(NEW, redirect, app)).toBe(userId);
+	expect(await passkeysOf(userId)).toEqual([passkey.id]);
+	expect((await post(NEW, '/passkey/finish', { skip: true, upgrade: token })).status).toBe(400);
+	expect((await begin(NEW, { query, upgrade: token })).status).toBe(400);
 });
 
 it('takes the legacy RP ID only for a sign-in on the passkey page', async () => {
-	const { passkey } = await legacyAccount();
+	const { passkey, userId } = await legacyAccount();
 	const { query } = await loginQuery(NEW);
 	const refused = { status: 400, body: { error: 'The request was not understood.' } };
 
@@ -197,10 +230,20 @@ it('takes the legacy RP ID only for a sign-in on the passkey page', async () => 
 	const usual = await begin(NEW, { query });
 	const crossed = await finish(NEW, usual.body.challenge_id, await passkey.assert({ ...usual.body.public_key, rpId: 'localhost' }, nextCounter(passkey), { origin: NEW }));
 	expect(crossed.status).toBe(400);
-	// An upgrade needs a handle a legacy sign-in gave.
-	expect((await begin(NEW, { query, upgrade: `rq_${'A'.repeat(43)}` })).status).toBe(400);
-	expect(await begin(NEW, { query, upgrade: 'rq_short' })).toEqual(refused);
-	expect(await begin(NEW, { query, legacy: true, upgrade: `rq_${'A'.repeat(43)}` })).toEqual(refused);
+
+	// An upgrade takes only a token a legacy sign-in gave: never an addition link's
+	// request handle, which a client's URL carries and anyone who sees it could send.
+	const handle = await runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { store: { accounts: { get(userId: string): { userHandle?: string } | null } }; createRequestHandle(userId: string, userHandle: string | undefined, now: number): Promise<string> };
+		return server.createRequestHandle(userId, server.store.accounts.get(userId)?.userHandle, Date.now());
+	});
+	expect(handle).toMatch(/^rq_/);
+	expect(await begin(NEW, { query, upgrade: handle })).toEqual(refused);
+	expect((await post(NEW, '/passkey/finish', { skip: true, upgrade: handle })).status).toBe(400);
+	expect((await begin(NEW, { query, upgrade: `up_${'A'.repeat(43)}` })).status).toBe(400);
+	expect(await begin(NEW, { query, upgrade: 'up_short' })).toEqual(refused);
+	expect(await begin(NEW, { query, legacy: true, upgrade: `up_${'A'.repeat(43)}` })).toEqual(refused);
+	expect(await passkeysOf(userId)).toEqual([passkey.id]);
 	// A sign-in with a passkey for the new RP ID offers no upgrade.
 	const fresh = await softPasskey(NEW);
 	const unknown = await begin(NEW, { query });

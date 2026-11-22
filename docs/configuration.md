@@ -967,7 +967,11 @@ them, checked when the Worker starts:
 | `BACKUP_KEEP`: how many backup files of each kind are kept, newest first | `14` | `"14"` | `"14"` |
 | `BACKUP_PRIVATE_ROOMS`: whether private rooms are backed up | `true` | `"true"` | `"true"` |
 
-Each backup's key is `backups/<host>-<kind>-<date>.jsonl.gz`, the kind
+Each backup's key is `backups/<host>-<kind>-<date>.jsonl.gz` (`<host>` as
+for the cold tier: until 2026-11-22 it was `RP_ID`, so a server whose
+`PUBLIC_ORIGIN` host differs from its `RP_ID` stopped pruning its earlier
+backups, `backups/<RP_ID>-…`, then; delete those by hand once `BACKUP_KEEP`
+new ones exist), the kind
 `scheduled` or `manual`, with the codecs it went through recorded in its
 metadata (`codecs: gzip`); after writing one, the backups of its kind past
 the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.

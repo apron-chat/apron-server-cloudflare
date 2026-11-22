@@ -495,6 +495,7 @@ describe('configuration policy boundaries', () => {
 		expect(config({ ...production, PUBLIC_ORIGIN: 'https://server.apron.chat' }).serverHost).toBe('server.apron.chat');
 		expect(config({ ...production, PUBLIC_ORIGIN: '' }).serverHost).toBe('apron.chat');
 		expect(config({ PUBLIC_ORIGIN: 'http://localhost:8787' }).serverHost).toBe('localhost');
-		expect(() => config({ ...production, PUBLIC_ORIGIN: 'https://server.apron.chat/' })).toThrow(/PUBLIC_ORIGIN must be an exact/);
+		// One that is not an exact origin names nothing, and is refused only where uploads or live text use it.
+		expect(config({ ...production, PUBLIC_ORIGIN: 'https://server.apron.chat/' }).serverHost).toBe('apron.chat');
 	});
 });

@@ -419,10 +419,11 @@ where the browser knows it; where it is missing, try the ceremony in place
 and fall back to `external.url` when it throws `SecurityError`. A
 `NotAllowedError` is the person cancelling or having no passkey for the RP
 ID, not a missing feature: offer the page then, but don't open it unasked.
-Until 2026-12-22 the page also signs in with production's passkeys made for
-`apron.chat` ([Moving `RP_ID`](#moving-rp_id)). <!-- LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts) -->
 
-<!-- LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts) -->
+<!-- LEGACY_RP_ID begin: remove through "end LEGACY_RP_ID" after 2026-12-22 (src/legacy-passkeys.ts) -->
+Until 2026-12-22 the page also signs in with production's passkeys made for
+`apron.chat` ([Moving `RP_ID`](#moving-rp_id)).
+
 ### Moving `RP_ID`
 
 Temporary: this section and `LEGACY_RP_ID` are removed after 2026-12-22,
@@ -598,9 +599,11 @@ budget:check` refuses a production config without that); its
 domain. `wrangler.toml` sets neither, so turn them off before deploying it
 anywhere.
 
-The RP ID is `server.apron.chat`, the server's own host. Until 2026-12-22,
-passkeys made before for `apron.chat` still sign in on the passkey page
-(`LEGACY_RP_ID`, [Moving `RP_ID`](#moving-rp_id)). <!-- LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts) -->
+The RP ID is `server.apron.chat`, the server's own host.
+<!-- LEGACY_RP_ID begin: remove through "end LEGACY_RP_ID" after 2026-12-22 (src/legacy-passkeys.ts) -->
+Until 2026-12-22, passkeys made before for `apron.chat` still sign in on the
+passkey page (`LEGACY_RP_ID`, [Moving `RP_ID`](#moving-rp_id)).
+<!-- end LEGACY_RP_ID -->
 Guest connections accept every origin, including localhost, LAN frontends,
 local files (opaque origins), and clients without Origin. Passkey
 verification allows only the exact `https://web.apron.chat` origin.
