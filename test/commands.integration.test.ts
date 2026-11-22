@@ -224,22 +224,45 @@ describe('command forms', () => {
 	const form = (spec: Record<string, unknown>) => defineCommands<ScopeBase>(({ publicCommand }) => [
 		publicCommand({ name: 'demo', usageErrors: 'reply', parse: () => ({}), run: () => {}, ...spec } as never),
 	]);
+	const someone = { tier: 'registered', userId: 'someone_1' };
 
-	it('name each form by its words, and write the usage and the list from them', () => {
-		const table = form({ forms: [{ description: 'Show it' }, { words: 'add', hint: '<id>', description: 'Add one', uses: ['body.embeds'], requires: ['body.embeds'] }] });
+	it('name each form by its words, and write the usage, /help and the list from them', () => {
+		const table = form({ forms: [{ description: 'Show it' }, { words: 'add', hint: '<id>', description: 'Add one, at most <max>', uses: ['body.embeds'], requires: ['body.embeds'] }] });
 		const [demo] = table.commands;
-		expect(demo.usage).toBe('/demo, or /demo add <id>');
-		expect(commandList(table.commands)).toEqual([
+		expect(demo.usage(undefined)).toBe('/demo, or /demo add <id>');
+		const offered = table.listFor(someone, undefined, true);
+		expect(commandList(offered)).toEqual([
 			{ name: 'demo', group: 'all', description: 'Show it' },
-			{ name: 'demo add', group: 'all', description: 'Add one', hint: '<id>', uses: ['body.embeds'], requires: ['body.embeds'] },
+			{ name: 'demo add', group: 'all', description: 'Add one, at most <max>', hint: '<id>', uses: ['body.embeds'], requires: ['body.embeds'] },
 		]);
-		expect(helpText(table.commands)).toBe('- `/demo`: Show it\n- `/demo add <id>`: Add one');
+		// A description is CommonMark text in /help, so a placeholder is not read as HTML.
+		expect(helpText(offered)).toBe('- `/demo`: Show it\n- `/demo add <id>`: Add one, at most \\<max\\>');
 	});
 
-	it('refuse a form without a description, a requires outside uses or naming room_id, and forms out of order', () => {
+	it('offer only the forms their predicates allow, and give a hint from the runtime', () => {
+		const table = form({ forms: [
+			{ description: 'Show it', hint: (runtime: { choices: string[] }) => runtime.choices.join('|') },
+			{ words: 'add', description: 'Add one', offered: (runtime: { adding: boolean }, identity: { userId?: string }) => runtime.adding && identity.userId !== 'admin' },
+		] });
+		const names = (runtime: unknown, identity: { tier: string; userId?: string }) => commandList(table.listFor(identity, runtime, true)).map((entry) => entry.hint ? `${entry.name} ${entry.hint}` : entry.name);
+		expect(names({ choices: ['a', 'b'], adding: true }, someone)).toEqual(['demo a|b', 'demo add']);
+		expect(names({ choices: ['a'], adding: false }, someone)).toEqual(['demo a']);
+		expect(names({ choices: ['a'], adding: true }, { tier: 'registered', userId: 'admin' })).toEqual(['demo a']);
+		// The usage names every form, offered or not.
+		expect(table.commands[0].usage({ choices: ['a'], adding: false })).toBe('/demo a, or /demo add');
+	});
+
+	it('refuse forms that say what the extension does not allow', () => {
 		expect(() => form({ forms: [{ description: '' }] })).toThrow(/no description/);
+		expect(() => form({ forms: [{ description: '   ' }] })).toThrow(/no description/);
+		expect(() => form({ forms: [{ description: 'x', hint: ' ' }] })).toThrow(/blank hint/);
+		expect(() => form({ forms: [{ words: 'a  b', description: 'x' }] })).toThrow(/one space apart/);
+		expect(() => form({ forms: [{ words: ' a', description: 'x' }] })).toThrow(/one space apart/);
+		expect(() => form({ forms: [{ description: 'x', uses: ['reply_to', 'reply_to'] }] })).toThrow(/repeats/);
+		expect(() => form({ forms: [{ description: 'x', uses: ['body.embeds'], requires: ['body.embeds', 'body.embeds'] }] })).toThrow(/repeats/);
 		expect(() => form({ forms: [{ description: 'x', requires: ['reply_to'] }] })).toThrow(/requires/);
-		expect(() => form({ forms: [{ description: 'x', uses: ['room_id'], requires: ['room_id'] }] })).toThrow(/requires/);
+		// A form may require room_id, as one that acts only on a room the client names.
+		expect(() => form({ forms: [{ description: 'x', uses: ['room_id'], requires: ['room_id'] }] })).not.toThrow();
 		expect(() => form({ forms: [{ words: 'b', description: 'x' }, { words: 'a', description: 'y' }] })).toThrow(/out of place/);
 		expect(() => form({ forms: [{ words: 'a', description: 'x' }, { words: 'a', description: 'y' }] })).toThrow(/out of place/);
 	});

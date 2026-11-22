@@ -109,12 +109,12 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 			expect(form.name).toMatch(/^[a-z-]+( [a-z]+)?$/);
 			expect(form.description).not.toBe('');
 			if (form.uses) expect(form.uses.length).toBeGreaterThan(0);
-			// What a form requires it uses, and never the room.
-			if (form.requires) expect(form.requires.every((field) => form.uses!.includes(field) && field !== 'room_id')).toBe(true);
+			// What a form requires it uses.
+			if (form.requires) expect(form.requires.every((field) => form.uses!.includes(field))).toBe(true);
 		}
 		const byName = new Map(all.map((form) => [form.name, form]));
 		// A fixed word after the name is a form of its own; uses name the fields the form reads.
-		expect(byName.get('kick')).toEqual({ name: 'kick', group: 'admin', description: 'Remove a user from this room', hint: '@user', uses: ['room_id'] });
+		expect(byName.get('kick')).toEqual({ name: 'kick', group: 'admin', description: 'Remove a user from this room', hint: '@user', uses: ['room_id'], requires: ['room_id'] });
 		expect(byName.get('admin')).toEqual({ name: 'admin', group: 'admin', description: 'Make a registered user an admin', hint: '@user' });
 		expect(byName.get('admin remove')).toEqual({ name: 'admin remove', group: 'admin', description: 'Make a user no longer an admin', hint: '@user' });
 		expect(byName.get('emoji add')).toEqual({ name: 'emoji add', group: 'role', description: 'Add a custom emoji, or replace its image, from one attached image', hint: ':<name>:', uses: ['body.embeds'], requires: ['body.embeds'] });
@@ -127,7 +127,8 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		expect(byName.get('toggle')!.hint).toBe('activity|uploads|presence|addmember|livetext');
 		expect(byName.get('server title')!.hint).toBe('[<text>]');
 		expect(byName.get('passkeys remove')).toEqual({ name: 'passkeys remove', group: 'member', description: 'Remove one of your account\'s passkeys', hint: '<n>' });
-		expect(['invite-device add', 'invite-device list', 'invite-device remove'].map((name) => byName.get(name)?.hint)).toEqual(['[<id>]', undefined, '<id>']);
+		// The admin user holds no device tokens, so it is offered only the list.
+		expect(all.map((form) => form.name).filter((name) => name.startsWith('invite-device'))).toEqual(['invite-device list']);
 		expect(['history export', 'history import', 'history status'].map((name) => byName.get(name)?.hint)).toEqual(['[<room_id>...]', '<key> [dry-run] [match|new] [renumber] [restart]', undefined]);
 		// The user-target commands read the user from the text alone.
 		for (const name of ['admin', 'invite-purge', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
@@ -143,11 +144,112 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		const own = await list(alice, 'alice-list');
 		expect(own.map(usage)).toEqual(await helped(alice, 'alice-help'));
 		expect(own.map((form) => form.name)).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove']);
+		expect(own.filter((form) => form.name.startsWith('invite-device')).map((form) => form.hint)).toEqual(['[<id>]', undefined, '<id>']);
 
 		// It changes with the user's roles: /emoji for a friend.
 		expect((await command(admin, 'friend', `/role ${aliceId} friend`)).frame.result).toEqual({});
 		expect((await list(alice, 'friend-list')).map((form) => form.name)).toEqual(expect.arrayContaining(['emoji add', 'emoji remove']));
 	} finally { admin.close(); alice.close(); }
+});
+
+/** A connection's ext:command_list names, in order. */
+async function listed(peer: Peer, id: string): Promise<string[]> {
+	return ((await request(peer, id, 'ext:command_list', {})).result.commands as Array<{ name: string }>).map((form) => form.name);
+}
+
+async function setGuestPosting(value: boolean): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { guestPosting: boolean } };
+		server.config = { ...server.config, guestPosting: value };
+	});
+}
+
+it('ext:command_list follows who may run each command: bots, guests, mods, and before auth', async () => {
+	const admin = await signedInAdmin();
+	const ownerId = unique('owner');
+	const owner = await signedIn(ownerId);
+	const modId = unique('mod');
+	const mod = await signedIn(modId);
+	const early = await connect();
+	const guest = await connect();
+	let bot: Peer | undefined;
+	try {
+		// Before auth: denied, as `command` is; without an id, no reply at all.
+		await early.next();
+		early.send({ method: 'ext:command_list', params: {} });
+		const refused = await exchange(early, 'early', 'ext:command_list', {});
+		expect(refused.frame.error).toMatchObject({ code: -32001, message: 'Authenticate first' });
+		// The welcome notice may come first; no reply does.
+		expect(refused.skipped.filter((frame) => 'id' in frame)).toEqual([]);
+
+		// A bot: /avatar and live text, not the owners' commands or /emoji.
+		const invited = await command(owner, 'invite-bot', '/invite-bot');
+		const token = /```\n(apron_bot_[A-Za-z0-9_-]+)\n```/.exec(invited.notice!.params.body.text)![1];
+		bot = await connect(null);
+		await bot.next();
+		expect((await request(bot, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(`bot_${ownerId}`);
+		expect(await listed(bot, 'bot-list')).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help']);
+		// Even with a role that may use /emoji: a bot is no owner.
+		await command(admin, 'bot-mod', `/role bot_${ownerId} mod`);
+		expect(await listed(bot, 'bot-mod-list')).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help']);
+
+		// A mod: the owners' commands and /emoji, none of the admins'.
+		await command(admin, 'mod', `/role ${modId} mod`);
+		expect(await listed(mod, 'mod-list')).toEqual(['avatar', 'embed-append', 'embed-terminal', 'emoji add', 'emoji remove', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove']);
+
+		// A guest who may only read: /help alone; one who may post also gets live text.
+		await guest.next();
+		await request(guest, 'auth', 'auth', { scheme: 'guest' });
+		expect(await listed(guest, 'guest-posting')).toEqual(['embed-append', 'embed-terminal', 'help']);
+		await setGuestPosting(false);
+		expect(await listed(guest, 'guest-reading')).toEqual(['help']);
+	} finally {
+		await setGuestPosting(true);
+		admin.close(); owner.close(); mod.close(); early.close(); guest.close(); bot?.close();
+	}
+});
+
+it('refuses a command that requires room_id when it comes without one, rather than run it in the default room', async () => {
+	const admin = await signedInAdmin();
+	const aliceId = unique('alice');
+	const alice = await signedIn(aliceId);
+	try {
+		for (const [id, text] of [['kick', `/kick ${aliceId}`], ['terminal', '/embed-terminal build'], ['append', '/embed-append Hi']] as const) {
+			const refused = await exchange(admin, `no-room-${id}`, 'command', { body: { text } });
+			expect(refused.frame.error, text).toEqual({ code: -32602, message: `Send /${text.slice(1).split(' ')[0]} from a room, with its room_id` });
+			// Nothing ran: no notice, and alice is still in general.
+			expect(refused.skipped.filter((frame) => frame.method === 'message' || frame.method === 'room_update'), text).toEqual([]);
+		}
+		// The socket stays open, and the same command with room_id runs.
+		const kicked = await command(admin, 'kick', `/kick ${aliceId}`);
+		expect(kicked.frame.result).toEqual({});
+		expect(kicked.notice!.params.body.text).toBe(`Removed \`${aliceId}\` from this room.`);
+		// Commands that do not require it still default to general.
+		expect((await exchange(admin, 'help', 'command', { body: { text: '/help' } })).frame.result).toEqual({});
+	} finally { admin.close(); alice.close(); }
+});
+
+it('ext:command_list leaves out what uploads and live text turned off refuse, /emoji remove staying', async () => {
+	const admin = await signedInAdmin();
+	const modId = unique('mod');
+	const mod = await signedIn(modId);
+	try {
+		await command(admin, 'mod', `/role ${modId} mod`);
+		const offered = ['avatar', 'embed-append', 'embed-terminal', 'emoji add', 'emoji remove'];
+		const shown = async (id: string) => (await listed(mod, id)).filter((name) => offered.includes(name));
+		expect(await shown('on')).toEqual(offered);
+		expect((await command(admin, 'uploads-off', '/toggle uploads')).frame.result).toEqual({});
+		// /emoji add is refused while uploads are off ("Uploads are turned off here"); a removal still works.
+		expect(await shown('uploads-off')).toEqual(['embed-append', 'embed-terminal', 'emoji remove']);
+		const help = (await command(mod, 'help-uploads-off', '/help')).notice!.params.body.text;
+		expect(help).not.toContain('/emoji add');
+		expect(help).toContain('/emoji remove');
+		expect((await command(admin, 'livetext-off', '/toggle livetext')).frame.result).toEqual({});
+		expect(await shown('both-off')).toEqual(['emoji remove']);
+		expect((await command(admin, 'uploads-on', '/toggle uploads')).frame.result).toEqual({});
+		expect((await command(admin, 'livetext-on', '/toggle livetext')).frame.result).toEqual({});
+		expect(await shown('back')).toEqual(offered);
+	} finally { admin.close(); mod.close(); }
 });
 
 it('/admin makes a registered user an admin, but not a guest, bot, or unknown user', async () => {

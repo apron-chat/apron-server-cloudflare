@@ -780,8 +780,8 @@ describe('uploads end to end', () => {
 
 			// Live text: /embed-append starts one, and /embed-terminal is refused only
 			// by the one-open-at-a-time rule everyone has, not for being a bot.
-			expect((await request(bot, 'live-append', 'command', { body: { text: '/embed-append' } })).result).toBeDefined();
-			expect((await request(bot, 'live-terminal', 'command', { body: { text: '/embed-terminal build' } })).error.message).toMatch(/^You already have a live text open/);
+			expect((await request(bot, 'live-append', 'command', { room_id: 'general', body: { text: '/embed-append' } })).result).toBeDefined();
+			expect((await request(bot, 'live-terminal', 'command', { room_id: 'general', body: { text: '/embed-terminal build' } })).error.message).toMatch(/^You already have a live text open/);
 		} finally { owner.close(); bot.close(); }
 	});
 

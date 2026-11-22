@@ -759,14 +759,14 @@ it('ext:command_list lists as data the commands /help lists, after auth', async 
 		// Only name, group, description, and the hint, uses and requires a form has; no audience or roles.
 		expect(listed.result).toEqual({
 			commands: [
-				{ name: 'embed-append', group: 'all', description: 'Get a link to stream text into a message in this room, such as an LLM\'s reply, after the opening <markdown>; the message appears when the stream starts', hint: '[<markdown>]', uses: ['room_id', 'reply_to'] },
-				{ name: 'embed-terminal', group: 'all', description: 'Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts', hint: '[<title>]', uses: ['room_id', 'reply_to'] },
+				{ name: 'embed-append', group: 'all', description: 'Get a link to stream text into a message in this room, such as an LLM\'s reply, after the opening <markdown>; the message appears when the stream starts', hint: '[<markdown>]', uses: ['room_id', 'reply_to'], requires: ['room_id'] },
+				{ name: 'embed-terminal', group: 'all', description: 'Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts', hint: '[<title>]', uses: ['room_id', 'reply_to'], requires: ['room_id'] },
 				{ name: 'help', group: 'all', description: 'List the commands that you can use' },
 			],
 		});
-		// The same commands, in the same order, as /help.
+		// The same commands, in the same order, as /help, whose descriptions are escaped CommonMark.
 		const help = await exchange(peer, 'help', 'command', { body: { text: '/help' } });
-		const helped = [...help.skipped.find((frame) => frame.method === 'message')!.params.body.text.matchAll(/^- `\/([^`]+)`: (.*)$/gm)].map((match) => [match[1], match[2]]);
+		const helped = [...help.skipped.find((frame) => frame.method === 'message')!.params.body.text.matchAll(/^- `\/([^`]+)`: (.*)$/gm)].map((match) => [match[1], match[2].replace(/\\(.)/g, '$1')]);
 		expect(helped).toEqual(listed.result.commands.map((command: { name: string; hint?: string; description: string }) => [command.hint ? `${command.name} ${command.hint}` : command.name, command.description]));
 	} finally { peer.close(); }
 });
@@ -783,7 +783,8 @@ it('answers /help with a private notice and rejects other commands without closi
 			room_id: 'general', from: { user_id: '~private', name: 'System message to you' },
 			body: {
 				text: [
-					'- `/embed-append [<markdown>]`: Get a link to stream text into a message in this room, such as an LLM\'s reply, after the opening <markdown>; the message appears when the stream starts',
+					// A description is CommonMark text here: its placeholder is escaped, not read as HTML.
+					'- `/embed-append [<markdown>]`: Get a link to stream text into a message in this room, such as an LLM\'s reply, after the opening \\<markdown\\>; the message appears when the stream starts',
 					'- `/embed-terminal [<title>]`: Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts',
 					'- `/help`: List the commands that you can use',
 				].join('\n'),

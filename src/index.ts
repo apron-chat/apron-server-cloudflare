@@ -116,7 +116,7 @@ import {
 import { arity, inviteUses, issuableUserId, oneOf, passkeyNumber, requiredArg, requiredUserId, roomIdArgs, stripMention, userIdArg, usageError, type InviteUses, type IssuableUserId, type PasskeyNumber, type RoomIdArg, type UserIdArg } from "./commands/args";
 import { noAuditSink, type AuditSink } from "./commands/audit";
 import { type AdminCapability, assertAdmin, assertRoles, type RoleCapability } from "./commands/capability";
-import { commandList, defineCommands, dispatchCommand, helpText, type Command } from "./commands/registry";
+import { commandList, defineCommands, dispatchCommand, helpText, type OfferedCommand } from "./commands/registry";
 import {
 	authorizationServerMetadata,
 	AUTHORIZE_PATH,
@@ -670,11 +670,11 @@ function passkeysArgs(words: readonly string[], usage: string): PasskeysArgs {
 /** `/emoji`'s arguments: add (with its image attached) or remove the custom emoji `key`, written `:name:`. */
 type EmojiArgs = { action: "add" | "remove"; key: string };
 
-function emojiArgs(words: readonly string[], body: Readonly<Record<string, unknown>>): EmojiArgs {
+function emojiArgs(words: readonly string[], body: Readonly<Record<string, unknown>>, usage: string): EmojiArgs {
 	const args = words.slice(1);
 	const action = args[0];
 	if (args.length !== 2 || (action !== "add" && action !== "remove")) {
-		throw usageError("Usage: /emoji add :<name>: with one image attached, or /emoji remove :<name>:");
+		throw usageError(`Usage: ${usage}`);
 	}
 	const key = args[1];
 	if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
@@ -700,7 +700,7 @@ function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limit
 	if (chosen !== "avatar" && embeds.length) throw usageError("Only /server avatar takes an attachment");
 	if (!chosen) return { field: "show" };
 	if (chosen === "avatar") {
-		if (value) throw usageError("Usage: /server avatar with one image attached, or alone to clear it");
+		if (value) throw usageError(`Usage: ${usage}`);
 		if (embeds.length && !oneUploadEmbed(embeds)) throw usageError("Attach one image to /server avatar as an upload embed");
 		return { field: "avatar", upload: embeds.length > 0 };
 	}
@@ -7897,14 +7897,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}),
 		publicCommand({
 			name: "embed-append", usageErrors: "violation", posting: true,
-			forms: [{ hint: "[<markdown>]", description: "Get a link to stream text into a message in this room, such as an LLM's reply, after the opening <markdown>; the message appears when the stream starts", uses: ["room_id", "reply_to"] }],
+			forms: [{ hint: "[<markdown>]", description: "Get a link to stream text into a message in this room, such as an LLM's reply, after the opening <markdown>; the message appears when the stream starts", uses: ["room_id", "reply_to"], requires: ["room_id"] }],
 			available: (runtime) => runtime.liveTextOn(),
 			parse: ({ text }) => liveOpening(text),
 			run: ({ runtime, socket, attachment, request, roomId }, opening) => runtime.liveCommand(socket, attachment, request, roomId, "append", opening),
 		}),
 		publicCommand({
 			name: "embed-terminal", usageErrors: "violation", posting: true,
-			forms: [{ hint: "[<title>]", description: "Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts", uses: ["room_id", "reply_to"] }],
+			forms: [{ hint: "[<title>]", description: "Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts", uses: ["room_id", "reply_to"], requires: ["room_id"] }],
 			available: (runtime) => runtime.liveTextOn(),
 			parse: ({ text }) => liveOpening(text),
 			run: ({ runtime, socket, attachment, request, roomId }, title) => runtime.liveCommand(socket, attachment, request, roomId, "terminal", title),
@@ -7912,12 +7912,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		ownerCommand({
 			name: "emoji", usageErrors: "reply",
 			forms: [
-				{ words: "add", hint: ":<name>:", description: "Add a custom emoji, or replace its image, from one attached image", uses: ["body.embeds"], requires: ["body.embeds"] },
+				// Refused while uploads are off; a removal still works.
+				{ words: "add", hint: ":<name>:", description: "Add a custom emoji, or replace its image, from one attached image", uses: ["body.embeds"], requires: ["body.embeds"], offered: (runtime) => runtime.uploadsOn() },
 				{ words: "remove", hint: ":<name>:", description: "Remove a custom emoji" },
 			],
 			roles: EMOJI_ROLES,
 			available: (runtime) => !!runtime.config.uploads,
-			parse: ({ words, body }) => emojiArgs(words, body),
+			parse: ({ words, body, usage }) => emojiArgs(words, body, usage),
 			run: ({ grant, runtime, socket, attachment, request, roomId }, args) => runtime.emojiCommand(grant, socket, attachment, request, roomId, args),
 		}),
 		publicCommand({
@@ -7948,7 +7949,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			forms: [{ hint: "<uses>", description: `Get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; 0 revokes it` }],
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
-				return inviteUses(requiredArg(words[1], usage), MAX_JOIN_USES);
+				return inviteUses(requiredArg(words[1], usage), MAX_JOIN_USES, usage);
 			},
 			audit: (uses) => ({ action: uses === 0 ? "revoke" : `mint ${uses}` }),
 			run: ({ cap, runtime, socket, request, roomId }, uses) => runtime.invite(cap, socket, request, roomId, uses),
@@ -7956,9 +7957,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		ownerCommand({
 			name: "invite-device", usageErrors: "reply",
 			forms: [
-				{ words: "add", hint: "[<id>]", description: "Get a token that signs in as you on another device" },
+				// The admin user signs in with APRON_ADMIN_TOKEN only, so it holds no device tokens.
+				{ words: "add", hint: "[<id>]", description: "Get a token that signs in as you on another device", offered: (_runtime, identity) => identity.userId !== ADMIN_USER_ID },
 				{ words: "list", description: "List the tokens that sign in as you on other devices" },
-				{ words: "remove", hint: "<id>", description: "Revoke a token that signs in as you on another device" },
+				{ words: "remove", hint: "<id>", description: "Revoke a token that signs in as you on another device", offered: (_runtime, identity) => identity.userId !== ADMIN_USER_ID },
 			],
 			parse: ({ words, usage }) => deviceArgs(words, usage),
 			run: ({ runtime, socket, attachment, request, roomId }, args) => args.action === "list" ? runtime.listDevices(socket, attachment, request, roomId)
@@ -7989,7 +7991,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}),
 		adminCommand({
 			name: "kick", usageErrors: "reply",
-			forms: [{ hint: "@user", description: "Remove a user from this room", uses: ["room_id"] }],
+			forms: [{ hint: "@user", description: "Remove a user from this room", uses: ["room_id"], requires: ["room_id"] }],
 			parse: ({ words, usage }) => {
 				arity(words, 1, usage);
 				return requiredUserId(words[1], usage);
@@ -8060,12 +8062,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}),
 		adminCommand({
 			name: "toggle", usageErrors: "reply",
-			forms: [{ hint: "activity|uploads|presence|addmember|livetext", description: "Turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone" }],
+			// The features this deployment configures (toggleFeatures), as its usage error names them.
+			forms: [{ hint: (runtime) => runtime.toggleFeatures().join("|"), description: "Turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone" }],
 			parse: ({ words, usage }, runtime) => {
 				arity(words, 1, usage);
 				const word = requiredArg(words[1], usage);
-				const features = runtime.toggleFeatures();
-				return oneOf(word, features, `Usage: /toggle ${features.join("|")}`);
+				return oneOf(word, runtime.toggleFeatures(), `Usage: ${usage}`);
 			},
 			audit: (feature) => ({ target: feature }),
 			run: ({ cap, runtime, socket, request, roomId }, feature) => runtime.toggle(cap, socket, request, roomId, feature),
@@ -8077,7 +8079,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * commandTable's, each for its audience and roles, run by
 	 * dispatchCommand; `/help` replies with a `~private` notice listing
 	 * those the sender may run. An unknown command is an error the client
-	 * shows; it is not a policy violation, since people mistype.
+	 * shows; it is not a policy violation, since people mistype. A command
+	 * without `room_id` is in the default room, except a form that requires
+	 * one (`/kick`, live text), which the dispatcher refuses.
 	 */
 	private async handleCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
@@ -8085,7 +8089,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const name of ["message_id", "deleted"]) {
 			if (params[name] !== undefined) throw { name: "invalid_params", message: `A command has no ${name}; send it as a message instead` } satisfies ProtocolError;
 		}
-		const roomId = optionalString(params, "room_id") ?? ROOM_ID;
+		const named = optionalString(params, "room_id");
+		const roomId = named ?? ROOM_ID;
 		const body = objectParam(params, "body");
 		if (!body) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		const text = optionalString(body, "text") ?? "";
@@ -8095,6 +8100,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			protocolOf: errorToProtocol,
 			audit: this.audit,
 			now: nowMs(),
+			roomNamed: named !== undefined,
 		});
 	}
 
@@ -8117,7 +8123,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** The commands offered now that this connection may run, for `/help` and `ext:command_list`: those that post only for those who may post. */
-	private commandsFor(attachment: ConnectionAttachment): Command<CommandScope>[] {
+	private commandsFor(attachment: ConnectionAttachment): OfferedCommand[] {
 		const posts = attachment.tier !== "anonymous" || this.config.guestPosting;
 		return ApronDemoServer.commandTable.listFor(attachment, this, posts);
 	}
@@ -8285,7 +8291,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const chosen = passkeys[args.remove - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
-		if (!this.store.credentials.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usageError(`Usage: ${ApronDemoServer.commandTable.get("passkeys").usage}`);
+		if (!this.store.credentials.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw { name: "invalid_params", message: "That passkey is already gone; see /passkeys" } satisfies ProtocolError;
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.

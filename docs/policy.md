@@ -112,18 +112,19 @@ within it:
   push: attendance is the separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run. Registered users other than bots have `/invite-bot` (a bot
-  token), `/invite-device list|add|remove [<id>]` (tokens for other devices) and
-  `/passkeys`, and all registered users, bots included, have `/avatar` with
-  uploads (all below); anyone who may post has, with
-  live text, `/embed-terminal [title]` and `/embed-append [markdown]`
-  (below); those with the role `admin`,
-  `mod`, or `friend` also have `/emoji add|remove :name:` (custom emoji,
-  below). Admins have their own (see [SPEC section 5](../SPEC.md#admins)),
-  among them `/server`, which sets the server's title, description and
-  avatar (below), `/toggle activity|uploads|presence|addmember|livetext`, and
-  `/invite-purge <user_id>`, which signs a user out everywhere, removes
-  their passkeys and tokens, and gives the admin a new token for them.
-  `/help` lists commands alphabetically, each form on its own line (such as
+  token), `/invite-device add [<id>]`, `/invite-device list` and
+  `/invite-device remove <id>` (tokens for other devices), and `/passkeys`,
+  and all registered users, bots included, have `/avatar` with uploads (all
+  below); anyone who may post has, with live text, `/embed-terminal
+  [<title>]` and `/embed-append [<markdown>]` (below); those with the role
+  `admin`, `mod`, or `friend` also have `/emoji add :<name>:` (with uploads
+  on) and `/emoji remove :<name>:` (custom emoji, below). Admins have their
+  own (see [SPEC section 5](../SPEC.md#admins)), among them `/server`, which
+  sets the server's title, description and avatar (below),
+  `/toggle activity|uploads|presence|addmember|livetext`, and
+  `/invite-purge @user`, which signs a user out everywhere, removes their
+  passkeys and tokens, and gives the admin a new token for them. `/help`
+  lists commands alphabetically, each form on its own line (such as
   `/emoji add :<name>:` and `/emoji remove :<name>:`), and marks the admins'
   "(admin-only)"; `ext:command_list` returns the same list as data. An
   unknown command is `invalid_params`, and one the sender may not run
@@ -524,7 +525,8 @@ Every extension the frame advertises is defined in
   `/help` lists, after auth: each form's `name`, `group` (who may use it:
   `all`, `member`, `role` for `/emoji`, or `admin`), `description`, and its
   `hint` (the text after the name), `uses` (`room_id`, `reply_to` or
-  `body.embeds`) and `requires` (`body.embeds`) where it has them.
+  `body.embeds`) and `requires` (`room_id` for `/kick` and live text, which
+  are refused without it, or `body.embeds`) where it has them.
 - `ext:emoji`, once a custom emoji has been added, carries
   `server.params.ext.emoji.catalog_url`, the catalog's URL on the media
   origin. Registered users with the role `admin`, `mod` or `friend`, other
