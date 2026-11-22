@@ -391,9 +391,11 @@ describe("export and import", () => {
 	});
 
 	it("journals a renumbered import by its first ID, and refuses one in original IDs too large to resume before writing", async () => {
-		// More moved IDs than a journal of 256 KiB holds (MAX_JOURNAL_BYTES, 1 MiB, holds about 60,000).
-		const many = 25_000;
-		const maxJournalBytes = 256 * 1024;
+		// More moved IDs than a journal capped at 16 KiB holds (about 1,500), and
+		// far fewer than the real cap (MAX_JOURNAL_BYTES, 1 MiB) holds: the cap
+		// is an option, so the test stays small.
+		const many = 2_000;
+		const maxJournalBytes = 16 * 1024;
 		const message = (logId: number) => ({ room_id: "lobby", log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: "lobby", from: { user_id: "zed" }, body: { text: "x" } }) });
 		const records = Array.from({ length: many }, (_, index) => message(1_000 + index));
 		const text = await writeArchiveToString(async (writer) => {
@@ -405,7 +407,7 @@ describe("export and import", () => {
 		const target = chainOf("head", new TestClock(100_000));
 		for (const record of records) target.head.records.set(`${record.log_id}\u0000elsewhere`, { ...record, room_id: "elsewhere", record_json: record.record_json.replace('"x"', '"other"') });
 		const dry = await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true, maxJournalBytes });
-		expect(dry.refused).toMatch(/moves 25000 log IDs, too many to resume from if it fails: import it with renumber/);
+		expect(dry.refused).toMatch(new RegExp(`moves ${many} log IDs, too many to resume from if it fails: import it with renumber`));
 		// Under the real cap, the same import's journal fits.
 		expect((await importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true })).refused).toBeUndefined();
 		await expect(importArchive(target.chain, target.head, jsonlReader(linesOf(text)), { clock: target.clock, maxJournalBytes })).rejects.toThrow(/import it with renumber/);
