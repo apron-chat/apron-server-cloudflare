@@ -248,6 +248,14 @@ export class WebAuthnService {
 		return page ? this.config.passkeyPage && pageOriginServes(origin, this.config.rpId) : this.config.rpOrigins.includes(origin);
 	}
 
+	/**
+	 * Whether a ceremony may be for `rpId`: the RP ID, or the legacy one for
+	 * a sign-in on the passkey page, whose host is under both.
+	 */
+	private rpIdAllowed(rpId: string, action: WebAuthnAction, page: boolean): boolean {
+		return rpId === this.config.rpId || (page && action === "login" && this.config.legacyRpId !== undefined && rpId === this.config.legacyRpId);
+	}
+
 	async begin(
 		action: WebAuthnAction,
 		origin: string,
@@ -261,10 +269,15 @@ export class WebAuthnService {
 		 * authenticator replaces rather than duplicates its passkey for it.
 		 */
 		registration: { name?: string; userIdTaken?: (userId: string) => boolean; adds?: { userHandle?: string } } = {},
-		/** `page`: a ceremony on the passkey page, on the server's own origin. */
-		ceremony: { page?: boolean } = {},
+		/**
+		 * `page`: a ceremony on the passkey page, on the server's own origin.
+		 * `legacy`: a sign-in there with a passkey made for `LEGACY_RP_ID`.
+		 */
+		ceremony: { page?: boolean; legacy?: boolean } = {},
 	): Promise<BeginResult> {
 		if (!this.originAllowed(origin, ceremony.page === true)) throw new Error("origin is not configured for passkeys");
+		const rpId = ceremony.legacy ? this.config.legacyRpId : this.config.rpId;
+		if (rpId === undefined || !this.rpIdAllowed(rpId, action, ceremony.page === true)) throw new Error("passkeys for that RP ID are not taken here");
 		const adds = action === "register" && identity?.tier === "registered" && registration.adds !== undefined;
 		if (action === "register" && identity?.tier === "registered" && !adds) throw new Error("identity switching requires reconnect");
 		const challengeId = randomBase64Url(18);
@@ -300,7 +313,7 @@ export class WebAuthnService {
 				timeout: this.config.limits.challengeTtlSeconds * 1_000,
 			})
 			: await generateAuthenticationOptions({
-				rpID: this.config.rpId,
+				rpID: rpId,
 				challenge,
 				userVerification: "required",
 				timeout: this.config.limits.challengeTtlSeconds * 1_000,
@@ -312,7 +325,7 @@ export class WebAuthnService {
 				action,
 				challenge: options.challenge,
 				origin,
-				rpId: this.config.rpId,
+				rpId,
 				...(connectionId ? { connectionId } : {}),
 				...(action === "register" ? { identityUserId: identity?.user_id ?? null } : {}),
 				...(candidateUserId ? { userId: candidateUserId, userHandle: candidateUserHandle, userName: candidateName } : {}),
@@ -334,7 +347,7 @@ export class WebAuthnService {
 		if (challenge.challengeId !== challengeId || input.now >= challenge.expiresAt) throw new AuthError("Passkey challenge is missing or expired");
 		if (challenge.connectionId !== undefined && challenge.connectionId !== input.connectionId) throw new AuthError("Passkey challenge is bound to another connection");
 		if (Object.hasOwn(challenge, "identityUserId") && challenge.identityUserId !== (input.identity?.user_id ?? null)) throw new AuthError("Passkey registration identity changed");
-		if (challenge.origin.length === 0 || !this.originAllowed(challenge.origin, challenge.page === true) || challenge.rpId !== this.config.rpId) {
+		if (challenge.origin.length === 0 || !this.originAllowed(challenge.origin, challenge.page === true) || !this.rpIdAllowed(challenge.rpId, challenge.action, challenge.page === true)) {
 			throw new AuthError("Passkey challenge binding is invalid");
 		}
 		if (serializedBytes(credentialValue) > this.config.limits.maxCredentialBytes) throw new AuthTooLargeError();

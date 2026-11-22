@@ -390,7 +390,68 @@ refuse passkeys on such a frontend; there a client that implements the
 passkey page uses it instead: the Worker serves it on its own host when that
 is `RP_ID` or under it (`PASSKEY_PAGE`, on by default). Otherwise users sign
 in another way, such as with a token from `/invite-device` ([other devices](#other-devices)).
-Changing `RP_ID` strands the passkeys registered under the old one.
+Changing `RP_ID` strands the passkeys registered under the old one, unless
+the old one is a domain the new one is under: see [Moving `RP_ID`](#moving-rp_id).
+
+### Native passkeys or the passkey page
+
+A client on a related origin (`web.apron.chat` for `RP_ID =
+"server.apron.chat"`) can run passkeys in place only where the browser
+supports related origins; elsewhere the browser refuses the RP ID with a
+`SecurityError`. Every `webauthn` begin result carries the passkey page as
+`external.url` besides `public_key`, so the client chooses:
+
+```js
+// Whether this browser can run the server's passkeys here, or should open external.url.
+async function nativePasskeys(rpId) {
+	if (!window.PublicKeyCredential || !navigator.credentials) return false;
+	const host = location.hostname;
+	if (host === rpId || host.endsWith(`.${rpId}`)) return true; // the RP ID's own site
+	try {
+		const capabilities = await PublicKeyCredential.getClientCapabilities?.();
+		if (capabilities && 'relatedOrigins' in capabilities) return capabilities.relatedOrigins === true;
+	} catch {}
+	return undefined; // unknown: try in place, and open the page on a SecurityError
+}
+```
+
+`getClientCapabilities()` (WebAuthn Level 3) reports `relatedOrigins`
+where the browser knows it; where it is missing, try the ceremony in place
+and fall back to `external.url` when it throws `SecurityError`. A
+`NotAllowedError` is the person cancelling or having no passkey for the RP
+ID, not a missing feature: offer the page then (it signs in with
+[legacy passkeys](#moving-rp_id) too), but don't open it unasked.
+
+### Moving `RP_ID`
+
+A server whose `RP_ID` is a parent domain (`apron.chat`) can move to its own
+host (`server.apron.chat`) without stranding its passkeys: set the old one as
+`LEGACY_RP_ID`.
+
+```toml
+[vars]
+RP_ID = "server.apron.chat"
+LEGACY_RP_ID = "apron.chat"
+RP_ORIGINS = "https://web.apron.chat"
+```
+
+New passkeys are made for `RP_ID`, and clients' own ceremonies use only
+`RP_ID`. The passkey page, whose host is under both, adds "Passkey not
+listed? Use one made for apron.chat" to its sign-in screens: that sign-in
+uses the old RP ID, and before going back to the client the page offers
+"Add a passkey for server.apron.chat", which is added to the account at
+once ("Not now" goes back without it). An account then signs in with either
+passkey. The Worker answers `/.well-known/webauthn` on the new RP ID's host,
+so regenerate the edge rules (`npm run budget:generate`), which let it
+through. `SIGNAL_UNKNOWN_PASSKEYS` never signals a legacy passkey, which
+other sites may have made.
+
+Unset `LEGACY_RP_ID` once its users have moved; those who never came back
+then sign in another way, such as with a device token. History and backups
+are named by the server's own host (`PUBLIC_ORIGIN`'s, else `RP_ID`), not by
+the RP ID: chunks already written keep their keys, and the old
+`backups/<old>-…` files are no longer pruned, so delete them by hand once
+`BACKUP_KEEP` new ones exist.
 
 ## Operations and secrets
 
@@ -486,7 +547,7 @@ differs from production in:
   production's, `npm run budget:generate`); and its own metrics dataset,
   `apron_server_metrics_preview`, shared by all Previews.
 - **Passkeys.** `RP_ID` is `previews.apron.chat`, so Preview passkeys never
-  mix with production's (`apron.chat`). No client is on that RP ID, so every
+  mix with production's (`server.apron.chat`, and `apron.chat` before it). No client is on that RP ID, so every
   client, `web.apron.chat` included, signs in through the
   [passkey page](policy.md#passkey-page) on the Preview's host, which warns
   that the host has not verified the app. `EXTERNAL_SIGN_IN` is on too, so
@@ -532,7 +593,9 @@ budget:check` refuses a production config without that); its
 domain. `wrangler.toml` sets neither, so turn them off before deploying it
 anywhere.
 
-The RP ID stays `apron.chat` to keep existing passkey credentials working.
+The RP ID is `server.apron.chat`, the server's own host; passkeys made
+before for `apron.chat` still sign in on the passkey page (`LEGACY_RP_ID`,
+[Moving `RP_ID`](#moving-rp_id)).
 Guest connections accept every origin, including localhost, LAN frontends,
 local files (opaque origins), and clients without Origin. Passkey
 verification allows only the exact `https://web.apron.chat` origin.
@@ -585,7 +648,8 @@ For direct Wrangler production commands, always pass
    configuration rule too, or the edge may hold a slow writer's first bytes,
    such as typed keys, until more arrive ([edge admission](edge-admission.md)).
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
-   passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
+   passkey RP ID `server.apron.chat` (with `LEGACY_RP_ID = "apron.chat"`)
+   and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
    RP changes can make previously registered credentials unusable.
 4. Run all checks here, and check the matching frontend in apron-chat/apron-web

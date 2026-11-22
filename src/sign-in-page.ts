@@ -27,6 +27,12 @@ export interface SignInPageView {
 	recognised: boolean;
 	/** The account an addition adds to. */
 	account?: { userId: string; name: string };
+	/**
+	 * The RP ID passkeys were made for before this server's own
+	 * (`LEGACY_RP_ID`), on a sign-in screen: it offers a sign-in with one,
+	 * and then a new passkey for `host`.
+	 */
+	legacyRpId?: string;
 	/** The page's own query, which its script sends back with begin. */
 	query: string;
 	/** Where Cancel goes: the redirect with `error=access_denied`. */
@@ -81,7 +87,10 @@ button:disabled { opacity: 0.6; cursor: default; }
  * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
  * ceremony instead, begun on its click. Cancel goes back with
  * `error=access_denied`. A sign-in with a passkey no account here has stays
- * on the page, and asks the device to drop that passkey.
+ * on the page, and asks the device to drop that passkey. A sign-in with a
+ * passkey made for the legacy RP ID (`legacy`) is offered a new passkey for
+ * this server's own before it goes back (`upgrade`): created, it is added at
+ * once; "Not now" goes back without it.
  */
 const SCRIPT = `
 "use strict";
@@ -91,6 +100,9 @@ const status = (text) => { $("status").textContent = text; };
 const primary = config.start === "login" ? "login" : "register";
 let prepared = null;
 let preparing = null;
+// After a sign-in with a legacy passkey: where to go back to, and the handle that adds a new one.
+let upgrade = null;
+const again = () => upgrade ? "upgrade" : primary;
 
 const fromB64 = (text) => Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
 const toB64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
@@ -128,7 +140,8 @@ function prepare(action) {
 	prepared = null;
 	const mine = { action };
 	preparing = mine;
-	mine.done = post(${JSON.stringify(PAGE_BEGIN_PATH)}, { page: config.page, query: config.query, action }).then((result) => {
+	const body = action === "legacy" ? { action: "login", legacy: true } : action === "upgrade" ? { upgrade: upgrade.handle } : { action };
+	mine.done = post(${JSON.stringify(PAGE_BEGIN_PATH)}, { page: config.page, query: config.query, ...body }).then((result) => {
 		if (preparing !== mine) return;
 		preparing = null;
 		if (result.error) { status(result.error); return; }
@@ -162,23 +175,33 @@ async function passkey(action) {
 	busy(true);
 	let credential;
 	try {
-		credential = action === "login"
+		credential = action === "login" || action === "legacy"
 			? await navigator.credentials.get({ publicKey: requestOptions(options.public_key) })
 			: await navigator.credentials.create({ publicKey: creationOptions(options.public_key) });
 	} catch (error) {
 		busy(false);
 		status(error && error.name === "NotAllowedError" ? "No passkey was used. Try again when you're ready." : "Your browser could not use a passkey" + (error && error.message ? ": " + error.message : "."));
-		prepare(primary);
+		prepare(again());
 		return;
 	}
 	const result = await post(${JSON.stringify(PAGE_FINISH_PATH)}, { challenge_id: options.challenge_id, credential: credentialJson(credential) });
 	if (result.unknownCredential && action === "login") forget(options.public_key.rpId, credential.id);
-	if (result.error) { busy(false); status(result.error); prepare(primary); return; }
+	if (result.error) { busy(false); status(result.error); prepare(again()); return; }
+	if (action === "upgrade") { location.assign(upgrade.redirect); return; }
+	if (action === "legacy" && result.upgrade && $("upgrade")) {
+		upgrade = { redirect: result.redirect, handle: result.upgrade };
+		$("start").hidden = true;
+		$("upgrade").hidden = false;
+		busy(false);
+		prepare("upgrade");
+		return;
+	}
 	location.assign(result.redirect);
 }
 
 for (const button of document.querySelectorAll("[data-passkey]")) button.addEventListener("click", () => passkey(button.dataset.passkey || primary));
 for (const button of document.querySelectorAll("[data-cancel]")) button.addEventListener("click", () => { busy(true); location.assign(config.deny); });
+for (const button of document.querySelectorAll("[data-skip]")) button.addEventListener("click", () => { busy(true); location.assign(upgrade.redirect); });
 prepare(primary);
 `;
 
@@ -197,7 +220,8 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 <p>It will be able to read and send messages as you.</p>
 ${caution}
 <div class="actions"><button type="button" class="primary" data-passkey>Continue with passkey</button>${cancel}</div>
-${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}`,
+${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}
+${view.legacyRpId ? `<p class="muted switch">Passkey not listed? <button type="button" class="link" data-passkey="legacy">Use one made for ${e(view.legacyRpId)}</button></p>` : ""}`,
 		register: `<h1>Create an account on ${e(view.title)}</h1>
 <p>${who} wants to create an account for you on ${host}, with a new passkey. It will be able to read and send messages as you.</p>
 ${caution}
@@ -207,6 +231,12 @@ ${caution}
 ${caution}
 <div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>`,
 	};
+	// Shown after a sign-in with a legacy passkey, in place of the screen.
+	const upgrade = view.start === "login" && view.legacyRpId ? `<div id="upgrade" hidden>
+<h1>Add a passkey for ${e(view.host)}</h1>
+<p>You signed in with a passkey made for <strong>${e(view.legacyRpId)}</strong>. ${e(view.title)} now uses passkeys made for ${host}: create one now to keep signing in.</p>
+<div class="actions"><button type="button" class="primary" data-passkey="upgrade">Create passkey</button><button type="button" data-skip>Not now</button></div>
+</div>` : "";
 	const pageTitle = view.start === "add" ? "Add a passkey" : view.start === "register" ? `Create an account on ${view.title}` : `Sign in to ${view.title}`;
 	return `<!doctype html>
 <html lang="en">
@@ -219,7 +249,10 @@ ${caution}
 </head>
 <body>
 <main>
+<div id="start">
 ${screens[view.start]}
+</div>
+${upgrade}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
 <p id="status" class="warn" role="status" aria-live="polite"></p>
 </main>

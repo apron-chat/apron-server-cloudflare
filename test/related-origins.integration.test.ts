@@ -31,10 +31,19 @@ it('publishes RP_ORIGINS as related origins on the RP ID host', async () => {
 	expect(await head.text()).toBe('');
 });
 
+it('publishes them on server.apron.chat, as production now is', async () => {
+	const production = selfHosted({ RP_ID: 'server.apron.chat', LEGACY_RP_ID: 'apron.chat', RP_ORIGINS: 'https://web.apron.chat', ALLOWED_ORIGINS: '*' });
+	const response = await fetchEntry(wellKnown('server.apron.chat'), production);
+	expect(response.status).toBe(200);
+	expect(await response.json()).toEqual({ origins: ['https://web.apron.chat'] });
+	// Never on the legacy RP ID, which this Worker does not serve.
+	expect((await fetchEntry(wellKnown('apron.chat'), production)).status).toBe(404);
+});
+
 it('is not found on a host other than the RP ID', async () => {
-	// As in production: the Worker on server.apron.chat, RP ID apron.chat.
-	const production = selfHosted({ RP_ID: 'apron.chat', RP_ORIGINS: 'https://web.apron.chat', ALLOWED_ORIGINS: '*' });
-	expect((await fetchEntry(wellKnown('server.apron.chat'), production)).status).toBe(404);
+	// The Worker on server.apron.chat with a parent-domain RP ID, apron.chat, as production had before LEGACY_RP_ID.
+	const parent = selfHosted({ RP_ID: 'apron.chat', RP_ORIGINS: 'https://web.apron.chat', ALLOWED_ORIGINS: '*' });
+	expect((await fetchEntry(wellKnown('server.apron.chat'), parent)).status).toBe(404);
 	expect((await fetchEntry(wellKnown('web.apron.shazow.net'), selfHosted())).status).toBe(404);
 	// Only GET and HEAD, and only that path.
 	expect((await fetchEntry(wellKnown('apron.shazow.net', 'POST'), selfHosted())).status).toBe(404);

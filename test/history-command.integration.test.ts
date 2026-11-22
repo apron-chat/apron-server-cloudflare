@@ -49,7 +49,7 @@ it('backs history up to the backup store, and imports a foreign archive as a new
 		const exported = await command(admin, 'export', '/history export general');
 		expect(exported.frame.result).toEqual({});
 		const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
-		expect(key, exported.notice).toMatch(/^backups\/localhost-manual-\d{8}-\d{6}\.jsonl\.gz$/);
+		expect(key, exported.notice).toMatch(/^backups\/demo\.test-manual-\d{8}-\d{6}\.jsonl\.gz$/);
 		const object = await env.HISTORY_BLOB!.get(key!);
 		// gzip-compressed, the codec recorded with it (not encrypted).
 		expect(object!.customMetadata).toEqual({ codecs: 'gzip' });
@@ -188,7 +188,7 @@ it('never matches users without an authenticating codec, and refuses a codec it 
 
 		// This server's own backup, gzip-compressed: read back, but gzip verifies nothing, so no users are matched either.
 		// (An earlier test's backup may hold this second's key: out of the way.)
-		const earlier = (await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.map((object) => object.key);
+		const earlier = (await env.HISTORY_BLOB!.list({ prefix: 'backups/demo.test-manual-' })).objects.map((object) => object.key);
 		if (earlier.length) await env.HISTORY_BLOB!.delete(earlier);
 		const exported = await command(admin, 'gz-export', '/history export general');
 		const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
@@ -371,8 +371,8 @@ it('takes the D1 tier for off only once it holds history; then /history status s
 });
 
 it('backs up on BACKUP_EVERY\'s schedule only, keeping BACKUP_KEEP scheduled backups apart from manual ones', async () => {
-	const scheduled = async () => (await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-scheduled-' })).objects.map((object) => object.key);
-	const manual = (await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.length;
+	const scheduled = async () => (await env.HISTORY_BLOB!.list({ prefix: 'backups/demo.test-scheduled-' })).objects.map((object) => object.key);
+	const manual = (await env.HISTORY_BLOB!.list({ prefix: 'backups/demo.test-manual-' })).objects.length;
 	// On demand only (development's BACKUP_EVERY = ""): no schedule runs.
 	await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).runScheduledBackup(Date.now() + 86_400_000));
 	expect(await scheduled()).toEqual([]);
@@ -396,9 +396,9 @@ it('backs up on BACKUP_EVERY\'s schedule only, keeping BACKUP_KEEP scheduled bac
 	});
 	const keys = await scheduled();
 	expect(keys).toHaveLength(2);
-	for (const key of keys) expect(key).toMatch(/^backups\/localhost-scheduled-\d{8}-\d{6}\.jsonl\.gz$/);
+	for (const key of keys) expect(key).toMatch(/^backups\/demo\.test-scheduled-\d{8}-\d{6}\.jsonl\.gz$/);
 	// Pruning the scheduled ones left the manual ones alone.
-	expect((await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.length).toBe(manual);
+	expect((await env.HISTORY_BLOB!.list({ prefix: 'backups/demo.test-manual-' })).objects.length).toBe(manual);
 });
 
 it('says once a wake that the scheduled backup has no store', async () => {

@@ -76,6 +76,24 @@ describe("ColdHistoryTier chunks", () => {
 		}
 	});
 
+	it("reads chunks written under an earlier server name by their own keys, and writes new ones under the new name", async () => {
+		// A server renamed (as one named by a parent-domain RP ID moving to its own host): the same store and index.
+		const before = coldTier({ prefix: "history/apron.chat/" });
+		const log = sampleLog();
+		const older = log.filter((record) => record.log_id <= 1006);
+		await before.tier.append(toRange(older));
+		const { tier, store, index } = coldTier({ store: before.store, index: before.index, prefix: "history/server.apron.chat/" });
+		expect((await tier.scan(0, 100)).records).toEqual(older);
+		await tier.append(toRange(log.filter((record) => record.log_id > 1006)));
+		expect((await tier.scan(0, 100)).records).toEqual(log);
+		const keys = (await index.list()).sort((a, b) => a.first - b.first).map((ref) => ref.key);
+		expect(keys).toEqual(["history/apron.chat/0000000000001001.jsonl.gz", "history/server.apron.chat/0000000000001007.jsonl.gz"]);
+		// Trimmed by its own key too.
+		await tier.trimBelow(1007, 100);
+		expect((await store.list("history/apron.chat/")).keys).toEqual([]);
+		expect((await tier.scan(0, 100)).records).toEqual(log.filter((record) => record.log_id > 1006));
+	});
+
 	it("rewrites the same key when a copy is retried, and splits a range overlapping chunks at their bounds", async () => {
 		const { tier, store, index } = coldTier();
 		const log = sampleLog();

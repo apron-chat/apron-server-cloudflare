@@ -40,12 +40,17 @@ new_sqlite_classes = ["ApronDemoServer"]
 # loads this table as the Worker does, so a bad value fails before a deploy.
 
 # ---- Passkeys and origins ----
-# Which sites may connect and sign in. RP_ID is a parent domain of this
-# server's host: anything else on apron.chat may issue passkeys for it, which
-# this server cannot see, so SIGNAL_UNKNOWN_PASSKEYS stays unset (off) unless
-# this server is the sole user of the RP ID, or the passkey page would ask
-# devices to drop those passkeys.
-RP_ID = "apron.chat"
+# Which sites may connect and sign in. RP_ID is this server's own host, so
+# nothing else on apron.chat can make or use its passkeys. web.apron.chat is
+# a related origin: browsers that support related origins run its passkeys in
+# place, allowed by https://server.apron.chat/.well-known/webauthn (which the
+# Worker answers with RP_ORIGINS); the others use the passkey page here.
+# Passkeys made before the move are for the parent domain, LEGACY_RP_ID: the
+# passkey page still signs in with them and then offers one for RP_ID (docs/
+# guide.md, Moving RP_ID). Anything else on apron.chat may make passkeys for
+# that one, so SIGNAL_UNKNOWN_PASSKEYS stays unset (off) while it is set.
+RP_ID = "server.apron.chat"
+LEGACY_RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
 

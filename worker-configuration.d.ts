@@ -41,6 +41,8 @@ declare global {
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
+		/** An RP ID passkeys were made for before RP_ID, which the passkey page still signs in with (src/config.ts legacyRpId). */
+		LEGACY_RP_ID?: string;
 		RP_ORIGINS?: string;
 		RP_NAME?: string;
 		SERVER_TITLE?: string;
@@ -97,6 +99,7 @@ declare global {
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;
+			LEGACY_RP_ID?: string;
 			RP_ORIGINS?: string;
 			RP_NAME?: string;
 			SERVER_TITLE?: string;

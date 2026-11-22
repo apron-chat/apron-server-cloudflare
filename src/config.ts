@@ -17,8 +17,23 @@ export interface RuntimeConfig {
 	backups: BackupSettings;
 	allowedOrigins: readonly string[];
 	rpId: string;
+	/**
+	 * An RP ID this server used to have (`LEGACY_RP_ID`), a domain `rpId` is
+	 * under, such as `apron.chat` for `server.apron.chat`: the passkey page,
+	 * whose host is under both, still signs in with passkeys made for it,
+	 * and then offers to make one for `rpId`. Never for new passkeys, and
+	 * never from `RP_ORIGINS` clients, whose ceremonies use `rpId` only.
+	 */
+	legacyRpId?: string;
 	rpOrigins: readonly string[];
 	rpName: string;
+	/**
+	 * This server's own host name, which names what it keeps in shared
+	 * storage (history chunks under `history/<host>/`, backups as
+	 * `backups/<host>-…`): `PUBLIC_ORIGIN`'s host, else `rpId`. Never a
+	 * parent domain other servers may share.
+	 */
+	serverHost: string;
 	/**
 	 * What the `server` frame shows people about this server (§3.1), as the
 	 * deployment sets it: a plain `title` (`SERVER_TITLE`), a short CommonMark
@@ -263,6 +278,7 @@ type EnvLike = {
 	BILL_CAP_MONTH?: string;
 	ALLOWED_ORIGINS?: string;
 	RP_ID?: string;
+	LEGACY_RP_ID?: string;
 	RP_ORIGINS?: string;
 	RP_NAME?: string;
 	SERVER_TITLE?: string;
@@ -318,6 +334,29 @@ function validOrigin(origin: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * `LEGACY_RP_ID`: unset or empty for none, else a host name that `rpId` is
+ * under (not `rpId` itself), so the passkey page, on `rpId` or a host under
+ * it, may run ceremonies for it. Only the passkey page uses it, so it needs
+ * `PASSKEY_PAGE`.
+ */
+function loadLegacyRpId(value: string | undefined, rpId: string, passkeyPage: boolean): string | undefined {
+	const legacy = String(value ?? "").trim().toLowerCase();
+	if (!legacy) return undefined;
+	if (legacy.includes("://") || legacy.includes("/") || legacy.includes(" ")) throw new ConfigError("LEGACY_RP_ID must be a host name");
+	if (!rpId.endsWith(`.${legacy}`)) throw new ConfigError("LEGACY_RP_ID must be a domain RP_ID is under, such as apron.chat for server.apron.chat");
+	if (!passkeyPage) throw new ConfigError("LEGACY_RP_ID needs PASSKEY_PAGE, whose page signs in with its passkeys");
+	return legacy;
+}
+
+/** This server's host name (RuntimeConfig.serverHost): `PUBLIC_ORIGIN`'s, else `rpId`. */
+function loadServerHost(publicOrigin: string | undefined, rpId: string): string {
+	const origin = String(publicOrigin ?? "").trim();
+	if (!origin) return rpId;
+	if (!validOrigin(origin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
+	return new URL(origin).hostname;
 }
 
 /** The environment variable spelling of a camelCase limit name. */
@@ -649,6 +688,8 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", false);
 	const externalSignIn = parseSwitch(env.EXTERNAL_SIGN_IN, "EXTERNAL_SIGN_IN", false);
 	if (externalSignIn && !passkeyPage) throw new ConfigError("EXTERNAL_SIGN_IN needs PASSKEY_PAGE, whose passkey ceremony its page runs");
+	const legacyRpId = loadLegacyRpId(env.LEGACY_RP_ID, rpId, passkeyPage);
+	const serverHost = loadServerHost(env.PUBLIC_ORIGIN, rpId);
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
@@ -678,8 +719,10 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		backups,
 		allowedOrigins,
 		rpId,
+		...(legacyRpId ? { legacyRpId } : {}),
 		rpOrigins,
 		rpName,
+		serverHost,
 		server,
 		admission,
 		activityEnabled,

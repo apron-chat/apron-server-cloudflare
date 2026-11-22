@@ -946,6 +946,12 @@ interface StoredPageCeremony {
 	request: AuthorizationRequest;
 	/** An addition's account, from its `request` handle. */
 	addsUserId?: string;
+	/**
+	 * An addition right after a sign-in with a legacy passkey (LEGACY_RP_ID):
+	 * the person just proved the account is theirs, on this page, so the new
+	 * passkey is written at finish rather than kept with a code.
+	 */
+	upgrade?: true;
 	expiresMs: number;
 }
 
@@ -2804,7 +2810,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			layout, limits: this.config.limits, store: this.store.history, clock: { now: nowMs },
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
 			chunkIndex: (tier) => this.store.history.chunkIndex(tier),
-			server: this.config.rpId,
+			server: this.config.serverHost,
 			serverUrl: this.archiveHeader().server,
 		});
 		// An overrun is observed, not fatal: the day's first is told, and a
@@ -4425,6 +4431,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			who, client, where,
 			recognised: recognisedClient(redirect, this.config.rpOrigins),
 			...(account ? { account } : {}),
+			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId } : {}),
 			query: query.toString(),
 			deny: redirectWith(value.redirectUri, { error: "access_denied", state: value.state, iss: origin }),
 		};
@@ -4443,8 +4450,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
 		if (!parsed.ok) return pageJson(400, { error: parsed.error });
 		// The passkey page's action is its link's; `/oauth/authorize` lets the person choose.
-		const action = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
-		const value: PasskeyPageRequest = { ...parsed.value, action };
+		const chosen = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
+		// A sign-in with a passkey made for LEGACY_RP_ID; or, after one, a
+		// passkey for RP_ID added to that account (`upgrade`, its handle).
+		const legacy = body.legacy === true;
+		const upgrade = typeof body.upgrade === "string" && /^rq_[A-Za-z0-9_-]{43}$/.test(body.upgrade) ? body.upgrade : undefined;
+		if (body.upgrade !== undefined && !upgrade) return pageJson(400, { error: "The request was not understood." });
+		if ((legacy || upgrade) && (!this.config.legacyRpId || chosen !== "login" || (parsed.value as PasskeyPageRequest).request !== undefined || (legacy && upgrade))) {
+			return pageJson(400, { error: "The request was not understood." });
+		}
+		const action = upgrade ? "register" : chosen;
+		const value: PasskeyPageRequest = { ...parsed.value, action, ...(upgrade ? { request: upgrade } : {}) };
 		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
 		if (value.name !== undefined && ([...value.name].length > maxNameCodePoints || utf8Bytes(value.name) > maxNameBytes)) {
 			return pageJson(400, { error: "The name for the new account is too long. Start again from the app with a shorter one." });
@@ -4464,11 +4480,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				...(value.name !== undefined ? { name: value.name } : {}),
 				userIdTaken: (userId) => this.store.accounts.idTaken(userId),
 				...(adds ? { adds: adds.userHandle ? { userHandle: adds.userHandle } : {} } : {}),
-			}, { page: true });
+			}, { page: true, ...(legacy ? { legacy: true } : {}) });
 		const ceremony: StoredPageCeremony = {
 			v: 1, page, challenge: begun.challenge,
 			request: { clientId: value.clientId, redirectUri: value.redirectUri, codeChallenge: value.codeChallenge, state: value.state, resource: value.resource },
 			...(adds ? { addsUserId: adds.userId } : {}),
+			...(upgrade ? { upgrade: true } : {}),
 			expiresMs: begun.challenge.expiresAt,
 		};
 		await this.putSignInRecord(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(begun.challenge.challengeId), ceremony);
@@ -4525,10 +4542,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A passkey no account has, nor a code about to give it one, such as
 			// one made here whose code was never redeemed: the script asks the
 			// device to drop it. Anything else, or a failed read, is the usual error.
-			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && !await this.pendingCredential(error.credentialId)) {
+			// Never for a legacy RP ID's passkey, which other sites may have made.
+			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && ceremony.challenge.rpId === this.config.rpId && !await this.pendingCredential(error.credentialId)) {
 				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
 			}
 			throw error;
+		}
+		if (ceremony.upgrade) {
+			// Under the user handle it began with: `/invite-purge` may have
+			// cleared it meanwhile, and a new passkey must not bring it back.
+			if (!created || created.userId !== ceremony.addsUserId || this.store.accounts.get(created.userId)?.userHandle !== created.userHandle) {
+				return pageJson(400, { error: "Your account changed. Sign in again to add a passkey." });
+			}
+			this.store.credentials.add({ userId: created.userId, userHandle: created.userHandle, credential: created.credential, now, ipKey });
+			return pageJson(200, { added: true });
 		}
 		const code = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const record: StoredSignInCode = {
@@ -4546,7 +4573,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 			} satisfies StoredPendingCredential);
 		}
 		await this.putSignInRecord(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code), record);
-		return pageJson(200, { redirect: redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin }) });
+		const redirect = redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin });
+		const upgrade = ceremony.challenge.rpId !== this.config.rpId ? await this.upgradeHandle(finished.identity.user_id, now) : undefined;
+		return pageJson(200, { redirect, ...(upgrade ? { upgrade } : {}) });
+	}
+
+	/**
+	 * After a sign-in with a legacy passkey (LEGACY_RP_ID), a handle that
+	 * lets the page add a passkey for RP_ID to the account (pageBegin
+	 * `upgrade`), where it may still take one, under its user handle; else
+	 * undefined. The page offers it before going back to the client.
+	 */
+	private async upgradeHandle(userId: string, now: number): Promise<string | undefined> {
+		const identity = this.store.accounts.get(userId);
+		if (!identity?.userHandle || this.store.credentials.idsForUser(userId).length >= MAX_PASSKEYS_PER_USER) return undefined;
+		return await this.createRequestHandle(userId, identity.userHandle, now);
 	}
 
 	/**
@@ -9252,11 +9293,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * What an archive's header says of this server (ARCHIVE.md §2): its
-	 * WebSocket URL, from PUBLIC_ORIGIN or else RP_ID, and the origins its
-	 * media loads from.
+	 * WebSocket URL, from PUBLIC_ORIGIN or else its host (serverHost), and
+	 * the origins its media loads from.
 	 */
 	private archiveHeader(): { server: string; media: string[] } {
-		const origin = this.config.uploads?.publicOrigin || this.config.liveText?.publicOrigin || `https://${this.config.rpId}`;
+		const origin = this.config.uploads?.publicOrigin || this.config.liveText?.publicOrigin || `https://${this.config.serverHost}`;
 		const host = new URL(origin).host;
 		const media = [...new Set([origin, ...(this.config.uploads?.mediaOrigin ? [this.config.uploads.mediaOrigin] : [])])];
 		return { server: `wss://${host}/`, media };
@@ -9288,7 +9329,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(backups: BackupStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
 		return writeBackup(this.archiveChain(), this.store.history.export(), backups, this.config.backups, kind, {
-			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
+			server: this.config.serverHost, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
 	}
