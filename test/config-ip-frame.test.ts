@@ -489,19 +489,6 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'https://apron.shazow.net' })).toThrow(/RP_ID must be a host name/);
 	});
 
-	it('takes a legacy RP ID that RP_ID is under, for the passkey page', () => {
-		const production = { ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'server.apron.chat' };
-		expect(config(production).legacyRpId).toBeUndefined();
-		expect(config({ ...production, LEGACY_RP_ID: '' }).legacyRpId).toBeUndefined();
-		expect(config({ ...production, LEGACY_RP_ID: ' Apron.Chat ' }).legacyRpId).toBe('apron.chat');
-		// Only a domain RP_ID is under, which the page on RP_ID's host may use.
-		expect(() => config({ ...production, LEGACY_RP_ID: 'server.apron.chat' })).toThrow(/domain RP_ID is under/);
-		expect(() => config({ ...production, LEGACY_RP_ID: 'pron.chat' })).toThrow(/domain RP_ID is under/);
-		expect(() => config({ ...production, LEGACY_RP_ID: 'web.apron.chat' })).toThrow(/domain RP_ID is under/);
-		expect(() => config({ ...production, LEGACY_RP_ID: 'https://apron.chat' })).toThrow(/must be a host name/);
-		expect(() => config({ ...production, LEGACY_RP_ID: 'apron.chat', PASSKEY_PAGE: 'false' })).toThrow(/needs PASSKEY_PAGE/);
-	});
-
 	it("names what it keeps in shared storage by its own host, not a parent RP ID", () => {
 		const production = { ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'apron.chat' };
 		expect(config(production).serverHost).toBe('apron.chat');

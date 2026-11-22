@@ -390,8 +390,7 @@ refuse passkeys on such a frontend; there a client that implements the
 passkey page uses it instead: the Worker serves it on its own host when that
 is `RP_ID` or under it (`PASSKEY_PAGE`, on by default). Otherwise users sign
 in another way, such as with a token from `/invite-device` ([other devices](#other-devices)).
-Changing `RP_ID` strands the passkeys registered under the old one, unless
-the old one is a domain the new one is under: see [Moving `RP_ID`](#moving-rp_id).
+Changing `RP_ID` strands the passkeys registered under the old one.
 
 ### Native passkeys or the passkey page
 
@@ -419,10 +418,15 @@ async function nativePasskeys(rpId) {
 where the browser knows it; where it is missing, try the ceremony in place
 and fall back to `external.url` when it throws `SecurityError`. A
 `NotAllowedError` is the person cancelling or having no passkey for the RP
-ID, not a missing feature: offer the page then (it signs in with
-[legacy passkeys](#moving-rp_id) too), but don't open it unasked.
+ID, not a missing feature: offer the page then, but don't open it unasked.
+Until 2026-12-22 the page also signs in with production's passkeys made for
+`apron.chat` ([Moving `RP_ID`](#moving-rp_id)). <!-- LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts) -->
 
+<!-- LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts) -->
 ### Moving `RP_ID`
+
+Temporary: this section and `LEGACY_RP_ID` are removed after 2026-12-22,
+30 days after production moved.
 
 A server whose `RP_ID` is a parent domain (`apron.chat`) can move to its own
 host (`server.apron.chat`) without stranding its passkeys: set the old one as
@@ -452,6 +456,7 @@ are named by the server's own host (`PUBLIC_ORIGIN`'s, else `RP_ID`), not by
 the RP ID: chunks already written keep their keys, and the old
 `backups/<old>-…` files are no longer pruned, so delete them by hand once
 `BACKUP_KEEP` new ones exist.
+<!-- end LEGACY_RP_ID -->
 
 ## Operations and secrets
 
@@ -593,9 +598,9 @@ budget:check` refuses a production config without that); its
 domain. `wrangler.toml` sets neither, so turn them off before deploying it
 anywhere.
 
-The RP ID is `server.apron.chat`, the server's own host; passkeys made
-before for `apron.chat` still sign in on the passkey page (`LEGACY_RP_ID`,
-[Moving `RP_ID`](#moving-rp_id)).
+The RP ID is `server.apron.chat`, the server's own host. Until 2026-12-22,
+passkeys made before for `apron.chat` still sign in on the passkey page
+(`LEGACY_RP_ID`, [Moving `RP_ID`](#moving-rp_id)). <!-- LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts) -->
 Guest connections accept every origin, including localhost, LAN frontends,
 local files (opaque origins), and clients without Origin. Passkey
 verification allows only the exact `https://web.apron.chat` origin.
@@ -648,8 +653,8 @@ For direct Wrangler production commands, always pass
    configuration rule too, or the edge may hold a slow writer's first bytes,
    such as typed keys, until more arrive ([edge admission](edge-admission.md)).
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
-   passkey RP ID `server.apron.chat` (with `LEGACY_RP_ID = "apron.chat"`)
-   and the explicit, exact `RP_ORIGINS` allowlist;
+   passkey RP ID `server.apron.chat` and the explicit, exact `RP_ORIGINS`
+   allowlist;
    wildcard guest admission never enables wildcard passkey verification.
    RP changes can make previously registered credentials unusable.
 4. Run all checks here, and check the matching frontend in apron-chat/apron-web

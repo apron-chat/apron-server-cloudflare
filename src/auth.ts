@@ -9,6 +9,7 @@ import {
 } from "@simplewebauthn/server";
 import type { RuntimeConfig } from "./config";
 import type { Identity, StoredCredential } from "./domain";
+import { legacyRpIdAllowed } from "./legacy-passkeys"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
 import { clientDataFramed, pageOriginServes } from "./oauth";
 
 type WebAuthnAction = "register" | "login";
@@ -248,12 +249,10 @@ export class WebAuthnService {
 		return page ? this.config.passkeyPage && pageOriginServes(origin, this.config.rpId) : this.config.rpOrigins.includes(origin);
 	}
 
-	/**
-	 * Whether a ceremony may be for `rpId`: the RP ID, or the legacy one for
-	 * a sign-in on the passkey page, whose host is under both.
-	 */
+	/** Whether a ceremony may be for `rpId`: the RP ID only. */
 	private rpIdAllowed(rpId: string, action: WebAuthnAction, page: boolean): boolean {
-		return rpId === this.config.rpId || (page && action === "login" && this.config.legacyRpId !== undefined && rpId === this.config.legacyRpId);
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts); keep `rpId === this.config.rpId`.
+		return rpId === this.config.rpId || legacyRpIdAllowed(this.config.legacyRpId, rpId, action, page);
 	}
 
 	async begin(
@@ -271,12 +270,12 @@ export class WebAuthnService {
 		registration: { name?: string; userIdTaken?: (userId: string) => boolean; adds?: { userHandle?: string } } = {},
 		/**
 		 * `page`: a ceremony on the passkey page, on the server's own origin.
-		 * `legacy`: a sign-in there with a passkey made for `LEGACY_RP_ID`.
+		 * `legacy`: LEGACY_RP_ID, remove after 2026-12-22 (src/legacy-passkeys.ts).
 		 */
 		ceremony: { page?: boolean; legacy?: boolean } = {},
 	): Promise<BeginResult> {
 		if (!this.originAllowed(origin, ceremony.page === true)) throw new Error("origin is not configured for passkeys");
-		const rpId = ceremony.legacy ? this.config.legacyRpId : this.config.rpId;
+		const rpId = ceremony.legacy ? this.config.legacyRpId : this.config.rpId; // LEGACY_RP_ID: remove after 2026-12-22; keep this.config.rpId
 		if (rpId === undefined || !this.rpIdAllowed(rpId, action, ceremony.page === true)) throw new Error("passkeys for that RP ID are not taken here");
 		const adds = action === "register" && identity?.tier === "registered" && registration.adds !== undefined;
 		if (action === "register" && identity?.tier === "registered" && !adds) throw new Error("identity switching requires reconnect");

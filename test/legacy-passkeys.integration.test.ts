@@ -1,7 +1,8 @@
+// TEMPORARY: REMOVE AFTER 2026-12-22, with src/legacy-passkeys.ts (LEGACY_RP_ID).
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { WebAuthnService } from '../src/auth';
-import type { RuntimeConfig } from '../src/config';
+import { loadConfig, type RuntimeConfig } from '../src/config';
 import { connect as open, greeting, request, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 
@@ -123,7 +124,7 @@ it('signs in on the passkey page with a passkey made for the legacy RP ID, then 
 	// The page offers the older passkey, and has the next screen ready.
 	const { app, query, url } = await loginQuery(NEW);
 	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
-	expect(html).toContain('data-passkey="legacy">Use one made for localhost</button>');
+	expect(html).toContain('data-legacy="legacy">Use one made for localhost</button>');
 	expect(html).toContain('<div id="upgrade" hidden>');
 
 	// The usual sign-in is for the new RP ID; the legacy one, asked for, for the old.
@@ -169,7 +170,7 @@ it('takes the legacy RP ID only for a sign-in on the passkey page', async () => 
 	await rpIds('chat.localhost');
 	expect(await begin(NEW, { query, legacy: true })).toEqual(refused);
 	const html = await (await SELF.fetch(`${NEW}/passkey?${query}`, { headers: { 'CF-Connecting-IP': ip() } })).text();
-	expect(html).not.toContain('data-passkey="legacy"');
+	expect(html).not.toContain('data-legacy');
 	expect(html).not.toContain('id="upgrade"');
 
 	await rpIds('chat.localhost', 'localhost');
@@ -188,4 +189,79 @@ it('takes the legacy RP ID only for a sign-in on the passkey page', async () => 
 	const fresh = await softPasskey(NEW);
 	const unknown = await begin(NEW, { query });
 	expect((await finish(NEW, unknown.body.challenge_id, await fresh.assert(unknown.body.public_key, nextCounter(fresh)))).body.upgrade).toBeUndefined();
+});
+
+it('takes a legacy RP ID that RP_ID is under, for the passkey page', () => {
+	const config = (extra: Record<string, string>) => loadConfig({ NODE_ENV: 'test', ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'server.apron.chat', ...extra } as Parameters<typeof loadConfig>[0]);
+	expect(config({}).legacyRpId).toBeUndefined();
+	expect(config({ LEGACY_RP_ID: '' }).legacyRpId).toBeUndefined();
+	expect(config({ LEGACY_RP_ID: ' Apron.Chat ' }).legacyRpId).toBe('apron.chat');
+	// Only a domain RP_ID is under, which the page on RP_ID's host may use.
+	expect(() => config({ LEGACY_RP_ID: 'server.apron.chat' })).toThrow(/domain RP_ID is under/);
+	expect(() => config({ LEGACY_RP_ID: 'pron.chat' })).toThrow(/domain RP_ID is under/);
+	expect(() => config({ LEGACY_RP_ID: 'web.apron.chat' })).toThrow(/domain RP_ID is under/);
+	expect(() => config({ LEGACY_RP_ID: 'https://apron.chat' })).toThrow(/must be a host name/);
+	expect(() => config({ LEGACY_RP_ID: 'apron.chat', PASSKEY_PAGE: 'false' })).toThrow(/needs PASSKEY_PAGE/);
+});
+
+it("runs the page's scripts: the legacy sign-in, then the new passkey, then back to the client", async () => {
+	const { passkey, userId } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const { url } = await loginQuery(NEW);
+	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
+	const config = html.match(/<script type="application\/json" id="config">(.*?)<\/script>/s)![1];
+	// The page's script, then this module's, sharing one scope as classic scripts do.
+	const scripts = [...html.matchAll(/<script nonce="[^"]*">(.*?)<\/script>/gs)].map((match) => match[1]);
+	expect(scripts).toHaveLength(2);
+
+	type Element = { hidden: boolean; disabled: boolean; dataset: Record<string, string>; textContent: string; id: string; parentElement?: { children: Element[] }; listeners: (() => void)[]; addEventListener(type: string, listener: () => void): void };
+	const element = (id = '', dataset: Record<string, string> = {}): Element => {
+		const made: Element = { id, hidden: false, disabled: false, dataset, textContent: '', listeners: [], addEventListener: (_type, listener) => made.listeners.push(listener) };
+		return made;
+	};
+	const status = element('status');
+	const legacyButton = element('', { legacy: 'legacy' });
+	const createButton = element('', { legacy: 'upgrade' });
+	const screen = { ...element('upgrade'), hidden: true };
+	const heading = element();
+	const main = { children: [heading, screen, status] };
+	screen.parentElement = main;
+	const document = {
+		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? screen : status,
+		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [legacyButton, createButton] : selector === '[data-passkey]' ? [element()] : [],
+	};
+	const fresh = await softPasskey(NEW);
+	const PublicKeyCredential = { parseRequestOptionsFromJSON: (json: unknown) => json, parseCreationOptionsFromJSON: (json: unknown) => json };
+	const navigator = { credentials: {
+		get: async ({ publicKey }: { publicKey: { challenge: string; rpId: string } }) => {
+			expect(publicKey.rpId).toBe('localhost');
+			const assertion = await passkey.assert(publicKey, nextCounter(passkey), { origin: NEW });
+			return { id: assertion.id, toJSON: () => assertion };
+		},
+		create: async ({ publicKey }: { publicKey: { challenge: string; rp: { id: string } } }) => {
+			expect(publicKey.rp.id).toBe('chat.localhost');
+			const created = await fresh.register(publicKey);
+			return { id: created.id, toJSON: () => created };
+		},
+	} };
+	const fetch = (path: string, init: { body: string }) => post(NEW, path, JSON.parse(init.body));
+	const assigned: string[] = [];
+	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', scripts.join('\n'))(
+		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) },
+	);
+
+	legacyButton.listeners[0]();
+	// Signed in: the screen offering a new passkey, in place of the rest.
+	await vi.waitFor(() => expect(screen.hidden).toBe(false));
+	expect(heading.hidden).toBe(true);
+	expect(status.hidden).toBe(false);
+	expect(assigned).toEqual([]);
+	createButton.listeners[0]();
+	await vi.waitFor(() => expect(assigned).toHaveLength(1));
+	expect(status.textContent).toBe('');
+	expect(assigned[0]).toMatch(/^com\.example\.myapp:\/signed-in\?code=/);
+	await runInDurableObject(stub(), (instance) => {
+		const store = (instance as unknown as { store: { credentials: { idsForUser(userId: string): string[] } } }).store;
+		expect(store.credentials.idsForUser(userId).sort()).toEqual([passkey.id, fresh.id].sort());
+	});
 });

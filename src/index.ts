@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { addUpgradePasskey, legacyBegin, upgradeHandle, type LegacyAccounts } from "./legacy-passkeys"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
@@ -946,11 +947,7 @@ interface StoredPageCeremony {
 	request: AuthorizationRequest;
 	/** An addition's account, from its `request` handle. */
 	addsUserId?: string;
-	/**
-	 * An addition right after a sign-in with a legacy passkey (LEGACY_RP_ID):
-	 * the person just proved the account is theirs, on this page, so the new
-	 * passkey is written at finish rather than kept with a code.
-	 */
+	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). An addition after a sign-in with a legacy passkey. */
 	upgrade?: true;
 	expiresMs: number;
 }
@@ -4431,7 +4428,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			who, client, where,
 			recognised: recognisedClient(redirect, this.config.rpOrigins),
 			...(account ? { account } : {}),
-			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId } : {}),
+			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId } : {}), // LEGACY_RP_ID: remove after 2026-12-22
 			query: query.toString(),
 			deny: redirectWith(value.redirectUri, { error: "access_denied", state: value.state, iss: origin }),
 		};
@@ -4451,14 +4448,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!parsed.ok) return pageJson(400, { error: parsed.error });
 		// The passkey page's action is its link's; `/oauth/authorize` lets the person choose.
 		const chosen = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
-		// A sign-in with a passkey made for LEGACY_RP_ID; or, after one, a
-		// passkey for RP_ID added to that account (`upgrade`, its handle).
-		const legacy = body.legacy === true;
-		const upgrade = typeof body.upgrade === "string" && /^rq_[A-Za-z0-9_-]{43}$/.test(body.upgrade) ? body.upgrade : undefined;
-		if (body.upgrade !== undefined && !upgrade) return pageJson(400, { error: "The request was not understood." });
-		if ((legacy || upgrade) && (!this.config.legacyRpId || chosen !== "login" || (parsed.value as PasskeyPageRequest).request !== undefined || (legacy && upgrade))) {
-			return pageJson(400, { error: "The request was not understood." });
-		}
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with `legacy` and `upgrade` below;
+		// then `action` is `chosen` and `value` is `{ ...parsed.value, action }`.
+		const old = legacyBegin(body, this.config.legacyRpId, chosen, (parsed.value as PasskeyPageRequest).request !== undefined);
+		if (old === "refused") return pageJson(400, { error: "The request was not understood." });
+		const legacy = old !== undefined && "legacy" in old;
+		const upgrade = old !== undefined && "upgrade" in old ? old.upgrade : undefined;
 		const action = upgrade ? "register" : chosen;
 		const value: PasskeyPageRequest = { ...parsed.value, action, ...(upgrade ? { request: upgrade } : {}) };
 		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
@@ -4480,12 +4475,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				...(value.name !== undefined ? { name: value.name } : {}),
 				userIdTaken: (userId) => this.store.accounts.idTaken(userId),
 				...(adds ? { adds: adds.userHandle ? { userHandle: adds.userHandle } : {} } : {}),
-			}, { page: true, ...(legacy ? { legacy: true } : {}) });
+			}, { page: true, ...(legacy ? { legacy: true } : {}) }); // LEGACY_RP_ID: remove after 2026-12-22; keep { page: true }
 		const ceremony: StoredPageCeremony = {
 			v: 1, page, challenge: begun.challenge,
 			request: { clientId: value.clientId, redirectUri: value.redirectUri, codeChallenge: value.codeChallenge, state: value.state, resource: value.resource },
 			...(adds ? { addsUserId: adds.userId } : {}),
-			...(upgrade ? { upgrade: true } : {}),
+			...(upgrade ? { upgrade: true } : {}), // LEGACY_RP_ID: remove after 2026-12-22
 			expiresMs: begun.challenge.expiresAt,
 		};
 		await this.putSignInRecord(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(begun.challenge.challengeId), ceremony);
@@ -4542,20 +4537,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A passkey no account has, nor a code about to give it one, such as
 			// one made here whose code was never redeemed: the script asks the
 			// device to drop it. Anything else, or a failed read, is the usual error.
-			// Never for a legacy RP ID's passkey, which other sites may have made.
+			// Never for a legacy RP ID's passkey, which other sites may have made
+			// (LEGACY_RP_ID: remove `ceremony.challenge.rpId === this.config.rpId` after 2026-12-22).
 			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && ceremony.challenge.rpId === this.config.rpId && !await this.pendingCredential(error.credentialId)) {
 				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
 			}
 			throw error;
 		}
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts).
 		if (ceremony.upgrade) {
-			// Under the user handle it began with: `/invite-purge` may have
-			// cleared it meanwhile, and a new passkey must not bring it back.
-			if (!created || created.userId !== ceremony.addsUserId || this.store.accounts.get(created.userId)?.userHandle !== created.userHandle) {
-				return pageJson(400, { error: "Your account changed. Sign in again to add a passkey." });
-			}
-			this.store.credentials.add({ userId: created.userId, userHandle: created.userHandle, credential: created.credential, now, ipKey });
-			return pageJson(200, { added: true });
+			const answer = addUpgradePasskey(this.legacyAccounts(), created, ceremony.addsUserId, { now, ipKey });
+			return pageJson("added" in answer ? 200 : 400, answer);
 		}
 		const code = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const record: StoredSignInCode = {
@@ -4574,20 +4566,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		await this.putSignInRecord(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code), record);
 		const redirect = redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin });
-		const upgrade = ceremony.challenge.rpId !== this.config.rpId ? await this.upgradeHandle(finished.identity.user_id, now) : undefined;
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts); then the answer is `{ redirect }`.
+		const upgrade = ceremony.challenge.rpId !== this.config.rpId ? await upgradeHandle(this.legacyAccounts(), finished.identity.user_id, now) : undefined;
 		return pageJson(200, { redirect, ...(upgrade ? { upgrade } : {}) });
 	}
 
-	/**
-	 * After a sign-in with a legacy passkey (LEGACY_RP_ID), a handle that
-	 * lets the page add a passkey for RP_ID to the account (pageBegin
-	 * `upgrade`), where it may still take one, under its user handle; else
-	 * undefined. The page offers it before going back to the client.
-	 */
-	private async upgradeHandle(userId: string, now: number): Promise<string | undefined> {
-		const identity = this.store.accounts.get(userId);
-		if (!identity?.userHandle || this.store.credentials.idsForUser(userId).length >= MAX_PASSKEYS_PER_USER) return undefined;
-		return await this.createRequestHandle(userId, identity.userHandle, now);
+	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). The accounts, as the legacy sign-in's upgrade uses them. */
+	private legacyAccounts(): LegacyAccounts {
+		return {
+			userHandle: (userId) => this.store.accounts.get(userId)?.userHandle,
+			roomForPasskey: (userId) => this.store.credentials.idsForUser(userId).length < MAX_PASSKEYS_PER_USER,
+			requestHandle: (userId, userHandle, now) => this.createRequestHandle(userId, userHandle, now),
+			addPasskey: (input) => { this.store.credentials.add(input); },
+		};
 	}
 
 	/**
