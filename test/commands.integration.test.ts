@@ -105,6 +105,8 @@ const LINES: Record<string, { run?: (users: Users) => string; target?: (users: U
 	'invite-purge': { run: (u) => `/invite-purge ${u.resetting}`, target: (u) => u.resetting, usage: '/invite-purge' },
 	'invite-token': { run: (u) => `/invite-token ${u.invited}`, target: (u) => u.invited, usage: '/invite-token' },
 	'kick': { run: (u) => `/kick ${u.kicked}`, target: (u) => u.kicked, usage: '/kick' },
+	// Offered only with ACCESS=lobby (test/lobby.integration.test.ts); elsewhere an unknown command.
+	'lobby': { usage: '/lobby' },
 	'passkeys': { usage: '/passkeys remove' },
 	'purge': { run: (u) => `/purge ${u.purged}`, target: (u) => u.purged, usage: '/purge' },
 	'rename': { run: (u) => `/rename ${u.renamed} ${u.renamedTo}`, target: (u) => `${u.renamed} -> ${u.renamedTo}`, usage: '/rename x' },
@@ -112,6 +114,8 @@ const LINES: Record<string, { run?: (users: Users) => string; target?: (users: U
 	'server': { run: () => '/server title Secret title text', target: () => undefined, usage: '/server bogus' },
 	'status': { run: () => '/status', target: () => undefined, usage: null },
 	'toggle': { run: () => '/toggle activity', target: () => 'activity', usage: '/toggle' },
+	// Offered only with ACCESS=lobby (test/lobby.integration.test.ts); elsewhere an unknown command.
+	'welcome': { usage: '/welcome' },
 };
 
 /** What a command line may never leave in an audit event: tokens, and the text it set. */

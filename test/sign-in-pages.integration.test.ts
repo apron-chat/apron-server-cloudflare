@@ -29,7 +29,18 @@ async function setExternal(on: boolean): Promise<void> {
 	});
 }
 
+/** Sets the access mode on the running object (test/lobby.integration.test.ts has the rest of the modes' suite). */
+async function setAccess(access: 'public' | 'lobby' | 'private'): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: Record<string, unknown>; lobbyReady: boolean; applyAccess(): void };
+		server.config = { ...server.config, access, lobbyRoom: 'lobby', guestPosting: access === 'public' };
+		server.lobbyReady = false;
+		server.applyAccess();
+	});
+}
+
 afterEach(() => setExternal(false));
+afterEach(() => setAccess('public'));
 
 /** The Worker's environment with EXTERNAL_SIGN_IN on, for what it answers from its own configuration. */
 const withExternal = () => ({ ...env, EXTERNAL_SIGN_IN: 'true' }) as unknown as Env;
@@ -829,4 +840,106 @@ it('sweeps expired codes, ceremonies and addition handles from their expiry inde
 		while (await sweep(Date.now() + 11 * 60_000)) { /* a full batch may leave more */ }
 	});
 	expect(await records()).toEqual([]);
+});
+
+it('private: no page, external or token-endpoint path makes an account, even with a code from before the switch; members still sign in', async () => {
+	await setExternal(true);
+	// A member made while the server was public.
+	const member = await registerThroughPage('Member');
+	member.peer.close();
+	// Codes for new accounts, made while self sign-up was open.
+	const peer = await connect();
+	await greeting(peer);
+	const pageApp = await client();
+	const pageCode = returned((await ceremony(pageApp.url((await begin(peer, 'register', { name: 'Late' })).result.external.url), await softPasskey(ORIGIN))).body.redirect!, pageApp);
+	const extApp = await client();
+	const extCode = returned((await ceremony(extApp.url(`${ORIGIN}/oauth/authorize`), await softPasskey(ORIGIN), { page: 'authorize', action: 'register' })).body.redirect!, extApp);
+	const tokenApp = await client();
+	const tokenCode = returned((await ceremony(tokenApp.url(`${ORIGIN}/oauth/authorize`), await softPasskey(ORIGIN), { page: 'authorize', action: 'register' })).body.redirect!, tokenApp);
+	// A page ceremony begun, not finished.
+	const openApp = await client();
+	const openUrl = openApp.url((await begin(peer, 'register', { name: 'Halfway' })).result.external.url);
+	const openBegun = await pagePost('/passkey/begin', { page: 'passkey', query: openUrl.searchParams.toString() });
+	const { challenge_id, public_key } = await openBegun.json() as { challenge_id: string; public_key: any };
+	peer.close();
+
+	await setAccess('private');
+	const count = () => runInDurableObject(stub(), (instance) => (instance as unknown as { store: { ops: { status(now: number): { identities: number } } } }).store.ops.status(Date.now()).identities);
+	const before = await count();
+	try {
+		// The page and /oauth/authorize begin no new account.
+		const app = await client();
+		const pageBegin = await pagePost('/passkey/begin', { page: 'passkey', query: app.url(`${ORIGIN}/passkey?action=register&name=Nope`).searchParams.toString() });
+		expect(pageBegin.status).toBe(403);
+		expect((await pageBegin.json() as { error: string }).error).toBe('This server is invite-only. Ask for an invite link.');
+		expect((await pagePost('/passkey/begin', { page: 'authorize', action: 'register', query: app.url(`${ORIGIN}/oauth/authorize`).searchParams.toString() })).status).toBe(403);
+		// Nor finish one begun before the switch.
+		const finished = await pagePost('/passkey/finish', { challenge_id, credential: await (await softPasskey(ORIGIN)).register(public_key) });
+		expect(finished.status).toBe(403);
+		const fresh = await connect();
+		try {
+			const { server } = await greeting(fresh);
+			expect(server.params.signup).toEqual(['token']);
+			// A pending passkey's code, on a connection, by webauthn and by external.
+			const refused = { code: -32001, message: 'This server is invite-only; ask for an invite link' };
+			expect((await request(fresh, 'page-code', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...pageApp.redeem(pageCode) })).error).toMatchObject(refused);
+			expect((await request(fresh, 'ext-code', 'auth', { scheme: 'external', ...extApp.redeem(extCode) })).error).toMatchObject(refused);
+			// A client's ceremony on the connection: refused at its begin.
+			expect((await begin(fresh, 'register')).error).toMatchObject(refused);
+		} finally { fresh.close(); }
+		// And at the token endpoint.
+		const token = await tokenRequest({ grant_type: 'authorization_code', ...tokenApp.redeem(tokenCode) as Record<string, string> });
+		expect(token.status).toBe(400);
+		expect(await token.json()).toMatchObject({ error: 'invalid_grant' });
+		expect(await count()).toBe(before);
+
+		// A member signs in with the page's passkey login, as before, and with its session.
+		const login = await connect();
+		try {
+			await greeting(login);
+			const loginApp = await client();
+			const done = await ceremony(loginApp.url((await begin(login, 'login')).result.external.url), member.passkey);
+			expect(done.status).toBe(200);
+			const signedIn = await request(login, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', ...loginApp.redeem(returned(done.body.redirect!, loginApp)) });
+			expect(signedIn.result.you.user_id).toBe(member.userId);
+		} finally { login.close(); }
+		const resumed = await connect();
+		try {
+			await greeting(resumed);
+			expect((await request(resumed, 'resume', 'auth', { scheme: 'token', token: member.token })).result.you.user_id).toBe(member.userId);
+		} finally { resumed.close(); }
+	} finally {
+		await setAccess('public');
+	}
+});
+
+it('lobby: an account made at /oauth/token waits in the lobby, as one made on a connection does', async () => {
+	await setExternal(true);
+	await setAccess('lobby');
+	const app = await client();
+	const done = await ceremony(app.url(`${ORIGIN}/oauth/authorize`), await softPasskey(ORIGIN), { page: 'authorize', action: 'register' });
+	const token = await tokenRequest({ grant_type: 'authorization_code', ...app.redeem(returned(done.body.redirect!, app)) as Record<string, string> });
+	expect(token.status).toBe(200);
+	const { access_token } = await token.json() as { access_token: string };
+	const peer = await connect();
+	try {
+		await greeting(peer);
+		const signedIn = await request(peer, 'resume', 'auth', { scheme: 'token', token: access_token });
+		expect(signedIn.result.you.roles).toEqual(['waiting']);
+		expect((await request(peer, 'history', 'history', { room_id: 'general' })).error.code).toBe(-32602);
+	} finally { peer.close(); }
+});
+
+it('cleans the name a passkey page link carries for a new account', async () => {
+	const peer = await connect();
+	try {
+		await greeting(peer);
+		const begun = await begin(peer, 'register');
+		const app = await client();
+		const url = app.url(begun.result.external.url, { name: '\u202E  \uFF2D\uFF41\uFF52\uFF59\u0000  Shelley\u200B ' });
+		const done = await ceremony(url, await softPasskey(ORIGIN));
+		expect(done.status).toBe(200);
+		const finished = await request(peer, 'finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(returned(done.body.redirect!, app)) });
+		expect(finished.result.you.name).toBe('Mary Shelley');
+	} finally { peer.close(); }
 });

@@ -28,7 +28,7 @@ import { IMAGE_TYPES, sniffImage } from "./content/media/image";
 import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./content/media/text";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./content/emoji";
 import { liveInputLimit, liveResultEmbed, uploadResultEmbed } from "./content/embeds";
-import { MAX_USER_EXT_BYTES, clientUserExt, mergeExt, userExtFits } from "./content/user";
+import { MAX_USER_EXT_BYTES, cleanName, clientUserExt, mergeExt, userExtFits } from "./content/user";
 import { limitData } from "./store-error";
 import { ADMIN_USER_ID } from "./user-ids";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
@@ -87,6 +87,8 @@ import {
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import {
+	LOBBY_ROOMS_DENIED,
+	ROOM_CREATOR_ROLES,
 	BOT_MODERATOR_ROLES,
 	BOT_NAME_PATTERN,
 	BOT_NAME_RULE,
@@ -384,6 +386,20 @@ interface ConnectionAttachment {
 	 * it sends a new one (syncServer).
 	 */
 	wakeJoined?: boolean;
+	/**
+	 * Where the lobby (`ACCESS=lobby`) holds this connection's user:
+	 * `waiting`, a waiting account (identity tier `waiting`) seeing only the
+	 * lobby; `welcomed`, a guest an admin or mod welcomed with `/welcome`,
+	 * whose next account on this connection is a member. Never stored: a
+	 * guest's goes with it. Clients are told with `~private` notices only.
+	 */
+	lobby?: "waiting" | "welcomed";
+	/**
+	 * Which `server` frame this connection was last sent (ServerView, as
+	 * frameKind names it), when it is not the frame every connection opens
+	 * with, so a sign-in or a welcome that changes it sends a new one.
+	 */
+	sv?: string;
 	closing?: boolean;
 }
 
@@ -768,7 +784,51 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  */
 const BOT_ID_PREFIX = "bot_";
 /** Features an admin can turn off and on with `/toggle`. */
-type ToggleFeature = "activity" | "uploads" | "presence" | "addmember" | "livetext";
+type ToggleFeature = "activity" | "uploads" | "presence" | "addmember" | "livetext" | "lobby";
+/** The features `/toggle` turns off and on: every override in `_meta` but the lobby's, which `/lobby` sets. */
+type AdminToggle = Exclude<ToggleFeature, "lobby">;
+
+/**
+ * Which `server` frame a connection gets (serverAnnouncement): `pre`
+ * before it signs in, `restricted` while the lobby holds its user (a guest
+ * or a waiting account, `ACCESS=lobby`), `member` otherwise.
+ */
+type ServerView = "pre" | "restricted" | "member";
+
+/** `/lobby open|close`'s word as the lobby's state to set: true for open, false for close. */
+function lobbyState(word: string | undefined): boolean | undefined {
+	const lower = word?.toLowerCase();
+	return lower === "open" ? true : lower === "close" ? false : undefined;
+}
+
+/** `/welcome`'s usage error, when nothing names its target (welcomeTarget). */
+const WELCOME_USAGE = "Usage: /welcome <user_id>, or /welcome in reply to their message";
+
+/**
+ * `/welcome`'s target from its line, in the order both servers use: the
+ * one distinct entry of `body.mentions`, whatever the text; else the
+ * typed `user_id` when it is the one word after the command, its leading
+ * `@` taken off (trailing spaces are gone with the split); else nothing
+ * yet, for the reply's author (welcomeTarget). Several mentions are the
+ * usage error.
+ */
+function welcomeArgs(words: readonly string[], body: Readonly<Record<string, unknown>>): { userId?: UserIdArg } {
+	const mentions = Array.isArray(body.mentions) ? [...new Set(body.mentions.filter((entry): entry is string => typeof entry === "string" && entry.length > 0))] : [];
+	if (mentions.length === 1) return { userId: mentions[0] as UserIdArg };
+	if (mentions.length > 1) throw usageError(WELCOME_USAGE);
+	const typed = words.length === 2 ? stripMention(words[1]) : "";
+	if (typed) return { userId: typed as UserIdArg };
+	return {};
+}
+
+/** The refusal of a sign-up, or of a waiting account's sign-in, where only invite links let people in. */
+const INVITE_ONLY = "This server is invite-only; ask for an invite link";
+/** The refusal of a guest or a sign-up while the lobby is closed (`/lobby close`). */
+const LOBBY_CLOSED = "The Public Lobby is closed; ask for an invite link";
+/** Who may run `/welcome <user_id>` and `/lobby` (PLAN: admins and mods). */
+const LOBBY_MODERATOR_ROLES = ROOM_CREATOR_ROLES;
+/** How many rooms' parents the runtime keeps (roomParent), as the rooms table is bounded. */
+const MAX_ROOM_PARENTS = 4_096;
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as (ADMIN_USER_ID, `admin`)
  * is always an admin. Registered users are `<name>_<digits>` or `u_…`, so no
@@ -971,6 +1031,8 @@ interface PasskeySignIn {
 	ext?: Record<string, unknown>;
 	seen?: number;
 	handle?: string;
+	/** The account waits in the lobby (Store identity tier `waiting`). */
+	waiting?: boolean;
 }
 
 interface IdentityShape {
@@ -1094,7 +1156,7 @@ function isBotId(userId: string | undefined): boolean {
 
 /** "Bot of <owner>", cut to the name limits by whole code points. */
 function botName(owner: string, limits: { maxNameCodePoints: number; maxNameBytes: number }): string {
-	const points = [...`Bot of ${owner}`].slice(0, limits.maxNameCodePoints);
+	const points = [...cleanName(`Bot of ${owner}`)].slice(0, limits.maxNameCodePoints);
 	while (utf8Bytes(points.join("")) > limits.maxNameBytes) points.pop();
 	return points.join("");
 }
@@ -1307,6 +1369,8 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			frameTimes: Array.isArray(attachment.frameTimes) ? attachment.frameTimes.slice(-120) : [],
 			...throttleState(attachment),
 			...(attachment.wakeJoined === true ? { wakeJoined: true } : {}),
+			...(attachment.lobby === "waiting" || attachment.lobby === "welcomed" ? { lobby: attachment.lobby } : {}),
+			...(typeof attachment.sv === "string" && attachment.sv.length <= 16 ? { sv: attachment.sv } : {}),
 			...(attachment.unreadOwed === true ? { unreadOwed: true } : {}),
 			...(attachment.closing ? { closing: true } : {}),
 		};
@@ -1477,7 +1541,7 @@ function connectionDeadlines(attachment: ConnectionAttachment): Array<[Connectio
  * connection now is, its rooms and credential, and the read cursors it
  * wrote for the user before.
  */
-const SIGN_IN_FIELDS = ["tier", "userId", "name", "avatar", "roles", "ext", "rooms", "listedJoined", "credential", "reads", "readsAt"] as const satisfies ReadonlyArray<keyof ConnectionAttachment>;
+const SIGN_IN_FIELDS = ["tier", "userId", "name", "avatar", "roles", "ext", "rooms", "listedJoined", "credential", "reads", "readsAt", "lobby"] as const satisfies ReadonlyArray<keyof ConnectionAttachment>;
 
 /**
  * Writes the fields `owned` of a copy of a connection's attachment read
@@ -2666,6 +2730,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly botActiveAt = new Map<string, number>();
 	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
+	/** Guests whose leave of the lobby was logged (guestLobbyChange), so it is logged once; bounded. */
+	private readonly guestLobbyLeft = new Set<string>();
+	/** Rooms' parents, once read (roomParent), for the lobby's visibility check. */
+	private readonly roomParents = new Map<string, string | null>();
+	/** Whether the lobby room is known to exist (applyAccess). */
+	private lobbyReady = false;
 	/**
 	 * Live texts this instance holds, by the id in their `url`: in memory
 	 * only, so an evicted or redeployed instance loses them, and the next one
@@ -2847,16 +2917,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.accountUsage.restore(this.store.ops.accountUsageSnapshot());
 				this.attackPauseRecord = null;
 				console.warn(JSON.stringify({ event: "storage_schema_reset" }));
+				this.applyAccess(false);
 			});
 		} else {
 			this.store.lifecycle.initialize();
 			this.accountUsage.restore(this.store.ops.accountUsageSnapshot());
 			try { this.attackPauseRecord = parseAttackPause(this.store.admission.attackPause()); } catch { /* read at the first event instead */ }
+			this.applyAccess(false);
 		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
 		this.stalls.event(() => this.awakeSnapshot());
+		// The lobby room, once per start or wake (ACCESS=lobby).
+		if (this.config.access === "lobby" && !this.lobbyReady) this.applyAccess();
 		// A live text streams for minutes by design: its requests are counted
 		// in flight while the object answers them, not timed (a reader's
 		// stream outlives its request: `live` in the awake snapshot counts it).
@@ -2902,6 +2976,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(origin ? { origin } : {}),
 			...(endpoint ? { endpoint } : {}),
 			openedAt: nowMs(),
+			// Which `server` frame it opens with, where that depends on who signs in (frameKind).
+			...(this.config.access !== "public" ? { sv: this.frameKind("pre") } : {}),
 			authDeadline: nowMs() + this.config.limits.authTimeoutSeconds * 1_000,
 			pendingFrames: 0,
 			pendingBytes: 0,
@@ -3395,13 +3471,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return protocol.name === "retry_after" ? response : remembered(response, protocol.name);
 	}
 
-	private serverAnnouncement(origin: string | null, endpoint: string | undefined, wakeJoined = false): Record<string, unknown> {
+	private serverAnnouncement(origin: string | null, endpoint: string | undefined, wakeJoined = false, view: ServerView = "pre"): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
-		const emoji = this.emojiCatalogUrl();
-		const general = this.generalDescription();
+		// Before sign-in where nobody comes in by themselves (`private`, or a
+		// closed lobby), the frame says nothing of the rooms: no description
+		// read from one, no emoji catalog, no `ext`.
+		const closed = view === "pre" && !this.selfSignUp();
+		const kind = this.frameKind(view);
+		const emoji = closed ? undefined : this.emojiCatalogUrl();
+		// A user the lobby holds, or anyone before sign-in while it is open, reads the lobby's description.
+		const lobby = this.lobbyId();
+		const general = closed ? undefined : kind === "lobby" && lobby !== undefined ? this.roomDescription(lobby) : this.generalDescription();
 		const server = originOfEndpoint(endpoint);
 		const external = this.config.externalSignIn && server !== undefined && this.pageServes(server);
+		const passkeys = this.passkeysOfferedTo(origin, endpoint);
+		const signUp = this.selfSignUp();
+		// Explicitly the room description read above as the fallback: none where nothing is read from a room.
+		const metadata = this.serverMetadata({ description: general });
+		const lobbyIsDescription = kind === "lobby" && metadata.description !== undefined && metadata.description === roomServerDescription(general);
 		return {
 			method: "server",
 			params: {
@@ -3444,19 +3532,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// tokens from anywhere (bots, invites, sessions from the page). No
 				// `email` (the demo has no way to send mail); `external` only with
 				// EXTERNAL_SIGN_IN, for clients that implement nothing else.
-				auth: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : []), "guest"],
+				// No `guest` where nobody comes in by themselves (selfSignUp).
+				auth: [...(passkeys ? ["webauthn"] : []), "token", ...(external ? ["external"] : []), ...(signUp ? ["guest"] : [])],
 				// Schemes that create an account (§3.2): a passkey registration (or
 				// `external`, whose page can create one), and a token only as an
 				// admin's sign-up invite (`/invite-code`); other tokens sign in to
 				// existing users. A guest is a throwaway identity for one
 				// connection, not an account, so `guest` is listed only in `auth`.
-				signup: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])],
+				// Where nobody comes in by themselves, only the invite link (`token`).
+				signup: signUp ? [...(passkeys ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])] : ["token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: general ?? this.signInWelcome(origin, endpoint),
+				// Where the lobby's description is already the frame's description,
+				// no `welcome` at all: neither it again nor a generated one beside it.
+				// (There is no operator-set welcome to keep: `welcome` is a room's
+				// description or generated.)
+				...(lobbyIsDescription ? {} : { welcome: general ?? this.signInWelcome(origin, endpoint) }),
 				// What the server is, for lists of servers (§3.1): what admins set
 				// with `/server`, else SERVER_TITLE, SERVER_DESCRIPTION and
-				// SERVER_AVATAR (config.ts), else for the description `general`'s.
-				...this.serverMetadata(general),
+				// SERVER_AVATAR (config.ts), else for the description the room
+				// description read above (`general`'s, the lobby's, or none).
+				...metadata,
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
 				// Web Push (§4.9), with the VAPID key browsers subscribe with and
@@ -3476,15 +3571,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// (private rooms only) with `activity`, else `false`.
 				// `private_rooms`: the most private rooms one user may be in.
 				// What each user may do is in `you` (permissions).
-				ext: {
+				// Nothing of it before sign-in where nobody comes in by themselves.
+				...(closed ? {} : { ext: {
 					settings: { read_cursors: this.activityOn(), read_receipts: this.activityOn() ? "private" : false, private_rooms: this.config.limits.privateMembershipsPerUser },
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
 					// Extension `ext:emoji`: where clients fetch the catalog, which
 					// changes with it (publishEmoji).
 					...(emoji ? { emoji: { catalog_url: emoji } } : {}),
-				},
+				} }),
 			},
 		};
+	}
+
+	/**
+	 * Which `server` frame a view gets, by what differs between them: `full`
+	 * in `public` (one frame for everyone); `closed` before sign-in where
+	 * nobody comes in by themselves (`private`, a closed lobby); `lobby` for
+	 * a user the lobby holds, and before sign-in while it is open (the
+	 * lobby's description); `member` for anyone else (`general`'s).
+	 */
+	private frameKind(view: ServerView): string {
+		if (this.config.access === "public") return "full";
+		if (view === "member") return "member";
+		if (view === "pre") return this.selfSignUp() ? (this.config.access === "lobby" ? "lobby" : "member") : "closed";
+		return "lobby";
+	}
+
+	/** Which `server` frame a connection gets now (ServerView). */
+	private viewOf(state: ConnectionAttachment): ServerView {
+		return state.tier === "pending" ? "pre" : this.restricted(state) ? "restricted" : "member";
 	}
 
 	/**
@@ -3495,9 +3610,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * one is within the description rules. The stored ones are read once
 	 * after a wake; while that read cannot be afforded, the variables apply.
 	 */
-	private serverMetadata(general = this.generalDescription()): ServerMetadata {
+	private serverMetadata(room: { description: string | undefined } | "general" = "general"): ServerMetadata {
 		const metadata: ServerMetadata = { ...this.config.server, ...this.storedServerMetadata() };
-		const fallback = metadata.description === undefined ? roomServerDescription(general) : undefined;
+		// The room whose description is the fallback: `general`'s by default,
+		// else the one given, whose `undefined` means no fallback at all.
+		const fallbackFrom = room === "general" ? this.generalDescription() : room.description;
+		const fallback = metadata.description === undefined ? roomServerDescription(fallbackFrom) : undefined;
 		return fallback ? { ...metadata, description: fallback } : metadata;
 	}
 
@@ -3556,8 +3674,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * none or its read cannot be afforded.
 	 */
 	private generalDescription(): string | undefined {
+		return this.roomDescription(ROOM_ID);
+	}
+
+	/** A room's description, or undefined when it has none or its read cannot be afforded. */
+	private roomDescription(roomId: string): string | undefined {
 		try {
-			return this.store.rooms.get(ROOM_ID, nowMs())?.description;
+			return this.store.rooms.get(roomId, nowMs())?.description;
 		} catch {
 			return undefined;
 		}
@@ -3569,6 +3692,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null, endpoint: string | undefined): string {
+		if (this.config.access !== "public" && !this.selfSignUp()) {
+			return "**This server is invite-only.** Sign in, or join with an invite link from an admin; add a passkey once you're in, so you can sign in again without it.";
+		}
+		if (this.config.access === "lobby") {
+			return "**Welcome to the Public Lobby.** Introduce yourself there as a guest; an admin or moderator can welcome you in. Create a passkey to keep your place, or sign in if you have an account.";
+		}
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
 		const signIn = this.passkeysOfferedTo(origin, endpoint)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
@@ -3580,7 +3709,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
 	private welcome(origin: string | null, endpoint: string | undefined): Record<string, unknown> {
 		const lines = [`Welcome to Apron Chat. Server version: \`${this.serverVersion()}\``];
-		if (!this.config.guestPosting) {
+		if (this.config.access !== "public") {
+			lines.push(!this.selfSignUp() ? "This server is invite-only: sign in, or use an invite link."
+				: "Guests see the Public Lobby. Introduce yourself there; an admin or moderator can welcome you in.");
+		} else if (!this.config.guestPosting) {
 			lines.push(this.passkeysOfferedTo(origin, endpoint)
 				? "Guests can read. *Sign in with passkey* to participate."
 				: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.");
@@ -3931,6 +4063,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const params = request.params;
 		const scheme = requiredString(params, "scheme");
 		if (scheme === "guest") {
+			// No guests where nobody comes in by themselves (`private`, a closed lobby).
+			if (!this.selfSignUp()) throw { name: "unsupported", message: this.closedRefusal() } satisfies ProtocolError;
+			this.applyAccess();
 			// A requested `name` or `user_id` is not honored: guests are
 			// `guest_<n>` from a server-wide counter, never reissued, with a
 			// generated name they keep (§3.2 lets the server assign identity).
@@ -3940,14 +4075,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.userId = `guest_${number}`;
 			attachment.name = `Guest ${number}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes));
 			delete attachment.ext;
-			// A new guest has joined the default room (§3.4).
-			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
+			// A new guest has joined the default room (§3.4): the lobby, where there is one.
+			attachment.rooms = this.config.access === "lobby" ? [this.config.lobbyRoom] : [...DEFAULT_JOINED_ROOMS];
+			delete attachment.lobby;
 			delete attachment.listedJoined;
 			writeAttachment(socket, attachment);
 			// A guest has no stored status or mutes: its choice lives on this connection.
 			this.prepareStatus(socket);
 			this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment) });
 			this.afterSignIn(socket);
+			// The lobby's members see the guest arrive (guestLobbyChange).
+			await this.guestLobbyChange(connectionAttachment(socket) ?? attachment, true);
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -3979,6 +4117,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
 		}
 		const step = requiredString(params, "step");
+		// A new account only where people come in by themselves (`private` and
+		// a closed lobby take invite links); signing in, and adding a passkey,
+		// still work.
+		if (action === "register" && !adding && !this.selfSignUp()) throw { name: "denied", message: this.closedRefusal() } satisfies ProtocolError;
 		const origin = this.requestOrigin(socket);
 		// A ceremony in the client needs one of RP_ORIGINS; the passkey page
 		// serves every other client, on the server's own origin (protocol §4.10.1).
@@ -4088,6 +4230,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				signIn.ext = identity?.ext;
 				signIn.seen = identity?.seen;
 				signIn.handle = identity?.userHandle;
+				signIn.waiting = identity?.waiting === true;
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
@@ -4102,8 +4245,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 					return { user_id: added.userId, name: added.name };
 				}
 				signIn.handle = input.userHandle;
+				// A new account (§4.10) only where people come in by themselves.
+				if (!this.selfSignUp()) throw { name: "denied", message: this.closedRefusal() } satisfies ProtocolError;
 				// A guest registering on its connection keeps the rooms it had joined.
-				const identity = this.store.accounts.register({ ...input, ...(attachment.tier === "anonymous" && attachment.rooms ? { rooms: attachment.rooms } : {}) });
+				const guest = connectionAttachment(socket) ?? attachment;
+				const guestRooms = guest.tier === "anonymous" ? guest.rooms : undefined;
+				// In the lobby, an account people make themselves waits there, and
+				// one a guest an admin or mod welcomed makes is a member, who
+				// starts in `general` too.
+				const lobby = this.lobbyId();
+				const welcomed = lobby !== undefined && guest.tier === "anonymous" && guest.lobby === "welcomed";
+				const waiting = lobby !== undefined && !welcomed;
+				const rooms = waiting ? guestRooms ?? [lobby]
+					: welcomed ? [...(guestRooms ?? []), ...DEFAULT_JOINED_ROOMS]
+					: guestRooms;
+				signIn.waiting = waiting;
+				const identity = this.store.accounts.register({ ...input, ...(rooms ? { rooms } : {}), ...(waiting ? { waiting } : {}) });
 				// Each starting room's logged join goes to the room's other members
 				// before anything else can commit (§4.2.2), and to this connection
 				// after its `auth` result (§3.2).
@@ -4146,6 +4303,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// so a failure leaves neither an orphan session nor a changed
 		// connection. The storage writes awaited in between hold the input
 		// gate, so no other event changes the user's status or mutes meanwhile.
+		// Refused before a session exists, so none is left behind.
+		if (signIn.waiting && this.config.access === "private") throw { name: "denied", message: INVITE_ONLY } satisfies ProtocolError;
 		const stored = this.readStatusInputs(finished.identity.user_id, signIn.seen);
 		const token = await this.issueSession(finished.identity.user_id, options.origin, nowMs(), signIn.handle);
 		const sessionCredential = await sessionKey(token);
@@ -4157,7 +4316,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		}
 		const previous = this.guestBefore(socket, attachment);
-		this.becomeRegistered(socket, attachment, { userId: finished.identity.user_id, name: finished.identity.name, avatar: signIn.avatar, roles: signIn.roles, ext: signIn.ext },
+		this.becomeRegistered(socket, attachment, { userId: finished.identity.user_id, name: finished.identity.name, avatar: signIn.avatar, roles: signIn.roles, ext: signIn.ext, waiting: signIn.waiting },
 			this.registeredRooms(socket, finished.identity.user_id), sessionCredential);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
@@ -4444,11 +4603,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!parsed.ok) return pageJson(400, { error: parsed.error });
 		// The passkey page's action is its link's; `/oauth/authorize` lets the person choose.
 		const action = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
+		// The new account's name, cleaned as every display name is; nothing left is no name.
+		const given = (parsed.value as Partial<PasskeyPageRequest>).name;
+		const cleaned = given === undefined ? undefined : cleanName(given);
 		const value: PasskeyPageRequest = { ...parsed.value, action };
+		if (cleaned) value.name = cleaned;
+		else delete value.name;
 		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
 		if (value.name !== undefined && ([...value.name].length > maxNameCodePoints || utf8Bytes(value.name) > maxNameBytes)) {
 			return pageJson(400, { error: "The name for the new account is too long. Start again from the app with a shorter one." });
 		}
+		// A new account only where people come in by themselves (selfSignUp).
+		if (action === "register" && !value.request && !this.selfSignUp()) return this.pageClosed();
 		const now = nowMs();
 		this.store.admission.reserveAuthAttempt({ ipKey, now });
 		let adds: { userId: string; name: string; userHandle?: string; existing: string[] } | undefined;
@@ -4476,6 +4642,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return pageJson(200, { challenge_id: begun.challenge.challengeId, public_key: begun.publicKey });
 	}
 
+	/** The passkey page's refusal of a new account where selfSignUp says no. */
+	private pageClosed(): Response {
+		return pageJson(403, { error: this.config.access === "private" ? "This server is invite-only. Ask for an invite link." : "The Public Lobby is closed. Ask for an invite link." });
+	}
+
 	/**
 	 * The page's finish: the ceremony is used up, verified on the server's
 	 * origin (no frame, user verification), and a code issued for its
@@ -4495,6 +4666,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return pageJson(400, { error: "This passkey request expired. Try again." });
 		}
 		const action = ceremony.challenge.action;
+		// A new account only where people come in by themselves: a ceremony
+		// begun before the mode changed issues no code (selfSignUp).
+		if (action === "register" && !ceremony.addsUserId && !this.selfSignUp()) return this.pageClosed();
 		let credential: Record<string, unknown>;
 		try {
 			credential = passkeyCredentialParam(body, action);
@@ -4602,14 +4776,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return identity ? { user_id: identity.userId, name: identity.name } : null;
 			},
 			registerCredential: (input) => {
+				// A new account only where people come in by themselves; in the
+				// lobby it waits there, as one made on a connection does
+				// (passkeySignIn). Refused, the token request is `invalid_grant`.
+				if (!this.selfSignUp()) throw { name: "denied", message: this.closedRefusal() } satisfies ProtocolError;
+				const lobby = this.lobbyId();
+				if (lobby !== undefined) this.applyAccess();
 				handle = input.userHandle;
-				const identity = this.store.accounts.register(input);
+				const identity = this.store.accounts.register({ ...input, ...(lobby !== undefined ? { waiting: true, rooms: [lobby] } : {}) });
 				for (const record of identity.broadcasts) this.broadcastRecord(record);
 				return { user_id: identity.userId, name: identity.name };
 			},
 			updateCredentialCounter: (credentialId, counter) => this.store.credentials.updateCounter(credentialId, counter),
 		};
 		const finished = await this.redeemPasskeyCode(code, repository, ipKey);
+		// A waiting account gets no session where it cannot sign in (`private`).
+		if (this.config.access === "private" && this.store.accounts.get(finished.identity.user_id)?.waiting) throw { name: "denied", message: INVITE_ONLY } satisfies ProtocolError;
 		const token = await this.issueSession(finished.identity.user_id, undefined, nowMs(), handle);
 		await this.rescheduleAlarm();
 		return new Response(JSON.stringify({ access_token: token, token_type: "Bearer", expires_in: this.config.limits.sessionTtlSeconds }), { headers: tokenHeaders() });
@@ -4634,7 +4816,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * within the name limits. It also seeds the new `user_id` (`foo_1234`).
 	 */
 	private requestedName(params: Record<string, unknown>): string | undefined {
-		const name = optionalString(params, "name")?.trim();
+		const requested = optionalString(params, "name");
+		// Cleaned as every display name is; one that cleans to nothing is none.
+		const name = requested === undefined ? undefined : cleanName(requested);
 		if (!name) return undefined;
 		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
 		if ([...name].length > maxNameCodePoints || utf8Bytes(name) > maxNameBytes) {
@@ -4656,20 +4840,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After a guest connection signs in (§3.3): a `newAccount` (passkey
-	 * registration, sign-up invite) is the same person under a new
-	 * `user_id`, so those who shared a room with the guest or share one with
-	 * the account get `user` `new` with `old`. Signing in to an existing
-	 * account is not that: the guest departs as a guest that disconnects does
-	 * (its connected memberships go with it, and its status turns `offline`
-	 * after the offline grace, if others were told one), with no `old` link,
-	 * and the account shows only through the usual paths, so an `invisible`
-	 * or `""` account tells others nothing.
+	 * After a guest connection signs in (§3.3), to an existing account or a
+	 * `newAccount` it made (passkey registration, sign-up invite,
+	 * `external`): the guest departs as a guest that disconnects does (its
+	 * connected memberships go with it, its logged lobby leave in lobby mode,
+	 * and its status turns `offline` after the offline grace, if others were
+	 * told one), with no `old` link. A new account is a new user, decoupled
+	 * from the guest's history (shazow/apron#137; a rename may replace this
+	 * later): those who share a room with it get `user` `new` with its
+	 * profile, after its logged joins. An existing account shows only
+	 * through the usual paths, so an `invisible` or `""` account tells
+	 * others nothing.
 	 */
 	private guestLeaves(socket: WebSocketConnection, attachment: ConnectionAttachment, previous: ConnectionAttachment | null, newAccount: boolean): void {
 		if (!previous?.userId) return;
-		if (newAccount) this.announceUser(socket, this.current(attachment), [...(previous.rooms ?? []), ...(attachment.rooms ?? [])], publicIdentity(previous));
-		else this.connectionGone(previous);
+		// A new account is a new user, decoupled from the guest's history (no
+		// `old`; shazow/apron#137): it arrives with its profile to those who
+		// share a room with it, its logged joins having gone already.
+		if (newAccount) this.announceUser(socket, this.current(attachment), attachment.rooms ?? []);
+		// The guest departs as a guest that disconnects does, its logged lobby leave included.
+		this.connectionGone(previous);
 	}
 
 	/**
@@ -4836,6 +5026,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!stored || stored.v !== 1 || !isBotId(stored.botId)) throw invalid;
 			const identity = this.store.accounts.get(stored.botId);
 			if (!identity) throw invalid;
+			// A bot acts for its owner: not while the owner waits to be let in
+			// (a bot made while another mode ignored the mark).
+			if (this.config.access !== "public" && this.store.accounts.get(stored.botId.slice(BOT_ID_PREFIX.length))?.waiting) {
+				throw { name: "denied", message: "This bot's owner is waiting to be welcomed in; it signs in once they are" } satisfies ProtocolError;
+			}
 			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
 		});
 	}
@@ -4922,10 +5117,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * APRON_ADMIN_TOKEN) are stored, and nothing else (SIGN_IN_FIELDS).
 	 */
 	private becomeRegistered(socket: WebSocketConnection, attachment: ConnectionAttachment,
-		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, rooms: string[], credential: string | undefined): void {
+		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown>; waiting?: boolean }, rooms: string[], credential: string | undefined): void {
+		// A waiting account (made in the lobby, never welcomed in) does not
+		// sign in where only invite links let people in; its data stays.
+		if (identity.waiting && this.config.access === "private") throw { name: "denied", message: INVITE_ONLY } satisfies ProtocolError;
 		// The identity was read before the sign-in awaited storage; a `/purge` or
 		// `/rename` meanwhile must not leave this connection signed in as it.
 		if (!this.store.accounts.exists(identity.userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
+		if (this.config.access === "lobby") this.applyAccess();
 		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
@@ -4934,7 +5133,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		setAvatar(attachment, identity.avatar);
 		attachment.roles = identity.roles;
 		setExt(attachment, identity.ext);
-		attachment.rooms = rooms;
+		// In the lobby a waiting account sees only it and its threads; another
+		// mode ignores the mark (a member there), but keeps it.
+		if (identity.waiting && this.config.access === "lobby") attachment.lobby = "waiting";
+		else delete attachment.lobby;
+		// A waiting account acts on no role it holds (one given while another
+		// mode ignored the mark, before roles cleared it): none until welcomed.
+		if (attachment.lobby) attachment.roles = [];
+		attachment.rooms = attachment.lobby ? rooms.filter((id) => this.canSee(attachment, id)) : rooms;
 		delete attachment.listedJoined;
 		if (credential !== undefined) attachment.credential = credential;
 		else delete attachment.credential;
@@ -5350,15 +5556,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleMe(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
 		if (!identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
-		const name = optionalString(request.params, "name");
+		// Cleaned as every display name is (cleanName); what the store keeps is this.
+		const given = optionalString(request.params, "name");
+		const name = given === undefined ? undefined : cleanName(given);
+		if (name !== undefined) request.params.name = name;
 		const avatar = optionalString(request.params, "avatar");
 		const status = optionalString(request.params, "status");
 		// The keys the server owns, `permissions`, are ignored like `roles`.
 		const ext = clientUserExt(objectParam(request.params, "ext", false));
 		const writesExt = ext !== undefined && Object.keys(ext).length > 0;
-		if (name !== undefined && attachment.tier !== "registered") {
-			throw { name: "denied", message: "Only registered users may change their name" } satisfies ProtocolError;
-		}
+
 		// A bot names itself, so long as the name says it is one (BOT_NAME_PATTERN).
 		if (name !== undefined && hasRole(attachment, "bot") && !BOT_NAME_PATTERN.test(name)) {
 			throw { name: "denied", message: BOT_NAME_RULE } satisfies ProtocolError;
@@ -5387,6 +5594,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.deleteMedia(cleared.deletedUploads);
 			// Announced as its empty value (§3.3), before the result.
 			if (cleared.changed) this.announceAvatar(identity.user_id, "");
+		}
+		// A guest's name lives on its connection, like the rest of its identity.
+		if (name !== undefined && attachment.tier === "anonymous") {
+			this.renameGuest(socket, attachment, request, name, removeAvatar);
+			return;
 		}
 		if (name === undefined && !writesExt) {
 			const current = connectionAttachment(socket) ?? attachment;
@@ -5427,12 +5639,40 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * A guest's `me` `name` (§3.3), in every mode, read-only guests' too
+	 * (`me` is not in the `write` row): checked and charged as a registered
+	 * user's (Store.checkGuestName), kept on its connection and stored
+	 * nowhere; `""` returns to the generated `Guest <n>`. Announced as any
+	 * profile change: `you` to its other connections and `new` to those who
+	 * share a room with it. Not deduplicated: setting a name twice is the
+	 * same name. No uniqueness is checked: clients show a guest's `user_id`
+	 * beside its name.
+	 */
+	private renameGuest(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, name: string, removeAvatar: boolean): void {
+		const userId = attachment.userId!;
+		const generated = `Guest ${userId.slice("guest_".length)}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes));
+		const next = name === "" ? generated : this.store.admission.checkGuestName({ name, ipKey: attachment.ipKey, now: nowMs() });
+		const current = connectionAttachment(socket) ?? attachment;
+		const changed = current.name !== next;
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			state.name = next;
+			writeAttachment(peer, state);
+		}
+		const latest = connectionAttachment(socket) ?? { ...current, name: next };
+		this.reply(socket, request, { you: { ...this.you(latest), ...(removeAvatar ? { avatar: "" } : {}) } });
+		if (changed) this.announceUser(socket, this.current(latest), latest.rooms ?? []);
+	}
+
+	/**
 	 * Guests only read unless `GUEST_POSTING` is on: posting, reacting,
 	 * joining, leaving, and room changes are denied by policy (§3.5, §4.2.2).
 	 * Listing rooms and reading history stay open.
 	 */
 	private assertMayWrite(attachment: ConnectionAttachment): void {
-		if (attachment.tier === "anonymous" && !this.config.guestPosting) throw { name: "denied", message: GUEST_READ_ONLY } satisfies ProtocolError;
+		// In the lobby, guests post there whatever GUEST_POSTING says (canSee keeps them in it).
+		if (attachment.tier === "anonymous" && !this.config.guestPosting && this.config.access !== "lobby") throw { name: "denied", message: GUEST_READ_ONLY } satisfies ProtocolError;
 	}
 
 	/** Shared path for logged mutations: dedup, quotas, commit, reply, broadcast. */
@@ -5490,9 +5730,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before posting" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
-		// Without room_id a message goes to the default room (§3.5). Posting does
-		// not require joining; a poster who has not joined gets only the result.
-		optionalString(request.params, "room_id");
+		// Without room_id a message goes to the default room (§3.5), the
+		// lobby for a user it holds. Posting does not require joining; a
+		// poster who has not joined gets only the result.
+		if (optionalString(request.params, "room_id") === undefined && this.restricted(attachment)) request.params.room_id = this.lobbyId();
 		// Server-owned fields are ignored on input (PROTOCOL.md §2).
 		delete request.params.log_id;
 		delete request.params.from;
@@ -5524,6 +5765,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// The server's description follows `general`'s while nothing else
 			// sets it (serverMetadata): read before a save of `general`.
 			const describedBefore = request.params.room_id === ROOM_ID ? this.serverMetadata().description : undefined;
+			// The lobby's description is the `welcome` and description of the
+			// frames the lobby's views get (serverAnnouncement): read before a save of it.
+			const lobbyBefore = request.params.room_id !== undefined && request.params.room_id === this.lobbyId() ? this.roomDescription(request.params.room_id as string) : undefined;
 			let result: StoreMutationResult | undefined;
 			try {
 				result = this.store.messages.mutate({
@@ -5552,7 +5796,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					this.sendToUser(identity.user_id, roomUpdate("updated", room));
 					// A new `general` description that is the server's: every
 					// connection gets a new `server` frame with it.
-					if (room.room_id === ROOM_ID && this.serverMetadata(room.description).description !== describedBefore) this.announceServer();
+					if (room.room_id === ROOM_ID && this.serverMetadata({ description: room.description }).description !== describedBefore) this.announceServer();
+					else if (room.room_id === this.lobbyId() && room.description !== lobbyBefore) this.announceServer();
 				}
 			}
 			this.reply(socket, request, result.result);
@@ -5582,6 +5827,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// adding someone to it is a join of a room that does not exist.
 		if (!known || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		if (target !== undefined && target !== identity.user_id) {
+			// Guests and waiting accounts add nobody.
+			if (this.restricted(attachment)) throw { name: "denied", message: LOBBY_ROOMS_DENIED } satisfies ProtocolError;
 			await this.addMember(socket, attachment, request, known, target);
 			return;
 		}
@@ -5601,6 +5848,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.setRooms(identity.user_id, [...current, roomId]);
 			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
 			this.announceJoiner(identity.user_id, roomId);
+			if (roomId === this.lobbyId()) await this.guestLobbyChange(attachment, true);
 			this.reply(socket, request, {});
 			return;
 		}
@@ -5653,6 +5901,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!room.private) this.assertMayManage(attachment, userId, room.room_id, true, room.parent_room_id !== undefined);
 		else if (attachment.tier !== "registered" || hasRole(attachment, "bot")) throw { name: "denied", message: "Only a signed-in member who is not a bot can add someone to a private room" } satisfies ProtocolError;
 		if (!this.store.accounts.exists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
+		// A waiting account sees only the lobby and its threads: it is welcomed in, not added elsewhere.
+		const lobby = this.lobbyId();
+		if (lobby !== undefined && room.room_id !== lobby && room.parent_room_id !== lobby && this.store.accounts.isWaiting(userId, nowMs())) {
+			throw { name: "denied", message: `${userId} is waiting in the Public Lobby; /welcome them first`.slice(0, 200) } satisfies ProtocolError;
+		}
 		const totals = new Map<string, number>();
 		const before = this.membersOf([room.room_id], totals);
 		await this.runMutation(async () => {
@@ -5710,6 +5963,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.setRooms(identity.user_id, current.filter((id) => id !== roomId));
 			this.sendToUser(identity.user_id, roomUpdate("left", { room_id: roomId }));
 			this.removeIfEmpty(roomId);
+			if (roomId === this.lobbyId()) await this.guestLobbyChange({ ...attachment, rooms: [roomId] }, false);
 			this.reply(socket, request, {});
 			return;
 		}
@@ -5744,7 +5998,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "invalid_params", message: "typing must be a non-negative number of seconds" } satisfies ProtocolError;
 		}
 		const read = asDecimalId(request.params.read_message_id, "read_message_id", false);
-		const roomId = request.params.room_id ?? ROOM_ID;
+		const roomId = request.params.room_id ?? this.defaultRoom(attachment);
 		if ((typing !== undefined || read !== undefined) && !validRoomId(roomId)) {
 			throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		}
@@ -5752,7 +6006,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		if (read !== undefined) this.noteRead(socket, attachment, roomId, read, now);
 		// A guest who only reads has nothing to be typing.
-		if (typing === undefined || (attachment.tier === "anonymous" && !this.config.guestPosting)) return;
+		if (typing === undefined || (attachment.tier === "anonymous" && !this.config.guestPosting && this.config.access !== "lobby")) return;
 		// A status that hides being connected (connectedMembers) hides typing too: it would show they are.
 		const choice = (connectionAttachment(socket) ?? attachment).choice;
 		if (this.config.push && (choice === "invisible" || choice === "")) return;
@@ -6221,7 +6475,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * addmember` sends it again.
 	 */
 	private permissions(attachment: ConnectionAttachment): Record<string, boolean> {
-		if (attachment.tier !== "registered") return this.config.guestPosting ? {} : { write: false };
+		// In the lobby, guests post there (canSee keeps them in it).
+		if (attachment.tier !== "registered") return this.config.guestPosting || this.config.access === "lobby" ? {} : { write: false };
+		// A waiting account adds nobody and moves nothing (LOBBY_ROOMS_DENIED).
+		if (this.restricted(attachment)) return {};
 		return {
 			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? { add_members: true } : {}),
 			...(mayMoveAny(attachment) ? { move_any: true } : {}),
@@ -6851,6 +7108,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private connectionGone(attachment: ConnectionAttachment | null): void {
 		if (!attachment?.userId || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return;
+		// A guest in the lobby leaves it with its connection, logged for the lobby's members.
+		if (attachment.tier === "anonymous") void this.guestLobbyChange(attachment, false);
 		if (attachment.reads) this.flushReads(attachment, nowMs());
 		this.touchPresence(attachment.userId, nowMs(), { hold: true, closing: attachment });
 	}
@@ -7769,7 +8028,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		// Unjoined top-level rooms: a user in every one has none, and the
 		// answer needs no listing or listing allowance.
-		if (filter === "not_joined" && parent === undefined && roomId === undefined && this.topLevelRoomIds(now).every((id) => joinedIds.has(id))) {
+		const topLevel = () => this.restricted(attachment) ? [this.lobbyId()!] : this.topLevelRoomIds(now);
+		if (filter === "not_joined" && parent === undefined && roomId === undefined && topLevel().every((id) => joinedIds.has(id))) {
 			if (withMembers) result.users = [];
 			this.reply(socket, request, result);
 			return;
@@ -7792,10 +8052,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!room || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 			candidates = [room];
 		} else {
-			// The public rooms, and the private ones the user is in: nobody else sees those.
-			const rooms = this.store.rooms.list(now);
-			if (identity.tier === "registered") rooms.push(...this.store.rooms.privateOf(identity.user_id, now));
-			for (const room of rooms) this.noteRoom(room.room_id, true);
+			// The public rooms, and the private ones the user is in: nobody else
+			// sees those. A user the lobby holds sees only it and its threads.
+			const restricted = this.restricted(attachment);
+			const lobby = this.lobbyId();
+			const listed = this.store.rooms.list(now);
+			for (const room of listed) {
+				this.noteRoom(room.room_id, true);
+				this.noteParent(room);
+			}
+			const rooms = restricted ? listed.filter((room) => room.room_id === lobby || room.parent_room_id === lobby) : listed;
+			if (identity.tier === "registered" && !restricted) rooms.push(...this.store.rooms.privateOf(identity.user_id, now));
 			if (parent !== undefined && !rooms.some((room) => room.room_id === parent)) throw { name: "invalid_params", message: "Unknown parent_room_id" } satisfies ProtocolError;
 			candidates = rooms.filter((room) => parent === undefined ? true : room.parent_room_id === parent);
 		}
@@ -8001,6 +8268,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.kick(cap, socket, attachment, request, roomId, userId),
 		}),
 		ownerCommand({
+			name: "lobby", usageErrors: "reply",
+			forms: [{ hint: "[open|close]", description: "Show whether the Public Lobby is open to newcomers; open or close it" }],
+			// Closing the lobby during a raid is moderation: admins and mods (LOBBY_MODERATOR_ROLES).
+			roles: LOBBY_MODERATOR_ROLES,
+			available: (runtime) => runtime.config.access === "lobby",
+			parse: ({ words, usage }) => {
+				if (words.length === 1) return {};
+				arity(words, 1, usage);
+				const set = lobbyState(words[1]);
+				if (set === undefined) throw usageError(`Usage: ${usage}`);
+				return { set };
+			},
+			audit: ({ set }) => ({ target: "lobby", action: set === undefined ? "show" : set ? "open" : "close" }),
+			run: ({ grant, runtime, socket, request, roomId }, { set }) => runtime.lobbyCommand(grant, socket, request, roomId, set),
+		}),
+		ownerCommand({
 			name: "passkeys", usageErrors: "reply",
 			forms: [
 				// The admin user signs in with APRON_ADMIN_TOKEN only, so it never holds a passkey.
@@ -8074,6 +8357,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 			audit: (feature) => ({ target: feature }),
 			run: ({ cap, runtime, socket, request, roomId }, feature) => runtime.toggle(cap, socket, request, roomId, feature),
 		}),
+		ownerCommand({
+			name: "welcome", usageErrors: "reply",
+			forms: [{ hint: "@user", description: "Let a guest or waiting account in the Public Lobby in: a waiting account becomes a member now, and a guest when it adds a passkey; the user mentioned, or the author of the message it replies to, if no user_id is given", uses: ["reply_to", "body.mentions"] }],
+			roles: LOBBY_MODERATOR_ROLES,
+			// In `private` too, for waiting accounts left from a lobby, which sign in only once welcomed.
+			available: (runtime) => runtime.config.access !== "public",
+			// The target, in order: the typed `user_id` (`@` allowed), else the
+			// one user in `body.mentions`, else, in reply to a message, its
+			// author (welcomeTarget).
+			parse: ({ words, body }) => welcomeArgs(words, body),
+			run: ({ grant, runtime, socket, attachment, request, roomId }, args) => runtime.welcomeUser(grant, socket, attachment, request, roomId, args),
+		}),
 	]);
 
 	/**
@@ -8092,12 +8387,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (params[name] !== undefined) throw { name: "invalid_params", message: `A command has no ${name}; send it as a message instead` } satisfies ProtocolError;
 		}
 		const named = optionalString(params, "room_id");
-		const roomId = named ?? ROOM_ID;
+		const roomId = named ?? this.defaultRoom(attachment);
 		const body = objectParam(params, "body");
 		if (!body) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		const text = optionalString(body, "text") ?? "";
 		if (!this.roomExists(roomId) || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
-		await dispatchCommand(ApronDemoServer.commandTable, { socket, attachment, request, roomId, runtime: this }, attachment, text, body, {
+		await dispatchCommand(ApronDemoServer.commandTable, { socket, attachment, request, roomId, runtime: this }, this.commandIdentity(attachment), text, body, {
 			fail: (error) => this.fail(socket, request, error),
 			protocolOf: errorToProtocol,
 			audit: this.audit,
@@ -8127,12 +8422,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** The commands offered now that this connection may run, for `/help` and `ext:command_list`: those that post only for those who may post. */
 	private commandsFor(attachment: ConnectionAttachment): OfferedCommand[] {
-		const posts = attachment.tier !== "anonymous" || this.config.guestPosting;
-		return ApronDemoServer.commandTable.listFor(attachment, this, posts);
+		// In the lobby, guests post there.
+		const posts = attachment.tier !== "anonymous" || this.config.guestPosting || this.config.access === "lobby";
+		const offered = ApronDemoServer.commandTable.listFor(this.commandIdentity(attachment), this, posts);
+		// A waiting account invites no bot until it is welcomed in.
+		return this.restricted(attachment) ? offered.filter((command) => !command.forms.some((form) => form.name === "invite-bot")) : offered;
+	}
+
+	/**
+	 * Who sends a command, as the registry authorizes and lists them: the
+	 * connection, holding no role while the lobby holds its user (a waiting
+	 * account's roles are already none on its connection; this keeps it so).
+	 */
+	private commandIdentity(attachment: ConnectionAttachment): ConnectionAttachment {
+		return this.restricted(attachment) && attachment.roles?.length ? { ...attachment, roles: [] } : attachment;
 	}
 
 	/** The features `/toggle` turns off and on here: uploads, presence and live text only where configured. */
-	private toggleFeatures(): ToggleFeature[] {
+	private toggleFeatures(): AdminToggle[] {
 		return ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
 	}
 
@@ -8212,7 +8519,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * users but admins and bots get `user` `you` with their new
 	 * `permissions`.
 	 */
-	private toggle(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, chosen: ToggleFeature): void {
+	private toggle(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, chosen: AdminToggle): void {
 		assertAdmin(cap);
 		// Flipped from what is stored, never from a default stood in for it: one that cannot be read refuses the command.
 		this.readToggle(chosen);
@@ -8248,7 +8555,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				for (const ws of this.ctx.getWebSockets()) this.sendShownStatus(ws as WebSocketConnection);
 			}
 		}
-		const notices: Record<ToggleFeature, [string, string]> = {
+		const notices: Record<AdminToggle, [string, string]> = {
 			presence: [
 				"Status is now **on**: others see who is online, idle, busy (`dnd`) or offline.",
 				"Status is now **off**: no one's status is shown, and connected clients were told to clear the ones they were shown.",
@@ -8272,6 +8579,248 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		this.sendNotice(socket, roomId, notices[chosen][on ? 0 : 1]);
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/lobby [open|close]` (admins and mods, `ACCESS=lobby`): alone, a
+	 * `~private` notice saying whether the lobby is open; `open` and `close`
+	 * set it (switchLobby), idempotently. The dispatcher audits each run
+	 * (RoleSpec.audit).
+	 */
+	private lobbyCommand(grant: RoleCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, set?: boolean): void {
+		assertRoles(grant, LOBBY_MODERATOR_ROLES);
+		if (set === undefined) {
+			// Read from what is stored: one that cannot be read refuses the command.
+			this.readToggle("lobby");
+			this.sendNotice(socket, roomId, this.lobbyOpen()
+				? "The Public Lobby is **open**: anyone may come in as a guest or make an account. `/lobby close` closes it."
+				: "The Public Lobby is **closed**: no new guests or accounts; waiting accounts still see it. `/lobby open` opens it.");
+			this.reply(socket, request, {});
+			return;
+		}
+		this.switchLobby(socket, request, roomId, set);
+	}
+
+	/**
+	 * Closes the lobby (`ACCESS=lobby`) or opens it again, for admins and
+	 * mods: kept in `_meta` (`toggle:lobby`, `off` while closed; open is the
+	 * default). While closed, nobody comes in by themselves: new connections
+	 * get the `server` frame of `private` (no `guest` in `auth`, `token`
+	 * alone in `signup`, nothing read from a room), guest sign-ins and new
+	 * accounts are refused, and the guests connected now (welcomed ones too)
+	 * get a `~private` notice and close with 1008. Waiting accounts still
+	 * sign in and see the lobby, and members still see it. Every other
+	 * connection gets a new `server` frame. The sender gets a `~private`
+	 * notice before the result (§1).
+	 */
+	private switchLobby(socket: WebSocketConnection, request: RequestFrame, roomId: string, open: boolean): void {
+		// Set from what is stored: one that cannot be read refuses the command.
+		this.readToggle("lobby");
+		const was = this.lobbyOpen();
+		// `open` or `close` when it is so already changes nothing.
+		if (open === was) {
+			this.sendNotice(socket, roomId, `The Public Lobby is already **${open ? "open" : "closed"}**.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		this.store.server.setToggle("lobby", open ? undefined : false, nowMs());
+		this.toggles.set("lobby", open ? undefined : false);
+		if (!open) {
+			for (const ws of this.ctx.getWebSockets()) {
+				const peer = ws as WebSocketConnection;
+				const state = openSocket(peer) ? connectionAttachment(peer) : null;
+				if (!state || state.closing || state.tier !== "anonymous") continue;
+				this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: "The Public Lobby is closed.", format: "markdown" } } });
+				// The connection error with no `id` (§1.1), so its client does not reconnect as a guest.
+				this.send(peer, protocolError(undefined, { name: "denied", message: "The Public Lobby is closed. Ask for an invite link." }));
+				this.closePolicy(peer, connectionAttachment(peer) ?? state, 1008, "The Public Lobby is closed");
+			}
+		}
+		this.announceServer();
+		this.sendNotice(socket, roomId, open
+			? "The Public Lobby is now **open**: anyone may come in as a guest or make an account, and see it. What was posted there while it was closed is public again."
+			: "The Public Lobby is now **closed**: no new guests or accounts, and the guests who were here were disconnected. Waiting accounts still see it, and can still be welcomed.");
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/welcome <user_id>` (`ACCESS=lobby` or `private`, admins and mods):
+	 * lets in a user the lobby holds, or in `private` a waiting account left
+	 * from a lobby, which nothing there makes and which signs in only once
+	 * welcomed. A connected guest becomes welcomed (on its connection
+	 * only, never stored): it gets `user` `you` with the role `welcomed`,
+	 * then a `~private` notice, and those who share the lobby get `user`
+	 * `new`; its next account on this connection is a member
+	 * (passkeySignIn). A waiting account is let in at once (admitWaiting). A
+	 * member is told about, and changes nothing; an unknown or departed user
+	 * is `invalid_params`. The sender gets a `~private` notice before the
+	 * result (§1).
+	 */
+	private async welcomeUser(grant: RoleCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: { userId?: UserIdArg }): Promise<void> {
+		assertRoles(grant, LOBBY_MODERATOR_ROLES);
+		const userId = args.userId ?? this.welcomeTarget(attachment, request);
+		const welcomer = `@${attachment.userId!}`;
+		if (isGuestId(userId)) {
+			const peers = this.connectionsOf(userId);
+			const states = peers.map((peer) => connectionAttachment(peer)).filter((state): state is ConnectionAttachment => !!state && state.tier === "anonymous");
+			if (!states.length) throw { name: "invalid_params", message: `No guest ${userId} is connected; send them an invite link instead`.slice(0, 200) } satisfies ProtocolError;
+			if (states.every((state) => state.lobby === "welcomed")) {
+				this.sendNotice(socket, roomId, `@${userId} is welcomed already: they become a member when they add a passkey.`);
+				this.reply(socket, request, {});
+				return;
+			}
+			for (const peer of peers) {
+				const state = connectionAttachment(peer);
+				if (!state || state.tier !== "anonymous") continue;
+				state.lobby = "welcomed";
+				writeAttachment(peer, state);
+			}
+			const state = connectionAttachment(peers[0])!;
+			// `you` to the guest, `new` with the role to those who share the lobby.
+			this.announceUser(null, this.current(state), state.rooms ?? []);
+			for (const peer of peers) {
+				this.deliverTo(peer, { method: "message", params: { room_id: this.lobbyId(), from: { ...PRIVATE_IDENTITY }, body: {
+					text: `${welcomer} welcomed you. Add a passkey to finish joining; until you do, closing this page ends your visit.`, format: "markdown",
+				} } });
+			}
+			this.sendNotice(socket, roomId, `@${userId} is welcomed: they become a member when they add a passkey on that connection. If they leave first, send them an invite link instead.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		const identity = this.store.accounts.get(userId);
+		if (!identity) throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+		if (!identity.waiting) {
+			this.sendNotice(socket, roomId, `@${userId} is already a member.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		await this.admitWaiting(attachment, userId, welcomer);
+		this.sendNotice(socket, roomId, `@${userId} is now a member, and has joined general.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/welcome`'s target when its line names none (welcomeArgs): in reply
+	 * to a message (`reply_to`), that message's author, if the sender may
+	 * see it; else the usage error. The same order as the Go server's.
+	 */
+	private welcomeTarget(attachment: ConnectionAttachment, request: RequestFrame): UserIdArg {
+		const replyTo = request.params.reply_to;
+		const messageId = isObject(replyTo) && typeof replyTo.message_id === "string" && replyTo.message_id.length > 0 && replyTo.message_id.length <= 256 ? replyTo.message_id : undefined;
+		const author = messageId === undefined ? null : this.store.messages.visibleAuthor(messageId, attachment.userId!, nowMs());
+		if (!author) throw usageError(WELCOME_USAGE);
+		return author as UserIdArg;
+	}
+
+	/**
+	 * Lets a waiting account in (`/welcome`): its mark is cleared in one
+	 * write, then every connection of it gets `user` `you` (its roles without
+	 * `waiting`), `room_update` `joined` for `general` with its logged
+	 * membership (charged to the welcomer), `room_update` `updated` with the
+	 * rooms it now sees and has not joined (newlyVisibleRooms), which
+	 * clients take for unjoined rooms, and a `~private` notice; those who
+	 * share a room with it get `user` `new`. Nothing reconnects.
+	 */
+	private async admitWaiting(welcomerState: ConnectionAttachment, userId: string, welcomer: string): Promise<void> {
+		const general = this.store.rooms.get(ROOM_ID, nowMs());
+		const totals = new Map<string, number>();
+		const before = general ? this.membersOf([ROOM_ID], totals) : new Map<string, PublicUser[]>();
+		let change: ReturnType<Store["rooms"]["changeMembership"]> | undefined;
+		let admitted = false;
+		await this.runMutation(async () => {
+			// Joined first, while it still waits: a refused join leaves it
+			// waiting, to be welcomed again, never a member outside `general`.
+			if (general) {
+				change = this.store.rooms.changeMembership({ userId, ipKey: welcomerState.ipKey, roomId: ROOM_ID, join: true, now: nowMs(), actorId: welcomerState.userId });
+				if (change.membership) this.broadcastRecord(change.membership, userId);
+			}
+			admitted = this.store.accounts.admitWaiting(userId, nowMs());
+		});
+		if (!admitted) return;
+		// Its connections act as the member now: its roles and every room it is
+		// in, `general` included, whether or not it was in it before.
+		const identity = this.store.accounts.get(userId);
+		const peers = this.connectionsOf(userId);
+		for (const peer of peers) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			delete state.lobby;
+			state.roles = identity?.roles ?? [];
+			state.rooms = [...new Set([...(change?.rooms ?? identity?.rooms ?? state.rooms ?? []), ...(general ? [ROOM_ID] : [])])].slice(0, MAX_ATTACHED_ROOMS);
+			writeAttachment(peer, state);
+			const user = this.complete(state);
+			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...this.withPermissions(user, state), ...this.ownStatus(state) } } });
+		}
+		if (general && peers.length) {
+			const state = connectionAttachment(peers[0]);
+			const joiner = state ? this.complete(state) : null;
+			if (joiner) this.sendToUser(userId, this.joinedUpdate(change?.room ?? general, before.get(ROOM_ID), joiner, totals.get(ROOM_ID), change?.membership));
+			if (change?.changed) this.announceJoiner(userId, ROOM_ID);
+		}
+		// The rooms it sees now and has not joined, as an unfiltered `room_list`
+		// would put them in `not_joined`: clients install unknown rooms from `updated`.
+		if (peers.length) {
+			const joinedNow = connectionAttachment(peers[0])?.rooms ?? [];
+			for (const frame of this.newlyVisibleRooms(joinedNow)) for (const peer of peers) this.deliverTo(peer, frame);
+		}
+		for (const peer of peers) {
+			// In the lobby, where it was (`general` where there is none: `private`).
+			this.deliverTo(peer, { method: "message", params: { room_id: this.lobbyId() ?? ROOM_ID, from: { ...PRIVATE_IDENTITY }, body: { text: `${welcomer} welcomed you in.`, format: "markdown" } } });
+		}
+		// Those who share a room with it see it without `waiting`.
+		const state = peers.length ? connectionAttachment(peers[0]) : null;
+		const user = state ? this.current(state) : null;
+		if (user && state) {
+			const shared = new Set(state.rooms ?? []);
+			for (const ws of this.ctx.getWebSockets()) {
+				const peer = ws as WebSocketConnection;
+				const other = connectionAttachment(peer);
+				if (!other || other.userId === userId || !other.rooms?.some((id) => shared.has(id))) continue;
+				this.deliverTo(peer, { method: "user", params: { new: user } });
+			}
+		}
+		// Its `server` frame becomes a member's.
+		for (const peer of peers) this.syncServer(peer);
+	}
+
+	/**
+	 * For a waiting account just let in: `room_update` `updated` frames with
+	 * the public top-level rooms it has not joined (what `room_list` without
+	 * `filter` or `parent_room_id` puts in `not_joined`), most recently active
+	 * first, split so each frame stays within historyMaxResponseBytes (as
+	 * boundedListing keeps a listing; at most MAX_TOP_LEVEL_ROOMS rooms of at
+	 * most roomMetadataBytes each). One listing read, reserved and charged as
+	 * a `room_list`'s (Store.listRooms); when it cannot be afforded, nothing
+	 * is sent and the client's next listing finds them.
+	 */
+	private newlyVisibleRooms(joined: readonly string[]): Array<Record<string, unknown>> {
+		let rooms: RoomRecord[];
+		try {
+			rooms = this.store.rooms.list(nowMs());
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "welcome_rooms_unlisted", reason: errorToProtocol(error).message }));
+			return [];
+		}
+		const have = new Set(joined);
+		const unjoined = rooms.filter((room) => room.parent_room_id === undefined && !room.private && !have.has(room.room_id))
+			.sort((a, b) => Number(b.latest_log_id) - Number(a.latest_log_id) || Number(b.log_id) - Number(a.log_id));
+		const limit = this.config.limits.historyMaxResponseBytes - 1_024;
+		const frames: Array<Record<string, unknown>> = [];
+		let batch: RoomRecord[] = [];
+		let bytes = 0;
+		for (const room of unjoined) {
+			this.noteRoom(room.room_id, true);
+			const size = utf8Bytes(jsonString(room)) + 1;
+			if (batch.length && bytes + size > limit) {
+				frames.push(roomUpdate("updated", ...batch));
+				batch = [];
+				bytes = 0;
+			}
+			batch.push(room);
+			bytes += size;
+		}
+		if (batch.length) frames.push(roomUpdate("updated", ...batch));
+		return frames;
 	}
 
 	/**
@@ -8863,13 +9412,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!state || state.closing) continue;
 			const origin = state.origin ?? null;
 			const joined = this.wakesJoined(state);
-			const cacheKey = `${joined ? 1 : 0} ${originOfEndpoint(state.endpoint) ?? ""} ${origin ?? ""}`;
+			const view = this.viewOf(state);
+			const cacheKey = `${joined ? 1 : 0} ${view} ${originOfEndpoint(state.endpoint) ?? ""} ${origin ?? ""}`;
 			let frame = frames.get(cacheKey);
 			if (!frame) {
-				frame = this.serverAnnouncement(origin, state.endpoint, joined);
+				frame = this.serverAnnouncement(origin, state.endpoint, joined, view);
 				frames.set(cacheKey, frame);
 			}
-			this.sendServer(socket, state, frame, joined);
+			this.sendServer(socket, state, frame, joined, this.frameKind(view));
 		}
 	}
 
@@ -8884,11 +9434,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** Sends a connection a `server` frame that lists `joined` or not, and keeps which on its attachment. */
-	private sendServer(socket: WebSocketConnection, state: ConnectionAttachment, frame: Record<string, unknown>, joined: boolean): void {
-		if (!this.send(socket, frame) || joined === (state.wakeJoined === true)) return;
+	private sendServer(socket: WebSocketConnection, state: ConnectionAttachment, frame: Record<string, unknown>, joined: boolean, kind: string): void {
+		const sent = this.sentKind(state);
+		if (!this.send(socket, frame) || (joined === (state.wakeJoined === true) && kind === sent)) return;
 		if (joined) state.wakeJoined = true;
 		else delete state.wakeJoined;
+		// `full`, the one frame of `public`, is not kept.
+		if (kind === "full") delete state.sv;
+		else state.sv = kind;
 		writeAttachment(socket, state);
+	}
+
+	/** The kind of `server` frame (frameKind) a connection was last sent: as kept, else the one it opened with. */
+	private sentKind(state: ConnectionAttachment): string {
+		return state.sv ?? "full";
 	}
 
 	/**
@@ -8900,8 +9459,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const state = connectionAttachment(socket);
 		if (!state || state.closing) return;
 		const joined = this.wakesJoined(state);
-		if (joined === (state.wakeJoined === true)) return;
-		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, state.endpoint, joined), joined);
+		const view = this.viewOf(state);
+		const kind = this.frameKind(view);
+		if (joined === (state.wakeJoined === true) && kind === this.sentKind(state)) return;
+		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, state.endpoint, joined, view), joined, kind);
 	}
 
 	/**
@@ -9217,7 +9778,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private current(attachment: ConnectionAttachment): PublicUser | null {
 		const user = currentUser(attachment);
-		return user && attachment.tier === "registered" ? { ...user, roles: attachment.roles ?? [] } : user;
+		if (!user) return user;
+		// The lobby's computed roles, never stored nor granted: `waiting` on a
+		// waiting account, `welcomed` on a guest an admin or mod welcomed.
+		if (attachment.tier === "registered") return { ...user, roles: this.restricted(attachment) ? [...(attachment.roles ?? []), "waiting"] : attachment.roles ?? [] };
+		return attachment.lobby === "welcomed" && this.config.access === "lobby" ? { ...user, roles: ["welcomed"] } : user;
 	}
 
 	/**
@@ -10223,7 +10788,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const peer of this.connectionsOf(userId)) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
-			state.rooms = [...unique];
+			// The lobby holds this user: memberships kept from another mode stay stored, undelivered.
+			state.rooms = this.restricted(state) ? unique.filter((id) => this.canSee({ ...state, rooms: unique }, id)) : [...unique];
 			writeAttachment(peer, state);
 		}
 	}
@@ -10304,7 +10870,140 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * so nobody learns which private rooms exist (§5.3).
 	 */
 	private sees(attachment: ConnectionAttachment, roomId: string): boolean {
-		return !isPrivateRoomId(roomId) || (attachment.rooms ?? []).includes(roomId);
+		return this.canSee(attachment, roomId);
+	}
+
+	/**
+	 * Whether a connection's user may see `roomId` (§5.3), whether or not it
+	 * exists: a private room only while they are in it, and while the lobby
+	 * holds them (restricted: a guest or a waiting account, `ACCESS=lobby`)
+	 * only the lobby and its threads (roomParent, one bounded read per
+	 * unknown room). Every path that names a room asks this, and one it may
+	 * not see is answered as a room that does not exist.
+	 */
+	private canSee(attachment: ConnectionAttachment, roomId: string): boolean {
+		if (isPrivateRoomId(roomId) && !(attachment.rooms ?? []).includes(roomId)) return false;
+		if (!this.restricted(attachment)) return true;
+		const lobby = this.lobbyId()!;
+		return roomId === lobby || this.roomParent(roomId) === lobby;
+	}
+
+	/** Keeps a listed room's parent for roomParent. */
+	private noteParent(room: RoomRecord): void {
+		if (this.roomParents.has(room.room_id)) return;
+		if (this.roomParents.size >= MAX_ROOM_PARENTS) this.roomParents.delete(this.roomParents.keys().next().value!);
+		this.roomParents.set(room.room_id, room.parent_room_id ?? null);
+	}
+
+	/** A room's parent (null for a top-level room), kept once read: a thread's never changes. Undefined for an unknown room. */
+	private roomParent(roomId: string): string | null | undefined {
+		if (this.roomParents.has(roomId)) return this.roomParents.get(roomId);
+		let room: RoomRecord | null;
+		try {
+			room = this.store.rooms.get(roomId, nowMs());
+		} catch {
+			return undefined;
+		}
+		if (!room) return undefined;
+		if (this.roomParents.size >= MAX_ROOM_PARENTS) this.roomParents.delete(this.roomParents.keys().next().value!);
+		this.roomParents.set(roomId, room.parent_room_id ?? null);
+		return room.parent_room_id ?? null;
+	}
+
+	/** The lobby room's `room_id` while the server has a lobby (`ACCESS=lobby`), else undefined. */
+	private lobbyId(): string | undefined {
+		return this.config.access === "lobby" ? this.config.lobbyRoom : undefined;
+	}
+
+	/** Whether the lobby is open (`ACCESS=lobby` and not closed with `/lobby close`). */
+	private lobbyOpen(): boolean {
+		// Fails closed: a toggle that cannot be read now keeps newcomers out.
+		return this.config.access === "lobby" && (this.toggled("lobby", false) ?? true);
+	}
+
+	/**
+	 * Whether people may come in by themselves: as guests, or by making an
+	 * account (a passkey, or `external`). In `public`, always; in `lobby`,
+	 * while it is open; in `private`, never: only invite links let people in.
+	 */
+	private selfSignUp(): boolean {
+		return this.config.access === "public" || this.lobbyOpen();
+	}
+
+	/** The refusal of a guest or a sign-up where selfSignUp says no. */
+	private closedRefusal(): string {
+		return this.config.access === "private" ? INVITE_ONLY : LOBBY_CLOSED;
+	}
+
+	/**
+	 * Whether the lobby holds a connection's user (`ACCESS=lobby`): a guest,
+	 * welcomed or not, or a waiting account. Such a user sees only the lobby
+	 * and its threads (canSee).
+	 */
+	private restricted(attachment: Pick<ConnectionAttachment, "tier" | "lobby">): boolean {
+		return this.config.access === "lobby" && (attachment.tier === "anonymous" || attachment.lobby === "waiting");
+	}
+
+	/**
+	 * A guest's join or leave of the lobby (`ACCESS=lobby`), logged as a
+	 * membership record (Store.logGuestMembership) and delivered to the
+	 * lobby's other members, so they see who is waiting there (§4.2.2:
+	 * guests' memberships elsewhere stay out of the log). A join when the
+	 * guest signs in (it starts there) or joins it again; a leave when it
+	 * leaves it, its connection closes, or it becomes an account. Committed
+	 * in the mutation queue, so deliveries keep log order; a refusal (an
+	 * exhausted budget) is logged and changes nothing else. A leave is
+	 * logged once per guest (guestLobbyLeft).
+	 */
+	private async guestLobbyChange(state: ConnectionAttachment, joined: boolean): Promise<void> {
+		const lobby = this.lobbyId();
+		const userId = state.userId;
+		if (lobby === undefined || state.tier !== "anonymous" || !userId || !(state.rooms ?? []).includes(lobby)) return;
+		if (!joined && this.guestLobbyLeft.has(userId)) return;
+		if (joined) this.guestLobbyLeft.delete(userId);
+		else {
+			if (this.guestLobbyLeft.size >= MAX_ROOM_PARENTS) this.guestLobbyLeft.delete(this.guestLobbyLeft.values().next().value!);
+			this.guestLobbyLeft.add(userId);
+		}
+		try {
+			await this.runMutation(async () => {
+				let record: Broadcast | null;
+				try {
+					record = this.store.rooms.logGuestMembership({ roomId: lobby, userId, name: state.name, joined, now: nowMs() });
+				} catch (error) {
+					console.warn(JSON.stringify({ event: "lobby_guest_membership_failed", reason: errorToProtocol(error).message }));
+					return;
+				}
+				if (record) this.broadcastRecord(record, userId);
+			});
+		} catch { /* logged above */ }
+	}
+
+	/** The room a request without `room_id` is in (§3.5): `general`, or the lobby for a user the lobby holds. */
+	private defaultRoom(attachment: ConnectionAttachment): string {
+		return this.restricted(attachment) ? this.lobbyId()! : ROOM_ID;
+	}
+
+	/**
+	 * Tells the store about the access mode (Store.lobbyRoom) and, in
+	 * `lobby` unless `ensure` is false, makes the lobby room if it is
+	 * missing. The constructor only tells the store, which reads nothing;
+	 * the first request after a start or wake makes sure of the room, and
+	 * a refused write is tried again at the next.
+	 */
+	private applyAccess(ensure = true): void {
+		const lobby = this.lobbyId();
+		this.store.lifecycle.setAccess({ lobbyRoom: lobby ?? null, waitingRefused: this.config.access === "private" });
+		if (lobby === undefined || this.lobbyReady || !ensure) return;
+		try {
+			const made = this.store.rooms.ensureLobby(lobby, nowMs());
+			this.lobbyReady = true;
+			this.noteRoom(lobby, true);
+			this.topLevelRooms = undefined;
+			if (made) console.log(JSON.stringify({ event: "lobby_room_created", room_id: lobby }));
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "lobby_room_failed", reason: errorToProtocol(error).message }));
+		}
 	}
 
 	/** Whether a room exists, from the cache or one bounded lookup. */
