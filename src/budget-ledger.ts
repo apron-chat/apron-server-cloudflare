@@ -259,15 +259,17 @@ export class BudgetLedger {
    * Refuses as reserve would refuse `input` at `at`, with no SQL and nothing
    * reserved: against the cached row, or, on a day after the cached one
    * (past a UTC midnight), against the new day's row as reserve would make
-   * it, empty, with the handover reserve would add. Before anything is
-   * cached (no reservation since the wake) nothing is refused.
+   * it, empty, with the handover reserve would add. Returns whether it could
+   * answer: with no row cached (no reservation since a wake, a start or a
+   * forget) it can't without reading one, and returns false, so the caller
+   * reserves for real instead.
    */
-  checkReservation(input: CostEstimate, at: number, maintenance: boolean): void {
+  checkReservation(input: CostEstimate, at: number, maintenance: boolean): boolean {
     const day = dayFor(at);
-    if (!this.cached || !this.cachedDay || day < this.cachedDay) return;
+    if (!this.cached || !this.cachedDay || day < this.cachedDay) return false;
     if (day === this.cachedDay) {
       this.check(this.reservationCost(input, day), maintenance, at);
-      return;
+      return true;
     }
     const cost = this.reservationCost(input, day);
     if (!this.handoverPending) {
@@ -275,6 +277,7 @@ export class BudgetLedger {
       cost.writes += 8;
     }
     this.check(cost, maintenance, at, { day, ...Object.fromEntries(BUDGET_COLUMNS.map((column) => [column, 0])) } as RawBudgetRow);
+    return true;
   }
 
   /**

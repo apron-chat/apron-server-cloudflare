@@ -85,3 +85,33 @@ it("touches SQL only inside src/store", () => {
     .map(([path]) => path);
   expect(outside).toEqual([]);
 });
+
+/**
+ * The history chain's state in `_meta` (tier and link values, kept rewrites,
+ * the copy marker, the rewrite queue and its sequence) is cached in memory by
+ * src/store/history-log.ts, which relies on being its only writer. So no other
+ * file may write those keys, apart from the listed sweeps, each of which must
+ * make the module forget its cache.
+ */
+const HISTORY_STATE_WRITERS: Record<string, string> = {
+  "sqlite-store.ts": "cleanup's tiers-off sweep deletes the chain's keys, then calls historyLog.forgetState()",
+};
+
+it("writes the history chain's cached state only in history-log.ts", () => {
+  const writes = /writeMeta\(\s*META_HISTORY_(?:TIER|LINK|KEPT|THROUGH|OPS|OPS_SEQ)\b|["'`]history:(?:tier|link|kept|head|ops)/;
+  const sweeps = /_meta\b[^"`]*'history:/;
+  const offenders: string[] = [];
+  for (const [path, text] of Object.entries(STORE)) {
+    const file = path.slice(path.lastIndexOf("/") + 1);
+    if (file === "history-log.ts" || file === "meta.ts") continue;
+    if (writes.test(text)) offenders.push(`${file}: writes a history state key`);
+    if (sweeps.test(text)) {
+      if (!HISTORY_STATE_WRITERS[file]) offenders.push(`${file}: sweeps history keys in SQL`);
+      else if (!text.includes("historyLog.forgetState()")) offenders.push(`${file}: sweeps history keys without historyLog.forgetState()`);
+    }
+  }
+  expect(offenders).toEqual([]);
+  // The listed sweep still exists, so the exception isn't stale.
+  const store = Object.entries(STORE).find(([path]) => path.endsWith("/sqlite-store.ts"))?.[1] ?? "";
+  expect(sweeps.test(store)).toBe(true);
+});

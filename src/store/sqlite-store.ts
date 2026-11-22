@@ -1196,13 +1196,17 @@ export class SqliteStore {
    * Refuses as reserved and reserveCost would refuse a maintenance
    * reservation of `costInput` (closed accounting, a spent maintenance
    * budget: a maintenance reservation has no breaker), reserving nothing
-   * (StoreCore.checkMaintenance).
+   * (StoreCore.checkMaintenance). With no budget row cached yet (after a
+   * wake, a start or a reset), the ledger can't answer from memory, so this
+   * makes the (empty) maintenance reservation itself, which reads the row
+   * and refuses exactly as the reservation it stands for would.
    */
   private checkMaintenance(costInput: CostEstimate, now: number): void {
     this.ensureReady();
     this.assertAccounting();
     if (this.alerting) return;
-    this.ledger.checkReservation(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), true);
+    if (this.ledger.checkReservation(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), true)) return;
+    this.reserved("unknown", costInput, true, now, () => undefined);
   }
 
   /** Spend the maintenance control gap when ordinary work is exhausted. */
