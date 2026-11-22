@@ -181,8 +181,6 @@ export interface Command<C extends ScopeBase> {
 	/** Its forms' names, in order. */
 	readonly formNames: readonly string[];
 	readonly audience: Audience;
-	/** Who may use it, as `ext:command_list` groups it. */
-	readonly group: CommandGroup;
 	readonly roles?: readonly string[];
 	readonly usageErrors: "reply" | "violation";
 	readonly posting: boolean;
@@ -191,8 +189,8 @@ export interface Command<C extends ScopeBase> {
 	forms(runtime: C["runtime"], identity?: CommandIdentity): ListedForm[];
 	/** Its usage, every form (formsUsage), for its usage errors. */
 	usage(runtime: C["runtime"]): string;
-	/** What the form a line names requires (formOf): its full name and its `requires`. */
-	requiredBy(words: readonly string[]): { readonly name: string; readonly requires: readonly CommandField[] };
+	/** What the form a line names requires (formOf): its full name and its `requires`; undefined when the line names none. */
+	requiredBy(words: readonly string[]): { readonly name: string; readonly requires: readonly CommandField[] } | undefined;
 	/** Parses a line into this command's handler call (throwing its usage error); the dispatcher's alone. */
 	prepare(line: CommandLine, runtime: C["runtime"]): PreparedCommand<C>;
 }
@@ -231,10 +229,11 @@ function checkForms(name: string, forms: readonly CommandForm<never>[]): void {
 
 /**
  * The form a command line names: the one with the most words that the
- * line's words after the name start with, matched exactly as the name is,
- * else the command's first form.
+ * line's words after the name start with, matched exactly as the name is
+ * (the name alone matches any line); undefined when none does, such as a
+ * mistyped word, which the command's parser answers.
  */
-function formOf<R>(forms: readonly CommandForm<R>[], words: readonly string[]): CommandForm<R> {
+function formOf<R>(forms: readonly CommandForm<R>[], words: readonly string[]): CommandForm<R> | undefined {
 	let chosen: CommandForm<R> | undefined;
 	let most = -1;
 	for (const form of forms) {
@@ -244,7 +243,7 @@ function formOf<R>(forms: readonly CommandForm<R>[], words: readonly string[]): 
 			most = own.length;
 		}
 	}
-	return chosen ?? forms[0];
+	return chosen;
 }
 
 /** A form as listed, its hint for `runtime`, with its command's group. */
@@ -280,13 +279,13 @@ function seal<C extends ScopeBase, Args>(
 		.filter((form) => !identity || (form.offered?.(runtime, identity) ?? true))
 		.map((form) => listedForm(spec.name, group, form, runtime));
 	return Object.freeze({
-		name: spec.name, formNames: Object.freeze(spec.forms.map((form) => formName(spec.name, form))), audience, group, ...(roles ? { roles } : {}), usageErrors: spec.usageErrors, posting,
+		name: spec.name, formNames: Object.freeze(spec.forms.map((form) => formName(spec.name, form))), audience, ...(roles ? { roles } : {}), usageErrors: spec.usageErrors, posting,
 		available: (runtime: C["runtime"]) => spec.available?.(runtime) ?? true,
 		forms,
 		usage: (runtime: C["runtime"]) => formsUsage(forms(runtime)),
 		requiredBy: (words: readonly string[]) => {
 			const form = formOf(spec.forms, words);
-			return { name: formName(spec.name, form), requires: form.requires ?? [] };
+			return form && { name: formName(spec.name, form), requires: form.requires ?? [] };
 		},
 		prepare(line: CommandLine, runtime: C["runtime"]): PreparedCommand<C> {
 			const args = spec.parse(line, runtime);
@@ -370,9 +369,14 @@ export function defineCommands<C extends ScopeBase>(build: (define: CommandHelpe
 	return new CommandTable(build(helpersFor<C>()));
 }
 
-/** Plain text as CommonMark text: `\`, `<`, `>` and `&` escaped, so a placeholder such as `<uses>` is not read as HTML. */
+/**
+ * Plain text as CommonMark text in a list item: the ASCII punctuation that
+ * could format it (emphasis, code, links, images, HTML, entities,
+ * strikethrough, tables, headings) backslash-escaped, so it renders as
+ * written, and a placeholder such as `<uses>` is not read as HTML.
+ */
 function markdownText(text: string): string {
-	return text.replace(/[\\<>&]/g, "\\$&");
+	return text.replace(/[\\`*_[\]<>&~|!#]/g, "\\$&");
 }
 
 /** `/help`'s list: each form offered, its name and hint as code and its description, admins' marked "(admin-only)". */
@@ -397,6 +401,8 @@ export interface DispatchHost {
 	readonly now: number;
 	/** Whether the request named its room (`room_id`), which a form that requires one needs. */
 	readonly roomNamed: boolean;
+	/** Throws the runtime's refusal unless the sender may post, for a `posting` command. */
+	assertPosts(): void;
 }
 
 /**
@@ -426,9 +432,10 @@ function hasLiveEmbed(body: Readonly<Record<string, unknown>>): boolean {
  * up among those offered, by its exact name (an unknown one, `/Kick`
  * included, is an error to show, not a policy
  * violation, since people mistype); authorize (audience, roles, and for an
- * admin command, the capability); refuse a form that requires `room_id`
- * sent without one, an error to show like an unknown command; refuse a
- * live text embed; parse; run.
+ * admin command, the capability); refuse a live text embed; refuse a
+ * `posting` command to a sender who may not post; refuse a form that
+ * requires `room_id` sent without one, an error to show like an unknown
+ * command; parse; run.
  * An admin command that passed authorization records one audit event,
  * `ok` or `failed` with the error's name. An `invalid_params` error from
  * parsing or running is answered as the command's `usageErrors` says;
@@ -449,17 +456,19 @@ export async function dispatchCommand<C extends ScopeBase>(
 	}
 	const grants = authorize(command, identity, host);
 	let details: AuditDetails = {};
-	// A form that acts only on a room the client names is not run in the default room.
-	const required = command.requiredBy(words);
-	if (required.requires.includes("room_id") && !host.roomNamed) {
-		grants.admin?.settle("failed", details, "invalid_params");
-		host.fail({ name: "invalid_params", message: `Send /${required.name} from a room, with its room_id` });
-		return;
-	}
 	// Live text starts with its own commands, or in a message (§4.8.3).
 	if (hasLiveEmbed(body)) {
 		grants.admin?.settle("failed", details, "invalid_params");
 		throw { name: "invalid_params", message: "A terminal or append embed goes in a message; or use /embed-terminal or /embed-append" } satisfies ProtocolError;
+	}
+	// A `posting` command is refused to a sender who may not post, as its handler would.
+	if (command.posting) host.assertPosts();
+	// A form that acts only on a room the client names is not run in the default room.
+	const required = command.requiredBy(words);
+	if (required?.requires.includes("room_id") && !host.roomNamed) {
+		grants.admin?.settle("failed", details, "invalid_params");
+		host.fail({ name: "invalid_params", message: `Send /${required.name} from a room, with its room_id` });
+		return;
 	}
 	try {
 		const prepared = command.prepare({ text, line, words, body, usage: command.usage(ctx.runtime) }, ctx.runtime);

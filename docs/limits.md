@@ -214,7 +214,7 @@ day), and "Upload storage is full" (retry in an hour).
 ### Live text
 
 Live text (`embed:terminal` and `embed:append`, PROTOCOL.md §4.8.3) is
-offered by `/embed-terminal [title]`, `/embed-append [markdown]`, and a
+offered by `/embed-terminal [<title>]`, `/embed-append [<markdown>]`, and a
 `message` with a new `{"kind": "terminal"}` or `{"kind": "append"}` embed.
 Both ways share these limits:
 

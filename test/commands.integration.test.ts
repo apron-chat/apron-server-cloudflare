@@ -3,7 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { noAuditSink, type AdminAuditEvent, type AuditSink } from '../src/commands/audit';
 import { AdminCapability, assertAdmin, assertRoles, authorizeAdmin, authorizeRoles, RoleCapability } from '../src/commands/capability';
-import { commandList, defineCommands, helpText, type CommandTable, type ScopeBase } from '../src/commands/registry';
+import { commandList, defineCommands, dispatchCommand, helpText, type CommandTable, type ScopeBase } from '../src/commands/registry';
 import { ApronDemoServer } from '../src/index';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
 
@@ -155,6 +155,11 @@ describe('the command registry', () => {
 					expect(events[0].actor).not.toBe('');
 				}
 			}
+			// Without room_id too, /kick is first refused for who sends it.
+			for (const [label, peer] of [['guest', visitor], ['registered', owner], ['bot', bot]] as const) {
+				const { frame } = await exchange(peer, `${label}-kick-no-room`, 'command', { body: { text: `/kick ${ownerId}` } });
+				expect(frame.error, label).toMatchObject({ code: -32001, message: 'Only an admin can use /kick' });
+			}
 			// Nothing they tried happened: the owner is still here, under their own id, with no roles.
 			expect((await request(owner, 'me', 'me', {})).result.you).toMatchObject({ user_id: ownerId, roles: [] });
 		} finally { owner.close(); bot.close(); visitor.close(); }
@@ -191,6 +196,10 @@ describe('the command registry', () => {
 			events = [];
 			expect((await command(admin, 'kick-self', '/kick admin')).frame.error.code).toBe(-32001);
 			expect(events).toEqual([{ event: 'admin_action', actor: 'admin', command: 'kick', target: 'admin', outcome: 'failed', reason: 'denied', at: expect.any(Number) }]);
+			// One refused for want of room_id is audited as a failure too, before its target is read.
+			events = [];
+			expect((await exchange(admin, 'kick-no-room', 'command', { body: { text: `/kick ${users.kicked}` } })).frame.error).toEqual({ code: -32602, message: 'Send /kick from a room, with its room_id' });
+			expect(events).toEqual([{ event: 'admin_action', actor: 'admin', command: 'kick', outcome: 'failed', reason: 'invalid_params', at: expect.any(Number) }]);
 		} finally {
 			await command(admin, 'invite-code-revoke', '/invite-code 0');
 			await command(admin, 'server-clear', '/server title');
@@ -250,6 +259,40 @@ describe('command forms', () => {
 		expect(names({ choices: ['a'], adding: true }, { tier: 'registered', userId: 'admin' })).toEqual(['demo a']);
 		// The usage names every form, offered or not.
 		expect(table.commands[0].usage({ choices: ['a'], adding: false })).toBe('/demo a, or /demo add');
+	});
+
+	it('write a description in /help as plain text, whatever CommonMark it looks like', () => {
+		const description = 'Use *x*, _y_, [a](b), `code`, ~z~, a|b, !#, <b> & \\';
+		const offered = form({ forms: [{ description }] }).listFor(someone, undefined, true);
+		expect(helpText(offered)).toBe('- `/demo`: Use \\*x\\*, \\_y\\_, \\[a\\](b), \\`code\\`, \\~z\\~, a\\|b, \\!\\#, \\<b\\> \\& \\\\');
+		// The list keeps it as written.
+		expect(commandList(offered)[0].description).toBe(description);
+	});
+
+	it('refuse a form that requires room_id without one only when the line names it; a mistyped word gets the usage error', async () => {
+		const table = defineCommands<ScopeBase>(({ publicCommand }) => [
+			publicCommand({
+				name: 'demo', usageErrors: 'reply',
+				forms: [{ words: 'here', description: 'Act on this room', uses: ['room_id'], requires: ['room_id'] }, { words: 'there', description: 'Act anywhere' }],
+				parse: ({ words, usage }) => {
+					if (words[1] !== 'here' && words[1] !== 'there') throw { name: 'invalid_params', message: `Usage: ${usage}` };
+					return {};
+				},
+				run: () => {},
+			}),
+		]);
+		const run = async (text: string, roomNamed: boolean) => {
+			const failed: unknown[] = [];
+			await dispatchCommand(table, { runtime: undefined }, someone, text, {}, {
+				fail: (error) => { failed.push(error); }, protocolOf: (error) => error as never, audit: noAuditSink, now: 0, roomNamed, assertPosts: () => {},
+			});
+			return failed;
+		};
+		expect(await run('/demo here', false)).toEqual([{ name: 'invalid_params', message: 'Send /demo here from a room, with its room_id' }]);
+		expect(await run('/demo here', true)).toEqual([]);
+		expect(await run('/demo there', false)).toEqual([]);
+		// No form named: the parser's usage error, not the first form's room_id.
+		expect(await run('/demo hree', false)).toEqual([{ name: 'invalid_params', message: 'Usage: /demo here, or /demo there' }]);
 	});
 
 	it('refuse forms that say what the extension does not allow', () => {

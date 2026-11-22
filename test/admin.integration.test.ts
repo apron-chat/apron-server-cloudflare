@@ -126,7 +126,8 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		expect(byName.get('server avatar')!.requires).toBeUndefined();
 		expect(byName.get('toggle')!.hint).toBe('activity|uploads|presence|addmember|livetext');
 		expect(byName.get('server title')!.hint).toBe('[<text>]');
-		expect(byName.get('passkeys remove')).toEqual({ name: 'passkeys remove', group: 'member', description: 'Remove one of your account\'s passkeys', hint: '<n>' });
+		// The admin user never holds a passkey, so it is offered neither form of /passkeys.
+		expect(all.map((form) => form.name).filter((name) => name.startsWith('passkeys'))).toEqual([]);
 		// The admin user holds no device tokens, so it is offered only the list.
 		expect(all.map((form) => form.name).filter((name) => name.startsWith('invite-device'))).toEqual(['invite-device list']);
 		expect(['history export', 'history import', 'history status'].map((name) => byName.get(name)?.hint)).toEqual(['[<room_id>...]', '<key> [dry-run] [match|new] [renumber] [restart]', undefined]);
@@ -134,8 +135,8 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		for (const name of ['admin', 'invite-purge', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
 
 		// A command's forms share its group: the audience it is for.
-		expect(Object.fromEntries(['help', 'embed-append', 'avatar', 'invite-bot', 'invite-device list', 'passkeys', 'emoji remove', 'history status', 'toggle'].map((name) => [name, byName.get(name)!.group]))).toEqual({
-			'help': 'all', 'embed-append': 'all', 'avatar': 'member', 'invite-bot': 'member', 'invite-device list': 'member', 'passkeys': 'member', 'emoji remove': 'role', 'history status': 'admin', 'toggle': 'admin',
+		expect(Object.fromEntries(['help', 'embed-append', 'avatar', 'invite-bot', 'invite-device list', 'emoji remove', 'history status', 'toggle'].map((name) => [name, byName.get(name)!.group]))).toEqual({
+			'help': 'all', 'embed-append': 'all', 'avatar': 'member', 'invite-bot': 'member', 'invite-device list': 'member', 'emoji remove': 'role', 'history status': 'admin', 'toggle': 'admin',
 		});
 		const word = (name: string) => name.split(' ')[0];
 		for (const form of all) expect(form.group, form.name).toBe(all.find((other) => word(other.name) === word(form.name))!.group);
@@ -145,6 +146,7 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		expect(own.map(usage)).toEqual(await helped(alice, 'alice-help'));
 		expect(own.map((form) => form.name)).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove']);
 		expect(own.filter((form) => form.name.startsWith('invite-device')).map((form) => form.hint)).toEqual(['[<id>]', undefined, '<id>']);
+		expect(own.find((form) => form.name === 'passkeys remove')).toEqual({ name: 'passkeys remove', group: 'member', description: 'Remove one of your account\'s passkeys', hint: '<n>' });
 
 		// It changes with the user's roles: /emoji for a friend.
 		expect((await command(admin, 'friend', `/role ${aliceId} friend`)).frame.result).toEqual({});
@@ -203,6 +205,11 @@ it('ext:command_list follows who may run each command: bots, guests, mods, and b
 		expect(await listed(guest, 'guest-posting')).toEqual(['embed-append', 'embed-terminal', 'help']);
 		await setGuestPosting(false);
 		expect(await listed(guest, 'guest-reading')).toEqual(['help']);
+		// Such a guest is told it only reads, with room_id or without.
+		for (const params of [{ room_id: 'general' }, {}]) {
+			const { frame } = await exchange(guest, `guest-terminal-${Object.keys(params).length}`, 'command', { ...params, body: { text: '/embed-terminal build' } });
+			expect(frame.error).toMatchObject({ code: -32001, message: expect.stringMatching(/^Guests can only read here/) });
+		}
 	} finally {
 		await setGuestPosting(true);
 		admin.close(); owner.close(); mod.close(); early.close(); guest.close(); bot?.close();

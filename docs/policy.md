@@ -147,7 +147,8 @@ within it:
   and cursor movement, such as a build) or text appended to the message's
   markdown body (such as an LLM's reply). It starts two ways, with the same
   limits:
-  - `/embed-terminal [title]` or `/embed-append [markdown]`: the result is
+  - `/embed-terminal [<title>]` or `/embed-append [<markdown>]`, sent with
+    the room's `room_id` (without it, the command is refused): the result is
     `{"embeds": [{embed_id, kind, write_url}]}`, and a `~private` notice
     gives the link in copy-paste recipes, for example
     `script -qfc 'stty cols 80 rows 40; make test' /dev/null | curl -sT - '<write_url>'`.
@@ -283,7 +284,9 @@ within it:
   cursor), left out of a push only for `joined`; and the message without
   `log_id`, its text cut to 200 characters, without format or embeds, in at
   most 2048 bytes.
-- Messages: a request without `room_id` is in `general`. A new message with
+- Messages: a request without `room_id` is in `general`, except a command
+  that requires one (`/kick`, `/embed-terminal`, `/embed-append`), which is
+  refused without it. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and
   text is never parsed for mentions. Each embed must be an object with a

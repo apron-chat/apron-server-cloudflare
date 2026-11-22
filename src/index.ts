@@ -8003,8 +8003,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		ownerCommand({
 			name: "passkeys", usageErrors: "reply",
 			forms: [
-				{ description: "List your account's passkeys" },
-				{ words: "remove", hint: "<n>", description: "Remove one of your account's passkeys" },
+				// The admin user signs in with APRON_ADMIN_TOKEN only, so it never holds a passkey.
+				{ description: "List your account's passkeys", offered: (_runtime, identity) => identity.userId !== ADMIN_USER_ID },
+				{ words: "remove", hint: "<n>", description: "Remove one of your account's passkeys", offered: (_runtime, identity) => identity.userId !== ADMIN_USER_ID },
 			],
 			parse: ({ words, usage }) => passkeysArgs(words, usage),
 			run: ({ runtime, socket, attachment, request, roomId }, args) => runtime.passkeysCommand(socket, attachment, request, roomId, args),
@@ -8102,6 +8103,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			audit: this.audit,
 			now: nowMs(),
 			roomNamed: named !== undefined,
+			assertPosts: () => this.assertMayWrite(attachment),
 		});
 	}
 
