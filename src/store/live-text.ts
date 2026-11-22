@@ -135,7 +135,7 @@ export class LiveTextModule {
   }
 
   /**
-   * `/embed-terminal [title]` and `/embed-append [markdown]`: a live text
+   * `/embed-terminal [<title>]` and `/embed-append [<markdown>]`: a live text
    * whose message is posted when its write arrives (claimLiveText), from
    * `userId`, in `roomId`, replying to `replyTo`. Everything is checked and
    * charged now, its post included (the posting limits), so the write

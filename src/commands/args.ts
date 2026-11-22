@@ -80,12 +80,12 @@ export function oneOf<T extends string>(word: string, choices: readonly T[], usa
 }
 
 /**
- * `/invite-code`'s count: one to three digits, else `invalid_params`; more
- * than `max` is a count limit, `denied` (§1.1).
+ * `/invite-code`'s count: one to three digits, else `invalid_params` with
+ * its usage and the range; more than `max` is a count limit, `denied` (§1.1).
  */
-export function inviteUses(word: string, max: number): InviteUses {
+export function inviteUses(word: string, max: number, usage: string): InviteUses {
 	const uses = /^\d{1,3}$/.test(word) ? Number(word) : -1;
-	if (uses < 0) throw usageError(`Usage: /invite-code <uses>, 0 to ${max}`);
+	if (uses < 0) throw usageError(`Usage: ${usage}, 0 to ${max}`);
 	if (uses > max) throw { name: "denied", message: `An invite signs up at most ${max} users` } satisfies ProtocolError;
 	return uses as InviteUses;
 }

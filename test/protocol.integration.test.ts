@@ -48,7 +48,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(10);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions', 'ext:editors']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions', 'ext:command_list', 'ext:editors']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(DEFAULT_LIMITS.pingSeconds);
 	// The extensions `ext:settings` and `ext:media` keep their data under their names in ext (§4, §4.13).
@@ -743,6 +743,34 @@ it('with ACTIVITY on, relays no typing of a user whose status hides that they ar
 	} finally { alice.close(); bob.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 
+it('ext:command_list lists as data the commands /help lists, after auth', async () => {
+	const peer = await connect();
+	try {
+		await greeting(peer);
+		// Like `command`, it needs a user.
+		expect((await request(peer, 'early', 'ext:command_list', {})).error).toMatchObject({ code: -32001, message: 'Authenticate first' });
+		peer.send({ method: 'auth', id: 'auth', params: { scheme: 'guest' } });
+		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
+		await drain(peer);
+		// A request sent without an `id` is ignored (§1.1): no reply, and no notice.
+		peer.send({ method: 'ext:command_list', params: {} });
+		expect(await drain(peer)).toEqual([]);
+		const listed = await request(peer, 'list', 'ext:command_list', {});
+		// Only name, group, description, and the hint, uses and requires a form has; no audience or roles.
+		expect(listed.result).toEqual({
+			commands: [
+				{ name: 'embed-append', group: 'all', description: 'Get a link to stream text into a message in this room, such as an LLM\'s reply, after the opening <markdown>; the message appears when the stream starts', hint: '[<markdown>]', uses: ['room_id', 'reply_to'], requires: ['room_id'] },
+				{ name: 'embed-terminal', group: 'all', description: 'Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts', hint: '[<title>]', uses: ['room_id', 'reply_to'], requires: ['room_id'] },
+				{ name: 'help', group: 'all', description: 'List the commands that you can use' },
+			],
+		});
+		// The same commands, in the same order, as /help, whose descriptions are escaped CommonMark.
+		const help = await exchange(peer, 'help', 'command', { body: { text: '/help' } });
+		const helped = [...help.skipped.find((frame) => frame.method === 'message')!.params.body.text.matchAll(/^- `\/([^`]+)`: (.*)$/gm)].map((match) => [match[1], match[2].replace(/\\(.)/g, '$1')]);
+		expect(helped).toEqual(listed.result.commands.map((command: { name: string; hint?: string; description: string }) => [command.hint ? `${command.name} ${command.hint}` : command.name, command.description]));
+	} finally { peer.close(); }
+});
+
 it('answers /help with a private notice and rejects other commands without closing the socket', async () => {
 	const peer = await connect();
 	try {
@@ -755,9 +783,10 @@ it('answers /help with a private notice and rejects other commands without closi
 			room_id: 'general', from: { user_id: '~private', name: 'System message to you' },
 			body: {
 				text: [
-					'- `/embed-append [markdown]`: get a link to stream text into a message that starts with [markdown], such as an LLM\'s reply: the message appears when the stream starts',
-					'- `/embed-terminal [title]`: get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts',
-					'- `/help`: list the commands you can use here',
+					// A description is CommonMark text here: its placeholder is escaped, not read as HTML.
+					'- `/embed-append [<markdown>]`: Get a link to stream text into a message in this room, such as an LLM\'s reply, after the opening \\<markdown\\>; the message appears when the stream starts',
+					'- `/embed-terminal [<title>]`: Get a link to stream a terminal (80×40) into this room, such as a build; the message appears when the stream starts',
+					'- `/help`: List the commands that you can use',
 				].join('\n'),
 				format: 'markdown',
 			},

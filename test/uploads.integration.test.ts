@@ -780,8 +780,8 @@ describe('uploads end to end', () => {
 
 			// Live text: /embed-append starts one, and /embed-terminal is refused only
 			// by the one-open-at-a-time rule everyone has, not for being a bot.
-			expect((await request(bot, 'live-append', 'command', { body: { text: '/embed-append' } })).result).toBeDefined();
-			expect((await request(bot, 'live-terminal', 'command', { body: { text: '/embed-terminal build' } })).error.message).toMatch(/^You already have a live text open/);
+			expect((await request(bot, 'live-append', 'command', { room_id: 'general', body: { text: '/embed-append' } })).result).toBeDefined();
+			expect((await request(bot, 'live-terminal', 'command', { room_id: 'general', body: { text: '/embed-terminal build' } })).error.message).toMatch(/^You already have a live text open/);
 		} finally { owner.close(); bot.close(); }
 	});
 
@@ -992,7 +992,7 @@ describe('uploads end to end', () => {
 			expect(before.ext).not.toHaveProperty('emoji');
 			// Admins only, listed in their /help; a key is :name:, with one image.
 			const help = await exchange(admin, 'help', 'command', { room_id: 'general', body: { text: '/help' } });
-			expect(help.skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text).toContain('`/emoji add|remove :name:`');
+			expect(help.skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text).toContain('`/emoji add :<name>:`');
 			expect((await request(user, 'not-admin', 'command', { body: { text: '/emoji add :mine:', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32001);
 			expect((await request(admin, 'no-colons', 'command', { body: { text: '/emoji add partyparrot', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
 			expect((await request(admin, 'no-image', 'command', { body: { text: '/emoji add :partyparrot:' } })).error.code).toBe(-32602);
@@ -1089,7 +1089,7 @@ describe('uploads end to end', () => {
 			expect((await request(user, 'denied', 'command', { room_id: 'general', body: { text: '/emoji remove :mine:' } })).error).toMatchObject({ code: -32001, message: '/emoji needs one of the roles admin, mod, friend' });
 			// `friend` and `mod` each may add and remove.
 			await role('friend', 'friend');
-			expect(await help('help-friend')).toContain('`/emoji add|remove :name:`');
+			expect(await help('help-friend')).toContain('`/emoji remove :<name>:`');
 			await add('friend-add', ':mine:');
 			await remove('friend-remove', ':mine:');
 			await role('unfriend', 'friend');
@@ -1131,7 +1131,7 @@ describe('uploads end to end', () => {
 			].join('\n'));
 			// Admins only, listed in their /help.
 			const help = await exchange(admin, 'help', 'command', { room_id: 'general', body: { text: '/help' } });
-			expect(notice(help.skipped)).toContain('`/server [title|description [<text>] | avatar]`');
+			for (const form of ['`/server`', '`/server avatar`', '`/server description [<text>]`', '`/server title [<text>]`']) expect(notice(help.skipped)).toContain(form);
 			expect((await request(user, 'not-admin', 'command', { body: { text: '/server title Mine' } })).error.code).toBe(-32001);
 			expect((await request(user, 'not-admin-show', 'command', { body: { text: '/server' } })).error.code).toBe(-32001);
 			// The rules of SERVER_TITLE and SERVER_DESCRIPTION; unknown fields and stray attachments are refused.
