@@ -40,6 +40,12 @@ export interface StoredIdentity {
 	 * when none is recorded. A sign-in carries it onto the connection.
 	 */
 	seen?: number;
+	/**
+	 * The account waits in the lobby (identity tier `waiting`, `ACCESS=lobby`):
+	 * made by self sign-up there, it sees only the lobby until welcomed.
+	 * Kept whatever the mode; only `lobby` restricts it.
+	 */
+	waiting?: boolean;
 }
 
 /**
@@ -121,8 +127,37 @@ export const BOT_NAME_RULE = "A bot's name must contain \"bot\"";
  */
 export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
 export { MAX_CREATED_ROOMS };
+/**
+ * Most lobby rooms an object ever makes or adopts (one per LOBBY_ROOM it
+ * ran with, `ACCESS=lobby`): a further LOBBY_ROOM is refused
+ * (ensureLobbyRoom), so the top-level rooms stay within MAX_TOP_LEVEL_ROOMS.
+ */
+export const MAX_LOBBY_ROOMS = 4;
+/**
+ * Most top-level public rooms: `general`, the lobby rooms (at most
+ * MAX_LOBBY_ROOMS), and MAX_CREATED_ROOMS. What a read of every top-level
+ * room is bounded by.
+ */
+export const MAX_TOP_LEVEL_ROOMS = MAX_CREATED_ROOMS + 1 + MAX_LOBBY_ROOMS;
 /** Most rooms userRooms lists: MAX_USER_ROOMS, the top-level rooms, and a room just joined. What a connection's attachment carries. */
-export const MAX_LISTED_USER_ROOMS = MAX_USER_ROOMS + MAX_CREATED_ROOMS + 2;
+export const MAX_LISTED_USER_ROOMS = MAX_USER_ROOMS + MAX_TOP_LEVEL_ROOMS + 1;
+/**
+ * An identity's tier while it waits in the lobby (`ACCESS=lobby`): an
+ * account its owner made themselves, which sees only the lobby until an
+ * admin or mod welcomes it in (admitWaiting). It acts as `registered`
+ * wherever no lobby restricts it. An additive value: no schema version.
+ */
+export const WAITING_TIER = "waiting";
+/**
+ * Roles the server computes for display in lobby mode (a waiting account's
+ * `waiting`, a welcomed guest's `welcomed`): never stored or given with
+ * `/role`, so they select no limits.
+ */
+export const COMPUTED_ROLES: readonly string[] = ["waiting", "welcomed"];
+/** The lobby room's title, as made (ensureLobbyRoom); admins and mods may change it. */
+export const LOBBY_TITLE = "Public Lobby";
+/** The refusal of a room creation or save by a guest or waiting account in the lobby. */
+export const LOBBY_ROOMS_DENIED = "Only members start or change rooms and threads here; an admin or mod can welcome you in";
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */

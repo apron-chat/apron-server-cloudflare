@@ -36,6 +36,35 @@ export function userExtFits(ext: Record<string, unknown> | undefined): boolean {
 	return ext === undefined || utf8Bytes(JSON.stringify(ext)) <= MAX_USER_EXT_BYTES;
 }
 
+/**
+ * Characters a display name drops rather than refuses (Unicode general
+ * categories Cc, Cf, Co, Cs): controls, format characters such as
+ * bidirectional overrides and zero-width joiners (which also breaks emoji
+ * ZWJ sequences into their parts, as the Go server does), private use, and
+ * lone surrogates.
+ */
+const INVISIBLE_IN_NAMES = /[\p{Cc}\p{Cf}\p{Co}\p{Cs}]/gu;
+/** Unassigned code points, which the PRECIS Nickname profile disallows. */
+const UNASSIGNED = /\p{Cn}/u;
+
+/**
+ * A display name as this server keeps it (protocol §3.3: the server may
+ * alter names, and `you.name` is the answer), the same as the Go server's
+ * prepareName: the invisible characters (INVISIBLE_IN_NAMES) dropped, then
+ * the PRECIS Nickname profile (RFC 8266): every space separator mapped to
+ * U+0020, NFKC compatibility normalization, runs of spaces folded to one,
+ * and leading and trailing spaces trimmed. A name with an unassigned code
+ * point cannot be a nickname and cleans to `""`, as Go's does. `""` means
+ * no name: each path treats it as it treats a name left out or removed.
+ * The length limits apply to the result. Names stored before are kept as
+ * they are.
+ */
+export function cleanName(name: string): string {
+	const visible = name.replace(INVISIBLE_IN_NAMES, "");
+	if (UNASSIGNED.test(visible)) return "";
+	return visible.replace(/\p{Zs}/gu, " ").normalize("NFKC").replace(/\p{Zs}/gu, " ").replace(/ {2,}/g, " ").trim();
+}
+
 /** A recorded user (§3.3): `user_id`, and `name` when it has a non-empty one. */
 export function recordedUser(userId: string, name: string | null | undefined): { user_id: string; name?: string } {
 	return { user_id: userId, ...(name ? { name } : {}) };

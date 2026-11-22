@@ -6,7 +6,7 @@
  */
 
 import { MAX_PUSHES_PER_MESSAGE, MAX_PUSH_CANDIDATES } from "../budget";
-import { JOINED_WAKE_ROLES, MAX_PUSH_URL_BYTES, PUSH_ID_PATTERN, WAKE_SCOPES, isPrivateRoomId } from "../domain";
+import { JOINED_WAKE_ROLES, MAX_PUSH_URL_BYTES, PUSH_ID_PATTERN, WAKE_SCOPES, WAITING_TIER, isPrivateRoomId } from "../domain";
 import type { RawLimitRow } from "../limiter-cache";
 import { StoreError } from "../store-error";
 import { ALL_WAKE, DEFAULT_WAKE, MAX_PUSH_SUBSCRIPTIONS_PER_USER, PUSH_REFRESH_MS } from "./limits";
@@ -51,7 +51,9 @@ export class PushModule {
       const effective = this.core.effectiveNow(now);
       const identity = sql.identityRow(input.userId);
       if (!identity) throw new StoreError("denied", "Sign in to receive push notifications");
-      const moderator = identity.tier === "registered" && parseRoles(identity.roles_json).some((role) => JOINED_WAKE_ROLES.includes(role));
+      // A waiting account is a member only where no lobby restricts it.
+      const member = identity.tier === "registered" || (identity.tier === WAITING_TIER && sql.lobbyRoom() === null);
+      const moderator = member && parseRoles(identity.roles_json).some((role) => JOINED_WAKE_ROLES.includes(role));
       const wake = moderator ? requested : requested & ~WAKE_SCOPES.joined;
       const pushId = input.pushId ?? null;
       const existing = sql.rows<{ p256dh: string; auth: string; push_id: string | null; wake: number; updated_ms: number }>(
@@ -178,6 +180,11 @@ export class PushModule {
         if (woken >= policy.wakesPerMessage) break;
         // A private room's message wakes only who is in it when it goes, however they were chosen.
         if (isPrivateRoomId(input.roomId) && !sql.isMember(input.roomId, userId)) continue;
+        // With a lobby, a waiting account wakes only for the lobby and its threads.
+        const lobby = sql.lobbyRoom();
+        if (lobby !== null && sql.restrictedViewer(userId) && !roomScopes().includes(lobby)) continue;
+        // Where waiting accounts cannot sign in (`ACCESS=private`), nothing wakes them.
+        if (sql.waitingRefused() && sql.identityRow(userId)?.tier === WAITING_TIER) continue;
         // A muted or `dnd` user gets no pushes (protocol §4.9, §4.5) and takes no wake.
         const status = sql.rows<{ status: string; mute_until_ms: number | null }>("SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
         if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) continue;

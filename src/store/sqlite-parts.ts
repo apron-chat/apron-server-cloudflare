@@ -20,6 +20,8 @@ export function sqliteAccounts(sqlite: SqliteStore): Accounts {
     exists: (userId) => sqlite.identityExists(userId),
     idTaken: (userId) => sqlite.userIdTaken(userId),
     register: (input) => sqlite.registerIdentity(input),
+    admitWaiting: (userId, now) => sqlite.admitWaiting(userId, now),
+    isWaiting: (userId, now) => sqlite.isWaiting(userId, now),
     createInvited: (input) => sqlite.createInvitedIdentity(input),
     ensureAdmin: (input) => sqlite.ensureAdminUser(input),
     rename: (input) => sqlite.renameIdentity(input),
@@ -68,6 +70,8 @@ export function sqliteRooms(sqlite: SqliteStore): Rooms {
     topLevelIds: (now) => sqlite.topLevelRoomIds(now),
     changeMembership: (input) => sqlite.changeMembership(input),
     chargeGuestMembership: (input) => sqlite.chargeGuestMembership(input),
+    ensureLobby: (roomId, now) => sqlite.ensureLobbyRoom(roomId, now),
+    logGuestMembership: (input) => sqlite.logGuestMembership(input),
     removeEmptyThread: (roomId, now) => sqlite.removeEmptyThread(roomId, now),
     memberCount: (roomId, now) => sqlite.roomMemberCount(roomId, now),
   };
@@ -79,6 +83,7 @@ export function sqliteMessages(sqlite: SqliteStore): Messages {
     mutate: (input) => sqlite.mutate(input),
     commit: (input) => sqlite.commitMutation(input),
     author: (messageId, now) => sqlite.messageAuthor(messageId, now),
+    visibleAuthor: (messageId, viewerId, now) => sqlite.visibleMessageAuthor(messageId, viewerId, now),
     historyAcrossTiers: (query) => sqlite.historyLog.historyAcrossTiers(query),
   };
 }
@@ -117,6 +122,7 @@ export function sqliteAdmission(sqlite: SqliteStore): Admission {
   return {
     reserveAuthAttempt: (input) => sqlite.admission.reserveAuthAttempt(input),
     reserveGuestNumbers: (count, now) => sqlite.admission.reserveGuestNumbers(count, now),
+    checkGuestName: (input) => sqlite.checkGuestName(input),
     reserveFrames: (input) => sqlite.admission.reserveFrames(input),
     reserveConnection: (input) => sqlite.admission.reserveConnection(input),
     checkConnectionBudget: (now) => sqlite.checkConnectionBudget(now),
@@ -167,6 +173,7 @@ export function sqliteOps(sqlite: SqliteStore): Ops {
 export function sqliteLifecycle(sqlite: SqliteStore): Lifecycle {
   return {
     initialize: () => sqlite.initialize(),
+    setAccess: (access) => sqlite.setAccess(access),
     requiresReset: () => sqlite.requiresReset(),
     resetStorage: () => sqlite.resetStorage(),
     scheduleAlarm: (socketDeadline, now) => sqlite.scheduleAlarm(socketDeadline, now),

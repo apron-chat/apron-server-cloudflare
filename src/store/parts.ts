@@ -50,7 +50,13 @@ export interface Accounts {
     ipKey: string;
     /** The rooms the new identity starts in, such as the guest's it replaces. */
     rooms?: readonly string[];
+    /** A self sign-up in the lobby (`ACCESS=lobby`): the account waits there (tier `waiting`) until welcomed. */
+    waiting?: boolean;
   }): StoredIdentity & { broadcasts: Broadcast[] };
+  /** `/welcome` of a waiting account: it becomes a member, in one identity row update; false when it was not waiting. */
+  admitWaiting(userId: string, now?: number): boolean;
+  /** Whether `userId` waits in the lobby: a waiting account where the server has a lobby (Lifecycle.setAccess). */
+  isWaiting(userId: string, now?: number): boolean;
   /**
    * `/invite-token`: a registered user with no passkey, who signs in with a
    * bearer token an admin hands out. The `user_id` must be free: no identity
@@ -345,6 +351,13 @@ export interface Rooms {
    */
   chargeGuestMembership(input: { ipKey: string; now?: number }): void;
   /**
+   * Makes the lobby room (`ACCESS=lobby`) if it is missing, outside the
+   * room caps for good (as every lobby the object had); its record when made.
+   */
+  ensureLobby(roomId: string, now?: number): RoomRecord | null;
+  /** A guest's join or leave of the lobby, logged for its members (§4.2.2); null when the room is gone. */
+  logGuestMembership(input: { roomId: string; userId: string; name?: string; joined: boolean; now?: number }): Broadcast | null;
+  /**
    * Removes a thread or private room that has emptied (§4.2.2): no registered member is
    * left in it, so the last to leave frees its slot instead of leaving it
    * until its log expires, whatever messages it holds. The caller checks
@@ -379,6 +392,8 @@ export interface Messages {
    * for an unknown or expired message.
    */
   author(messageId: string, now?: number): string | null;
+  /** The author of a retained message `viewerId` may see, else null (`/welcome` in reply). */
+  visibleAuthor(messageId: string, viewerId: string, now?: number): string | null;
   /**
    * history, for a runtime with tiers below: a page that reaches below the
    * hot floor is a PendingHistory, which the runtime completes with the
@@ -558,6 +573,8 @@ export interface Admission {
    * interleave two reservations.
    */
   reserveGuestNumbers(count: number, now?: number): { first: number; limit: number };
+  /** A guest's display name, cleaned and checked as a member's and charged as a `me` is; the name as kept. */
+  checkGuestName(input: { name: string; ipKey: string; now?: number }): string;
   /** Charges processed frames to the daily ceiling and the IP's limit; `retry_after` past either. */
   reserveFrames(input: { ipKey: string; now: number; count?: number }): void;
   /** Charges a connection's admission to the daily ceiling and the IP's limit; `retry_after` past either. */
@@ -689,6 +706,12 @@ export interface Ops {
 export interface Lifecycle {
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
   initialize(): void;
+  /**
+   * The access mode (`ACCESS`): the lobby room while there is one, else
+   * null (guests and waiting accounts then see only it), and whether
+   * waiting accounts are refused altogether (`private`).
+   */
+  setAccess(access: { lobbyRoom: string | null; waitingRefused: boolean }): void;
   /** Whether stored data is from a schema that is not upgraded in place (resetStorage wipes it). */
   requiresReset(): boolean;
   /**

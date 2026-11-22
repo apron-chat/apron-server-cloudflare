@@ -43,6 +43,7 @@ import {
   META_GUEST_NUMBER_MARK, META_HISTORY_EXPORT, META_HISTORY_IMPORT, META_HISTORY_IMPORT_PROGRESS, META_HISTORY_PUBLISHED,
   META_HISTORY_ROOMS_DUE, META_HISTORY_THROUGH, META_IDLE_ACTIVITY_SINCE, META_IDLE_PRUNE_DAY, META_IDLE_PRUNED, META_PURGE_ROOMS,
   META_PURGED_PREFIX, META_RENAMED_PREFIX, META_ROOM_NOTES_ALERTED, META_STORAGE_ALERTED, META_STORAGE_PRESSURE, USER_LIMIT_SCOPES,
+  META_LOBBY_ROOM, parseLobbyRooms,
 } from "./meta";
 import {
   ACCOUNTING_UNCERTAIN, BREAKER_ALERT_ONLY, BREAKER_EXEMPT, BREAKER_MS, BREAKER_OVERRUNS, BREAKER_WINDOW_MS, DEGRADED, emptyGuard,
@@ -63,6 +64,7 @@ import {
   BOT_MODERATOR_ROLES, BOT_NAME_PATTERN, BOT_NAME_RULE, DEFAULT_JOINED_ROOMS, isPrivateRoomId, isProtocolId, MAX_CREATED_ROOMS,
   MAX_LISTED_USER_ROOMS, MAX_PASSKEYS_PER_USER, MAX_ROLES_PER_USER, MAX_ROOM_MUTES_PER_USER, MAX_USER_ROOMS, MODERATOR_ROLES,
   PRIVATE_ROOM_PREFIX, ROLE_PATTERN, ROOM_CREATOR_ROLES, ROOM_ID, type StoredCredential, type StoredIdentity, UNCLAIMED_ROLE,
+  COMPUTED_ROLES, LOBBY_ROOMS_DENIED, LOBBY_TITLE, MAX_LOBBY_ROOMS, MAX_TOP_LEVEL_ROOMS, WAITING_TIER,
 } from "../domain";
 import { ADMIN_USER_ID, restorableUserId } from "../user-ids";
 import {
@@ -78,7 +80,7 @@ import type { ChatRecord } from "../history/records";
 import {
   type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type RoomListing,
 } from "@apron/archive";
-import { clientUserExt, MAX_USER_EXT_BYTES, mergeExt, recordedUser, userExtFits } from "../content/user";
+import { cleanName, clientUserExt, MAX_USER_EXT_BYTES, mergeExt, recordedUser, userExtFits } from "../content/user";
 import { isEmptyBody, type MessageBody } from "../content/body";
 import { hasAppend, messageContent, sharesText, withEditedBy } from "../content/snapshot";
 import { liveResultEmbed, terminalOg, uploadResultEmbed, uploadTitle } from "../content/embeds";
@@ -244,6 +246,10 @@ export class SqliteStore {
     maintenanceRow: () => this.maintenanceRow(),
     retainedEmbed: (messageId, embedId) => this.retainedEmbed(messageId, embedId),
     visibleRoomRow: (roomId, userId) => this.visibleRoomRow(roomId, userId),
+    lobbyRoom: () => this.access.lobbyRoom,
+    waitingRefused: () => this.access.waitingRefused,
+    restrictedViewer: (userId) => this.restrictedViewer(userId),
+    lobbyRoomIds: () => this.lobbyRoomIds(),
     messageReference: (value, field, floor, options) => this.messageReference(value, field, floor, options),
     commitLivePost: (input, effective, entry) => this.commitLivePost(input, effective, entry),
     rewriteEmbed: (message, snapshot, embedId, replacement, now, text) => this.rewriteEmbed(message, snapshot, embedId, replacement, now, text),
@@ -251,6 +257,17 @@ export class SqliteStore {
     limitRow: (scope, key, now) => this.limitRow(scope, key, now),
     updateLimitRow: (row, updates, now, weight) => this.updateLimitRow(row, updates, now, weight),
   };
+  /**
+   * The access mode as the runtime sets it (Lifecycle.setAccess): the lobby
+   * room while the server has one (`ACCESS=lobby`), else null; then guests
+   * and waiting accounts (WAITING_TIER) see only it and its threads
+   * (visibleRoomRow), post under the guests' limits (chargePosting), and
+   * wake for nothing else (push claim). `waitingRefused` (`ACCESS=private`):
+   * no push wakes a waiting account. With neither, a waiting account is a member.
+   */
+  readonly access: { lobbyRoom: string | null; waitingRefused: boolean } = { lobbyRoom: null, waitingRefused: false };
+  /** The lobby rooms' `room_id`s as `_meta` keeps them (META_LOBBY_ROOM), once read. */
+  private lobbyRoomMeta: string[] | undefined;
   /** The core the implementation modules run over (core.ts). */
   readonly core: StoreCore = this.makeCore();
   /** Room caps: the counts of rooms and memberships a creation, join or restore is checked against (room-caps.ts). */
@@ -903,7 +920,7 @@ export class SqliteStore {
             i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
             EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
          FROM credentials c JOIN identities i ON i.user_id = c.user_id
-         WHERE i.tier = 'registered' AND i.user_id <> ?
+         WHERE i.tier IN ('registered', 'waiting') AND i.user_id <> ?
          ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
         // `admin` holds no passkey; should one exist, a reset does not carry it.
         ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
@@ -926,8 +943,9 @@ export class SqliteStore {
         // A passkey holder is never a bot, so a stray `bot` role is not carried.
         const roles = parseRoles(row.roles_json).filter((role) => role !== "bot");
         this.rawExec(
-          "INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, ?, ?, 'registered', ?, ?, ?)",
-          row.user_id, row.user_handle, row.name, row.identity_created_ms, row.identity_updated_ms, JSON.stringify(roles),
+          "INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          // A waiting account stays one (WAITING_TIER).
+          row.user_id, row.user_handle, row.name, row.tier === WAITING_TIER ? WAITING_TIER : "registered", row.identity_created_ms, row.identity_updated_ms, JSON.stringify(roles),
         );
         this.rawExec(
           `INSERT OR IGNORE INTO credentials
@@ -1640,7 +1658,7 @@ export class SqliteStore {
     const newest = (kind: 0 | 1 | 2, limit: number) => this.rawRows<RawRoomRow>(
       `SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${roomKind(kind)} ORDER BY latest_log_id DESC LIMIT ?`, limit,
     );
-    const rows = [...newest(0, MAX_CREATED_ROOMS + 1), ...newest(1, this.listedThreadCount)];
+    const rows = [...newest(0, MAX_TOP_LEVEL_ROOMS), ...newest(1, this.listedThreadCount)];
     if (withPrivate) rows.push(...newest(2, LISTED_PRIVATE_ROOMS));
     return rows.sort((a, b) => integerColumn(a.created_log_id) - integerColumn(b.created_log_id) || (a.room_id < b.room_id ? -1 : 1));
   }
@@ -2095,7 +2113,7 @@ export class SqliteStore {
             if (!parent || parent.parent_room_id !== null || isPrivateRoomId(parent.room_id)) {
               throw new StoreError("invalid_params", `A thread's parent must be a public top-level room here: restore ${parentRoomId} first`.slice(0, 200));
             }
-          } else if (this.rawRows(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_CREATED_ROOMS + 1).length > MAX_CREATED_ROOMS) {
+          } else if (this.createdTopLevelRooms() >= MAX_CREATED_ROOMS) {
             throw new StoreError("denied", "room_limit");
           }
           if (!slot("public")) throw new StoreError("denied", "thread_limit");
@@ -2285,7 +2303,7 @@ export class SqliteStore {
    * Room IDs order the private rooms (a user is in at most
    * maxPrivateMembershipsPerUser) and `general` before the others, which are
    * log IDs: the newest rooms by creation. The user's top-level rooms (at
-   * most MAX_CREATED_ROOMS + 1, the oldest IDs) are always among them, read
+   * most MAX_TOP_LEVEL_ROOMS, the oldest IDs) are always among them, read
    * apart from the kind index, and so is `include`, a room just joined
    * however old: a connection is delivered to the rooms listed here. An
    * older thread is still theirs, read by its room_id. The join with `rooms`
@@ -2304,7 +2322,7 @@ export class SqliteStore {
       `SELECT t.room_id AS room_id, t.created_log_id AS created_log_id FROM (
          SELECT room_id, created_log_id FROM rooms WHERE ${roomKind(0)} LIMIT ?
        ) t JOIN memberships m ON m.room_id = t.room_id AND m.user_id = ?`,
-      MAX_CREATED_ROOMS + 1, userId,
+      MAX_TOP_LEVEL_ROOMS, userId,
     ));
     if (include !== undefined) {
       rows.push(...this.rawRows<{ room_id: string; created_log_id: number }>(
@@ -2324,7 +2342,7 @@ export class SqliteStore {
    * each an index entry and a membership lookup; and a room just joined.
    */
   private userRoomsReads(): number {
-    return 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 3 * (MAX_CREATED_ROOMS + 1);
+    return 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 3 * MAX_TOP_LEVEL_ROOMS;
   }
 
   /** Whether an identity has this `user_id` now, one indexed read. */
@@ -2371,7 +2389,7 @@ export class SqliteStore {
     const records = this.retainedRecords(now);
     const found = this.reserved("renameIdentity", { reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (this.caps.roomRowCount(this.sqlHandle) + MAX_PURGE_ROOMS) }, false, now, () => {
       const identity = this.identityRow(from);
-      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
+      if (!this.accountRow(identity)) throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
       if (this.idTaken(to)) throw new StoreError("invalid_params", `The user_id ${to} is taken`.slice(0, 200));
       const count = (sql: string) => integerColumn(this.rawRows<{ count: number }>(sql, from)[0]?.count);
@@ -2836,6 +2854,8 @@ export class SqliteStore {
         ...(avatar ? { avatar } : {}),
         ...(ext ? { ext } : {}),
         ...(seen !== undefined ? { seen } : {}),
+        // The mark is the account's, whatever the mode: the runtime decides what it means.
+        ...(row.tier === WAITING_TIER ? { waiting: true } : {}),
       };
     });
   }
@@ -2884,10 +2904,10 @@ export class SqliteStore {
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
-              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
+              ? `SELECT m.user_id, i.tier, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
                  FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`
-              : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+              : `SELECT m.user_id, i.tier, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`,
             roomId, perRoom,
           );
@@ -2911,7 +2931,7 @@ export class SqliteStore {
           const avatar = liveAvatar(row, now);
           const ext = parseUserExt(row.ext_json);
           return {
-            user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
+            user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: this.shownRoles(row.roles_json, row.tier),
             ...(ext ? { ext } : {}),
             ...(withStatus ? statusColumns(row) : {}),
           };
@@ -2929,10 +2949,10 @@ export class SqliteStore {
     return this.reserved("roomMember", { reads: 8 + (withStatus ? 3 : 2) }, false, now, () => {
       const row = this.rawRows<RawMemberRow>(
         withStatus
-          ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
+          ? `SELECT m.user_id, i.tier, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
              FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
              WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`
-          : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+          : `SELECT m.user_id, i.tier, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
              WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`,
         roomId, userId,
       )[0];
@@ -2940,7 +2960,7 @@ export class SqliteStore {
       const avatar = liveAvatar(row, now);
       const ext = parseUserExt(row.ext_json);
       return {
-        user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
+        user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: this.shownRoles(row.roles_json, row.tier),
         ...(ext ? { ext } : {}),
         ...(withStatus ? statusColumns(row) : {}),
       };
@@ -3007,9 +3027,9 @@ export class SqliteStore {
         if (used + adding > this.config.maxPrivateRooms) return `this archive would add ${adding} recently created private rooms, but there is room for ${Math.max(0, this.config.maxPrivateRooms - used)} more (${used} of ${this.config.maxPrivateRooms})`;
       }
       if (topLevel.length) {
-        const used = this.rawRows(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_CREATED_ROOMS + 2).length;
-        // restoreRoom refuses a top-level room once more than MAX_CREATED_ROOMS are here before it.
-        if (used + topLevel.length - 1 > MAX_CREATED_ROOMS) return `this archive would add ${topLevel.length} top-level rooms, but there is room for ${Math.max(0, MAX_CREATED_ROOMS + 1 - used)} more (room_limit)`;
+        const used = this.createdTopLevelRooms();
+        // restoreRoom refuses a top-level room once MAX_CREATED_ROOMS are here before it.
+        if (used + topLevel.length > MAX_CREATED_ROOMS) return `this archive would add ${topLevel.length} top-level rooms, but there is room for ${Math.max(0, MAX_CREATED_ROOMS - used)} more (room_limit)`;
       }
       if (publics.length) {
         const used = this.caps.recentRoomCount(this.sqlHandle, "public", now);
@@ -3133,6 +3153,8 @@ export class SqliteStore {
     ipKey: string;
     /** The rooms the new identity starts in, such as the guest's it replaces. */
     rooms?: readonly string[];
+    /** A self sign-up in the lobby: the account waits there (WAITING_TIER) until welcomed. */
+    waiting?: boolean;
   }): StoredIdentity & { broadcasts: Broadcast[] } {
     this.ensureReady();
     const { credential } = input;
@@ -3181,10 +3203,11 @@ export class SqliteStore {
           ...(credential.backedUp !== undefined ? { backedUp: credential.backedUp } : {}),
         });
         this.rawExec(
-          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)",
+          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?)",
           input.userId,
           input.userHandle,
           input.name,
+          input.waiting ? WAITING_TIER : "registered",
           effective,
           effective,
         );
@@ -3220,6 +3243,7 @@ export class SqliteStore {
           credentialCount: 1,
           rooms: joined,
           roles: [],
+          ...(input.waiting ? { waiting: true } : {}),
           broadcasts,
         });
       });
@@ -3252,7 +3276,7 @@ export class SqliteStore {
       const effective = this.effectiveNow(input.now);
       return this.transaction(() => {
         const identity = this.identityRow(input.userId);
-        if (!identity || identity.tier !== "registered" || parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "Only a registered user can add a passkey");
+        if (!this.accountRow(identity) || parseRoles(identity!.roles_json).includes("bot")) throw new StoreError("denied", "Only a registered user can add a passkey");
         if (identity.user_id === ADMIN_USER_ID) throw new StoreError("denied", "The admin user signs in with APRON_ADMIN_TOKEN only");
         if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
         const count = integerColumn(this.rawRows<{ count: number }>(
@@ -3470,7 +3494,14 @@ export class SqliteStore {
    */
   private visibleMessage(messageId: string, userId: string, floor?: number): RawMessageRow | null {
     const row = this.currentMessage(messageId, floor);
-    return row && isPrivateRoomId(row.room_id) && !this.isMember(row.room_id, userId) ? null : row;
+    if (!row) return null;
+    if (isPrivateRoomId(row.room_id) && !this.isMember(row.room_id, userId)) return null;
+    // A restricted viewer sees only the lobby's messages (canSee).
+    if (this.access.lobbyRoom !== null && this.restrictedViewer(userId)) {
+      const room = this.roomRow(row.room_id);
+      if (!room || !this.inLobby(room)) return null;
+    }
+    return row;
   }
 
   /**
@@ -3481,7 +3512,8 @@ export class SqliteStore {
   private isModerator(userId: string): boolean {
     const identity = this.identityRow(userId);
     if (!identity) return false;
-    const roles = identity.tier === "registered" ? MODERATOR_ROLES : identity.tier === "bot" ? BOT_MODERATOR_ROLES : [];
+    const tier: string = identity.tier;
+    const roles = this.memberRow(identity) ? MODERATOR_ROLES : tier === "bot" ? BOT_MODERATOR_ROLES : [];
     return parseRoles(identity.roles_json).some((role) => roles.includes(role));
   }
 
@@ -3495,18 +3527,233 @@ export class SqliteStore {
    */
   private holdsAnyRole(userId: string): boolean {
     const identity = this.identityRow(userId);
-    return identity?.tier === "registered" && parseRoles(identity.roles_json).some((role) => role !== UNCLAIMED_ROLE);
+    return this.memberRow(identity) && parseRoles(identity.roles_json).some((role) => role !== UNCLAIMED_ROLE);
   }
 
   /** Whether a registered user holds one of `roles`, from the identity row. */
   private holdsRole(userId: string, roles: readonly string[]): boolean {
     const identity = this.identityRow(userId);
-    return identity?.tier === "registered" && parseRoles(identity.roles_json).some((role) => roles.includes(role));
+    return this.memberRow(identity) && parseRoles(identity.roles_json).some((role) => roles.includes(role));
   }
 
   /**
+   * Whether an identity row is a member's: a registered user, or a waiting
+   * account (WAITING_TIER) where no lobby restricts it. Not a bot, nor a
+   * waiting account in the lobby.
+   */
+  private memberRow(identity: RawIdentityRow | null | undefined): identity is RawIdentityRow {
+    return !!identity && (identity.tier === "registered" || (identity.tier === WAITING_TIER && this.access.lobbyRoom === null));
+  }
+
+  /** Whether an identity row is an account people sign in to with passkeys or tokens: registered or waiting, never a bot. */
+  private accountRow(identity: RawIdentityRow | null | undefined): identity is RawIdentityRow {
+    return !!identity && (identity.tier === "registered" || identity.tier === WAITING_TIER);
+  }
+
+  /**
+   * Whether `userId` sees only the lobby (`ACCESS=lobby`): a guest (no
+   * identity row) or a waiting account. One identity lookup, and none
+   * without a lobby.
+   */
+  private restrictedViewer(userId: string): boolean {
+    if (this.access.lobbyRoom === null) return false;
+    const identity = this.identityRow(userId);
+    return !identity || identity.tier === WAITING_TIER;
+  }
+
+  /** Whether a room row is the lobby or one of its threads: all a restricted viewer sees (restrictedViewer). */
+  private inLobby(row: Pick<RawRoomRow, "room_id" | "parent_room_id">): boolean {
+    const lobby = this.access.lobbyRoom;
+    return lobby !== null && (row.room_id === lobby || row.parent_room_id === lobby);
+  }
+
+  /** Whether a room is the lobby or one of its threads, by its `room_id` (one key lookup for any other). */
+  private inLobbyId(roomId: string): boolean {
+    if (this.access.lobbyRoom === null) return false;
+    if (roomId === this.access.lobbyRoom) return true;
+    const row = this.roomRow(roomId);
+    return !!row && this.inLobby(row);
+  }
+
+  /** Whether a move between two rooms crosses the lobby's edge: one is the lobby or its thread, the other not. */
+  private crossesLobby(from: string, to: string): boolean {
+    return this.inLobbyId(from) !== this.inLobbyId(to);
+  }
+
+  /**
+   * The roles a user object shows (§3.3): the stored ones, and for a
+   * waiting account in the lobby the computed `waiting`, which is never
+   * stored or given and selects no limits.
+   */
+  private shownRoles(rolesJson: string | null, tier: string | null | undefined): string[] {
+    const roles = parseRoles(rolesJson);
+    return tier === WAITING_TIER && this.access.lobbyRoom !== null ? [...roles, WAITING_TIER] : roles;
+  }
+
+  /** The lobby rooms' `room_id`s as kept in `_meta` (META_LOBBY_ROOM), once read. */
+  private lobbyRoomIds(): string[] {
+    this.lobbyRoomMeta ??= parseLobbyRooms(this.metaValue(META_LOBBY_ROOM), MAX_LOBBY_ROOMS);
+    return this.lobbyRoomMeta;
+  }
+
+  /**
+   * The top-level public rooms admins and mods created, which room_limit
+   * caps: every top-level public row but `general` and the lobby rooms
+   * (built-in rooms), at most MAX_TOP_LEVEL_ROOMS read.
+   */
+  private createdTopLevelRooms(): number {
+    const rows = this.rawRows<{ room_id: string }>(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_TOP_LEVEL_ROOMS);
+    const builtIn = new Set([ROOM_ID, ...this.lobbyRoomIds()]);
+    return rows.filter((row) => !builtIn.has(row.room_id)).length;
+  }
+
+  /** Lifecycle.setAccess: the access mode as the runtime's configuration sets it (see access). */
+  setAccess(access: { lobbyRoom: string | null; waitingRefused: boolean }): void {
+    this.access.lobbyRoom = access.lobbyRoom;
+    this.access.waitingRefused = access.waitingRefused;
+  }
+
+  /**
+   * Whether `userId` waits in the lobby, from the identity row: their
+   * account is WAITING_TIER and this server has a lobby.
+   */
+  isWaiting(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    if (this.access.lobbyRoom === null) return false;
+    return this.reserved("isWaiting", { reads: 4 }, false, now, () => this.identityRow(userId)?.tier === WAITING_TIER);
+  }
+
+  /**
+   * Makes the lobby room (`ACCESS=lobby`), once: a permanent top-level
+   * public room titled LOBBY_TITLE, created as a logged room record like any
+   * room, outside the created-room caps (createdTopLevelRooms,
+   * recentRoomCount). A room already under `roomId` becomes the lobby as it
+   * is. Every lobby an object ran with stays exempt; past MAX_LOBBY_ROOMS a
+   * new LOBBY_ROOM is refused rather than counted. Returns the room's record
+   * when it made it, else null.
+   */
+  ensureLobbyRoom(roomId: string, now = this.clock.now()): RoomRecord | null {
+    this.ensureReady();
+    if (isPrivateRoomId(roomId) || roomId === ROOM_ID) throw new StoreError("invalid_params", "the lobby is a public room other than general");
+    if (this.reserved("ensureLobbyRoom", { reads: 8 }, false, now, () => this.lobbyRoomIds().includes(roomId) && this.roomRow(roomId) !== null)) return null;
+    const known = this.lobbyRoomIds();
+    if (!known.includes(roomId) && known.length >= MAX_LOBBY_ROOMS) {
+      throw new StoreError("denied", `This server has had ${MAX_LOBBY_ROOMS} lobby rooms (${known.join(", ")}); set LOBBY_ROOM to one of them`);
+    }
+    this.assertAccounting();
+    const beforeReads = this.observed.reads;
+    const beforeWrites = this.observed.writes;
+    const reservation = this.reserveCost("ensureLobbyRoom", { reads: 32, writes: 16 }, false, now);
+    try {
+      const effective = this.effectiveNow(now);
+      return this.transaction(() => {
+        let made: RoomRecord | null = null;
+        if (this.roomRow(roomId) === null) {
+          const state = this.logState();
+          const startLogId = state.last_log_id;
+          const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
+          const logId = this.allocateLogId(context);
+          const fieldsJson = JSON.stringify({ title: LOBBY_TITLE });
+          this.rawExec(
+            `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 0)`,
+            roomId, logId, logId, logId, fieldsJson, context.commitMs, context.commitMs,
+          );
+          const record = { room_id: roomId, log_id: idString(logId), title: LOBBY_TITLE };
+          this.rawExec(
+            "INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES (?, ?, ?, 'room', ?)",
+            roomId, logId, context.commitMs, JSON.stringify(record),
+          );
+          this.finishCommit(context, startLogId);
+          made = this.roomRecord({
+            room_id: roomId, parent_room_id: null, created_log_id: logId, record_log_id: logId, latest_log_id: logId,
+            fields_json: fieldsJson, created_ms: context.commitMs, updated_ms: context.commitMs, member_count: 0,
+          }, this.publishedFloor());
+        }
+        const kept = parseLobbyRooms(this.metaValue(META_LOBBY_ROOM), MAX_LOBBY_ROOMS);
+        if (!kept.includes(roomId)) this.writeMeta(META_LOBBY_ROOM, JSON.stringify([...kept, roomId]));
+        this.lobbyRoomMeta = kept.includes(roomId) ? kept : [...kept, roomId];
+        this.assertReservation(reservation, beforeReads, beforeWrites);
+        return made;
+      });
+    } finally {
+      this.settleReservation(reservation, beforeReads, beforeWrites);
+    }
+  }
+
+  /**
+   * `/welcome` of a waiting account (WAITING_TIER): it becomes a member, in
+   * one identity row update. False when it was not waiting (a member
+   * already, or gone).
+   */
+  admitWaiting(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved("admitWaiting", { reads: 8, writes: 4 }, false, now, () => this.transaction(() => {
+      if (this.identityRow(userId)?.tier !== WAITING_TIER) return false;
+      this.rawExec("UPDATE identities SET tier = 'registered', updated_ms = ? WHERE user_id = ? AND tier = ?", this.effectiveNow(now), userId, WAITING_TIER);
+      return true;
+    }));
+  }
+
+  /**
+   * A guest's join or leave of the lobby (`ACCESS=lobby`), logged as a
+   * membership record in its log (§4.2.2), so the lobby's members see who
+   * comes and goes, though guests' memberships elsewhere stay out of the
+   * log. Nothing is stored for the guest, and the room's `member_count`
+   * (stored registered members) is unchanged. One record and the room's
+   * head; null when the room is gone.
+   */
+  logGuestMembership(input: { roomId: string; userId: string; name?: string; joined: boolean; now?: number }): Broadcast | null {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved("logGuestMembership", { reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      if (!this.roomRow(input.roomId)) return null;
+      const effective = this.effectiveNow(now);
+      const state = this.logState();
+      const startLogId = state.last_log_id;
+      const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
+      const record = this.logMembership(context, input.roomId, recordedUser(input.userId, input.name ?? ""), input.joined);
+      // A guest is no stored member: the room's count stays as it was.
+      context.members?.delete(input.roomId);
+      this.finishCommit(context, startLogId);
+      return record;
+    }));
+  }
+
+  /**
+   * A guest's display name (`me` `name`, §3.3): cleaned and checked as a
+   * registered user's (cleanName, then ensureText: the byte limit; the code
+   * point limit) and charged as a `me` is, one post against the guests'
+   * (`anonymous:<ip>`), the IP's and the server's posting limits, with no
+   * category. Nothing is stored: the name lives on the guest's connection.
+   * Returns the name as checked.
+   */
+  checkGuestName(input: { name: string; ipKey: string; now?: number }): string {
+    this.ensureReady();
+    const name = ensureText(cleanName(input.name), "name", this.config.maxNameBytes);
+    if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
+    const operationNow = input.now ?? this.clock.now();
+    this.reserved("checkGuestName", { reads: 32, writes: 32, posts: 1 }, false, operationNow, () => {
+      const effective = this.effectiveNow(operationNow);
+      this.transaction(() => this.admission.chargePosting(this.sqlHandle, { userId: "", tier: "anonymous", ipKey: input.ipKey, now: effective, uncategorized: true }));
+    });
+    return name;
+  }
+
+  /**
+   * The author of a retained message `viewerId` may see (visibleMessage:
+   * not in a private room they are not in, nor outside the lobby for a
+   * guest or waiting account), else null: for `/welcome` in reply to a
+   * message. One metered lookup, and the visibility reads.
+   */
+  visibleMessageAuthor(messageId: string, viewerId: string, now = this.clock.now()): string | null {
+    this.ensureReady();
+    return this.reserved("visibleMessageAuthor", { reads: 24 }, false, now, () => this.visibleMessage(messageId, viewerId, this.logState().history_floor)?.author_id ?? null);
+  }
+
+
+  /**
    * The top-level rooms' IDs, `general` first, for `room_list`'s shortcut.
-   * At most MAX_CREATED_ROOMS + 1, and they are never removed. No index
+   * At most MAX_TOP_LEVEL_ROOMS, and they are never removed. No index
    * holds `parent_room_id`, so the scan reads every public row, threads
    * included, and the sort reads the top-level ones again: it is reserved
    * as the listing of every public room (roomListingReads), not by the rows
@@ -3515,7 +3762,7 @@ export class SqliteStore {
   topLevelRoomIds(now = this.clock.now()): string[] {
     this.ensureReady();
     return this.reserved("topLevelRoomIds", { reads: this.roomListingReads() }, false, now, () => this.rawRows<{ room_id: string }>(
-      `SELECT room_id FROM rooms WHERE ${roomKind(0)} ORDER BY created_log_id ASC LIMIT ?`, MAX_CREATED_ROOMS + 1,
+      `SELECT room_id FROM rooms WHERE ${roomKind(0)} ORDER BY created_log_id ASC LIMIT ?`, MAX_TOP_LEVEL_ROOMS,
     ).map((row) => row.room_id));
   }
 
@@ -3546,7 +3793,9 @@ export class SqliteStore {
     const existing = this.reserved("registerBot", { reads: 16 }, false, input.now, () => {
       const owner = this.identityRow(input.ownerId);
       // A bot, an owner's or one made by `/role … bot`, owns no bot of its own.
-      if (!owner || owner.tier !== "registered" || parseRoles(owner.roles_json).includes("bot")) throw new StoreError("denied", "Only registered users may invite a bot");
+      if (!this.memberRow(owner) || parseRoles(owner!.roles_json).includes("bot")) {
+        throw new StoreError("denied", owner?.tier === WAITING_TIER ? "Wait to be welcomed in before inviting a bot" : "Only registered users may invite a bot");
+      }
       return this.identityRow(input.botId);
     });
     if (existing) {
@@ -3576,9 +3825,11 @@ export class SqliteStore {
   setRole(input: { userId: string; role: string; on?: boolean; now?: number }): { changed: boolean; on: boolean; name: string; roles: string[] } {
     this.ensureReady();
     if (!ROLE_PATTERN.test(input.role)) throw new StoreError("invalid_params", "A role is 1 to 24 lowercase letters, digits, _ or -, starting with a letter");
+    if (COMPUTED_ROLES.includes(input.role)) throw new StoreError("invalid_params", `The role ${input.role} is the server's own; it is never given`);
     return this.reserved("setRole", { reads: 12, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
-      if (!identity || (identity.tier !== "registered" && identity.tier !== "bot")) throw new StoreError("invalid_params", "No registered user has that user_id");
+      if (identity?.tier === WAITING_TIER && !this.memberRow(identity)) throw new StoreError("denied", "That user is waiting in the lobby; /welcome them first");
+      if (!identity || (!this.memberRow(identity) && (identity as RawIdentityRow).tier !== "bot")) throw new StoreError("invalid_params", "No registered user has that user_id");
       const held = parseRoles(identity.roles_json);
       const on = input.on ?? !held.includes(input.role);
       const unchanged = { changed: false, on, name: identity.name, roles: held };
@@ -3597,6 +3848,10 @@ export class SqliteStore {
         }
       }
       if (held.length >= MAX_ROLES_PER_USER) throw new StoreError("denied", `A user has at most ${MAX_ROLES_PER_USER} roles`);
+      // A role is given to members: an account still marked waiting (from a
+      // lobby, given a role while another mode ignores the mark) becomes one,
+      // so it never holds a role while the lobby restricts it.
+      if (identity.tier === WAITING_TIER) this.rawExec("UPDATE identities SET tier = 'registered' WHERE user_id = ? AND tier = ?", identity.user_id, WAITING_TIER);
       return this.writeRoles(identity, [...held, input.role], on);
     }));
   }
@@ -3901,6 +4156,10 @@ export class SqliteStore {
       const target = this.visibleMessage(messageId, options.viewer, floor);
       if (!target) throw new StoreError("invalid_params", `${field} names an unknown or expired message`);
       if (isPrivateRoomId(target.room_id) && target.room_id !== options.roomId) throw new StoreError("denied", `${field} names a message in a private room; reply there instead`);
+      // From the lobby, a reply names only the lobby's messages (`ACCESS=lobby`).
+      if (this.access.lobbyRoom !== null && target.room_id !== options.roomId && this.inLobbyId(options.roomId) && !this.inLobbyId(target.room_id)) {
+        throw new StoreError("denied", `${field} names a message outside the lobby; reply there instead`);
+      }
     }
     return messageId;
   }
@@ -3986,6 +4245,11 @@ export class SqliteStore {
     // A private room's messages stay in it, and no other room's come in.
     if (current !== null && current.room_id !== roomId && (isPrivateRoomId(current.room_id) || isPrivateRoomId(roomId))) {
       throw new StoreError("denied", "Messages cannot be moved into or out of a private room");
+    }
+    // Nor across the lobby's edge (`ACCESS=lobby`): a move would show those
+    // it holds another room's id, or make what members said public.
+    if (current !== null && current.room_id !== roomId && this.access.lobbyRoom !== null && this.crossesLobby(current.room_id, roomId)) {
+      throw new StoreError("denied", "Messages cannot be moved into or out of the lobby");
     }
     const deleted = params.deleted === undefined ? false : params.deleted;
     if (typeof deleted !== "boolean") throw new StoreError("invalid_params", "deleted must be boolean");
@@ -4388,6 +4652,8 @@ export class SqliteStore {
     if (makePrivate && this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
     if (makePrivate && !registered) throw new StoreError("denied", "Sign in to start a private room");
     if (makePrivate && params.parent_room_id !== undefined) throw new StoreError("denied", "A private room cannot be a thread on this demo");
+    // In the lobby, guests and waiting accounts post, but start and change no rooms.
+    if (this.restrictedViewer(input.userId)) throw new StoreError("denied", LOBBY_ROOMS_DENIED);
     const titleParam = params.title;
     if (titleParam !== undefined && typeof titleParam !== "string") throw new StoreError("invalid_params", "title must be a string");
     const descriptionParam = params.description;
@@ -4431,8 +4697,7 @@ export class SqliteStore {
         if (!this.caps.roomSlotFree(this.sqlHandle, "private", context.commitMs)) throw new StoreError("denied", this.caps.privateRoomLimitMessage());
       } else if (parentId === undefined) {
         if (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES)) throw new StoreError("denied", "Only an admin or mod may create a room; others may create threads");
-        const rooms = this.rawRows(`SELECT room_id FROM rooms WHERE ${roomKind(0)} LIMIT ?`, MAX_CREATED_ROOMS + 1).length;
-        if (rooms > MAX_CREATED_ROOMS) throw new StoreError("denied", "room_limit");
+        if (this.createdTopLevelRooms() >= MAX_CREATED_ROOMS) throw new StoreError("denied", "room_limit");
       } else {
         if (typeof parentId !== "string" || parentId.length === 0) throw new StoreError("invalid_params", "parent_room_id must be a non-empty string");
         const parent = this.visibleRoomRow(parentId, input.userId);
@@ -4526,7 +4791,11 @@ export class SqliteStore {
    */
   private visibleRoomRow(roomId: string, userId: string): RawRoomRow | null {
     const row = this.roomRow(roomId);
-    if (!row || !isPrivateRoomId(row.room_id)) return row;
+    if (!row) return null;
+    // With a lobby, a guest or waiting account sees only it and its threads,
+    // and every other room reads as absent, as a private room does (canSee).
+    if (this.access.lobbyRoom !== null && !this.inLobby(row) && this.restrictedViewer(userId)) return null;
+    if (!isPrivateRoomId(row.room_id)) return row;
     return this.isMember(row.room_id, userId) ? row : null;
   }
 
@@ -4583,7 +4852,9 @@ export class SqliteStore {
    * write and the keys it changed (changedExt).
    */
   private commitMeMutation(input: StoreMutationInput, now: number): StoreMutationResult {
-    const name = input.params.name;
+    const raw = input.params.name;
+    // Cleaned as every display name is (cleanName); `""` removes the name.
+    const name = typeof raw === "string" ? cleanName(raw) : raw;
     if (name !== undefined) {
       if (typeof name !== "string") throw new StoreError("invalid_params", "name must be a string");
       ensureText(name, "name", this.config.maxNameBytes);
