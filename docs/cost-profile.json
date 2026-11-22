@@ -1,6 +1,6 @@
 {
-	"version": "4091af1-dirty",
-	"commit": "4091af1b5eb0c54b3d226ae2f727176c47f7c30a",
+	"version": "b3a07ad-dirty",
+	"commit": "b3a07adaa9e9afb73794b0284be78788dd2ef864",
 	"heldAlarms": 0,
 	"steps": [
 		{
@@ -12,10 +12,10 @@
 		},
 		{
 			"step": "guest.connect (server greeting, welcome)",
-			"reads": 42,
-			"writes": 24,
-			"reservedReads": 224,
-			"reservedWrites": 124
+			"reads": 40,
+			"writes": 23,
+			"reservedReads": 200,
+			"reservedWrites": 116
 		},
 		{
 			"step": "guest.auth",
@@ -26,38 +26,38 @@
 		},
 		{
 			"step": "guest.reconnect (close, connect, auth)",
-			"reads": 13,
-			"writes": 9,
-			"reservedReads": 224,
-			"reservedWrites": 104
+			"reads": 11,
+			"writes": 8,
+			"reservedReads": 200,
+			"reservedWrites": 96
 		},
 		{
 			"step": "passkey.register (guest becomes an account)",
 			"reads": 48,
 			"writes": 30,
-			"reservedReads": 1966,
+			"reservedReads": 1978,
 			"reservedWrites": 206
 		},
 		{
 			"step": "passkey.register (new connection)",
-			"reads": 68,
-			"writes": 47,
-			"reservedReads": 2138,
-			"reservedWrites": 278
+			"reads": 66,
+			"writes": 46,
+			"reservedReads": 2126,
+			"reservedWrites": 270
 		},
 		{
 			"step": "passkey.login (new connection)",
-			"reads": 51,
-			"writes": 34,
-			"reservedReads": 2028,
-			"reservedWrites": 222
+			"reads": 49,
+			"writes": 33,
+			"reservedReads": 2016,
+			"reservedWrites": 214
 		},
 		{
 			"step": "token.resume (new connection)",
-			"reads": 44,
-			"writes": 29,
-			"reservedReads": 1941,
-			"reservedWrites": 164
+			"reads": 42,
+			"writes": 28,
+			"reservedReads": 1929,
+			"reservedWrites": 156
 		},
 		{
 			"step": "room_list (all)",
@@ -125,7 +125,7 @@
 		},
 		{
 			"step": "room_set (create thread)",
-			"reads": 16,
+			"reads": 17,
 			"writes": 17,
 			"reservedReads": 4472,
 			"reservedWrites": 120
@@ -141,21 +141,21 @@
 			"step": "room_join (thread)",
 			"reads": 27,
 			"writes": 14,
-			"reservedReads": 3244,
+			"reservedReads": 3256,
 			"reservedWrites": 88
 		},
 		{
 			"step": "room_leave (thread)",
 			"reads": 15,
 			"writes": 8,
-			"reservedReads": 1492,
+			"reservedReads": 1504,
 			"reservedWrites": 72
 		},
 		{
 			"step": "room_join (thread, again)",
 			"reads": 25,
 			"writes": 10,
-			"reservedReads": 3244,
+			"reservedReads": 3256,
 			"reservedWrites": 88
 		},
 		{
@@ -254,7 +254,7 @@
 			"step": "room_join (add a member to the private room)",
 			"reads": 32,
 			"writes": 11,
-			"reservedReads": 4676,
+			"reservedReads": 4700,
 			"reservedWrites": 96
 		},
 		{

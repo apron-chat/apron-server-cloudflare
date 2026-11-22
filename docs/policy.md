@@ -34,7 +34,19 @@ server.apron.chat is under `apron.chat`). Other connections advertise
 tokens and sessions from the passkey page but not other passkey sessions
 (below), and reject WebAuthn requests as `unsupported`. Guest user IDs are
 `guest_<n>` from a server-wide counter, with the name `Guest <n>`; a
-requested `user_id` or `name` is ignored. Numbers are never reissued, so they
+`user_id` or `name` in `auth` is ignored. A guest may then set a display
+name with `me` `name`, in every mode, even while guests only read: checked
+and charged as a registered user's, kept on its connection only, and
+announced to those who share a room with it; `""` returns to `Guest <n>`,
+and a passkey registered on that connection keeps the name. Names are not
+unique: clients show a guest's `user_id` beside it.
+
+Every display name is cleaned as it comes in, as on the Go server:
+control, format (bidirectional overrides, zero-width joiners), private-use
+and surrogate characters are dropped, compatibility forms are normalized
+(NFKC), runs of spaces fold to one, and the ends are trimmed; a name left
+empty is no name. This applies to `me`, passkey and sign-up names, and bot
+names made from their owners'; names stored before stay as they were. Numbers are never reissued, so they
 have gaps (see [SPEC section 5](../SPEC.md#guest)). No user ever gets a
 `user_id` starting with `~`, which the protocol reserves for system
 identities such as `~private`.
@@ -322,12 +334,14 @@ within it:
   With uploads, `avatar: ""` removes the avatar; other `avatar` values and
   `roles` (which only the server assigns) are ignored. A rename or an `ext`
   change sends `user` notifications to the user's other
-  connections and to users who share a room with them, as does a guest's
-  connection creating a new account (passkey registration or sign-up
-  invite: `new` with the retired guest as `old`). A guest's connection that
-  signs in to an existing account sends no such link: the guest simply
-  departs (offline after a minute's grace), and the account shows only
-  through its status, so an invisible one stays unseen. History pages
+  connections and to users who share a room with them. A guest's
+  connection that creates a new account (passkey registration, sign-up
+  invite, `external`) makes a new user, not linked to the guest: no `old`
+  is sent, the guest departs (offline after a minute's grace) and keeps
+  its messages, and the account arrives with its joins and `user` `new`.
+  A guest's connection that signs in to an existing account departs the
+  same way, and the account shows only through its status, so an
+  invisible one stays unseen. History pages
   carry no `users`: records keep the names they were logged with, and
   listings carry current ones. A `user_id` or `name` requested in `auth` is
   not honored.
@@ -495,6 +509,98 @@ normalized IP; native IPv6 addresses share a /56 bucket. Registered users
 also share the aggregate IP limit. NAT users can therefore limit one another.
 Passkeys do not provide one-person-one-account or prevent Sybil attacks.
 
+## Access modes
+
+`ACCESS` ([configuration](configuration.md#runtime-overrides)) decides who
+may come in by themselves. Invite links (`/invite-code`, `/invite-token`)
+work in every mode, as the way in from outside.
+
+- **`public`** (the default): everything above. Anyone may be a guest or
+  make an account, and sees every room but other people's private rooms.
+- **`lobby`**: newcomers see one room, the **Public Lobby** (`LOBBY_ROOM`,
+  `lobby` by default), and its threads. Admins and mods let them in.
+  - The lobby is made on first start, titled "Public Lobby", and is
+    permanent like `general`. It does not count against the created-room
+    caps. Admins and mods may change its title and description. Members are
+    not joined to it, and join it like any public room.
+  - Guests start in the lobby instead of `general`, and may post, edit and
+    delete their own messages, react and type there and in its threads,
+    under the guests' limits (`GUEST_POSTING` is for `public` only and is
+    refused with another mode). They start no threads or rooms and change
+    none, and add nobody to rooms.
+  - A passkey registered by a guest, or on a new connection, makes a
+    **waiting account**: durable, but it sees only the lobby, posts under
+    the guests' limits, wakes by push only from the lobby, and may not
+    invite bots or be added to other rooms (`denied`). It may set its name,
+    avatar and push registrations, and manage its passkeys and devices.
+    Others see it with the computed role `waiting`; it is never stored or
+    granted and selects no limits. Waiting accounts expire as idle accounts
+    do ([configuration](configuration.md#server-tiers)).
+  - Every other room is answered as one that does not exist
+    (`invalid_params`), the same way private rooms are to non-members:
+    listings, history, lookups, reactions, `reply_to`, moves, typing,
+    joins, commands, `room_update` delivery and push wakes. A request
+    without `room_id` is in the lobby.
+  - `/welcome <user_id>` (admins and mods) lets someone in: the one user
+    the command mentions, else the `user_id` typed after it (a leading `@`
+    is allowed), else the author of the message it replies to, so
+    `/welcome` sent in reply to a guest's introduction welcomes them. A connected guest becomes **welcomed**: it gets `user`
+    `you` with the role `welcomed`, and a `~private` notice ("@<welcomer>
+    welcomed you. Add a passkey to finish joining; until you do, closing
+    this page ends your visit."); adding a passkey on that connection then
+    makes a member, who starts in `general` and keeps the lobby. The mark
+    lives on the connection only. A waiting account is let in at once: it
+    gets `user` `you` without `waiting`, `room_update` `joined` for
+    `general` with its logged membership, `room_update` `updated` with the
+    rooms it now sees and has not joined (as an unfiltered `room_list`'s
+    `not_joined`), and a `~private` notice ("@<welcomer> welcomed you
+    in."). Welcoming a member says so and changes nothing; an unknown or
+    departed user is `invalid_params`. The welcomer gets a `~private`
+    notice.
+  - `/lobby` (admins and mods) says whether the lobby is open;
+    `/lobby close` and `/lobby open` close it or open it again, and do
+    nothing when it already is. Each run is audited. Kept in `_meta`
+    across restarts; if it cannot be read, the lobby counts as closed.
+    While it is closed, new connections get the `server` frame of
+    `private` (below), guest sign-ins are `unsupported` and new accounts
+    `denied` ("The Public Lobby is closed; ask for an invite link");
+    connected guests, welcomed ones included, get a `~private` notice ("The
+    Public Lobby is closed."), a connection error with no `id` ("The Public
+    Lobby is closed. Ask for an invite link.") and close with 1008. Waiting accounts still
+    sign in and see the lobby, and can still be welcomed. Every connection
+    gets a new `server` frame on each change. Reopening makes everything
+    the lobby kept public again, including what members posted while it
+    was closed.
+  - The lobby's members see guests come and go: a guest's join and leave
+    of the lobby are logged membership records, kept in its history.
+  - Messages do not move into or out of the lobby, and a reply in the
+    lobby names only the lobby's messages. A waiting account acts on no
+    role and its bot stays out until it is welcomed; `waiting` and
+    `welcomed` are never given with `/role`.
+  - The `server` frame's `welcome` and `description` come from the lobby's
+    description, not `general`'s, before sign-in and for guests and waiting
+    accounts.
+- **`private`**: only members see anything, and **nobody gets in without an
+  admin's token invite** (`/invite-code` or `/invite-token`). No
+  self-directed scheme makes an account: there are no guests (`guest` is
+  `unsupported`), `signup` is `["token"]`, and a new account's passkey is
+  refused ("This server is invite-only; ask for an invite link") in the
+  client, on the passkey page and `/oauth/authorize`, through `external`,
+  and at `/oauth/token` (`invalid_grant`), even for a passkey or code made
+  before the server became private. Members keep signing in by every
+  scheme. A waiting account left from `lobby` cannot sign in (`denied`,
+  its data kept) until an admin or mod runs `/welcome` on it, which makes
+  it a member in `general`. The `server` frame before
+  sign-in has nothing read from a room: no `description` from `general`, a
+  generic `welcome`, no `ext` (so no emoji catalog). A member who signs in
+  is sent the full frame.
+
+Switching modes needs no migration: from `public` to `lobby` every existing
+account is a member; from `lobby` to `public` a waiting account signs in as
+a member (its mark is kept, and switching back restores it) and the lobby
+stays as an ordinary public room; from `lobby` to `private` waiting accounts
+are refused.
+
 ## Server settings and extensions
 
 The `server` frame carries `title`, `description` and `avatar` (protocol
@@ -522,7 +628,9 @@ Every extension the frame advertises is defined in
   guest while guests only read, `add_members` for an admin, or any
   registered user but a bot while `addmember` is on, and `move_any` for a
   registered user with `admin`, `mod` or `threader`, or an owner's bot with
-  `threader`, who may also add anyone to a thread. It
+  `threader`, who may also add anyone to a thread. Access modes add no
+  key: a guest in the lobby may write there, and a waiting account's is
+  `{}`. It
   is the server's: `me` ignores an `ext.permissions` it writes.
 - `ext:command_list` answers the request of its name with the commands
   `/help` lists, after auth: each form's `name`, `group` (who may use it:

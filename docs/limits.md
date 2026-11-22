@@ -131,6 +131,32 @@ they can only read: writes are `denied` ("Guests can only read here; sign in
 with a passkey to post or join rooms"), and the guest's `you` carries
 `ext.permissions` `{"write": false}`.
 
+### Access modes
+
+A server set to `ACCESS=lobby` or `ACCESS=private`
+([policy](policy.md#access-modes)) refuses more. `server.auth` and
+`server.signup` say what a connection may still do; check them before
+offering a guest or a new account.
+
+| Error | When |
+| --- | --- |
+| `unsupported` "This server is invite-only; ask for an invite link" / "The Public Lobby is closed; ask for an invite link" (`auth` `guest`) | `private`, or a closed lobby: `guest` is not in `server.auth`. |
+| `denied` "This server is invite-only; ask for an invite link" / "The Public Lobby is closed; ask for an invite link" (a new account's passkey `begin` or `finish`, or a code from the passkey page); the passkey page answers 403 | The same: `server.signup` is `["token"]`. Join with an invite link (`/invite-code`) instead. Adding a passkey to an account still works. |
+| `denied` "This server is invite-only; ask for an invite link" (`auth` of a waiting account) | `private`: an account made in the lobby and never let in no longer signs in, until an admin or mod runs `/welcome` on it. |
+| `invalid_grant` at `POST /oauth/token` | `private`, or a closed lobby: a code for a new account is not redeemed. |
+| A `~private` notice "The Public Lobby is closed.", then an error with no `id`, `denied` "The Public Lobby is closed. Ask for an invite link.", then a 1008 close | A guest when an admin or mod closes the lobby. Don't reconnect as a guest: `server.auth` no longer lists `guest`. |
+| `invalid_params` "Unknown room" (or "unknown room", "unknown or expired message") | A guest or waiting account (whose `you` has the role `waiting`) naming a room other than the lobby or its threads, or a message in one: every other room is answered as one that does not exist. |
+| `denied` "Messages cannot be moved into or out of the lobby"; `denied` "reply_to names a message outside the lobby; reply there instead" | A move across the lobby's edge, either way, or a reply in the lobby to a message elsewhere. |
+| `denied` "This bot's owner is waiting to be welcomed in; it signs in once they are" | A bot whose owner is a waiting account, in `lobby` or `private`. |
+| `invalid_params` "The role waiting is the server's own; it is never given" (or `welcomed`) | `/role` with a computed role. |
+| `denied` "Only members start or change rooms and threads here; an admin or mod can welcome you in" | A guest or waiting account creating or editing a room or thread, or adding someone to a room. |
+| `denied` "<user> is waiting in the Public Lobby; /welcome them first" | Adding a waiting account to a room other than the lobby or its threads. |
+| `invalid_params` "Usage: /welcome <user_id>, or /welcome in reply to their message" | `/welcome` with no `user_id`, no single mention, and no `reply_to` naming a message the sender can see. Not a policy violation. |
+| `denied` "/welcome needs one of the roles admin, mod" (or `/lobby`) | `/welcome` or `/lobby` from someone without `admin` or `mod`. |
+
+A guest in the lobby posts under the guests' limits (above), and so does a
+waiting account until it is let in.
+
 ## Requests
 
 ### Posting and other writes
@@ -142,7 +168,7 @@ join or leave that changes nothing is free). Refusals carry `ext.limits`
 
 | Message | Limit |
 | --- | --- |
-| Guest posting limit reached | Guests (when the deployment lets them post): 5 a minute per address |
+| Guest posting limit reached | Guests (when the deployment lets them post, and for name changes with `me` whether or not): 5 a minute per address |
 | Posting limit reached | 20 a minute per account (100 with any role); 120 a minute per address; 600 a minute on the server |
 | Daily posting limit reached | 1,000 a day per account (4,000 with any role); 200 per guest address; 5,000 per address |
 | Daily posting limit reached for the server | 60,000 a day on the server |
@@ -269,7 +295,7 @@ Oversized fields get `too_large`; a frame over the limit closes the socket
 | Message snapshot as stored | 24,576 bytes |
 | JSON depth / values | 8 levels / 2,048 values |
 | Request `id` | 128 bytes |
-| Name | 80 code points and 320 bytes |
+| Name, after cleaning (controls, format and private-use characters dropped, NFKC, spaces folded and trimmed) | 80 code points and 320 bytes |
 | Embeds per message | 4 |
 | A room's `title`, `description` and `ext`, serialized | 8,192 bytes |
 | What every room's past 1,024 bytes adds up to, serialized (a save that would grow its room's share past it; a room within 1,024 bytes is always accepted) | 262,144 bytes |
