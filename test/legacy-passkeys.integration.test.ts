@@ -2,7 +2,7 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebAuthnService } from '../src/auth';
-import { LEGACY_PASSKEYS_REMOVE_AFTER } from '../src/legacy-passkeys';
+import { LEGACY_PASSKEYS_REMOVE_AFTER, signInNotice, SINCE_KEY } from '../src/legacy-passkeys';
 import { loadConfig, type RuntimeConfig } from '../src/config';
 import { connect as open, greeting, request, until, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
@@ -40,13 +40,19 @@ const counters = new WeakMap<Passkey, number>();
 const nextCounter = (passkey: Passkey) => { const next = (counters.get(passkey) ?? 0) + 1; counters.set(passkey, next); return next; };
 const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 
-type Server = { config: RuntimeConfig; webAuthn: WebAuthnService };
+type Server = { config: RuntimeConfig; webAuthn: WebAuthnService; legacySince?: number };
 let kept: RuntimeConfig | undefined;
 
-/** Sets the object's RP IDs, as RP_ID and LEGACY_RP_ID would. */
+/**
+ * Sets the object's RP IDs, as RP_ID and LEGACY_RP_ID would, and makes now
+ * the switch: passkeys made before are the legacy RP ID's (SINCE_KEY), as
+ * after a deploy.
+ */
 async function rpIds(rpId: string, legacyRpId?: string): Promise<void> {
-	await runInDurableObject(stub(), (instance) => {
+	await runInDurableObject(stub(), async (instance, state) => {
 		const server = instance as unknown as Server;
+		await state.storage.put(SINCE_KEY, Date.now());
+		delete server.legacySince;
 		kept ??= server.config;
 		const { legacyRpId: _, ...rest } = server.config;
 		server.config = { ...rest, rpId, ...(legacyRpId ? { legacyRpId } : {}) };
@@ -101,7 +107,7 @@ const finish = async (origin: string, challenge_id: string, credential: unknown)
 };
 
 /** An account made through the passkey page under the old RP ID, as it was before the move; `keep` keeps its connection open. */
-async function legacyAccount(keep = false): Promise<{ passkey: Passkey; userId: string; peer: Peer }> {
+async function legacyAccount(keep = false): Promise<{ passkey: Passkey; userId: string; peer: Peer; token: string }> {
 	const peer = await connect(OLD);
 	try {
 		await greeting(peer);
@@ -114,7 +120,7 @@ async function legacyAccount(keep = false): Promise<{ passkey: Passkey; userId: 
 		const done = await finish(OLD, started.body.challenge_id, await passkey.register(started.body.public_key));
 		expect(done.status).toBe(200);
 		const signedIn = await request(peer, 'finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(app.code(done.body.redirect!)) });
-		return { passkey, userId: signedIn.result.you.user_id, peer };
+		return { passkey, userId: signedIn.result.you.user_id, peer, token: signedIn.result.token };
 	} finally { if (!keep) peer.close(); }
 }
 
@@ -323,4 +329,100 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 		const store = (instance as unknown as { store: { credentials: { idsForUser(userId: string): string[] } } }).store;
 		expect(store.credentials.idsForUser(userId).sort()).toEqual([passkey.id, fresh.id].sort());
 	});
+});
+
+const replace = (body: Record<string, unknown>) => begin(NEW, { page: 'replace', ...body });
+
+/** A sign-in on the replace screen with the old passkey: its answer. */
+async function replaceSignIn(passkey: Passkey) {
+	const begun = await replace({ legacy: true });
+	expect(begun.status).toBe(200);
+	expect(begun.body.public_key.rpId).toBe('localhost');
+	const finished = await post(NEW, '/passkey/finish', { challenge_id: begun.body.challenge_id, credential: await passkey.assert(begun.body.public_key, nextCounter(passkey), { origin: NEW }) });
+	return { status: finished.status, body: await finished.json() as Record<string, any> };
+}
+
+it('replaces a legacy passkey on the replace screen, with no client and no code, and then says the account is set', async () => {
+	const { passkey, userId } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const html = await (await SELF.fetch(`${NEW}/passkey?action=replace`, { headers: { 'CF-Connecting-IP': ip() } })).text();
+	expect(html).toContain('Replace your passkey');
+	expect(html).toContain('data-run="old"');
+
+	const before = await codes();
+	const signedIn = await replaceSignIn(passkey);
+	expect(signedIn).toEqual({ status: 200, body: { state: 'create', account: { user_id: userId, name: 'Ada' }, upgrade: expect.stringMatching(/^up_/) } });
+	// Its token works only on the replace screen.
+	const elsewhere = await loginQuery(NEW);
+	expect((await begin(NEW, { query: elsewhere.query, upgrade: signedIn.body.upgrade })).status).toBe(400);
+	const upgraded = await replace({ upgrade: signedIn.body.upgrade });
+	expect(upgraded.body.public_key.rp.id).toBe('chat.localhost');
+	const fresh = await softPasskey(NEW);
+	expect(await finish(NEW, upgraded.body.challenge_id, await fresh.register(upgraded.body.public_key))).toEqual({ status: 200, body: { added: true } });
+	expect(await passkeysOf(userId)).toEqual([passkey.id, fresh.id].sort());
+	expect(await codes()).toBe(before);
+
+	// Back again with the old passkey: the account is set, and this device may add one too.
+	const again = await replaceSignIn(passkey);
+	expect(again).toEqual({ status: 200, body: { state: 'already', account: { user_id: userId, name: 'Ada' }, added_at: expect.any(String), upgrade: expect.stringMatching(/^up_/) } });
+	expect(Date.parse(again.body.added_at)).toBeGreaterThan(Date.now() - 60_000);
+
+	// A sign-in screen no longer offers the upgrade to this account.
+	const { query } = await loginQuery(NEW);
+	const legacy = await begin(NEW, { query, legacy: true });
+	const done = await finish(NEW, legacy.body.challenge_id, await passkey.assert(legacy.body.public_key, nextCounter(passkey), { origin: NEW }));
+	expect(done).toEqual({ status: 200, body: { redirect: expect.any(String) } });
+});
+
+it('takes only a legacy sign-in or its upgrade on the replace screen, and only with LEGACY_RP_ID', async () => {
+	const refused = { status: 400, body: { error: 'The request was not understood.' } };
+	await rpIds('chat.localhost');
+	expect(await replace({ legacy: true })).toEqual(refused);
+	// Without LEGACY_RP_ID, the replace link is the passkey page's, which needs a client's request.
+	expect((await SELF.fetch(`${NEW}/passkey?action=replace`, { headers: { 'CF-Connecting-IP': ip() } })).status).toBe(400);
+	await rpIds('chat.localhost', 'localhost');
+	expect(await replace({})).toEqual(refused);
+	expect(await replace({ action: 'register', legacy: true })).toEqual(refused);
+	expect((await replace({ upgrade: `up_${'A'.repeat(43)}` })).status).toBe(400);
+});
+
+it('tells an account signing in with only legacy passkeys to replace them, at most once a day, and says so on the sign-in screen', async () => {
+	const { passkey, userId, token } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	// The sign-in screen's welcome links to the replace screen.
+	const guest = await connect(NEW);
+	try {
+		const { server } = await greeting(guest);
+		expect(server.params.welcome).toContain(`[Replace it](${NEW}/passkey?action=replace)`);
+	} finally { guest.close(); }
+
+	// Signing in (here with its session token) brings the notice.
+	const peer = await connect(NEW);
+	try {
+		await greeting(peer);
+		expect((await request(peer, 'resume', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+		const notice = await until(peer, (frame) => frame.method === 'message' && frame.params?.from?.user_id === '~private' && /Replace your passkey/.test(frame.params?.body?.text ?? ''));
+		expect(notice.frame.params.body.text).toBe(`Your passkey was made for localhost, which this server stops accepting after December 22. [Replace your passkey](${NEW}/passkey?action=replace) to keep signing in.`);
+	} finally { peer.close(); }
+
+	const notice = (now = Date.now()) => runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { legacyPort(): import('../src/legacy-passkeys').LegacyPort };
+		return signInNotice(server.legacyPort(), userId, 'localhost', NEW, now);
+	});
+	// Not again today; again tomorrow.
+	expect(await notice()).toBeUndefined();
+	expect(await notice(Date.now() + 86_400_000)).toEqual(expect.stringContaining('Replace your passkey'));
+	// None once the account has a passkey for the new RP ID.
+	const signedIn = await replaceSignIn(passkey);
+	const upgraded = await replace({ upgrade: signedIn.body.upgrade });
+	const fresh = await softPasskey(NEW);
+	expect((await finish(NEW, upgraded.body.challenge_id, await fresh.register(upgraded.body.public_key))).status).toBe(200);
+	expect(await notice(Date.now() + 2 * 86_400_000)).toBeUndefined();
+
+	// Without LEGACY_RP_ID, no welcome line.
+	await rpIds('chat.localhost');
+	const plain = await connect(NEW);
+	try {
+		expect((await greeting(plain)).server.params.welcome).not.toContain('passkey?action=replace');
+	} finally { plain.close(); }
 });

@@ -49,7 +49,7 @@ export function pageHeaders(nonce?: string): Headers {
 	});
 }
 
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
 
@@ -58,7 +58,7 @@ function scriptJson(value: unknown): string {
 	return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
-const STYLE = `
+export const STYLE = `
 :root { color-scheme: light dark; --bg: #f6f6f4; --card: #ffffff; --text: #1d1d1b; --muted: #5f5f5a; --line: #deded8; --accent: #2457c5; --accent-text: #ffffff; --warn: #8a4b00; }
 @media (prefers-color-scheme: dark) { :root { --bg: #161615; --card: #20201f; --text: #ececea; --muted: #a5a59f; --line: #3a3a37; --accent: #7aa2f7; --accent-text: #0f1420; --warn: #f0b35a; } }
 * { box-sizing: border-box; }
@@ -78,23 +78,13 @@ button:disabled { opacity: 0.6; cursor: default; }
 `;
 
 /**
- * The page's script: prepares the screen's ceremony as it shows (so the
- * click that the browser needs goes straight to the passkey prompt), runs
- * it, sends the credential to the server, and goes back to the client with
- * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
- * ceremony instead, begun on its click. Cancel goes back with
- * `error=access_denied`. A sign-in with a passkey no account here has stays
- * on the page, and asks the device to drop that passkey.
+ * What every passkey page script shares: `$`, `status` (the live region),
+ * the option parsers, `credentialJson`, `post` (same origin, JSON, no
+ * cookies) and `busy`.
  */
-const SCRIPT = `
-"use strict";
-const config = JSON.parse(document.getElementById("config").textContent);
+export const PAGE_HELPERS = `
 const $ = (id) => document.getElementById(id);
 const status = (text) => { $("status").textContent = text; };
-const primary = config.start === "login" ? "login" : "register";
-let prepared = null;
-let preparing = null;
-
 const fromB64 = (text) => Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
 const toB64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 function requestOptions(json) {
@@ -126,6 +116,25 @@ async function post(path, body) {
 		return { error: "Could not reach the server. Check your connection and try again." };
 	}
 }
+function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
+`;
+
+/**
+ * The page's script: prepares the screen's ceremony as it shows (so the
+ * click that the browser needs goes straight to the passkey prompt), runs
+ * it, sends the credential to the server, and goes back to the client with
+ * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
+ * ceremony instead, begun on its click. Cancel goes back with
+ * `error=access_denied`. A sign-in with a passkey no account here has stays
+ * on the page, and asks the device to drop that passkey.
+ */
+const SCRIPT = `
+"use strict";
+const config = JSON.parse(document.getElementById("config").textContent);
+${PAGE_HELPERS}
+const primary = config.start === "login" ? "login" : "register";
+let prepared = null;
+let preparing = null;
 
 function prepare(action) {
 	prepared = null;
@@ -149,7 +158,6 @@ function forget(rpId, credentialId) {
 	} catch {}
 }
 
-function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
 
 async function passkey(action) {
 	status("");

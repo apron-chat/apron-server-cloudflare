@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import { beginUpgrade, finishUpgrade, legacyBegin, offerUpgrade, skipUpgrade, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+import { beginUpgrade, finishUpgrade, legacyBegin, NOTICE_KEY_PREFIX, offerUpgrade, REPLACE_PAGE, replaceRequest, replaceSignedIn, signInNotice, SINCE_KEY, skipUpgrade, welcomeLine, LEGACY_PASSKEYS_REMOVE_AFTER, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+import { renderReplacePage } from "./legacy-passkeys-page"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
@@ -942,7 +943,7 @@ interface StoredSignInCode extends AuthorizationRequest {
 /** A ceremony on a sign-in page, from its begin to its finish, with the request it is for. */
 interface StoredPageCeremony {
 	v: 1;
-	page: SignInPage;
+	page: SignInPage | typeof REPLACE_PAGE; // LEGACY_RP_ID: remove after 2026-12-22; keep SignInPage
 	challenge: ChallengeRecord;
 	request: AuthorizationRequest;
 	/** An addition's account, from its `request` handle. */
@@ -2611,6 +2612,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly runtimeEnv: Env;
 	private readonly store: Store;
 	private readonly webAuthn: WebAuthnService;
+	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with `legacySince`. When this object woke, and LegacyPort.since once read. */
+	private readonly wokeMs = nowMs();
+	private legacySince?: number;
 	private mutationTail: Promise<void> = Promise.resolve();
 	/** Where admin commands' `admin_action` audit events go (src/commands/audit.ts): nowhere yet, unless a test captures them. */
 	private audit: AuditSink = noAuditSink;
@@ -3455,7 +3459,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// connection, not an account, so `guest` is listed only in `auth`.
 				signup: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: general ?? this.signInWelcome(origin, endpoint),
+				welcome: this.withLegacyWelcome(general ?? this.signInWelcome(origin, endpoint), endpoint), // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts); keep the argument
 				// What the server is, for lists of servers (§3.1): what admins set
 				// with `/server`, else SERVER_TITLE, SERVER_DESCRIPTION and
 				// SERVER_AVATAR (config.ts), else for the description `general`'s.
@@ -3578,6 +3582,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
 		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
 		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`.`;
+	}
+
+	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). The welcome, with a line linking to the replace screen where this host serves it. */
+	private withLegacyWelcome(welcome: string, endpoint: string | undefined): string {
+		const server = originOfEndpoint(endpoint);
+		return this.config.legacyRpId && server !== undefined && this.pageServes(server) ? `${welcome}\n\n${welcomeLine(this.config.legacyRpId, server)}` : welcome;
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
@@ -4409,6 +4419,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async signInPage(query: URLSearchParams, page: SignInPage, origin: string, nonce: string): Promise<Response> {
 		const refuse = (message: string, title = "This sign-in link doesn't work") =>
 			new Response(renderErrorPage(title, message, nonce), { status: 400, headers: pageHeaders(nonce) });
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts): the replace screen.
+		if (page === "passkey" && query.get("action") === REPLACE_PAGE && this.config.legacyRpId) {
+			const cutoff = new Date(`${LEGACY_PASSKEYS_REMOVE_AFTER}T12:00:00Z`).toLocaleDateString("en-US", { month: "long", day: "numeric", timeZone: "UTC" });
+			const view = { title: this.serverMetadata().title ?? this.config.rpName, host: new URL(origin).host, legacyRpId: this.config.legacyRpId, cutoff };
+			return new Response(renderReplacePage(view, nonce), { headers: pageHeaders(nonce) });
+		}
 		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
 		if (!parsed.ok) return refuse(parsed.error);
 		const value: PasskeyPageRequest = { action: "login", ...parsed.value };
@@ -4441,17 +4457,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Charged as an `auth` attempt.
 	 */
 	private async pageBegin(body: Record<string, unknown>, origin: string, ipKey: string): Promise<Response> {
-		const page = body.page === "authorize" && this.config.externalSignIn ? "authorize" : body.page === "passkey" ? "passkey" : undefined;
-		const query = typeof body.query === "string" && body.query.length <= 8_192 ? new URLSearchParams(body.query) : undefined;
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts): the replace screen, with no client request; then `replace` and its uses go.
+		const replace = body.page === REPLACE_PAGE && this.config.legacyRpId !== undefined;
+		const page = replace ? REPLACE_PAGE : body.page === "authorize" && this.config.externalSignIn ? "authorize" : body.page === "passkey" ? "passkey" : undefined;
+		const query = replace ? new URLSearchParams() : typeof body.query === "string" && body.query.length <= 8_192 ? new URLSearchParams(body.query) : undefined;
 		if (!page || !query) return pageJson(400, { error: "The request was not understood." });
-		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
+		const parsed = replace ? { ok: true as const, value: { action: "login" as const, ...replaceRequest(origin) } }
+			: page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
 		if (!parsed.ok) return pageJson(400, { error: parsed.error });
 		// The passkey page's action is its link's; `/oauth/authorize` lets the person choose.
 		const chosen = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
 		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with `legacy` and `upgrade` below;
 		// then `action` is `chosen` and `value` is `{ ...parsed.value, action }`.
 		const old = legacyBegin(body, this.config.legacyRpId, chosen, (parsed.value as PasskeyPageRequest).request !== undefined);
-		if (old === "refused") return pageJson(400, { error: "The request was not understood." });
+		if (old === "refused" || (replace && old === undefined)) return pageJson(400, { error: "The request was not understood." });
 		const legacy = old !== undefined && "legacy" in old;
 		const upgrade = old !== undefined && "upgrade" in old ? old.upgrade : undefined;
 		const action = upgrade ? "register" : chosen;
@@ -4565,6 +4584,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const answer = await finishUpgrade(this.legacyPort(), ceremony.upgrade, created, origin, { now, ipKey });
 			return pageJson(answer.status, answer.body);
 		}
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). The replace screen issues no code.
+		if (ceremony.page === REPLACE_PAGE) {
+			return pageJson(200, await replaceSignedIn(this.legacyPort(), finished.identity.user_id, { origin, page: ceremony.page, request: ceremony.request }, now));
+		}
 		const record: Omit<StoredSignInCode, "expiresMs"> = {
 			v: 1, page: ceremony.page, action, ...ceremony.request,
 			userId: finished.identity.user_id,
@@ -4605,10 +4628,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 			account: (userId) => {
 				const identity = this.store.accounts.get(userId);
 				if (!identity) return undefined;
-				const passkeys = this.store.credentials.idsForUser(userId);
+				const passkeys = this.store.credentials.passkeys(userId).map(({ credentialId, createdMs }) => ({ credentialId, createdMs }));
 				const mayAddPasskey = identity.userId !== ADMIN_USER_ID && !(identity.roles ?? []).includes("bot") && !isBotId(identity.userId) && passkeys.length < MAX_PASSKEYS_PER_USER;
 				return { name: identity.name || identity.userId, ...(identity.userHandle ? { userHandle: identity.userHandle } : {}), passkeys, mayAddPasskey };
 			},
+			// Recorded on first use as when this object woke: a deploy restarts it, and its
+			// clients sign in again (afterSignIn) before they can make a passkey on it.
+			since: async () => {
+				if (this.legacySince !== undefined) return this.legacySince;
+				try {
+					const stored = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<number>(SINCE_KEY));
+					if (typeof stored === "number") return this.legacySince = stored;
+					const since = this.wokeMs;
+					await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.put(SINCE_KEY, since));
+					return this.legacySince = since;
+				} catch {
+					return undefined;
+				}
+			},
+			noticedDay: (userId) => this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<number>(NOTICE_KEY_PREFIX + userId)),
+			noteNoticed: (userId, day) => this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.put(NOTICE_KEY_PREFIX + userId, day)),
 			put: (key, record) => this.putSignInRecord(key, record),
 			read: (key) => this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredUpgrade>(key)),
 			take: (key) => this.takeSignInRecord<StoredUpgrade>(key),
@@ -6191,6 +6230,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
 		this.sendShownStatus(socket);
+		void this.legacyNotice(socket); // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+	}
+
+	/**
+	 * LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). To an account signing in with only passkeys for the
+	 * legacy RP ID, at most once a day: a `~private` notice linking to the
+	 * replace screen. Best effort: a failure only skips it.
+	 */
+	private async legacyNotice(socket: WebSocketConnection): Promise<void> {
+		const attachment = connectionAttachment(socket);
+		const origin = attachment ? this.passkeyPageOrigin(attachment) : undefined;
+		if (!this.config.legacyRpId || attachment?.tier !== "registered" || !attachment.userId || !origin) return;
+		try {
+			const text = await signInNotice(this.legacyPort(), attachment.userId, this.config.legacyRpId, origin, nowMs());
+			if (text && openSocket(socket)) this.deliverTo(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
+		} catch { /* skipped */ }
 	}
 
 	/**

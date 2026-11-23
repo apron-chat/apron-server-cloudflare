@@ -445,7 +445,12 @@ New passkeys are made for `RP_ID`, and clients' own ceremonies use only
 listed? Use one made for apron.chat" to its sign-in screens: that sign-in
 uses the old RP ID, and before going back to the client the page offers
 "Add a passkey for server.apron.chat", which is added to the account at
-once ("Not now" goes back without it). An account then signs in with either
+once ("Not now" goes back without it). The replace screen,
+`https://server.apron.chat/passkey?action=replace`, does the same with no
+client: sign in with the old passkey, make the new one, or learn the
+account already has one. Accounts with only old passkeys get a private
+notice linking to it when they sign in (at most once a day), and the sign-in
+screen's welcome links to it too. An account then signs in with either
 passkey. The Worker answers `/.well-known/webauthn` on the new RP ID's host,
 so regenerate the edge rules (`npm run budget:generate`), which let it
 through. `SIGNAL_UNKNOWN_PASSKEYS` never signals a legacy passkey, which
