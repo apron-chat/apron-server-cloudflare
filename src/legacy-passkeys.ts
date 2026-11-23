@@ -266,9 +266,9 @@ function cutoffDay(): string {
  * undefined. Accounts without passkeys (bots, invited users) get none.
  */
 export async function signInNotice(port: LegacyPort, userId: string, legacyRpId: string, origin: string, now: number): Promise<string | undefined> {
+	const since = await port.since();
 	const account = port.account(userId);
 	if (!account?.passkeys.length) return undefined;
-	const since = await port.since();
 	if (since === undefined || newPasskeyMs(account, since) !== undefined) return undefined;
 	const day = Math.floor(now / 86_400_000);
 	if (await port.noticedDay(userId) === day) return undefined;

@@ -426,3 +426,41 @@ it('tells an account signing in with only legacy passkeys to replace them, at mo
 		expect((await greeting(plain)).server.params.welcome).not.toContain('passkey?action=replace');
 	} finally { plain.close(); }
 });
+
+it('records the switch on a sign-in by an account with no passkeys, before it can make one', async () => {
+	await rpIds('chat.localhost', 'localhost');
+	// Not yet recorded, as just after a deploy; then the admin, who has no passkeys, signs in.
+	await runInDurableObject(stub(), async (instance, state) => {
+		const server = instance as unknown as Server & { config: RuntimeConfig & { adminToken?: string } };
+		await state.storage.delete(SINCE_KEY);
+		delete server.legacySince;
+		server.config = { ...server.config, adminToken: 'legacy-admin-token-0123456789' };
+	});
+	const peer = await connect(NEW);
+	try {
+		await greeting(peer);
+		expect((await request(peer, 'auth', 'auth', { scheme: 'token', token: 'legacy-admin-token-0123456789' })).result.you.user_id).toBe('admin');
+		await vi.waitFor(async () => expect(await runInDurableObject(stub(), (_instance, state) => state.storage.get<number>(SINCE_KEY))).toEqual(expect.any(Number)));
+	} finally { peer.close(); }
+	// At most when the object woke: before anything this connection could make.
+	const since = await runInDurableObject(stub(), (_instance, state) => state.storage.get<number>(SINCE_KEY));
+	expect(since).toBeLessThanOrEqual(Date.now());
+});
+
+it('makes every new passkey for the new RP ID: in the client, on the passkey page, and as an addition', async () => {
+	await rpIds('chat.localhost', 'localhost');
+	// In a client from RP_ORIGINS.
+	const web = await open({ ip: ip(), origin: 'http://localhost:5173', host: new URL(NEW).host });
+	try {
+		await greeting(web);
+		const begun = await request(web, 'begin', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin', name: 'Grace' });
+		expect(begun.result.public_key.rp.id).toBe('chat.localhost');
+		const login = await request(web, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' });
+		expect(login.result.public_key.rpId).toBe('chat.localhost');
+	} finally { web.close(); }
+	// On the passkey page, for a new account; the legacy RP ID is refused for it.
+	const app = await client(NEW);
+	const query = app.url(`${NEW}/passkey?action=register&name=Grace`).searchParams.toString();
+	expect((await begin(NEW, { query })).body.public_key.rp.id).toBe('chat.localhost');
+	expect((await begin(NEW, { query, legacy: true })).status).toBe(400);
+});

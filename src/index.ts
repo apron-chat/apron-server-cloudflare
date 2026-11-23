@@ -6240,10 +6240,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async legacyNotice(socket: WebSocketConnection): Promise<void> {
 		const attachment = connectionAttachment(socket);
-		const origin = attachment ? this.passkeyPageOrigin(attachment) : undefined;
-		if (!this.config.legacyRpId || attachment?.tier !== "registered" || !attachment.userId || !origin) return;
+		if (!this.config.legacyRpId || attachment?.tier !== "registered" || !attachment.userId) return;
+		const port = this.legacyPort();
 		try {
-			const text = await signInNotice(this.legacyPort(), attachment.userId, this.config.legacyRpId, origin, nowMs());
+			// First, whoever signs in: the switch must be recorded before any passkey made since,
+			// and one can be made only on a connection signed in after the deploy restarted this object.
+			await port.since();
+			const origin = this.passkeyPageOrigin(attachment);
+			if (!origin) return;
+			const text = await signInNotice(port, attachment.userId, this.config.legacyRpId, origin, nowMs());
 			if (text && openSocket(socket)) this.deliverTo(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
 		} catch { /* skipped */ }
 	}
