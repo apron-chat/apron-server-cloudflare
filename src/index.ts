@@ -4422,7 +4422,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts): the replace screen.
 		if (page === "passkey" && query.get("action") === REPLACE_PAGE && this.config.legacyRpId) {
 			const cutoff = new Date(`${LEGACY_PASSKEYS_REMOVE_AFTER}T12:00:00Z`).toLocaleDateString("en-US", { month: "long", day: "numeric", timeZone: "UTC" });
-			const view = { title: this.serverMetadata().title ?? this.config.rpName, host: new URL(origin).host, legacyRpId: this.config.legacyRpId, cutoff };
+			const cutoffShort = new Date(`${LEGACY_PASSKEYS_REMOVE_AFTER}T12:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+			const view = { title: this.serverMetadata().title ?? this.config.rpName, host: new URL(origin).host, legacyRpId: this.config.legacyRpId, cutoff, cutoffShort };
 			return new Response(renderReplacePage(view, nonce), { headers: pageHeaders(nonce) });
 		}
 		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);

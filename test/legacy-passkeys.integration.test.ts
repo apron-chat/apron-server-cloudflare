@@ -279,9 +279,18 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 	const scripts = [...html.matchAll(/<script nonce="[^"]*">(.*?)<\/script>/gs)].map((match) => match[1]);
 	expect(scripts).toHaveLength(2);
 
-	type Element = { hidden: boolean; disabled: boolean; dataset: Record<string, string>; textContent: string; id: string; parentElement?: { children: Element[] }; listeners: (() => void)[]; addEventListener(type: string, listener: () => void): void };
+	type Element = {
+		hidden: boolean; disabled: boolean; dataset: Record<string, string>; textContent: string; className: string; id: string;
+		classList: { contains(name: string): boolean }; parentElement?: { children: Element[] }; listeners: (() => void)[];
+		addEventListener(type: string, listener: () => void): void; querySelector(selector: string): { focus(): void }; focus(): void;
+	};
 	const element = (id = '', dataset: Record<string, string> = {}): Element => {
-		const made: Element = { id, hidden: false, disabled: false, dataset, textContent: '', listeners: [], addEventListener: (_type, listener) => made.listeners.push(listener) };
+		const made: Element = {
+			id, hidden: false, disabled: false, dataset, textContent: '', className: '', listeners: [],
+			classList: { contains: (name) => made.className.split(' ').includes(name) },
+			addEventListener: (_type, listener) => made.listeners.push(listener),
+			querySelector: () => ({ focus: () => {} }), focus: () => {},
+		};
 		return made;
 	};
 	const status = element('status');
@@ -289,7 +298,9 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 	const createButton = element('', { legacy: 'upgrade' });
 	const screen = { ...element('upgrade'), hidden: true };
 	const heading = element();
-	const main = { children: [heading, screen, status] };
+	const brandLine = { ...element(), className: 'brand' };
+	brandLine.classList = { contains: (name) => name === 'brand' };
+	const main = { children: [brandLine, heading, screen, status] };
 	screen.parentElement = main;
 	const document = {
 		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? screen : status,
@@ -320,6 +331,7 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 	await vi.waitFor(() => expect(screen.hidden).toBe(false));
 	expect(heading.hidden).toBe(true);
 	expect(status.hidden).toBe(false);
+	expect(brandLine.hidden).toBe(false);
 	expect(assigned).toEqual([]);
 	createButton.listeners[0]();
 	await vi.waitFor(() => expect(assigned).toHaveLength(1));
@@ -463,4 +475,65 @@ it('makes every new passkey for the new RP ID: in the client, on the passkey pag
 	const query = app.url(`${NEW}/passkey?action=register&name=Grace`).searchParams.toString();
 	expect((await begin(NEW, { query })).body.public_key.rp.id).toBe('chat.localhost');
 	expect((await begin(NEW, { query, legacy: true })).status).toBe(400);
+});
+
+it("runs the replace screen's script: the old passkey, then the new one, then done", async () => {
+	const { passkey, userId } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const html = await (await SELF.fetch(`${NEW}/passkey?action=replace`, { headers: { 'CF-Connecting-IP': ip() } })).text();
+	const scripts = [...html.matchAll(/<script nonce="[^"]*">(.*?)<\/script>/gs)].map((match) => match[1]);
+	expect(scripts).toHaveLength(1);
+	const ids = [...html.matchAll(/<section id="([a-z]+)" data-screen/g)].map((match) => match[1]);
+	expect(ids).toEqual(['start', 'create', 'already', 'full', 'none', 'done', 'later', 'close']);
+
+	type Node = { id: string; hidden: boolean; disabled: boolean; textContent: string; className: string; dataset: Record<string, string>; listeners: (() => void)[]; addEventListener(type: string, listener: () => void): void };
+	const node = (id = '', dataset: Record<string, string> = {}, hidden = false): Node => {
+		const made: Node = { id, hidden, disabled: false, textContent: '', className: '', dataset, listeners: [], addEventListener: (_type, listener) => made.listeners.push(listener) };
+		return made;
+	};
+	const screens = ids.map((id) => node(id, {}, id !== 'start'));
+	const shown = () => screens.filter((screen) => !screen.hidden).map((screen) => screen.id);
+	const status = node('status');
+	const names = [node(), node()];
+	const accounts = [node()];
+	const useOld = node('', { run: 'old' });
+	const create = node('', { run: 'new' });
+	const document = {
+		getElementById: () => status,
+		querySelector: () => ({ focus: () => {} }),
+		querySelectorAll: (selector: string) => ({
+			'[data-screen]': screens, '[data-name]': names, '[data-account]': accounts, '[data-added]': [],
+			'[data-run]': [useOld, create], '[data-show]': [], button: [useOld, create],
+		} as Record<string, Node[]>)[selector] ?? [],
+	};
+	const fresh = await softPasskey(NEW);
+	const PublicKeyCredential = { parseRequestOptionsFromJSON: (json: unknown) => json, parseCreationOptionsFromJSON: (json: unknown) => json };
+	const hints: string[] = [];
+	const navigator = { credentials: {
+		get: async ({ publicKey }: { publicKey: { challenge: string; rpId: string } }) => {
+			hints.push(status.textContent);
+			expect(publicKey.rpId).toBe('localhost');
+			const assertion = await passkey.assert(publicKey, nextCounter(passkey), { origin: NEW });
+			return { id: assertion.id, toJSON: () => assertion };
+		},
+		create: async ({ publicKey }: { publicKey: { challenge: string; rp: { id: string } } }) => {
+			expect(publicKey.rp.id).toBe('chat.localhost');
+			const created = await fresh.register(publicKey);
+			return { id: created.id, toJSON: () => created };
+		},
+	} };
+	const fetch = (path: string, init: { body: string }) => post(NEW, path, JSON.parse(init.body));
+	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', scripts[0])(
+		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: () => { throw new Error('the replace screen goes nowhere'); } },
+	);
+
+	useOld.listeners[0]();
+	await vi.waitFor(() => expect(shown()).toEqual(['create']));
+	expect(hints).toEqual(['In your device’s prompt, choose the passkey for localhost.']);
+	expect(names.map((name) => name.textContent)).toEqual(['Ada', 'Ada']);
+	expect(accounts[0].textContent).toBe(`Ada (@${userId})`);
+	create.listeners[0]();
+	await vi.waitFor(() => expect(shown()).toEqual(['done']));
+	expect(status.textContent).toBe('');
+	expect(await passkeysOf(userId)).toEqual([passkey.id, fresh.id].sort());
 });
