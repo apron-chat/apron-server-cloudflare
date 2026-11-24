@@ -159,9 +159,22 @@ export async function offerUpgrade(port: LegacyPort, userId: string, code: Recor
 }
 
 /**
+ * Of an account's passkeys, those for RP_ID: made since the switch
+ * (`since`), as every passkey made since is; none while `since` is unknown.
+ * Only these go in a new passkey's `excludeCredentials`. The spec matches
+ * that list within the new passkey's RP ID, but a password manager may match
+ * by credential ID alone (Bitwarden does), and then refuses to save a
+ * passkey for RP_ID beside the previous RP ID's one it already holds.
+ */
+export function passkeysForRpId(passkeys: readonly { credentialId: string; createdMs: number }[], since: number | undefined): string[] {
+	return since === undefined ? [] : passkeys.filter((passkey) => passkey.createdMs >= since).map((passkey) => passkey.credentialId);
+}
+
+/**
  * An upgrade's begin, on the page it was offered on: the addition it is
- * (the account, under its user handle then, and the passkeys to exclude),
- * and the key its finish takes; else undefined.
+ * (the account, under its user handle then, and the passkeys to exclude:
+ * only those for RP_ID, `passkeysForRpId`), and the key its finish takes;
+ * else undefined.
  */
 export async function beginUpgrade(port: LegacyPort, token: string, binding: UpgradeBinding, now: number):
 	Promise<{ key: string; userId: string; name: string; userHandle: string; existing: string[] } | undefined> {
@@ -170,7 +183,7 @@ export async function beginUpgrade(port: LegacyPort, token: string, binding: Upg
 	if (record?.v !== 1 || !(record.expiresMs > now) || !sameBinding(record, binding)) return undefined;
 	const account = port.account(record.userId);
 	if (!upgradable(account, record.userHandle)) return undefined;
-	return { key, userId: record.userId, name: account.name, userHandle: record.userHandle, existing: account.passkeys.map((passkey) => passkey.credentialId) };
+	return { key, userId: record.userId, name: account.name, userHandle: record.userHandle, existing: passkeysForRpId(account.passkeys, await port.since()) };
 }
 
 /**

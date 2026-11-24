@@ -434,7 +434,9 @@ each server's `RP_ORIGINS`.
 
 A server can move from one RP ID to another it is under, such as from
 `apron.chat` to `server.apron.chat`, without stranding its passkeys: set the
-previous one as `LEGACY_RP_ID`.
+previous one as `LEGACY_RP_ID`, in the same deploy that changes `RP_ID`. The
+server tells the two kinds apart by when each passkey was made: before or
+after it first ran with `LEGACY_RP_ID`.
 
 ```toml
 [vars]
