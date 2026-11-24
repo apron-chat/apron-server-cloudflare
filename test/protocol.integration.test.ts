@@ -703,8 +703,8 @@ it('with ACTIVITY on, relays typing to room members, throttles per user, and tel
 		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'done typing' } } });
 		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'done typing');
 		const relayed = done.skipped.filter((frame) => frame.method === 'activity');
-		// Ten per minute in total: the first, then nine of the eleven.
-		expect(relayed.map((frame) => frame.params.typing)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+		// Ten per minute in total: the first, then nine more. The stop (0) ending the first's indicator is not counted.
+		expect(relayed.map((frame) => frame.params.typing)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 		const mine = await until(alice, (frame) => frame.id === 'after');
 		const notices = mine.skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private');
 		expect(notices).toHaveLength(1);
@@ -718,6 +718,44 @@ it('with ACTIVITY on, relays typing to room members, throttles per user, and tel
 		// No system notice is logged.
 		expect(entries.some((entry) => entry.from?.user_id?.startsWith('~'))).toBe(false);
 	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.activityEnabled = false; }); }
+});
+
+it('with ACTIVITY on, relays a stop that ends a showing indicator past the typing allowance, once', async () => {
+	await configure((config) => { config.activityEnabled = true; });
+	const alice = await connect();
+	const bob = await connect();
+	try {
+		await authenticate(alice, 'guest', ['activity']);
+		await authenticate(bob, 'guest', ['activity']);
+		// The allowance spent on starts alone.
+		for (let index = 1; index <= 10; index += 1) alice.send({ method: 'activity', params: { room_id: 'general', typing: index } });
+		// Over it: another start is dropped, the stop ending the indicator is relayed, and a second stop has nothing to end.
+		alice.send({ method: 'activity', params: { room_id: 'general', typing: 11 } });
+		alice.send({ method: 'activity', params: { room_id: 'general', typing: 0 } });
+		alice.send({ method: 'activity', params: { room_id: 'general', typing: 0 } });
+		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'stopped' } } });
+		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'stopped');
+		expect(done.skipped.filter((frame) => frame.method === 'activity').map((frame) => frame.params.typing)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0]);
+	} finally { alice.close(); bob.close(); await configure((config) => { config.activityEnabled = false; }); }
+});
+
+it('with ACTIVITY on, counts a stop whose indicator already ran out', async () => {
+	await configure((config) => { config.activityEnabled = true; });
+	const alice = await connect();
+	const bob = await connect();
+	try {
+		await authenticate(alice, 'guest', ['activity']);
+		await authenticate(bob, 'guest', ['activity']);
+		// The allowance spent on one-second indicators, which then run out.
+		for (let index = 0; index < 10; index += 1) alice.send({ method: 'activity', params: { room_id: 'general', typing: 1 } });
+		await until(bob, (frame) => frame.method === 'activity');
+		await new Promise((resolve) => setTimeout(resolve, 1_100));
+		// Nothing shows to end, so the stop counts, and over the allowance it is dropped.
+		alice.send({ method: 'activity', params: { room_id: 'general', typing: 0 } });
+		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'ran out' } } });
+		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'ran out');
+		expect(done.skipped.filter((frame) => frame.method === 'activity').map((frame) => frame.params.typing)).not.toContain(0);
+	} finally { alice.close(); bob.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 
 it('with ACTIVITY on, relays no typing of a user whose status hides that they are connected', async () => {

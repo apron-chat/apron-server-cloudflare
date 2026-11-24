@@ -557,6 +557,10 @@ class MinuteRateLimit {
 }
 
 const RATE_LIMIT_KEYS = 10_000;
+/** A user's typing indicator in a room, as `typingUntil` keys it. */
+function typingKey(userId: string, roomId: string): string {
+	return `${userId}\n${roomId}`;
+}
 const THROTTLE_WINDOW_MS = 60_000;
 /**
  * The system identity for notices to one connection only, never logged
@@ -2753,6 +2757,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * have no connection, whose next announcement may then come sooner.
 	 */
 	private readonly announcedAt = new Map<string, number>();
+	/**
+	 * When each relayed typing indicator runs out, by user and room
+	 * (typingKey), so the stop that ends one is relayed outside the typing
+	 * allowance: at most one free stop per relayed start. In memory, at most
+	 * RATE_LIMIT_KEYS, the least recently started go first; a stop it no
+	 * longer knows of (after a wake) counts as any typing update does.
+	 */
+	private readonly typingUntil = new Map<string, number>();
 	/**
 	 * Users whose last connection's close this object handled (touchPresence)
 	 * and who have not signed in since, most recent last, at most
@@ -5824,7 +5836,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the connection's `status` `idle` (§4.5). At most
 	 * `activityBroadcastsPerUserMinute` relays per user; past that typing is
 	 * dropped and the sender gets one `~private` notice per minute, and a read
-	 * cursor is kept but not relayed.
+	 * cursor is kept but not relayed. A stop (`typing` under 1) that ends the
+	 * user's indicator still showing in the room is not counted (typingUntil):
+	 * a client that ends what it started spends no more than one that lets it
+	 * run out, and an indicator is not left showing for want of allowance.
 	 */
 	private async handleActivity(socket: WebSocketConnection, request: RequestFrame): Promise<void> {
 		const attachment = connectionAttachment(socket);
@@ -5847,13 +5862,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A status that hides being connected (connectedMembers) hides typing too: it would show they are.
 		const choice = (connectionAttachment(socket) ?? attachment).choice;
 		if (this.config.push && (choice === "invisible" || choice === "")) return;
+		const seconds = Math.min(Math.floor(typing), this.config.limits.activityMaxTypingSeconds);
+		const key = typingKey(identity.user_id, roomId);
+		const ending = seconds === 0 && (this.typingUntil.get(key) ?? 0) > now;
 		const limit = this.config.limits.activityBroadcastsPerUserMinute;
-		if (!this.takeThrottle(socket, identity.user_id, "activity", limit, now)) {
+		if (!ending && !this.takeThrottle(socket, identity.user_id, "activity", limit, now)) {
 			this.noticeThrottled(socket, identity.user_id, "activity", roomId, now,
 				`Typing updates are limited to ${limit} per minute, so others may not see you typing for a moment.`);
 			return;
 		}
-		const seconds = Math.min(Math.floor(typing), this.config.limits.activityMaxTypingSeconds);
+		this.typingUntil.delete(key);
+		if (seconds > 0) {
+			this.typingUntil.set(key, now + seconds * 1_000);
+			if (this.typingUntil.size > RATE_LIMIT_KEYS) this.typingUntil.delete(this.typingUntil.keys().next().value!);
+		}
 		const frame = { method: "activity", params: { room_id: roomId, from: identity, typing: seconds } };
 		this.deliver(frame, [roomId], undefined, socket);
 	}
@@ -9706,6 +9728,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.announcedAt.delete(from);
 		if (announced !== undefined) this.noteAnnounced(to, announced);
 		if (this.departed.delete(from)) this.departed.add(to);
+		for (const [key, until] of [...this.typingUntil]) {
+			if (!key.startsWith(typingKey(from, ""))) continue;
+			this.typingUntil.delete(key);
+			this.typingUntil.set(typingKey(to, key.slice(typingKey(from, "").length)), until);
+		}
 		for (const ws of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(ws as WebSocketConnection);
 			if (!state?.owed?.some(([id]) => id === from)) continue;
