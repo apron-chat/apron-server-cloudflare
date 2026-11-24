@@ -61,8 +61,10 @@ it("creates a private room for a registered user only: top-level, untitled unles
 		const named = create(store, clock, "ada", { title: "Plans", description: "Who brings what" });
 		expect(store.rooms.get(named)).toMatchObject({ private: true, title: "Plans", description: "Who brings what" });
 		const saved = store.messages.mutate(op(clock, "ada", "room_set", { room_id: named, private: false }));
-		expect(saved.room).toMatchObject({ room_id: named, private: true });
-		expect(saved.room).not.toHaveProperty("title");
+		expect(saved.room).toMatchObject({ room_id: named, private: true, title: "Plans" });
+		const untitled = store.messages.mutate(op(clock, "ada", "room_set", { room_id: named, title: "" }));
+		expect(untitled.room).toMatchObject({ room_id: named, private: true, description: "Who brings what" });
+		expect(untitled.room).not.toHaveProperty("title");
 		// Guests have no private rooms, and none is a thread or has one.
 		expect(errorCode(() => store.messages.mutate(op(clock, "guest_1", "room_set", { private: true })))).toBe("denied");
 		expect(errorCode(() => store.messages.mutate(op(clock, "ada", "room_set", { private: true, parent_room_id: "general" })))).toBe("denied");

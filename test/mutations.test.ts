@@ -331,7 +331,7 @@ it("keeps an unchanged reply reference editable after its target expires", async
 	});
 });
 
-it("creates only thread rooms and replaces their client fields on save", async () => {
+it("creates only thread rooms and merges into their client fields on save", async () => {
 	await withStore("rooms", (store, clock) => {
 		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "top", "room_set", { title: "Top level" })))).toBe("denied");
 		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "orphan", "room_set", { parent_room_id: "missing", title: "x" })))).toBe("invalid_params");
@@ -357,26 +357,29 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		});
 		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
 
-		// Any participant may save a thread's metadata; omitted fields are
-		// cleared but `ext`, which merges (§4.13), the server supplies a title,
-		// and parent_room_id and private are fixed.
+		// Any participant may save a thread's metadata. A save merges (§4.2.4):
+		// omitted fields keep their values, `ext` merges (§4.13), and
+		// parent_room_id and private are fixed.
 		const saved = store.messages.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
 		expect(saved.result).toEqual({ room_id: roomId });
 		expect(saved.created).toBe(false);
-		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Thread" });
-		expect(saved.room?.description).toBeUndefined();
+		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(saved.room).not.toHaveProperty("private");
 		expect(saved.room?.ext).toEqual({ demo: { color: "blue" } });
 		expect(Number(saved.room?.log_id)).toBeGreaterThan(Number(roomId));
 		expect(saved.room?.latest_log_id).toBe(saved.room?.log_id);
 		expect(saved.room?.history_log_id).toBe(roomId);
+		// Empty fields clear them, and the server supplies a title.
+		const cleared = store.messages.mutate(op(clock, "alice", "clear", "room_set", { room_id: roomId, title: "", description: "" }));
+		expect(cleared.room).toMatchObject({ room_id: roomId, title: "Thread", ext: { demo: { color: "blue" } } });
+		expect(cleared.room?.description).toBeUndefined();
 
 		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "general", "room_set", { room_id: "general", title: "Renamed" })))).toBe("denied");
 		expect(errorCode(() => store.messages.mutate(op(clock, "alice", "unknown", "room_set", { room_id: "404", title: "x" })))).toBe("invalid_params");
 
 		// Room records are logged in their own room.
 		const history = sqliteOf(store).historyLog.historyPage({ roomId, after: "0", limit: 50, now: clock.value });
-		expect(history.rooms?.map((room) => room.log_id)).toEqual([roomId, saved.room?.log_id]);
+		expect(history.rooms?.map((room) => room.log_id)).toEqual([roomId, saved.room?.log_id, cleared.room?.log_id]);
 		expect(history.rooms?.[0]).toMatchObject({ title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(history.messages).toBeUndefined();
 		expect(store.rooms.list().map((room) => room.room_id)).toEqual(["general", roomId]);

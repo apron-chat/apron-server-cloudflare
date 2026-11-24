@@ -4402,8 +4402,14 @@ export class SqliteStore {
     // description is no description.
     const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
     const fallbackTitle = isPrivate ? undefined : existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
-    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle;
-    const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
+    // A save merges into the room's client fields (§4.2.4): a field it leaves
+    // out keeps its value, and an empty one clears it.
+    const stored = existing ? parseJson<Record<string, unknown>>(existing.fields_json, {}) : {};
+    const keptTitle = existing && titleParam === undefined && typeof stored.title === "string" ? stored.title : undefined;
+    const title = keptTitle ?? (typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle);
+    const description = existing && descriptionParam === undefined
+      ? (typeof stored.description === "string" ? stored.description : undefined)
+      : typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
     // `ext` merges into the room's current one (§4.13, §4.2.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
       const ext = mergeExt(stored, write);
@@ -4481,7 +4487,7 @@ export class SqliteStore {
       this.checkRoomFields(fields);
       this.checkRoomFieldsTotal(fields, existing);
       logId = this.allocateLogId(context);
-      // A save replaces the client fields; the creator stays.
+      // A save merges into the client fields; the creator stays.
       const creator = storedCreator(existing.fields_json);
       const fieldsJson = JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator });
       this.rawExec(

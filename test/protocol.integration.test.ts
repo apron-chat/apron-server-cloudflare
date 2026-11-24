@@ -590,9 +590,8 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		const renamedReply = await until(bob, (frame) => frame.id === 'rename');
 		expect(renamedReply.frame.result).toEqual({ room_id: roomId });
 		const renamed = renamedReply.skipped.find((frame) => frame.method === 'room_update')!.params.updated[0];
-		// A save replaces every client field: the description is gone.
-		expect(renamed).toMatchObject({ room_id: roomId, parent_room_id: 'general', title: 'Deploys' });
-		expect(renamed.description).toBeUndefined();
+		// A save merges into the client fields (§4.2.4): the description stays.
+		expect(renamed).toMatchObject({ room_id: roomId, parent_room_id: 'general', title: 'Deploys', description: 'Why the *4pm* deploy failed' });
 		expect((await until(alice, (frame) => frame.method === 'room_update')).frame.params).toEqual({ updated: [renamed] });
 
 		// Now a member, Bob receives the thread's messages.

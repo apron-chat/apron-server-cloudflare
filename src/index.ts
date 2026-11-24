@@ -5528,7 +5528,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `room_set` (§4.2.4): creates a thread under a top-level room, or for an
-	 * admin or mod a top-level room, which joins its creator, or replaces a
+	 * admin or mod a top-level room, which joins its creator, or merges into a
 	 * room's client fields (Store.commitRoom has who may). Creating sends the
 	 * creator's connections `room_update` `joined` with the room's members,
 	 * then a registered creator's logged membership, and the parent's other
