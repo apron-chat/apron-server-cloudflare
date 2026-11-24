@@ -1485,7 +1485,8 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		// account, no token, and the use given back for the retry.
 		const retried = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-retry', '/invite-code 1')).notice!.params.body.text)![0];
 		const tokens = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'invite-token:' })).size);
-		const [identitiesBefore, tokensBefore] = [await identities(), await tokens()];
+		const pointers = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'invite:' })).size);
+		const [identitiesBefore, tokensBefore, pointersBefore] = [await identities(), await tokens(), await pointers()];
 		await runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Record<'becomeRegistered', (...args: unknown[]) => unknown>;
 			const original = runtime.becomeRegistered;
@@ -1499,6 +1500,7 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		expect((await request(failing, 'join', 'auth', { scheme: 'token', token: retried, name: 'Retry' })).error.message).toBe('That account changed; try again');
 		expect(await identities()).toBe(identitiesBefore);
 		expect(await tokens()).toBe(tokensBefore);
+		expect(await pointers()).toBe(pointersBefore);
 		// The guest connection still gets what is sent to general.
 		await request(ada, 'post-to-guest', 'message', { room_id: 'general', body: { text: 'still there?' } });
 		await until(failing, (frame) => frame.method === 'message' && frame.params?.body?.text === 'still there?');

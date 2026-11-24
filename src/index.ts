@@ -4896,7 +4896,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const ownKey = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(own);
 			// A connection gone before the sign-in leaves the token unspent.
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-			await this.store.meter.foreground({ writes: 3 }, async () => {
+			// Six writes: the spend's three, and the three that put it back if the
+			// sign-in then fails, so that restore needs no reservation of its own.
+			await this.store.meter.foreground({ writes: 6 }, async () => {
 				// No await between them, so they commit together: the one-time
 				// token never outlives the pointer moving off it.
 				const spent = this.ctx.storage.delete(key);
@@ -4915,15 +4917,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// `/purge`, `/rename` or `/invite-reset` waiting on it acts on
 				// what this restores. Once signed in, the reply is sent with the
 				// user's own token; a reply lost after that spends the token.
+				// Its writes were reserved with the spend's; a failure is logged, so
+				// the sign-in's own error is the one the client sees.
 				if (connectionAttachment(socket)?.credential !== ownKey) {
-					await this.store.meter.foreground({ writes: 3 }, async () => {
+					try {
 						const dropped = this.ctx.storage.delete(ownKey);
 						const restored = this.ctx.storage.put({
 							[key]: stored,
 							[INVITE_KEY_PREFIX + identity.userId]: { v: 1, tokenKey: key, expiresMs: stored.expiresMs } satisfies StoredInvitePointer,
 						});
 						await Promise.all([dropped, restored]);
-					});
+					} catch (error) {
+						console.warn(JSON.stringify({ event: "reset_token_restore_failed", reason: errorToProtocol(error).message }));
+					}
 				}
 			}
 		});
@@ -5114,11 +5120,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the account frees never comes with a live token, and the use given back
 	 * in the same commit; then the account; and the connection, still a
 	 * guest, gets what was held for it. A failure here is logged, not
-	 * thrown, so the sign-in's own error is the one the client sees; it
-	 * leaves at worst the account without a token, as before.
+	 * thrown, so the sign-in's own error is the one the client sees. If the
+	 * first step is refused (an exhausted budget), nothing is undone: the
+	 * account stays with a token nobody received and the use stays spent,
+	 * as before undoing existed, until an admin /purges it; if the purge
+	 * fails, the account stays without a token.
 	 */
 	private async undoSignUp(socket: WebSocketConnection, userId: string, inviteKey: string, ownKey: string): Promise<void> {
 		this.releaseDeliveries(socket);
+		// None should be signed in as the account, but none may stay if one is.
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (state) this.closePolicy(peer, state, 1008, "Sign-up undone");
+		}
 		try {
 			await this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 				const invite = await this.ctx.storage.get<StoredJoinInvite>(inviteKey);
