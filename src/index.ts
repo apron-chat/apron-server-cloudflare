@@ -2756,7 +2756,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (typingKey), so the stop that ends one is relayed outside the typing
 	 * allowance: at most one free stop per relayed start. In memory, at most
 	 * RATE_LIMIT_KEYS, the least recently started go first; a stop it no
-	 * longer knows of (a wake, a rename) counts as any typing update does.
+	 * longer knows of (after a wake) counts as any typing update does.
 	 */
 	private readonly typingUntil = new Map<string, number>();
 	/**
@@ -9623,6 +9623,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.announcedAt.delete(from);
 		if (announced !== undefined) this.noteAnnounced(to, announced);
 		if (this.departed.delete(from)) this.departed.add(to);
+		for (const [key, until] of [...this.typingUntil]) {
+			if (!key.startsWith(typingKey(from, ""))) continue;
+			this.typingUntil.delete(key);
+			this.typingUntil.set(typingKey(to, key.slice(typingKey(from, "").length)), until);
+		}
 		for (const ws of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(ws as WebSocketConnection);
 			if (!state?.owed?.some(([id]) => id === from)) continue;

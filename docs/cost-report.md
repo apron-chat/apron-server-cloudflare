@@ -477,13 +477,15 @@ is one frame plus its mutation.
 `activity` (typing) is on in the Paid plan and off in Free; `ACTIVITY`
 overrides it ([configuration](configuration.md#runtime-overrides)). The web
 client sends a typing update when typing starts and every 12 seconds while it
-continues, letting a pause run the 15-second indicator out, and a stop only
-when the draft is emptied or typing moves to another room (a sent message
-ends it without one): about 5 frames, or 12 reserved writes, per typing
+continues, letting a pause run the 15-second indicator out, and a stop when
+the draft is emptied, typing moves to another room, or a message waits
+(for files, a join or link previews) before it goes; a message sent at once
+ends it without one: about 5 frames, or 12 reserved writes, per typing
 minute. Read-cursor updates cost the same per frame, plus their own
 writes ([Read cursors](#read-cursors)). The per-user relay limit (10 a
-minute) and the frame limits (60 per connection and 120 per IP a minute)
-bound a single sender.
+minute, and at most as many uncounted stops, each ending a relayed start's
+indicator, so at most 20 relays) and the frame limits (60 per connection and
+120 per IP a minute) bound a single sender.
 
 A throttled sender's `~private` notice is sent to that connection only, at
 most once per user per minute, and needs no SQL. `room_list` reuses the

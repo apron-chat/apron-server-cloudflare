@@ -739,6 +739,25 @@ it('with ACTIVITY on, relays a stop that ends a showing indicator past the typin
 	} finally { alice.close(); bob.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 
+it('with ACTIVITY on, counts a stop whose indicator already ran out', async () => {
+	await configure((config) => { config.activityEnabled = true; });
+	const alice = await connect();
+	const bob = await connect();
+	try {
+		await authenticate(alice, 'guest', ['activity']);
+		await authenticate(bob, 'guest', ['activity']);
+		// The allowance spent on one-second indicators, which then run out.
+		for (let index = 0; index < 10; index += 1) alice.send({ method: 'activity', params: { room_id: 'general', typing: 1 } });
+		await until(bob, (frame) => frame.method === 'activity');
+		await new Promise((resolve) => setTimeout(resolve, 1_100));
+		// Nothing shows to end, so the stop counts, and over the allowance it is dropped.
+		alice.send({ method: 'activity', params: { room_id: 'general', typing: 0 } });
+		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'ran out' } } });
+		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'ran out');
+		expect(done.skipped.filter((frame) => frame.method === 'activity').map((frame) => frame.params.typing)).not.toContain(0);
+	} finally { alice.close(); bob.close(); await configure((config) => { config.activityEnabled = false; }); }
+});
+
 it('with ACTIVITY on, relays no typing of a user whose status hides that they are connected', async () => {
 	await configure((config) => { config.activityEnabled = true; });
 	const alice = await connect();

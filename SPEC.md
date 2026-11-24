@@ -241,7 +241,7 @@ Some message types have their own per-user rate, counted across the user's conne
 
 | Type | Default per user per minute | Over the limit |
 | --- | ---: | --- |
-| `activity` (relayed typing) | 10 | Dropped. The sender's connection gets one `~private` notice per window ([PROTOCOL.md Appendix A.1](https://github.com/shazow/apron/blob/main/PROTOCOL.md#a1-system-identities-and-scoped-notices)) saying typing is limited. A stop (`typing: 0`) that ends the user's indicator still showing in that room is not counted, so one can always end what was relayed; this is kept in memory, and a stop it no longer knows of (after a wake or a rename) counts |
+| `activity` (relayed typing) | 10 | Dropped. The sender's connection gets one `~private` notice per window ([PROTOCOL.md Appendix A.1](https://github.com/shazow/apron/blob/main/PROTOCOL.md#a1-system-identities-and-scoped-notices)) saying typing is limited. A stop (`typing: 0`) that ends the user's indicator still showing in that room is not counted, so one can always end what was relayed; this is kept in memory, and a stop it no longer knows of (after a wake) counts |
 | `room_list` | 6 | `retry_after` with the seconds until the oldest counted listing leaves the window. The first `filter: "joined"` listing after each authentication is not counted: it is how a client learns its rooms |
 | `push_register` (with push) | 10 (`registersPerUserMinute`) | `retry_after`, as for `room_list`; refused registrations count too. Counted on the object per user, so reconnecting does not reset it |
 | `status` `mute` and `me` `status` changes (with push) | 6 (`mutesPerUserMinute`), the two together | `retry_after`, and nothing in the request changes (section 4.4). Counted on the object per user |
