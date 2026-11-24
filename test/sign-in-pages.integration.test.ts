@@ -782,6 +782,7 @@ it('asks the device to drop the passkey it just used, only when the page says no
 		const document = {
 			getElementById: (id: string) => id === 'config' ? { textContent: config } : status,
 			querySelectorAll: (selector: string) => selector === '[data-cancel]' ? [] : [button],
+			querySelector: (selector: string) => selector === '[data-passkey=""]' ? button : null,
 		};
 		const signals: unknown[] = [];
 		const PublicKeyCredential = {

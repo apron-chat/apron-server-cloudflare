@@ -27,7 +27,7 @@ type Runtime = {
 	backupStore(): BackupStore;
 	archiveHeader(): { server: string; media: string[] };
 	writeBackup(backups: BackupStore, kind: "manual"): Promise<BackupResult>;
-	config: { rpId: string; backups: BackupSettings };
+	config: { serverHost: string; backups: BackupSettings };
 	exportRecords(records: ChatRecord[]): Promise<PublicRecord[]>;
 };
 
@@ -79,7 +79,7 @@ export async function exportFrom(name: string, keep: string, options: { maxMembe
 		const runtime = instance as unknown as Runtime;
 		if (options.maxMembers === undefined) return runtime.writeBackup(runtime.backupStore(), "manual");
 		return writeBackup(runtime.archiveChain(), runtime.store.history.export(), runtime.backupStore(), runtime.config.backups, "manual", {
-			server: runtime.config.rpId, clock: { now: Date.now }, header: runtime.archiveHeader(), prepare: (records) => runtime.exportRecords(records), maxMembers: options.maxMembers,
+			server: runtime.config.serverHost, clock: { now: Date.now }, header: runtime.archiveHeader(), prepare: (records) => runtime.exportRecords(records), maxMembers: options.maxMembers,
 		});
 	});
 	options.report?.(result);

@@ -933,7 +933,8 @@ and whether the chain's invariants hold.
 
 **The cold tier** keeps the oldest history in R2 as chunks of the whole
 log, about 10,000 log IDs each (every room's records over that stretch),
-under `history/<RP_ID>/` (so servers may share a bucket), each a complete
+under `history/<host>/`, the server's own host (`PUBLIC_ORIGIN`'s, else
+`RP_ID`), so servers may share a bucket, each a complete
 ARCHIVE.md v1 file, gzip-encoded through the same codec chain as backups,
 with one small row a chunk in the object's SQLite (`history_chunks`: its
 bounds, size, and the rooms it holds). It serves every history page,
@@ -966,7 +967,11 @@ them, checked when the Worker starts:
 | `BACKUP_KEEP`: how many backup files of each kind are kept, newest first | `14` | `"14"` | `"14"` |
 | `BACKUP_PRIVATE_ROOMS`: whether private rooms are backed up | `true` | `"true"` | `"true"` |
 
-Each backup's key is `backups/<RP_ID>-<kind>-<date>.jsonl.gz`, the kind
+Each backup's key is `backups/<host>-<kind>-<date>.jsonl.gz` (`<host>` as
+for the cold tier. Earlier versions used `RP_ID`, so a server whose
+`PUBLIC_ORIGIN` host differs from its `RP_ID` stops pruning its earlier
+backups, `backups/<RP_ID>-…`, once it runs this version; delete those by
+hand once `BACKUP_KEEP` new ones exist), the kind
 `scheduled` or `manual`, with the codecs it went through recorded in its
 metadata (`codecs: gzip`); after writing one, the backups of its kind past
 the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
@@ -1225,7 +1230,8 @@ implementation and recalibrating its resource model.
 
 | Variable | Meaning |
 | --- | --- |
-| `RP_ID` | Explicit passkey relying-party hostname: the server's host or a domain it is under (clients check this); local default `localhost`. On the host that is `RP_ID`, the Worker answers `GET /.well-known/webauthn` with `{"origins": RP_ORIGINS}`; with a parent-domain `RP_ID`, or a Worker not on its host, nothing serves that file, so serve it there yourself |
+| `RP_ID` | Explicit passkey relying-party hostname: the server's host or a domain it is under (clients check this); local default `localhost`. Prefer the server's own host, which nothing else can make passkeys for. On the host that is `RP_ID`, the Worker answers `GET /.well-known/webauthn` with `{"origins": RP_ORIGINS}`; with a parent-domain `RP_ID`, or a Worker not on its host, nothing serves that file, so serve it there yourself |
+| `LEGACY_RP_ID` | Unset by default. A previous RP ID that `RP_ID` is under, such as `apron.chat` for `RP_ID = "server.apron.chat"`, whose passkeys keep working: the passkey page's "Continue with passkey" finds a passkey for either RP ID without asking which, and after a sign-in with an old one offers to save one for `RP_ID`, added to the account at once. Only the passkey page takes it, for sign-ins only; clients' own ceremonies and every new passkey use `RP_ID`. Needs `PASSKEY_PAGE` ([guide](guide.md#moving-rp_id)) |
 | `RP_ORIGINS` | Comma-separated exact WebAuthn origins; defaults to `ALLOWED_ORIGINS` and must be a subset of it, but is required explicitly with wildcard guest admission; never accepts wildcards. An origin outside `RP_ID` (such as `https://web.apron.chat` with `RP_ID=apron.shazow.net`) is a [related origin](https://www.w3.org/TR/webauthn-3/#sctn-related-origins): browsers allow it only where `https://<RP_ID>/.well-known/webauthn` lists it, which the Worker serves when it is on `RP_ID`'s host; otherwise serve that file there yourself. Startup checks only that each origin is exact and in `ALLOWED_ORIGINS`, not that it sits under `RP_ID`, so a mistyped origin fails only in the browser, as a refused passkey. Browsers without related origins refuse passkeys on such a frontend, whose users then sign in another way ([guide](guide.md#passkeys-on-your-own-server)) |
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts, default `Apron Demo`; WebAuthn only, never the `server` frame's `title` |

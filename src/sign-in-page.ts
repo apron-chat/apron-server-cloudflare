@@ -8,6 +8,7 @@
  * back to the client with its code; the device's passkey sheet has already
  * shown which account it is.
  */
+import { legacyPageParts } from "./legacy-passkeys-page";
 import { PAGE_BEGIN_PATH, PAGE_FINISH_PATH, type SignInPage } from "./oauth";
 
 /** What a sign-in page shows: everything is text, escaped here. */
@@ -27,6 +28,8 @@ export interface SignInPageView {
 	recognised: boolean;
 	/** The account an addition adds to. */
 	account?: { userId: string; name: string };
+	/** On a sign-in screen, a previous RP ID (`LEGACY_RP_ID`) whose passkeys it also finds (src/legacy-passkeys-page.ts). */
+	legacyRpId?: string;
 	/** The page's own query, which its script sends back with begin. */
 	query: string;
 	/** Where Cancel goes: the redirect with `error=access_denied`. */
@@ -46,7 +49,7 @@ export function pageHeaders(nonce?: string): Headers {
 	});
 }
 
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
 
@@ -55,43 +58,92 @@ function scriptJson(value: unknown): string {
 	return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
-const STYLE = `
-:root { color-scheme: light dark; --bg: #f6f6f4; --card: #ffffff; --text: #1d1d1b; --muted: #5f5f5a; --line: #deded8; --accent: #2457c5; --accent-text: #ffffff; --warn: #8a4b00; }
-@media (prefers-color-scheme: dark) { :root { --bg: #161615; --card: #20201f; --text: #ececea; --muted: #a5a59f; --line: #3a3a37; --accent: #7aa2f7; --accent-text: #0f1420; --warn: #f0b35a; } }
+export const STYLE = `
+:root { color-scheme: light dark; --bg: #faf8f4; --chip: #ffffff; --text: #161a23; --muted: #5b6170; --line: #dfd9cf; --accent: #a63d17; --on-accent: #ffffff; --ok: #2d6a45; --err: #a3261b; --warn: #8a4b00; --focus: #161a23; }
+@media (prefers-color-scheme: dark) { :root { --bg: #121316; --chip: #1c1e23; --text: #eceae6; --muted: #a5a6ac; --line: #34363d; --accent: #ec8a5f; --on-accent: #1a0c05; --ok: #86cf9e; --err: #f4907f; --warn: #f0b35a; --focus: #eceae6; } }
 * { box-sizing: border-box; }
-body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-main { width: 100%; max-width: 28rem; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
-h1 { font-size: 1.25rem; margin: 0 0 16px; }
+[hidden] { display: none !important; }
+body { margin: 0; min-height: 100vh; padding: clamp(24px, 10vh, 72px) 16px 32px; background: var(--bg); color: var(--text); font: 17px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 26rem; margin: 0 auto; }
+.brand { display: flex; align-items: center; gap: 8px; margin: 0 0 32px; font-size: 0.875rem; color: var(--muted); }
+.brand b { color: var(--text); }
+.mark { width: 24px; height: 24px; flex: none; }
+.mark rect { fill: var(--accent); }
+.mark path { fill: var(--bg); }
+h1 { font-size: 1.875rem; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 12px; }
+h1:focus { outline: none; }
 p { margin: 0 0 12px; }
 .muted { color: var(--muted); font-size: 0.9375rem; }
 .warn { color: var(--warn); font-size: 0.9375rem; }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
-button { font: inherit; border-radius: 8px; padding: 8px 16px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
-button.link { border: 0; padding: 0; background: none; color: var(--accent); text-decoration: underline; }
+.i { width: 22px; height: 22px; }
+.keys { margin: 24px 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; justify-items: center; }
+.keys > .i { width: 18px; height: 18px; color: var(--muted); }
+.key { width: 100%; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--chip); font-size: 0.9375rem; line-height: 1.3; overflow-wrap: anywhere; }
+.key > .i { flex: none; color: var(--muted); }
+.key small { display: block; color: var(--muted); font-size: 0.8125rem; }
+.key em { margin-left: auto; font-style: normal; font-size: 0.75rem; font-weight: 600; color: var(--muted); white-space: nowrap; }
+.key.pick { border: 2px solid var(--accent); padding: 11px 13px; }
+.key.pick > .i, .key.pick em { color: var(--accent); }
+.key.next { border-style: dashed; background: none; }
+.key.past { opacity: 0.6; }
+.key.gone { border-style: dashed; background: none; color: var(--muted); }
+.key.ok em, .key.ok > .i { color: var(--ok); }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
+button { font: inherit; font-size: 1rem; font-weight: 600; border-radius: 999px; padding: 12px 22px; min-height: 48px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.link { border: 0; padding: 0; min-height: 0; border-radius: 0; font-size: inherit; font-weight: 500; background: none; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+button:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
 button:disabled { opacity: 0.6; cursor: default; }
-#status:empty { display: none; }
-#status, .switch { margin-top: 16px; }
+.status { margin: 20px 0 0; font-size: 0.9375rem; color: var(--err); font-weight: 600; }
+.status.hint { color: var(--muted); font-weight: 400; }
+.status:empty { display: none; }
+.switch { margin: 24px 0 0; }
+code { font-size: 0.9em; }
+@media (max-width: 30rem) { h1 { font-size: 1.625rem; } .actions button { flex: 1 1 100%; } }
 `;
 
-/**
- * The page's script: prepares the screen's ceremony as it shows (so the
- * click that the browser needs goes straight to the passkey prompt), runs
- * it, sends the credential to the server, and goes back to the client with
- * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
- * ceremony instead, begun on its click. Cancel goes back with
- * `error=access_denied`. A sign-in with a passkey no account here has stays
- * on the page, and asks the device to drop that passkey.
- */
-const SCRIPT = `
-"use strict";
-const config = JSON.parse(document.getElementById("config").textContent);
-const $ = (id) => document.getElementById(id);
-const status = (text) => { $("status").textContent = text; };
-const primary = config.start === "login" ? "login" : "register";
-let prepared = null;
-let preparing = null;
+/** The icons the pages draw: inline SVG, which the page's CSP allows (no image requests). */
+const ICONS = {
+	key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 20 3m-3 3 2.5 2.5M14.5 8.5l2 2"/>',
+	check: '<circle cx="12" cy="12" r="9"/><path d="m8 12.4 2.8 2.8L16 10"/>',
+	search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4M8.8 11h4.4"/>',
+	app: '<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 8h18M8 21h8"/>',
+	down: '<path d="M12 5v14m-5-5 5 5 5-5"/>',
+} as const;
 
+export function icon(name: keyof typeof ICONS): string {
+	return `<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+/** The line at the top of every page: the server's mark, its title and its host (both already escaped). */
+export function brand(title: string, host: string): string {
+	return `<header class="brand"><svg class="mark" viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="8"/><path d="M8.5 8h11a2.5 2.5 0 0 1 2.5 2.5v6a2.5 2.5 0 0 1-2.5 2.5H14l-4.5 3.5V19h-1A2.5 2.5 0 0 1 6 16.5v-6A2.5 2.5 0 0 1 8.5 8z"/></svg><span><b>${title}</b> ${host}</span></header>`;
+}
+
+/**
+ * A chip as the device's passkey sheet lists a passkey or a client: an
+ * icon, a name, a note, and a tag (all markup, already escaped). `kind`
+ * is its look: `pick` (choose this), `next`, `past`, `gone`, `ok`.
+ */
+export function chip(options: { icon: keyof typeof ICONS; name: string; note: string; tag?: string; kind?: string }): string {
+	return `<div class="key${options.kind ? ` ${options.kind}` : ""}">${icon(options.icon)}<span><b>${options.name}</b><small>${options.note}</small></span>${options.tag ? `<em>${options.tag}</em>` : ""}</div>`;
+}
+
+/** Chips in a column, with an arrow between each; `label` says what they show to a screen reader. */
+export function chips(label: string, items: string[]): string {
+	return `<div class="keys" role="img" aria-label="${label}">${items.join(icon("down"))}</div>`;
+}
+
+/**
+ * What every passkey page script shares: `$`, `status` (the live region),
+ * the option parsers, `credentialJson`, `post` (same origin, JSON, no
+ * cookies) and `busy`.
+ */
+export const PAGE_HELPERS = `
+const $ = (id) => document.getElementById(id);
+// A problem (in the error colour); \`hint\`, guidance while the device's prompt is open.
+const status = (text) => { $("status").className = "status"; $("status").textContent = text; };
+const hint = (text) => { $("status").className = "status hint"; $("status").textContent = text; };
 const fromB64 = (text) => Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
 const toB64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 function requestOptions(json) {
@@ -123,6 +175,25 @@ async function post(path, body) {
 		return { error: "Could not reach the server. Check your connection and try again." };
 	}
 }
+function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
+`;
+
+/**
+ * The page's script: prepares the screen's ceremony as it shows (so the
+ * click that the browser needs goes straight to the passkey prompt), runs
+ * it, sends the credential to the server, and goes back to the client with
+ * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
+ * ceremony instead, begun on its click. Cancel goes back with
+ * `error=access_denied`. A sign-in with a passkey no account here has stays
+ * on the page, and asks the device to drop that passkey.
+ */
+const SCRIPT = `
+"use strict";
+const config = JSON.parse(document.getElementById("config").textContent);
+${PAGE_HELPERS}
+const primary = config.start === "login" ? "login" : "register";
+let prepared = null;
+let preparing = null;
 
 function prepare(action) {
 	prepared = null;
@@ -146,7 +217,6 @@ function forget(rpId, credentialId) {
 	} catch {}
 }
 
-function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
 
 async function passkey(action) {
 	status("");
@@ -179,7 +249,8 @@ async function passkey(action) {
 
 for (const button of document.querySelectorAll("[data-passkey]")) button.addEventListener("click", () => passkey(button.dataset.passkey || primary));
 for (const button of document.querySelectorAll("[data-cancel]")) button.addEventListener("click", () => { busy(true); location.assign(config.deny); });
-prepare(primary);
+// With LEGACY_RP_ID, the page's sign-in button is the legacy script's, which prepares its own ceremony.
+if (document.querySelector('[data-passkey=""]')) prepare(primary);
 `;
 
 /** A sign-in page, ready for `navigator.credentials` on the server's origin. */
@@ -190,20 +261,26 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 	const caution = `${view.recognised ? "" : `<p class="warn">${e(view.host)} has not verified this app.</p>`}
 <p class="muted">Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
+	// With LEGACY_RP_ID, a "Continue with passkey" that finds either kind, and the upgrade after an old one.
+	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;
+	const signIn = legacy?.button ?? `<button type="button" class="primary" data-passkey>Continue with passkey</button>`;
 	const account = view.account ? `${view.account.name} (@${view.account.userId})` : "";
 	const screens = {
 		// `/oauth/authorize` is always this screen, with a new account's passkey besides.
 		login: `<h1>Sign in to ${e(view.title)} on ${e(view.client)}?</h1>
 <p>It will be able to read and send messages as you.</p>
+${chips(`${e(view.client)} signing in to ${e(view.title)}`, [chip({ icon: "app", name: e(view.client), note: "Wants to sign in as you" })])}
 ${caution}
-<div class="actions"><button type="button" class="primary" data-passkey>Continue with passkey</button>${cancel}</div>
+<div class="actions">${signIn}${cancel}</div>
 ${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}`,
 		register: `<h1>Create an account on ${e(view.title)}</h1>
 <p>${who} wants to create an account for you on ${host}, with a new passkey. It will be able to read and send messages as you.</p>
+${chips(`${e(view.client)} creating an account`, [chip({ icon: "app", name: e(view.client), note: "Wants to create an account for you" })])}
 ${caution}
 <div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>`,
 		add: `<h1>Add a passkey</h1>
 <p>${who} wants to add a passkey to <strong>${e(account)}</strong>’s account on ${host}.</p>
+${chips(`${e(view.client)} adding a passkey`, [chip({ icon: "app", name: e(view.client), note: `Wants to add a passkey to ${e(account)}` })])}
 ${caution}
 <div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>`,
 	};
@@ -219,12 +296,15 @@ ${caution}
 </head>
 <body>
 <main>
+${brand(e(view.title), e(view.host))}
 ${screens[view.start]}
+${legacy?.screen ?? ""}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
-<p id="status" class="warn" role="status" aria-live="polite"></p>
+<p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
 <script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny })}</script>
 <script nonce="${nonce}">${SCRIPT}</script>
+${legacy?.script ?? ""}
 </body>
 </html>`;
 }

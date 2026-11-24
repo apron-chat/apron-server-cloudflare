@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { beginUpgrade, finishUpgrade, legacyBegin, offerUpgrade, SINCE_KEY, skipUpgrade, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
@@ -202,7 +203,7 @@ const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
  * full alarms may be a day apart). Each is small, and any later version
  * reads one as expired.
  */
-const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending):[0-9a-f]{64}$/;
+const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending|upgrade):[0-9a-f]{64}$/;
 /**
  * The path the entry Worker forwards the sign-in pages' requests to the
  * object on, with the route after it, and the header that carries the
@@ -965,6 +966,8 @@ interface StoredPageCeremony {
 	request: AuthorizationRequest;
 	/** An addition's account, from its `request` handle. */
 	addsUserId?: string;
+	/** An upgrade's key: an addition after a sign-in with a passkey for LEGACY_RP_ID (src/legacy-passkeys.ts). */
+	upgrade?: string;
 	expiresMs: number;
 }
 
@@ -2627,6 +2630,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly runtimeEnv: Env;
 	private readonly store: Store;
 	private readonly webAuthn: WebAuthnService;
+	/** When this object woke, and LegacyPort.since once read: which passkeys are for LEGACY_RP_ID (src/legacy-passkeys.ts). */
+	private readonly wokeMs = nowMs();
+	private legacySince?: number;
 	private mutationTail: Promise<void> = Promise.resolve();
 	/** Where admin commands' `admin_action` audit events go (src/commands/audit.ts): nowhere yet, unless a test captures them. */
 	private audit: AuditSink = noAuditSink;
@@ -2831,7 +2837,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			layout, limits: this.config.limits, store: this.store.history, clock: { now: nowMs },
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
 			chunkIndex: (tier) => this.store.history.chunkIndex(tier),
-			server: this.config.rpId,
+			server: this.config.serverHost,
 			serverUrl: this.archiveHeader().server,
 		});
 		// An overrun is observed, not fatal: the day's first is told, and a
@@ -4452,6 +4458,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			who, client, where,
 			recognised: recognisedClient(redirect, this.config.rpOrigins),
 			...(account ? { account } : {}),
+			// A sign-in screen that also finds passkeys for LEGACY_RP_ID (src/legacy-passkeys.ts).
+			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId } : {}),
 			query: query.toString(),
 			deny: redirectWith(value.redirectUri, { error: "access_denied", state: value.state, iss: origin }),
 		};
@@ -4470,7 +4478,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
 		if (!parsed.ok) return pageJson(400, { error: parsed.error });
 		// The passkey page's action is its link's; `/oauth/authorize` lets the person choose.
-		const action = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
+		const chosen = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
+		// A sign-in with a passkey for LEGACY_RP_ID (`legacy`), or after one, a new passkey (`upgrade`): src/legacy-passkeys.ts.
+		const old = legacyBegin(body, this.config.legacyRpId, chosen, (parsed.value as PasskeyPageRequest).request !== undefined);
+		if (old === "refused") return pageJson(400, { error: "The request was not understood." });
+		const legacy = old !== undefined && "legacy" in old;
+		const upgrade = old !== undefined && "upgrade" in old ? old.upgrade : undefined;
+		const action = upgrade ? "register" : chosen;
 		const value: PasskeyPageRequest = { ...parsed.value, action };
 		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
 		if (value.name !== undefined && ([...value.name].length > maxNameCodePoints || utf8Bytes(value.name) > maxNameBytes)) {
@@ -4479,7 +4493,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		this.store.admission.reserveAuthAttempt({ ipKey, now });
 		let adds: { userId: string; name: string; userHandle?: string; existing: string[] } | undefined;
-		if (value.request) {
+		// After a sign-in with a passkey for LEGACY_RP_ID: the upgrade it offered (src/legacy-passkeys.ts).
+		let upgradeKey: string | undefined;
+		if (upgrade) {
+			const found = await beginUpgrade(this.legacyPort(), upgrade, { origin, page, request: {
+				clientId: value.clientId, redirectUri: value.redirectUri, codeChallenge: value.codeChallenge, state: value.state, resource: value.resource,
+			} }, now);
+			if (!found) return pageJson(400, { error: "This sign-in expired. Start again from the app." });
+			upgradeKey = found.key;
+			adds = found;
+		} else if (value.request) {
 			const found = await this.readRequestHandle(value.request, now);
 			if (!found) return pageJson(400, { error: "This link to add a passkey has expired. Start again from the app." });
 			const existing = this.store.credentials.idsForUser(found.identity.userId);
@@ -4491,11 +4514,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				...(value.name !== undefined ? { name: value.name } : {}),
 				userIdTaken: (userId) => this.store.accounts.idTaken(userId),
 				...(adds ? { adds: adds.userHandle ? { userHandle: adds.userHandle } : {} } : {}),
-			}, { page: true });
+			}, { page: true, ...(legacy ? { legacy: true } : {}) });
 		const ceremony: StoredPageCeremony = {
 			v: 1, page, challenge: begun.challenge,
 			request: { clientId: value.clientId, redirectUri: value.redirectUri, codeChallenge: value.codeChallenge, state: value.state, resource: value.resource },
 			...(adds ? { addsUserId: adds.userId } : {}),
+			...(upgradeKey ? { upgrade: upgradeKey } : {}),
 			expiresMs: begun.challenge.expiresAt,
 		};
 		await this.putSignInRecord(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(begun.challenge.challengeId), ceremony);
@@ -4513,6 +4537,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * an account's nor pending answers `unknown_credential`.
 	 */
 	private async pageFinish(body: Record<string, unknown>, origin: string, ipKey: string): Promise<Response> {
+		// "Not now" on the upgrade after a sign-in with a passkey for LEGACY_RP_ID (src/legacy-passkeys.ts).
+		if (body.skip === true) {
+			const now = nowMs();
+			this.store.admission.reserveAuthAttempt({ ipKey, now });
+			const answer = await skipUpgrade(this.legacyPort(), body, origin, now);
+			return pageJson(answer.status, answer.body);
+		}
 		const challengeId = typeof body.challenge_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(body.challenge_id) ? body.challenge_id : undefined;
 		if (!challengeId) return pageJson(400, { error: "The request was not understood." });
 		const now = nowMs();
@@ -4552,28 +4583,88 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A passkey no account has, nor a code about to give it one, such as
 			// one made here whose code was never redeemed: the script asks the
 			// device to drop it. Anything else, or a failed read, is the usual error.
-			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && !await this.pendingCredential(error.credentialId)) {
+			// Never for a passkey for LEGACY_RP_ID, which other sites may have made.
+			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && ceremony.challenge.rpId === this.config.rpId && !await this.pendingCredential(error.credentialId)) {
 				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
 			}
 			throw error;
 		}
-		const code = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
-		const record: StoredSignInCode = {
+		// The upgrade after a sign-in with a passkey for LEGACY_RP_ID (src/legacy-passkeys.ts).
+		if (ceremony.upgrade) {
+			const answer = await finishUpgrade(this.legacyPort(), ceremony.upgrade, created, origin, { now, ipKey });
+			return pageJson(answer.status, answer.body);
+		}
+		const record: Omit<StoredSignInCode, "expiresMs"> = {
 			v: 1, page: ceremony.page, action, ...ceremony.request,
 			userId: finished.identity.user_id,
 			...(finished.credential ? { credentialId: finished.credential.credentialId } : {}),
 			...(created ? { register: { name: created.name, userHandle: created.userHandle, credential: created.credential } } : {}),
 			...(ceremony.addsUserId ? { adds: true } : {}),
-			expiresMs: nowMs() + CODE_TTL_MS,
 		};
+		// After a sign-in with a passkey for LEGACY_RP_ID, the page offers one for RP_ID
+		// first, and the code is issued when that ends (src/legacy-passkeys.ts).
+		if (ceremony.challenge.rpId !== this.config.rpId) {
+			const upgrade = await offerUpgrade(this.legacyPort(), record.userId, record as unknown as Record<string, unknown>, { origin, page: ceremony.page, request: ceremony.request }, now);
+			if (upgrade) return pageJson(200, { upgrade });
+		}
+		return pageJson(200, { redirect: await this.issuePageCode(record, origin) });
+	}
+
+	/**
+	 * Issues a sign-in page's code for its record (5 minutes, single use,
+	 * under its SHA-256), a new passkey it holds marked pending first; the
+	 * redirect back to the client with it.
+	 */
+	private async issuePageCode(fields: Omit<StoredSignInCode, "expiresMs">, origin: string): Promise<string> {
+		const code = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const record: StoredSignInCode = { ...fields, expiresMs: nowMs() + CODE_TTL_MS };
 		// Before the code, so no code holds a passkey that is not marked pending.
-		if (created) {
-			await this.putSignInRecord(PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(created.credential.credentialId), {
+		if (record.register) {
+			await this.putSignInRecord(PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(record.register.credential.credentialId), {
 				v: 1, expiresMs: record.expiresMs + PENDING_CREDENTIAL_GRACE_MS,
 			} satisfies StoredPendingCredential);
 		}
 		await this.putSignInRecord(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code), record);
-		return pageJson(200, { redirect: redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin }) });
+		return redirectWith(record.redirectUri, { code, state: record.state, iss: origin });
+	}
+
+	/** What the sign-in with a passkey for LEGACY_RP_ID, and its upgrade, use here (src/legacy-passkeys.ts). */
+	private legacyPort(): LegacyPort {
+		return {
+			account: (userId) => {
+				const identity = this.store.accounts.get(userId);
+				if (!identity) return undefined;
+				const passkeys = this.store.credentials.passkeys(userId).map(({ credentialId, createdMs }) => ({ credentialId, createdMs }));
+				const mayAddPasskey = identity.userId !== ADMIN_USER_ID && !(identity.roles ?? []).includes("bot") && !isBotId(identity.userId) && passkeys.length < MAX_PASSKEYS_PER_USER;
+				return { name: identity.name || identity.userId, ...(identity.userHandle ? { userHandle: identity.userHandle } : {}), passkeys, mayAddPasskey };
+			},
+			// Recorded on first use as when this object woke: a deploy restarts it, and its
+			// clients sign in again (afterSignIn) before they can make a passkey on it.
+			since: async () => {
+				if (this.legacySince !== undefined) return this.legacySince;
+				try {
+					const stored = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<number>(SINCE_KEY));
+					if (typeof stored === "number") return this.legacySince = stored;
+					const since = this.wokeMs;
+					await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.put(SINCE_KEY, since));
+					return this.legacySince = since;
+				} catch {
+					return undefined;
+				}
+			},
+			put: (key, record) => this.putSignInRecord(key, record),
+			read: (key) => this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredUpgrade>(key)),
+			take: (key) => this.takeSignInRecord<StoredUpgrade>(key),
+			addPasskey: (input) => { this.store.credentials.add(input); },
+			tellAdded: (userId) => {
+				for (const peer of this.connectionsOf(userId)) {
+					this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: {
+						text: "A passkey was added to your account on the passkey page. If it wasn't you, remove it with `/passkeys`.", format: "markdown",
+					} } });
+				}
+			},
+			issueCode: (code, origin) => this.issuePageCode(code as unknown as Omit<StoredSignInCode, "expiresMs">, origin),
+		};
 	}
 
 	/**
@@ -6253,6 +6344,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
 		this.sendShownStatus(socket);
+		void this.recordLegacySince(socket);
+	}
+
+	/**
+	 * With LEGACY_RP_ID, on a registered sign-in: records when this server
+	 * first ran with it (LegacyPort.since), so passkeys made since count as
+	 * for RP_ID (src/legacy-passkeys.ts). One can be made only on a
+	 * connection signed in after the deploy restarted this object, so the
+	 * time recorded comes before any. Best effort: a failure only defers it.
+	 */
+	private async recordLegacySince(socket: WebSocketConnection): Promise<void> {
+		const attachment = connectionAttachment(socket);
+		if (!this.config.legacyRpId || attachment?.tier !== "registered") return;
+		try { await this.legacyPort().since(); } catch { /* deferred */ }
 	}
 
 	/**
@@ -9411,11 +9516,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * What an archive's header says of this server (ARCHIVE.md §2): its
-	 * WebSocket URL, from PUBLIC_ORIGIN or else RP_ID, and the origins its
-	 * media loads from.
+	 * WebSocket URL, from PUBLIC_ORIGIN or else its host (serverHost), and
+	 * the origins its media loads from.
 	 */
 	private archiveHeader(): { server: string; media: string[] } {
-		const origin = this.config.uploads?.publicOrigin || this.config.liveText?.publicOrigin || `https://${this.config.rpId}`;
+		const origin = this.config.uploads?.publicOrigin || this.config.liveText?.publicOrigin || `https://${this.config.serverHost}`;
 		const host = new URL(origin).host;
 		const media = [...new Set([origin, ...(this.config.uploads?.mediaOrigin ? [this.config.uploads.mediaOrigin] : [])])];
 		return { server: `wss://${host}/`, media };
@@ -9447,7 +9552,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(backups: BackupStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
 		return writeBackup(this.archiveChain(), this.store.history.export(), backups, this.config.backups, kind, {
-			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
+			server: this.config.serverHost, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
 	}

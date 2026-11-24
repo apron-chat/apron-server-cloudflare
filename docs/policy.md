@@ -29,7 +29,7 @@ WebAuthn uses the canonical [optional authentication scheme](https://github.com/
 advertised through `auth: ["webauthn", "token", "guest"]` on connections whose
 origin is in `RP_ORIGINS`, and on every connection to a host that serves the
 [passkey page](#passkey-page) (`RP_ID` or a host under it, as
-server.apron.chat is under `apron.chat`). Other connections advertise
+server.apron.chat is its own `RP_ID`). Other connections advertise
 `auth: ["token", "guest"]`, where `token` takes bot, device, and invite
 tokens and sessions from the passkey page but not other passkey sessions
 (below), and reject WebAuthn requests as `unsupported`. Guest user IDs are

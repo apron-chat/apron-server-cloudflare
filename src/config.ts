@@ -1,3 +1,4 @@
+import { loadLegacyRpId } from "./legacy-passkeys.ts";
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
@@ -17,8 +18,21 @@ export interface RuntimeConfig {
 	backups: BackupSettings;
 	allowedOrigins: readonly string[];
 	rpId: string;
+	/**
+	 * A previous RP ID (`LEGACY_RP_ID`), a domain `rpId` is under, that
+	 * passkeys were made for before: the passkey page still signs in with
+	 * them, and offers a passkey for `rpId` after (src/legacy-passkeys.ts).
+	 */
+	legacyRpId?: string;
 	rpOrigins: readonly string[];
 	rpName: string;
+	/**
+	 * This server's own host name, which names what it keeps in shared
+	 * storage (history chunks under `history/<host>/`, backups as
+	 * `backups/<host>-…`): `PUBLIC_ORIGIN`'s host, else `rpId`. Never a
+	 * parent domain other servers may share.
+	 */
+	serverHost: string;
 	/**
 	 * What the `server` frame shows people about this server (§3.1), as the
 	 * deployment sets it: a plain `title` (`SERVER_TITLE`), a short CommonMark
@@ -263,6 +277,7 @@ type EnvLike = {
 	BILL_CAP_MONTH?: string;
 	ALLOWED_ORIGINS?: string;
 	RP_ID?: string;
+	LEGACY_RP_ID?: string;
 	RP_ORIGINS?: string;
 	RP_NAME?: string;
 	SERVER_TITLE?: string;
@@ -318,6 +333,17 @@ function validOrigin(origin: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * This server's host name (RuntimeConfig.serverHost): `PUBLIC_ORIGIN`'s,
+ * else `rpId`. A `PUBLIC_ORIGIN` that is not an exact origin is left to
+ * uploads and live text, which refuse it where they are configured, as
+ * before it named anything else.
+ */
+function loadServerHost(publicOrigin: string | undefined, rpId: string): string {
+	const origin = String(publicOrigin ?? "").trim();
+	return origin && validOrigin(origin) ? new URL(origin).hostname : rpId;
 }
 
 /** The environment variable spelling of a camelCase limit name. */
@@ -649,6 +675,9 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", false);
 	const externalSignIn = parseSwitch(env.EXTERNAL_SIGN_IN, "EXTERNAL_SIGN_IN", false);
 	if (externalSignIn && !passkeyPage) throw new ConfigError("EXTERNAL_SIGN_IN needs PASSKEY_PAGE, whose passkey ceremony its page runs");
+	const { legacyRpId, error: legacyRpIdError } = loadLegacyRpId(env.LEGACY_RP_ID, rpId, passkeyPage);
+	if (legacyRpIdError) throw new ConfigError(legacyRpIdError);
+	const serverHost = loadServerHost(env.PUBLIC_ORIGIN, rpId);
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
@@ -678,8 +707,10 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		backups,
 		allowedOrigins,
 		rpId,
+		...(legacyRpId ? { legacyRpId } : {}),
 		rpOrigins,
 		rpName,
+		serverHost,
 		server,
 		admission,
 		activityEnabled,

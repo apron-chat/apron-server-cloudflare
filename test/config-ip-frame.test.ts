@@ -488,4 +488,14 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat/app', RP_ID: 'apron.shazow.net' })).toThrow(ConfigError);
 		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'https://apron.shazow.net' })).toThrow(/RP_ID must be a host name/);
 	});
+
+	it("names what it keeps in shared storage by its own host, not a parent RP ID", () => {
+		const production = { ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'apron.chat' };
+		expect(config(production).serverHost).toBe('apron.chat');
+		expect(config({ ...production, PUBLIC_ORIGIN: 'https://server.apron.chat' }).serverHost).toBe('server.apron.chat');
+		expect(config({ ...production, PUBLIC_ORIGIN: '' }).serverHost).toBe('apron.chat');
+		expect(config({ PUBLIC_ORIGIN: 'http://localhost:8787' }).serverHost).toBe('localhost');
+		// One that is not an exact origin names nothing, and is refused only where uploads or live text use it.
+		expect(config({ ...production, PUBLIC_ORIGIN: 'https://server.apron.chat/' }).serverHost).toBe('apron.chat');
+	});
 });

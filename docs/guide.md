@@ -392,6 +392,83 @@ is `RP_ID` or under it (`PASSKEY_PAGE`, on by default). Otherwise users sign
 in another way, such as with a token from `/invite-device` ([other devices](#other-devices)).
 Changing `RP_ID` strands the passkeys registered under the old one.
 
+### Native passkeys or the passkey page
+
+A client on a related origin (`web.apron.chat` for `RP_ID =
+"server.apron.chat"`) can run passkeys in place only where the browser
+supports related origins; elsewhere the browser refuses the RP ID with a
+`SecurityError`. Every `webauthn` begin result carries the passkey page as
+`external.url` besides `public_key`, so the client chooses:
+
+```js
+// Whether this browser can run the server's passkeys here, or should open external.url.
+async function nativePasskeys(rpId) {
+	if (!window.PublicKeyCredential || !navigator.credentials) return false;
+	const host = location.hostname;
+	if (host === rpId || host.endsWith(`.${rpId}`)) return true; // the RP ID's own site
+	try {
+		const capabilities = await PublicKeyCredential.getClientCapabilities?.();
+		if (capabilities && 'relatedOrigins' in capabilities) return capabilities.relatedOrigins === true;
+	} catch {}
+	return undefined; // unknown: try in place, and open the page on a SecurityError
+}
+```
+
+`getClientCapabilities()` (WebAuthn Level 3) reports `relatedOrigins`
+where the browser knows it; where it is missing, try the ceremony in place
+and fall back to `external.url` when it throws `SecurityError`. A
+`NotAllowedError` is the person cancelling or having no passkey for the RP
+ID, not a missing feature: offer the page then, but don't open it unasked.
+
+### Choosing `RP_ID`
+
+Make `RP_ID` the server's own host, such as `server.apron.chat`. A passkey
+for a parent domain (`apron.chat`) can be made and used by any site under
+it, so only choose one where you run every site there. Servers that share a
+domain, such as tenants at `<name>.example.host`, each take their own host,
+and the shared domain belongs on the Public Suffix List, so browsers keep the
+servers apart. A shared web client is a related origin of each: list it in
+each server's `RP_ORIGINS`.
+
+### Moving `RP_ID`
+
+A server can move from one RP ID to another it is under, such as from
+`apron.chat` to `server.apron.chat`, without stranding its passkeys: set the
+previous one as `LEGACY_RP_ID`.
+
+```toml
+[vars]
+RP_ID = "server.apron.chat"
+LEGACY_RP_ID = "apron.chat"
+RP_ORIGINS = "https://web.apron.chat"
+```
+
+New passkeys are made for `RP_ID`. Passkeys made for the previous one keep
+working, and nobody is asked which kind they have:
+
+- The passkey page, whose host is under both RP IDs, has one "Continue with
+  passkey". It asks the device for the kind it last signed in with there,
+  else the previous kind; when the device has none, the next tap asks for the
+  other ("Tap Continue with passkey again…").
+- A sign-in with a previous-kind passkey then offers "Save a new passkey",
+  added to the account at once ("Not now" goes back without it). An account
+  that already has a passkey made since the move is not asked again.
+- Clients' own ceremonies use `RP_ID` only, so someone with only an old
+  passkey finds none there. A client that offers the passkey page after a
+  sign-in that finds nothing ([above](#native-passkeys-or-the-passkey-page))
+  reaches it in one more tap.
+
+The Worker answers `/.well-known/webauthn` on the new RP ID's host, so
+regenerate the edge rules (`npm run budget:generate`), which let it through.
+`SIGNAL_UNKNOWN_PASSKEYS` never signals a previous-kind passkey, which other
+sites may have made. History and backups are named by the server's own host
+(`PUBLIC_ORIGIN`'s, else `RP_ID`), not by the RP ID, so a move does not rename
+them. A server that ran a version that named them by `RP_ID`, such as one with
+the parent domain as `RP_ID`, starts new backup names once, with the version
+that names them by host: once 14 new backups exist, delete the old
+`backups/<old RP_ID>-*` objects, which are no longer pruned. History chunks
+keep their stored keys and need nothing.
+
 ## Operations and secrets
 
 IP rate limits key on the first 128 bits of SHA-256 of the canonical address
@@ -486,7 +563,7 @@ differs from production in:
   production's, `npm run budget:generate`); and its own metrics dataset,
   `apron_server_metrics_preview`, shared by all Previews.
 - **Passkeys.** `RP_ID` is `previews.apron.chat`, so Preview passkeys never
-  mix with production's (`apron.chat`). No client is on that RP ID, so every
+  mix with production's (`server.apron.chat`, and `apron.chat` before it). No client is on that RP ID, so every
   client, `web.apron.chat` included, signs in through the
   [passkey page](policy.md#passkey-page) on the Preview's host, which warns
   that the host has not verified the app. `EXTERNAL_SIGN_IN` is on too, so
@@ -532,7 +609,9 @@ budget:check` refuses a production config without that); its
 domain. `wrangler.toml` sets neither, so turn them off before deploying it
 anywhere.
 
-The RP ID stays `apron.chat` to keep existing passkey credentials working.
+The RP ID is `server.apron.chat`, the server's own host. Passkeys made
+before for `apron.chat` still sign in on the passkey page (`LEGACY_RP_ID`,
+[Moving `RP_ID`](#moving-rp_id)).
 Guest connections accept every origin, including localhost, LAN frontends,
 local files (opaque origins), and clients without Origin. Passkey
 verification allows only the exact `https://web.apron.chat` origin.
@@ -585,7 +664,8 @@ For direct Wrangler production commands, always pass
    configuration rule too, or the edge may hold a slow writer's first bytes,
    such as typed keys, until more arrive ([edge admission](edge-admission.md)).
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
-   passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
+   passkey RP ID `server.apron.chat` and the explicit, exact `RP_ORIGINS`
+   allowlist;
    wildcard guest admission never enables wildcard passkey verification.
    RP changes can make previously registered credentials unusable.
 4. Run all checks here, and check the matching frontend in apron-chat/apron-web
