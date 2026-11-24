@@ -482,6 +482,60 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	expect(old.assigned).toEqual([]);
 });
 
+it('excludes no legacy passkey from an addition, on the passkey page or in a client from RP_ORIGINS', async () => {
+	const { passkey, userId, token } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const excluded = (publicKey: { excludeCredentials?: { id: string }[] }) => (publicKey.excludeCredentials ?? []).map((entry) => entry.id);
+	// On the passkey page, from an addition's `request` handle.
+	const peer = await connect(NEW);
+	try {
+		await greeting(peer);
+		expect((await request(peer, 'token', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+		const begun = await request(peer, 'add', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' });
+		const app = await client(NEW);
+		const url = app.url(begun.result.external.url);
+		expect(url.searchParams.get('request')).toMatch(/^rq_/);
+		const started = await begin(NEW, { query: url.searchParams.toString() });
+		expect(started.status).toBe(200);
+		expect(started.body.public_key.rp.id).toBe('chat.localhost');
+		expect(excluded(started.body.public_key)).toEqual([]);
+	} finally { peer.close(); }
+	// In a client from RP_ORIGINS, whose own ceremony adds it.
+	const web = await open({ ip: ip(), origin: 'http://localhost:5173', host: new URL(NEW).host });
+	try {
+		await greeting(web);
+		expect((await request(web, 'token', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+		const begun = await request(web, 'add', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' });
+		expect(begun.result.public_key.rp.id).toBe('chat.localhost');
+		expect(excluded(begun.result.public_key)).toEqual([]);
+	} finally { web.close(); }
+	expect(await passkeysOf(userId)).toEqual([passkey.id]);
+});
+
+it('records the switch at the start of a passkey ceremony, before any passkey it makes', async () => {
+	await rpIds('chat.localhost', 'localhost');
+	const clear = () => runInDurableObject(stub(), async (instance, state) => {
+		await state.storage.delete(SINCE_KEY);
+		delete (instance as unknown as Server).legacySince;
+	});
+	const recorded = () => runInDurableObject(stub(), (_instance, state) => state.storage.get<number>(SINCE_KEY));
+	// On the passkey page, for a new account.
+	await clear();
+	const app = await client(NEW);
+	const before = Date.now();
+	expect((await begin(NEW, { query: app.url(`${NEW}/passkey?action=register&name=Grace`).searchParams.toString() })).status).toBe(200);
+	expect(await recorded()).toBeLessThanOrEqual(before);
+	// In a client, on a guest's connection that nothing signed in to as registered.
+	await clear();
+	const web = await open({ ip: ip(), origin: 'http://localhost:5173', host: new URL(NEW).host });
+	try {
+		await greeting(web);
+		await request(web, 'begin', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin', name: 'Grace' });
+		expect(await recorded()).toBeLessThanOrEqual(Date.now());
+	} finally { web.close(); }
+});
+
+// Last: it sweeps an hour ahead, which moves the store's effective clock on for any test after it.
 it('sweeps a sign-in with a legacy passkey whose new passkey was never saved', async () => {
 	const { passkey } = await legacyAccount();
 	await rpIds('chat.localhost', 'localhost');
