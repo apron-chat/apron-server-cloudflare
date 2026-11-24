@@ -608,6 +608,8 @@ const MAX_JOIN_USES = 50;
 /** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
 const JOIN_DEFAULT_NAME = MEMBER_NAME;
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
+/** How long the one-time token `/invite-reset` mints may be used. */
+const RESET_TOKEN_TTL_MS = 7 * 86_400_000;
 /** Device tokens one user may hold at once, each under its own id. */
 const MAX_DEVICE_TOKENS = 5;
 /**
@@ -855,11 +857,24 @@ interface StoredBot {
 /**
  * An invite token (`/invite-token`), stored only as its SHA-256 under
  * INVITE_TOKEN_KEY_PREFIX: the registered user it signs in as. The user's
- * INVITE_KEY_PREFIX entry is a StoredBot-shaped pointer back to it.
+ * INVITE_KEY_PREFIX entry is a StoredInvitePointer back to it. One
+ * `/invite-reset` mints has an `expiresMs`: it signs in once before then,
+ * and the sign-in replaces it with the user's own token that does not
+ * expire (handleInviteToken).
  */
 interface StoredInviteToken {
 	v: 1;
 	userId: string;
+	expiresMs?: number;
+}
+
+/**
+ * A user's pointer to their invite token, so the next one revokes it. It
+ * repeats a one-time token's `expiresMs`, so `/rename` moves the token
+ * without reading it.
+ */
+interface StoredInvitePointer extends StoredBot {
+	expiresMs?: number;
 }
 
 /**
@@ -4853,8 +4868,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Signs a user in with the token an admin made for them (`/invite-token`),
-	 * through the `token` scheme (§3.2), from any origin like a bot token.
+	 * Signs a user in with the token an admin made for them (`/invite-token`,
+	 * or `/invite-reset`'s one-time token), through the `token` scheme
+	 * (§3.2), from any origin like a bot token.
 	 */
 	private async handleInviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
 		return this.withSessionLock(async () => {
@@ -4866,7 +4882,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string") throw invalid;
 			const identity = this.store.accounts.get(stored.userId);
 			if (!identity) throw invalid;
-			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
+			if (stored.expiresMs === undefined) return void await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
+			// A one-time token from `/invite-reset`: an expired one is dropped when
+			// tried; a live one is spent, and the user gets their own token, which
+			// the result carries, as a sign-up's does.
+			if (!(stored.expiresMs > nowMs())) {
+				await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.delete(key));
+				throw { name: "denied", message: "This reset token has expired; ask an admin for a new one" } satisfies ProtocolError;
+			}
+			// A connection gone before the sign-in leaves the token unspent.
+			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+			const own = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+			const ownKey = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(own);
+			await this.store.meter.foreground({ writes: 3 }, async () => {
+				// No await between them, so they commit together: the one-time
+				// token never outlives the pointer moving off it.
+				const spent = this.ctx.storage.delete(key);
+				const replaced = this.ctx.storage.put({
+					[ownKey]: { v: 1, userId: identity.userId } satisfies StoredInviteToken,
+					[INVITE_KEY_PREFIX + identity.userId]: { v: 1, tokenKey: ownKey } satisfies StoredInvitePointer,
+				});
+				await Promise.all([spent, replaced]);
+			});
+			// A reply lost after this point spends the token: the admin resets them again.
+			await this.signInKeyless(socket, attachment, request, identity, own, false, ownKey);
 		});
 	}
 
@@ -9146,7 +9185,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * their push registrations, and mints them a new invite token, which the
 	 * sender gets in a `~private` notice before the result (§1): first in a
 	 * link that any Apron app opens (Appendix A.4), in code so it is copied
-	 * rather than opened, then on its own. Their account, posts and bot stay. Not the
+	 * rather than opened, then on its own. The token signs in once within
+	 * RESET_TOKEN_TTL_MS, and gives the user their own token that does not
+	 * expire (handleInviteToken). Their account, posts and bot stay. Not the
 	 * sender, `admin`, or a bot; an unknown user is `invalid_params`.
 	 */
 	private async inviteReset(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
@@ -9157,6 +9198,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.store.accounts.exists(userId)) throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		const expiresMs = nowMs() + RESET_TOKEN_TTL_MS;
 		let passkeys = 0;
 		try {
 			await this.withSessionLock(async () => {
@@ -9173,8 +9215,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					if (devices.length) await this.ctx.storage.delete(DEVICES_KEY_PREFIX + userId);
 					// Ends the sessions from before sessions carried their user handle (handleTokenResume).
 					await this.ctx.storage.put<StoredAuthReset>(AUTH_RESET_KEY_PREFIX + userId, { v: 1, resetMs: now });
-					await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
-					await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
+					await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId, expiresMs });
+					await this.ctx.storage.put<StoredInvitePointer>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key, expiresMs });
 				});
 				// Clearing the user handle ends the passkey sessions issued under it.
 				passkeys = this.store.credentials.resetAuth({ userId, now });
@@ -9191,11 +9233,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// here would sign the admin's own app in as them.
 		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint;
 		const removed = `Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had.`;
-		const after = "They can add a passkey once they're in.";
+		const once = `It works once, until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and whoever uses it first signs in as \`${userId}\`, so hand it over privately. Signing in with it gives them their own token to sign in again with, and they can add a passkey once they're in.`;
 		this.sendNotice(socket, roomId, [
 			endpoint
-				? `${removed} Send them this link, which signs them in with any Apron app, or the token after it if they'd rather paste it in. Neither expires, and anyone who has either signs in as \`${userId}\`, so hand them over privately. ${after}`
-				: `${removed} Send them this token, which signs in as them. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. ${after}`,
+				? `${removed} Send them this link, which signs them in with any Apron app, or the token after it if they'd rather paste it in. ${once}`
+				: `${removed} Send them this token, which signs in as them. ${once}`,
 			...endpoint ? ["`" + apronLink(endpoint, { token }) + "`"] : [],
 			"```\n" + token + "\n```",
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
@@ -9216,9 +9258,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
 	private async moveInviteToken(from: string, to: string): Promise<void> {
 		await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
-			const pointer = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + from);
+			const pointer = await this.ctx.storage.get<StoredInvitePointer>(INVITE_KEY_PREFIX + from);
 			if (pointer?.v !== 1 || typeof pointer.tokenKey !== "string") return;
-			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to });
+			// A one-time token keeps its expiry, which the pointer repeats.
+			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to, ...(typeof pointer.expiresMs === "number" ? { expiresMs: pointer.expiresMs } : {}) });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + to, pointer);
 			await this.ctx.storage.delete(INVITE_KEY_PREFIX + from);
 		}));

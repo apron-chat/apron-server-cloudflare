@@ -123,7 +123,8 @@ within it:
   sets the server's title, description and avatar (below),
   `/toggle activity|uploads|presence|addmember|livetext`, and
   `/invite-reset @user`, which signs a user out everywhere, removes their
-  passkeys and tokens, and gives the admin a new token for them. `/help`
+  passkeys and tokens, and gives the admin a one-time token for them, good
+  for 7 days, which they trade for their own token when they sign in. `/help`
   lists commands alphabetically, each form on its own line (such as
   `/emoji add :<name>:` and `/emoji remove :<name>:`), and marks the admins'
   "(admin-only)"; `ext:command_list` returns the same list as data. An

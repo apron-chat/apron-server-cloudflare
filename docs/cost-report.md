@@ -402,7 +402,10 @@ posts.
   three writes, `/invite-device remove` one read and two writes,
   `/invite-device list` at most six reads, `/invite-token` two KV writes;
   `/invite-reset` two KV reads and at most ten writes, plus deleting the
-  user's credential rows. Signing in with a device token is one KV read,
+  user's credential rows. Signing in with the one-time token it gives is
+  one KV read and three writes (it is deleted, and the user's own token and
+  pointer put), or one write to drop it once expired; `/rename` moves it
+  without reading it, since its pointer repeats its expiry. Signing in with a device token is one KV read,
   like a bot token, and one write on its first sign-in of a UTC day (its
   last use). A passkey session issued before sessions recorded their user
   handle costs one more KV read to resume, until the last of them expires.
