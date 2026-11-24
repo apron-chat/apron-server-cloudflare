@@ -3,6 +3,7 @@
  * one "Continue with passkey" that finds a passkey for either RP ID without
  * asking which, and the "Save a new passkey" step after an old one.
  */
+import { PAGE_PREPARED_FRESH_MS } from "./oauth";
 import { chip, chips } from "./sign-in-page";
 
 /**
@@ -29,6 +30,11 @@ ${chips(`Older passkey used; next a new one for ${host}`, [
 	chip({ icon: "key", name: host, note: "Your new passkey", tag: "Save this", kind: "pick next" }),
 ])}
 <div class="actions"><button type="button" class="primary" data-legacy="upgrade">Save passkey</button><button type="button" data-skip>Not now</button></div>
+</div>
+<div id="unsaved" hidden>
+<h1 tabindex="-1">Your new passkey wasn’t saved</h1>
+<p>You’re signed in. You can add a passkey later in the app’s settings. If your password manager saved an entry for <strong>${host}</strong>, you can delete it.</p>
+<div class="actions"><button type="button" class="primary" data-continue>Continue</button></div>
 </div>`,
 		script: `<script nonce="${nonce}">${legacyScript(paths)}</script>`,
 	};
@@ -64,13 +70,14 @@ async function begin(kind) {
 }
 function prepare(kind) {
 	ready = null;
-	begin(kind).then((options) => { if (options) ready = { kind, options }; });
+	begin(kind).then((options) => { if (options) ready = { kind, options, at: Date.now() }; });
 }
 async function run(kind) {
 	status("");
 	if (!window.PublicKeyCredential || !navigator.credentials) { status("This browser cannot use passkeys."); return; }
 	busy(true);
-	const options = ready && ready.kind === kind ? ready.options : await begin(kind);
+	// One begun so long ago that it could expire before the passkey is back is begun again.
+	const options = ready && ready.kind === kind && Date.now() - ready.at <= ${PAGE_PREPARED_FRESH_MS} ? ready.options : await begin(kind);
 	ready = null;
 	if (!options) { busy(false); return; }
 	let credential;
@@ -95,21 +102,29 @@ async function run(kind) {
 		prepare(order[step]);
 		return;
 	}
-	const result = await post(${JSON.stringify(paths.finish)}, { challenge_id: options.challenge_id, credential: credentialJson(credential) });
+	const result = await finish({ challenge_id: options.challenge_id, credential: credentialJson(credential) });
 	if (result.unknownCredential && kind === "login") forget(options.public_key.rpId, credential.id);
-	// An upgrade's answer carries the sign-in's code even when its passkey could not be added.
+	// An upgrade's answer carries the sign-in's code even when its passkey could not be added: said, not passed over.
+	if (result.redirect && kind === "upgrade" && !result.added) { show("unsaved"); onward = result.redirect; return; }
 	// The device holds a passkey the server knows for the new RP ID only after a sign-in with one, or an upgrade that added one.
-	if (result.redirect) { if (kind === "login" || (kind === "upgrade" && result.added)) remember(); location.assign(result.redirect); return; }
+	if (result.redirect) { if (kind === "login" || kind === "upgrade") remember(); location.assign(result.redirect); return; }
 	if (result.error || !result.upgrade) { busy(false); status(result.error || "Something went wrong. Try again."); prepare(kind === "upgrade" ? "upgrade" : order[step]); return; }
 	upgrade = result.upgrade;
-	const screen = $("upgrade");
+	show("upgrade");
+	prepare("upgrade");
+}
+// Shows the screen \`id\` in place of the rest, keeping the brand line and the status.
+function show(id) {
+	const screen = $(id);
 	for (const element of screen.parentElement.children) if (element !== screen && element.id !== "status" && !element.classList.contains("brand")) element.hidden = true;
 	screen.hidden = false;
 	status("");
 	screen.querySelector("h1").focus();
 	busy(false);
-	prepare("upgrade");
 }
+// Where Continue goes once the new passkey wasn't saved: back to the client, signed in.
+let onward = null;
+for (const button of document.querySelectorAll("[data-continue]")) button.addEventListener("click", () => { if (onward) { busy(true); location.assign(onward); } });
 for (const button of document.querySelectorAll("[data-legacy]")) button.addEventListener("click", () => run(button.dataset.legacy === "auto" ? order[step] : button.dataset.legacy));
 for (const button of document.querySelectorAll("[data-skip]")) button.addEventListener("click", async () => {
 	busy(true);

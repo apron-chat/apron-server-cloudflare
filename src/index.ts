@@ -188,6 +188,8 @@ const PAGE_CEREMONY_KEY_PREFIX = "signin-ceremony:";
 const REQUEST_HANDLE_KEY_PREFIX = "signin-request:";
 /** A new passkey that a code from the passkey page holds, under the SHA-256 of its credential ID (pendingCredential). */
 const PENDING_CREDENTIAL_KEY_PREFIX = "signin-pending:";
+/** A page finish's answer, kept for a retry of it (`pageFinish`). */
+const PAGE_FINISHED_KEY_PREFIX = "signin-finished:";
 /**
  * How long a pending passkey outlasts its code: a redemption takes the code
  * before it writes the passkey, so the passkey is never unknown in between.
@@ -203,7 +205,7 @@ const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
  * full alarms may be a day apart). Each is small, and any later version
  * reads one as expired.
  */
-const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending|upgrade):[0-9a-f]{64}$/;
+const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending|upgrade|finished):[0-9a-f]{64}$/;
 /**
  * The path the entry Worker forwards the sign-in pages' requests to the
  * object on, with the route after it, and the header that carries the
@@ -968,6 +970,20 @@ interface StoredPageCeremony {
 	addsUserId?: string;
 	/** An upgrade's key: an addition after a sign-in with a passkey for LEGACY_RP_ID (src/legacy-passkeys.ts). */
 	upgrade?: string;
+	expiresMs: number;
+}
+
+/**
+ * A page finish's answer, under its challenge: sent again to the same finish
+ * (the same credential, from the same origin), whose answer the page never
+ * got. Its passkey is already made, so a second one would only be refused.
+ */
+interface StoredPageFinished {
+	v: 1;
+	origin: string;
+	/** SHA-256 of the credential as sent. */
+	credential: string;
+	body: Record<string, unknown>;
 	expiresMs: number;
 }
 
@@ -4551,16 +4567,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!challengeId) return pageJson(400, { error: "The request was not understood." });
 		const now = nowMs();
 		this.store.admission.reserveAuthAttempt({ ipKey, now });
+		const finishedKey = PAGE_FINISHED_KEY_PREFIX + await sha256Hex(challengeId);
+		const sent = await sha256Hex(JSON.stringify(body.credential ?? null));
 		const ceremony = await this.takeSignInRecord<StoredPageCeremony>(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(challengeId));
 		if (ceremony?.v !== 1 || !(ceremony.expiresMs > now) || ceremony.challenge.challengeId !== challengeId || ceremony.request.resource !== origin) {
+			// The same finish again, whose answer was lost on the way (the page retries it): that answer again.
+			const earlier = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredPageFinished>(finishedKey));
+			if (earlier?.v === 1 && earlier.expiresMs > now && earlier.origin === origin && earlier.credential === sent) return pageJson(200, earlier.body);
 			return pageJson(400, { error: "This passkey request expired. Try again." });
 		}
+		const answer = await this.finishPageCeremony(ceremony, challengeId, body, origin, ipKey, now);
+		// Kept for a retry of this finish, as long as a code lasts: the page can't
+		// tell an answer lost on the way from no answer, and its passkey is made.
+		if (answer.status === 200) {
+			await this.putSignInRecord(finishedKey, { v: 1, origin, credential: sent, body: answer.body, expiresMs: now + CODE_TTL_MS } satisfies StoredPageFinished);
+		}
+		return pageJson(answer.status, answer.body);
+	}
+
+	/** The page's finish, once its ceremony is taken: the answer, for `pageFinish` to send and keep. */
+	private async finishPageCeremony(ceremony: StoredPageCeremony, challengeId: string, body: Record<string, unknown>, origin: string, ipKey: string, now: number): Promise<{ status: number; body: Record<string, unknown> }> {
+		const out = (status: number, answer: Record<string, unknown>) => ({ status, body: answer });
 		const action = ceremony.challenge.action;
 		let credential: Record<string, unknown>;
 		try {
 			credential = passkeyCredentialParam(body, action);
 		} catch {
-			return pageJson(400, { error: "The passkey's answer was not understood. Try again." });
+			return out(400, { error: "The passkey's answer was not understood. Try again." });
 		}
 		let created: { userId: string; name: string; userHandle: string; credential: StoredCredential } | undefined;
 		const repository: CredentialRepository = {
@@ -4588,14 +4621,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// device to drop it. Anything else, or a failed read, is the usual error.
 			// Never for a passkey for LEGACY_RP_ID, which other sites may have made.
 			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && ceremony.challenge.rpId === this.config.rpId && !await this.pendingCredential(error.credentialId)) {
-				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
+				return out(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
 			}
 			throw error;
 		}
 		// The upgrade after a sign-in with a passkey for LEGACY_RP_ID (src/legacy-passkeys.ts).
 		if (ceremony.upgrade) {
 			const answer = await finishUpgrade(this.legacyPort(), ceremony.upgrade, created, origin, { now, ipKey });
-			return pageJson(answer.status, answer.body);
+			return out(answer.status, answer.body);
 		}
 		const record: Omit<StoredSignInCode, "expiresMs"> = {
 			v: 1, page: ceremony.page, action, ...ceremony.request,
@@ -4608,10 +4641,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// first, and the code is issued when that ends (src/legacy-passkeys.ts).
 		if (ceremony.challenge.rpId !== this.config.rpId) {
 			const upgrade = await offerUpgrade(this.legacyPort(), record.userId, record as unknown as Record<string, unknown>, { origin, page: ceremony.page, request: ceremony.request }, now);
-			if (upgrade) return pageJson(200, { upgrade });
+			if (upgrade) return out(200, { upgrade });
 		}
-		return pageJson(200, { redirect: await this.issuePageCode(record, origin) });
-	}
+		return out(200, { redirect: await this.issuePageCode(record, origin) });
+}
 
 	/**
 	 * Issues a sign-in page's code for its record (5 minutes, single use,

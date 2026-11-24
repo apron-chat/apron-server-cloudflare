@@ -1,6 +1,8 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebAuthnService } from '../src/auth';
+import { PAGE_CHALLENGE_TTL_MS, PAGE_PREPARED_FRESH_MS } from '../src/oauth';
+import { PAGE_HELPERS } from '../src/sign-in-page';
 import { passkeysForRpId, SINCE_KEY } from '../src/legacy-passkeys';
 import { loadConfig, type RuntimeConfig } from '../src/config';
 import { connect as open, greeting, request, until, type Peer } from './helpers/socket';
@@ -403,7 +405,7 @@ it('makes every new passkey for the new RP ID: in the client, on the passkey pag
  * passkeys the device holds, by RP ID; a prompt for another RP ID is closed
  * empty (NotAllowedError), as a real one is. Returns its controls.
  */
-async function signInPage(has: Record<string, Passkey>, storage: Map<string, string>) {
+async function signInPage(has: Record<string, Passkey>, storage: Map<string, string>, options: { saves?: Passkey; finish?: (body: Record<string, unknown>) => Promise<unknown> | undefined } = {}) {
 	const { url } = await loginQuery(NEW);
 	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
 	const config = html.match(/<script type="application\/json" id="config">(.*?)<\/script>/s)![1];
@@ -417,10 +419,13 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	const auto = node('', { legacy: 'auto' });
 	const save = node('', { legacy: 'upgrade' });
 	const upgrade = { ...node('upgrade'), hidden: true };
-	upgrade.parentElement = { children: [upgrade, status] };
+	const unsaved = { ...node('unsaved'), hidden: true };
+	const onward = node();
+	upgrade.parentElement = { children: [upgrade, unsaved, status] };
+	unsaved.parentElement = upgrade.parentElement;
 	const document = {
-		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? upgrade : status,
-		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [auto, save] : [],
+		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? upgrade : id === 'unsaved' ? unsaved : status,
+		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [auto, save] : selector === '[data-continue]' ? [onward] : [],
 		querySelector: () => null,
 	};
 	const prompts: string[] = [];
@@ -432,17 +437,26 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 			const assertion = await passkey.assert(publicKey, nextCounter(passkey), { origin: NEW });
 			return { id: assertion.id, toJSON: () => assertion };
 		},
+		create: async ({ publicKey }: { publicKey: { challenge: string; rp: { id: string } } }) => {
+			if (!options.saves) throw Object.assign(new Error('closed'), { name: 'NotAllowedError' });
+			const created = await options.saves.register(publicKey);
+			return { id: created.id, toJSON: () => created };
+		},
 	} };
-	const PublicKeyCredential = { parseRequestOptionsFromJSON: (json: unknown) => json };
+	const PublicKeyCredential = { parseRequestOptionsFromJSON: (json: unknown) => json, parseCreationOptionsFromJSON: (json: unknown) => json };
 	const localStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => { storage.set(key, value); } };
 	const assigned: string[] = [];
-	const fetch = (path: string, init: { body: string }) => post(NEW, path, JSON.parse(init.body));
+	const fetch = (path: string, init: { body: string }) => {
+		const body = JSON.parse(init.body);
+		const instead = path.endsWith('/finish') ? options.finish?.(body) : undefined;
+		return instead ? instead.then((answer) => new Response(JSON.stringify(answer), { status: 200 })) : post(NEW, path, body);
+	};
 	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', 'localStorage', scripts.join('\n'))(
 		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) }, localStorage,
 	);
 	// Its ceremonies are begun as the page shows; a tap waits for none.
 	await new Promise((resolve) => setTimeout(resolve, 200));
-	return { tap: () => auto.listeners[0](), status, upgrade, prompts, assigned };
+	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), proceed: () => onward.listeners[0](), status, upgrade, unsaved, prompts, assigned };
 }
 
 it('finds the passkey whichever RP ID it is for, from one button, without asking which', async () => {
@@ -533,6 +547,97 @@ it('records the switch at the start of a passkey ceremony, before any passkey it
 		await request(web, 'begin', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin', name: 'Grace' });
 		expect(await recorded()).toBeLessThanOrEqual(Date.now());
 	} finally { web.close(); }
+});
+
+it('lasts on the server, for a ceremony the page begins before its tap, longer than the browser waits', async () => {
+	await rpIds('chat.localhost', 'localhost');
+	const { query } = await loginQuery(NEW);
+	const before = Date.now();
+	const begun = await begin(NEW, { query });
+	// The browser's own timeout starts at the tap; the server's, at the begin.
+	expect(begun.body.public_key.timeout).toBe(120_000);
+	const expires = await runInDurableObject(stub(), async (_instance, state) => {
+		const ceremonies = [...(await state.storage.list<{ challenge: { challengeId: string }; expiresMs: number }>({ prefix: 'signin-ceremony:' })).values()];
+		return ceremonies.find((ceremony) => ceremony.challenge.challengeId === begun.body.challenge_id)?.expiresMs;
+	});
+	expect(expires! - before).toBeGreaterThanOrEqual(PAGE_CHALLENGE_TTL_MS);
+	expect(expires! - Date.now()).toBeLessThanOrEqual(PAGE_CHALLENGE_TTL_MS);
+	// The page uses one it began ahead only while a whole timeout still fits before it expires.
+	expect(PAGE_PREPARED_FRESH_MS + 120_000).toBeLessThan(PAGE_CHALLENGE_TTL_MS);
+});
+
+it('answers the same finish again with its first answer, as the page retries one it got no answer to', async () => {
+	await rpIds('chat.localhost', 'localhost');
+	const app = await client(NEW);
+	const query = app.url(`${NEW}/passkey?action=register&name=Grace`).searchParams.toString();
+	const begun = await begin(NEW, { query });
+	const made = await (await softPasskey(NEW)).register(begun.body.public_key);
+	const first = await finish(NEW, begun.body.challenge_id, made);
+	expect(first.status).toBe(200);
+	expect(first.body.redirect).toMatch(/^com\.example\.myapp:\/signed-in\?code=/);
+	// The same finish: the same answer, with the same code.
+	expect(await finish(NEW, begun.body.challenge_id, made)).toEqual(first);
+	// Another credential for the same challenge is no retry.
+	const other = await (await softPasskey(NEW)).register(begun.body.public_key);
+	expect(await finish(NEW, begun.body.challenge_id, other)).toEqual({ status: 400, body: { error: 'This passkey request expired. Try again.' } });
+	// Nor is the same one from another origin.
+	const elsewhere = await SELF.fetch(`${OLD}/passkey/finish`, { method: 'POST', body: JSON.stringify({ challenge_id: begun.body.challenge_id, credential: made }), headers: { 'CF-Connecting-IP': ip(), 'Content-Type': 'application/json', Origin: OLD } });
+	expect(elsewhere.status).not.toBe(200);
+});
+
+it("sends a finish again after the server couldn't be reached, and says so when the new passkey wasn't saved", async () => {
+	const { passkey } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const fresh = await softPasskey(NEW);
+	let finishes = 0;
+	const redirect = 'com.example.myapp:/signed-in?code=kept&state=s';
+	const page = await signInPage({ localhost: passkey }, new Map(), {
+		saves: fresh,
+		finish: () => {
+			finishes++;
+			// The sign-in's first finish is lost on the way; the page sends it again.
+			if (finishes === 1) return Promise.reject(new TypeError('Failed to fetch'));
+			// The upgrade's answer: the sign-in's code, without the new passkey.
+			if (finishes === 3) return Promise.resolve({ redirect, error: 'The new passkey could not be added.' });
+			return undefined;
+		},
+	});
+	page.tap();
+	await vi.waitFor(() => expect(page.upgrade.hidden).toBe(false), { timeout: 5_000 });
+	expect(finishes).toBe(2);
+	page.save();
+	// Said, not passed over: nothing opens until Continue.
+	await vi.waitFor(() => expect(page.unsaved.hidden).toBe(false));
+	expect(page.upgrade.hidden).toBe(true);
+	expect(page.assigned).toEqual([]);
+	page.proceed();
+	expect(page.assigned).toEqual([redirect]);
+});
+
+it('reads a credential a password manager hands back, as apron-web does', () => {
+	const credentialJson = new Function(`${PAGE_HELPERS}; return credentialJson;`)() as (credential: unknown) => Record<string, any>;
+	const bytes = (...values: number[]) => new Uint8Array(values);
+	// 1Password's proxy in Firefox: toJSON throws, a field is reachable only through its getter, and
+	// a field is a view from another realm.
+	const proxy = {
+		id: 'AQID', rawId: bytes(1, 2, 3).buffer, type: 'public-key',
+		toJSON() { throw new Error('denied'); },
+		getClientExtensionResults: () => ({}),
+		response: {
+			clientDataJSON: bytes(4, 5),
+			get authenticatorData(): ArrayBuffer { throw new Error('denied'); },
+			getAuthenticatorData: () => bytes(6).buffer,
+			signature: bytes(7).buffer,
+			userHandle: null,
+		},
+	};
+	expect(credentialJson(proxy)).toEqual({ id: 'AQID', rawId: 'AQID', type: 'public-key', clientExtensionResults: {}, response: { clientDataJSON: 'BAU', authenticatorData: 'Bg', signature: 'Bw' } });
+	// A toJSON that encodes a field otherwise (padded base64): the credential's own fields are sent.
+	const padded = { ...proxy, toJSON: () => ({ id: 'AQID', rawId: 'AQID', type: 'public-key', clientExtensionResults: {}, response: { clientDataJSON: 'BAU=', authenticatorData: 'Bg', signature: 'Bw' } }) };
+	expect(credentialJson(padded).response.clientDataJSON).toBe('BAU');
+	// One that agrees, but leaves out clientExtensionResults: toJSON's, with the credential's own.
+	const agrees = { ...proxy, toJSON: () => ({ id: 'AQID', rawId: 'AQID', type: 'public-key', response: { clientDataJSON: 'BAU', authenticatorData: 'Bg', signature: 'Bw' } }) };
+	expect(credentialJson(agrees).clientExtensionResults).toEqual({});
 });
 
 // Last: it sweeps an hour ahead, which moves the store's effective clock on for any test after it.
