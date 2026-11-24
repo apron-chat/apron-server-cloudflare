@@ -3333,7 +3333,7 @@ export class SqliteStore {
 
   /**
    * Removes every passkey of an identity and clears its WebAuthn user
-   * handle, for `/invite-purge`: the passkey sessions issued under the old
+   * handle, for `/invite-reset`: the passkey sessions issued under the old
    * handle no longer resume, and a passkey registered later takes a new one.
    * Returns how many passkeys were removed.
    */

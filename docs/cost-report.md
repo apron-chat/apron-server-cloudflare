@@ -401,7 +401,7 @@ posts.
   reserved at their bound. `/invite-code` and `/invite-device add` are one KV read and
   three writes, `/invite-device remove` one read and two writes,
   `/invite-device list` at most six reads, `/invite-token` two KV writes;
-  `/invite-purge` two KV reads and at most ten writes, plus deleting the
+  `/invite-reset` two KV reads and at most ten writes, plus deleting the
   user's credential rows. Signing in with a device token is one KV read,
   like a bot token, and one write on its first sign-in of a UTC day (its
   last use). A passkey session issued before sessions recorded their user

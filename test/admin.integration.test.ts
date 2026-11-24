@@ -70,7 +70,7 @@ it('lists and runs the admin commands for admins only', async () => {
 		expect(help.notice!.params.body.text).toContain('/rename @user <new_user_id>');
 		// Admins' commands say so; everyone else's don't.
 		expect(help.notice!.params.body.text).toContain('- `/kick @user`: Remove a user from this room (admin-only)');
-		expect(help.notice!.params.body.text).toContain('/invite-purge @user');
+		expect(help.notice!.params.body.text).toContain('/invite-reset @user');
 		expect(help.notice!.params.body.text).not.toMatch(/`\/invite-bot`.*\(admin-only\)/);
 		// Listed alphabetically.
 		const listed = [...help.notice!.params.body.text.matchAll(/^- `\/([a-z-]+(?: [a-z]+)?)/gm)].map((match) => match[1]);
@@ -132,7 +132,7 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		expect(all.map((form) => form.name).filter((name) => name.startsWith('invite-device'))).toEqual(['invite-device list']);
 		expect(['history export', 'history import', 'history status'].map((name) => byName.get(name)?.hint)).toEqual(['[<room_id>...]', '<key> [dry-run] [match|new] [renumber] [restart]', undefined]);
 		// The user-target commands read the user from the text alone.
-		for (const name of ['admin', 'invite-purge', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
+		for (const name of ['admin', 'invite-reset', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
 
 		// A command's forms share its group: the audience it is for.
 		expect(Object.fromEntries(['help', 'embed-append', 'avatar', 'invite-bot', 'invite-device list', 'emoji remove', 'history status', 'toggle'].map((name) => [name, byName.get(name)!.group]))).toEqual({
@@ -724,7 +724,7 @@ it('/invite-device remove revokes a token and closes what signed in with it', as
 	} finally { phone?.close(); owner.close(); }
 });
 
-it('/invite-purge removes every way a user signs in and gives the admin a new token for them', async () => {
+it('/invite-reset removes every way a user signs in and gives the admin a new token for them', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('target');
 	// A session from before sessions carried their user handle, and one after.
@@ -750,10 +750,13 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		const onDevice = await signIn(device);
 		expect(onDevice.reply.result.you.user_id).toBe(userId);
 
-		const purged = await command(admin, 'invite-purge', `/invite-purge @${userId}`);
+		const purged = await command(admin, 'invite-reset', `/invite-reset @${userId}`);
 		expect(purged.frame.result).toEqual({});
 		expect(purged.notice!.params.body.text).toContain(`Signed \`${userId}\` out everywhere and removed 1 passkey`);
 		const fresh = purged.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		// The link comes first, in code so it is copied and sent on rather than opened, then the token on its own.
+		expect(purged.notice!.params.body.text).toContain(`\n\n\`https://link.apron.chat/#server=wss://demo.test/ws&token=${fresh}\`\n\n\`\`\`\n${fresh}\n\`\`\`\n\n`);
+		expect(purged.notice!.params.body.text).not.toContain('<https://link.apron.chat/');
 		for (const peer of [legacy, onSession.peer, onDevice.peer]) await vi.waitFor(() => expect(peer.closed()?.code).toBe(1008));
 		expect(admin.closed()).toBeUndefined();
 
@@ -766,7 +769,7 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		expect((await command(onFresh.peer, 'list', '/invite-device list')).notice!.params.body.text).toContain('no device tokens');
 
 		// Again, the token it gave before stops working too.
-		const again = await command(admin, 'invite-purge-2', `/invite-purge ${userId}`);
+		const again = await command(admin, 'invite-reset-2', `/invite-reset ${userId}`);
 		expect(again.notice!.params.body.text).toContain('removed 0 passkeys');
 		await vi.waitFor(() => expect(onFresh.peer.closed()?.code).toBe(1008));
 		expect((await signIn(fresh)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
@@ -776,14 +779,14 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		const otherAdmin = await signedIn(otherAdminId);
 		opened.push(otherAdmin);
 		await command(admin, 'grant', `/admin ${otherAdminId}`);
-		expect((await command(otherAdmin, 'self', `/invite-purge ${otherAdminId}`)).frame.error.message).toBe("You can't /invite-purge yourself");
-		expect((await command(admin, 'admin-user', '/invite-purge admin')).frame.error.code).toBe(-32001);
-		expect((await command(admin, 'bot', `/invite-purge bot_${userId}`)).frame.error.code).toBe(-32001);
-		expect((await command(admin, 'unknown', `/invite-purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
-		expect((await command(admin, 'usage', '/invite-purge')).frame.error.message).toBe('Usage: /invite-purge @user');
+		expect((await command(otherAdmin, 'self', `/invite-reset ${otherAdminId}`)).frame.error.message).toBe("You can't /invite-reset yourself");
+		expect((await command(admin, 'admin-user', '/invite-reset admin')).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'bot', `/invite-reset bot_${userId}`)).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'unknown', `/invite-reset ${unique('nobody')}`)).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'usage', '/invite-reset')).frame.error.message).toBe('Usage: /invite-reset @user');
 		const plain = await signedIn(unique('plain'));
 		opened.push(plain);
-		expect((await command(plain, 'plain', `/invite-purge ${otherAdminId}`)).frame.error.message).toMatch(/Only an admin/);
+		expect((await command(plain, 'plain', `/invite-reset ${otherAdminId}`)).frame.error.message).toMatch(/Only an admin/);
 	} finally {
 		for (const peer of opened) peer.close();
 		admin.close();
@@ -1187,7 +1190,7 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>, ed
 	} finally { peer.close(); }
 }
 
-it('a passkey ceremony verifying while /invite-purge runs signs nobody in and adds no passkey', async () => {
+it('a passkey ceremony verifying while /invite-reset runs signs nobody in and adds no passkey', async () => {
 	const userId = unique('raced');
 	const user = await signedIn(userId);
 	type Patchable = { updateCredentialCounter: (...args: unknown[]) => void; resetAuth(input: { userId: string }): number };

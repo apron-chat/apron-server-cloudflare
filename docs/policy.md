@@ -122,7 +122,7 @@ within it:
   own (see [SPEC section 5](../SPEC.md#admins)), among them `/server`, which
   sets the server's title, description and avatar (below),
   `/toggle activity|uploads|presence|addmember|livetext`, and
-  `/invite-purge @user`, which signs a user out everywhere, removes their
+  `/invite-reset @user`, which signs a user out everywhere, removes their
   passkeys and tokens, and gives the admin a new token for them. `/help`
   lists commands alphabetically, each form on its own line (such as
   `/emoji add :<name>:` and `/emoji remove :<name>:`), and marks the admins'

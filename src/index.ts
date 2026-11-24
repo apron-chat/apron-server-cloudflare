@@ -808,7 +808,7 @@ const DEVICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
 /** A credential's storage key, as a connection keeps it (ConnectionAttachment.credential): its prefix and a SHA-256. */
 const CREDENTIAL_KEY_PATTERN = /^(session|bot-token|invite-token|device-token):[0-9a-f]{64}$/;
 /**
- * Key prefix for the time of a user's last `/invite-purge`, which ends the
+ * Key prefix for the time of a user's last `/invite-reset`, which ends the
  * passkey sessions issued before sessions carried their user handle.
  */
 const AUTH_RESET_KEY_PREFIX = "auth-reset:";
@@ -829,7 +829,7 @@ interface StoredSession {
 	expiresMs: number;
 	/**
 	 * The account's WebAuthn user handle when the session was issued: once
-	 * `/invite-purge` clears it, the session no longer resumes. Sessions
+	 * `/invite-reset` clears it, the session no longer resumes. Sessions
 	 * issued before this was stored have none.
 	 */
 	handle?: string;
@@ -884,7 +884,7 @@ interface StoredDeviceToken {
  */
 const SESSION_HANDLES_SINCE = Date.parse("2026-10-31T00:00:00Z");
 
-/** A user's last `/invite-purge`, under AUTH_RESET_KEY_PREFIX. */
+/** A user's last `/invite-reset`, under AUTH_RESET_KEY_PREFIX. */
 interface StoredAuthReset {
 	v: 1;
 	resetMs: number;
@@ -4104,7 +4104,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 			registerCredential: (input) => {
 				if (input.adds) {
-					// `/invite-purge` may have cleared the account's user handle (and
+					// `/invite-reset` may have cleared the account's user handle (and
 					// closed this connection) while the ceremony was verifying; the
 					// handle it began under must not come back with a new passkey.
 					if (connectionAttachment(socket)?.closing || !this.store.accounts.get(input.userId)?.userHandle) {
@@ -4162,7 +4162,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const token = await this.issueSession(finished.identity.user_id, options.origin, nowMs(), signIn.handle);
 		const sessionCredential = await sessionKey(token);
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		// A passkey `/invite-purge` removed while the ceremony was verifying
+		// A passkey `/invite-reset` removed while the ceremony was verifying
 		// signs nobody in; with no await from here, a later purge finds this
 		// connection signed in and closes it.
 		if (finished.credential && !this.store.credentials.get(finished.credential.credentialId)) {
@@ -4258,7 +4258,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (record?.v !== 1 || typeof record.userId !== "string" || !(record.expiresMs > now)) return undefined;
 		const identity = this.store.accounts.get(record.userId);
 		// The account must still be one that adds passkeys (§4.10): not a bot or
-		// `admin`, and still under its user handle, which `/invite-purge` changes.
+		// `admin`, and still under its user handle, which `/invite-reset` changes.
 		if (!identity || identity.userId === ADMIN_USER_ID || (identity.roles ?? []).includes("bot") || isBotId(identity.userId)) return undefined;
 		if (record.userHandle && identity.userHandle !== record.userHandle) return undefined;
 		return { record, identity };
@@ -4783,7 +4783,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const identity = this.store.accounts.get(session.userId);
 		const lifetimeMs = this.config.limits.sessionTtlSeconds * 1_000;
 		// A session carries the user handle it was issued under, which
-		// `/invite-purge` clears, and an account later created under a freed
+		// `/invite-reset` clears, and an account later created under a freed
 		// `user_id` never has. One from before sessions carried it is checked
 		// against the purge's marker instead, and only for an account from
 		// before then (SESSION_HANDLES_SINCE): a new account under a retired id
@@ -7991,7 +7991,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				: runtime.removeDevice(socket, attachment, request, roomId, args.id),
 		}),
 		adminCommand({
-			name: "invite-purge", usageErrors: "reply",
+			name: "invite-reset", usageErrors: "reply",
 			forms: [{ hint: "@user", description: "Sign a user out everywhere, remove their passkeys and tokens, and get a new token for them" }],
 			// A second leading `@` is taken off too, as this command always has.
 			parse: ({ words, usage }) => {
@@ -7999,7 +7999,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return userIdArg(requiredArg(words[1], usage));
 			},
 			audit: (userId) => ({ target: userId }),
-			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.invitePurge(cap, socket, attachment, request, roomId, userId),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.inviteReset(cap, socket, attachment, request, roomId, userId),
 		}),
 		adminCommand({
 			name: "invite-token", usageErrors: "reply",
@@ -9140,17 +9140,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/invite-purge <user_id>` (a leading `@` is allowed): takes away every
+	 * `/invite-reset <user_id>` (a leading `@` is allowed): takes away every
 	 * way a registered user signs in (their passkeys, passkey sessions,
 	 * device tokens and invite token), closes their connections, deletes
 	 * their push registrations, and mints them a new invite token, which the
-	 * sender gets in a `~private` notice before the result (§1), as
-	 * `/invite-token` gives it. Their account, posts and bot stay. Not the
+	 * sender gets in a `~private` notice before the result (§1): first in a
+	 * link that any Apron app opens (Appendix A.4), in code so it is copied
+	 * rather than opened, then on its own. Their account, posts and bot stay. Not the
 	 * sender, `admin`, or a bot; an unknown user is `invalid_params`.
 	 */
-	private async invitePurge(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+	private async inviteReset(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
 		assertAdmin(cap);
-		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-purge yourself" } satisfies ProtocolError;
+		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-reset yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only" } satisfies ProtocolError;
 		if (isBotId(userId)) throw { name: "denied", message: "A bot signs in with its token only; its owner replaces it with /invite-bot" } satisfies ProtocolError;
 		if (!this.store.accounts.exists(userId)) throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
@@ -9186,10 +9187,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		}
 		this.store.push?.clearSubscriptions(userId, nowMs());
+		// The link in code, not a live link: it is for sending on, and opening it
+		// here would sign the admin's own app in as them.
+		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint;
+		const removed = `Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had.`;
+		const after = "They can add a passkey once they're in.";
 		this.sendNotice(socket, roomId, [
-			`Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had. This new token signs in as them; it does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately.`,
+			endpoint
+				? `${removed} Send them this link, which signs them in with any Apron app, or the token after it if they'd rather paste it in. Neither expires, and anyone who has either signs in as \`${userId}\`, so hand them over privately. ${after}`
+				: `${removed} Send them this token, which signs in as them. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. ${after}`,
+			...endpoint ? ["`" + apronLink(endpoint, { token }) + "`"] : [],
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -9837,7 +9845,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * user's other connections that signed in with the old one close. The
 	 * token goes to this connection only, in a `~private` notice before the
 	 * result (§1). It does not expire; `/invite-device remove`,
-	 * `/invite-purge` and `/purge` revoke it, and `/rename` moves it.
+	 * `/invite-reset` and `/purge` revoke it, and `/rename` moves it.
 	 */
 	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, requested: string | undefined): Promise<void> {
 		const userId = attachment.userId!;
