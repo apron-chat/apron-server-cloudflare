@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { beginUpgrade, finishUpgrade, legacyBegin, offerUpgrade, SINCE_KEY, skipUpgrade, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys";
+import { beginUpgrade, finishUpgrade, legacyBegin, offerUpgrade, passkeysForRpId, SINCE_KEY, skipUpgrade, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
@@ -4024,8 +4024,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Adding: the account's passkeys are excluded, and its user handle reused.
 			const stored = adding ? this.store.accounts.get(attachment.userId!) : null;
 			if (adding && !stored) throw { name: "denied", message: "Only a registered user can add a passkey" } satisfies ProtocolError;
-			const existing = adding ? this.store.credentials.idsForUser(attachment.userId!) : [];
-			if (existing.length >= MAX_PASSKEYS_PER_USER) throw { name: "denied", message: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys` } satisfies ProtocolError;
+			const held = adding ? this.store.credentials.idsForUser(attachment.userId!) : [];
+			if (held.length >= MAX_PASSKEYS_PER_USER) throw { name: "denied", message: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys` } satisfies ProtocolError;
+			const existing = adding ? await this.excludedPasskeys(attachment.userId!) : [];
 			// An account without a handle yet (an invited user) gets one now, so
 			// concurrent ceremonies for it share it.
 			const shared = !stored ? null : stored.userHandle || this.store.credentials.ensureHandle(stored.userId, bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))), nowMs());
@@ -4505,8 +4506,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} else if (value.request) {
 			const found = await this.readRequestHandle(value.request, now);
 			if (!found) return pageJson(400, { error: "This link to add a passkey has expired. Start again from the app." });
-			const existing = this.store.credentials.idsForUser(found.identity.userId);
-			if (existing.length >= MAX_PASSKEYS_PER_USER) return pageJson(400, { error: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys.` });
+			if (this.store.credentials.idsForUser(found.identity.userId).length >= MAX_PASSKEYS_PER_USER) return pageJson(400, { error: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys.` });
+			const existing = await this.excludedPasskeys(found.identity.userId);
 			adds = { userId: found.identity.userId, name: found.identity.name || found.identity.userId, existing, ...(found.record.userHandle ? { userHandle: found.record.userHandle } : {}) };
 		}
 		const begun = await this.webAuthn.begin(action, origin, now,
@@ -6352,6 +6353,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.presenceSignedIn(socket);
 		this.sendShownStatus(socket);
 		void this.recordLegacySince(socket);
+	}
+
+	/**
+	 * The passkeys a new one for `userId` excludes (`excludeCredentials`):
+	 * all of them, or with LEGACY_RP_ID only those for RP_ID, so a password
+	 * manager that matches the list by ID alone still saves the new one
+	 * (`passkeysForRpId`).
+	 */
+	private async excludedPasskeys(userId: string): Promise<string[]> {
+		if (!this.config.legacyRpId) return this.store.credentials.idsForUser(userId);
+		return passkeysForRpId(this.store.credentials.passkeys(userId), await this.legacyPort().since());
 	}
 
 	/**

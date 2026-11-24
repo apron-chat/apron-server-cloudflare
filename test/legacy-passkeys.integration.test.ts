@@ -1,7 +1,7 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebAuthnService } from '../src/auth';
-import { SINCE_KEY } from '../src/legacy-passkeys';
+import { passkeysForRpId, SINCE_KEY } from '../src/legacy-passkeys';
 import { loadConfig, type RuntimeConfig } from '../src/config';
 import { connect as open, greeting, request, until, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
@@ -162,16 +162,20 @@ it('signs in on the passkey page with a passkey made for the legacy RP ID, then 
 		const other = await loginQuery(NEW);
 		expect(await begin(NEW, { query: other.query, upgrade: token })).toEqual({ status: 400, body: { error: 'This sign-in expired. Start again from the app.' } });
 
-		// The new passkey, for the new RP ID, excluding the old one, is added at once, the account's
-		// connections are told, and the sign-in's code goes back with it.
+		// The new passkey, for the new RP ID, is added at once, the account's connections are told, and the
+		// sign-in's code goes back with it. It excludes no passkey for the previous RP ID: a password manager
+		// that matches excludeCredentials by ID alone (Bitwarden) would refuse to save it beside the old one.
 		const upgraded = await begin(NEW, { query, upgrade: token });
 		expect(upgraded.status).toBe(200);
 		expect(upgraded.body.public_key.rp.id).toBe('chat.localhost');
-		expect(upgraded.body.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([passkey.id]);
+		expect((upgraded.body.public_key.excludeCredentials ?? []).map((entry: { id: string }) => entry.id)).toEqual([]);
 		const fresh = await softPasskey(NEW);
 		const added = await finish(NEW, upgraded.body.challenge_id, await fresh.register(upgraded.body.public_key));
 		expect(added).toEqual({ status: 200, body: { redirect: expect.stringMatching(/^com\.example\.myapp:\/signed-in\?code=/), added: true } });
 		expect(await passkeysOf(userId)).toEqual([passkey.id, fresh.id].sort());
+		// A later passkey for the account, in the client or as an addition, excludes the new one only.
+		const excluded = await runInDurableObject(stub(), (instance) => (instance as unknown as { excludedPasskeys(userId: string): Promise<string[]> }).excludedPasskeys(userId));
+		expect(excluded).toEqual([fresh.id]);
 		const told = await until(peer, (frame) => frame.method === 'message' && frame.params?.from?.user_id === '~private');
 		expect(told.frame.params.body.text).toBe('A passkey was added to your account on the passkey page. If it wasn\'t you, remove it with `/passkeys`.');
 		expect(await redeem(NEW, added.body.redirect!, app)).toBe(userId);
@@ -246,6 +250,13 @@ it('takes the legacy RP ID only for a sign-in on the passkey page', async () => 
 	const fresh = await softPasskey(NEW);
 	const unknown = await begin(NEW, { query });
 	expect((await finish(NEW, unknown.body.challenge_id, await fresh.assert(unknown.body.public_key, nextCounter(fresh)))).body.upgrade).toBeUndefined();
+});
+
+it('excludes from a new passkey only the passkeys made for RP_ID, since the switch', () => {
+	const passkeys = [{ credentialId: 'old', createdMs: 1_000 }, { credentialId: 'new', createdMs: 2_000 }, { credentialId: 'at', createdMs: 1_500 }];
+	expect(passkeysForRpId(passkeys, 1_500)).toEqual(['new', 'at']);
+	// Before the switch is known, none: a duplicate is harmless; a refused new passkey is not.
+	expect(passkeysForRpId(passkeys, undefined)).toEqual([]);
 });
 
 it('takes a legacy RP ID that RP_ID is under, for the passkey page', () => {
