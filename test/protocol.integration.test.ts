@@ -748,7 +748,9 @@ it('with ACTIVITY on, counts a stop whose indicator already ran out', async () =
 		await authenticate(bob, 'guest', ['activity']);
 		// The allowance spent on one-second indicators, which then run out.
 		for (let index = 0; index < 10; index += 1) alice.send({ method: 'activity', params: { room_id: 'general', typing: 1 } });
-		await until(bob, (frame) => frame.method === 'activity');
+		// All ten, since the indicator runs a second from the last, however late a busy runner relays it.
+		let starts = 0;
+		await until(bob, (frame) => frame.method === 'activity' && ++starts === 10);
 		await new Promise((resolve) => setTimeout(resolve, 1_100));
 		// Nothing shows to end, so the stop counts, and over the allowance it is dropped.
 		alice.send({ method: 'activity', params: { room_id: 'general', typing: 0 } });
