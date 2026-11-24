@@ -1,5 +1,12 @@
 /** Errors the store raises, mapped to protocol errors by the socket layer. */
 
+/**
+ * The `invalid_params` message of a new message with no text and no embeds
+ * (§3.5.1). The socket layer answers it without counting a policy violation:
+ * it used to be accepted with `{}`, and a person can send one by mistake.
+ */
+export const EMPTY_MESSAGE = "A new message needs text or embeds";
+
 export type ErrorCode =
   | "parse_error"
   | "invalid_request"

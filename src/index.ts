@@ -29,7 +29,7 @@ import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./content/media/text";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./content/emoji";
 import { liveInputLimit, liveResultEmbed, uploadResultEmbed } from "./content/embeds";
 import { MAX_USER_EXT_BYTES, clientUserExt, mergeExt, userExtFits } from "./content/user";
-import { limitData } from "./store-error";
+import { EMPTY_MESSAGE, limitData } from "./store-error";
 import { ADMIN_USER_ID } from "./user-ids";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -3922,14 +3922,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, { you: this.you(attachment) });
 			return;
 		}
-		// Before an attempt is charged: a scheme the spec does not define (such
-		// as an `ext:` name) is `invalid_params` (§1), and one it defines that
-		// this server does not offer the connection, `email` (no mail here),
-		// `external` (unless EXTERNAL_SIGN_IN), or `webauthn` from an origin not
-		// configured for passkeys without the passkey page, is `unsupported` (§3.2).
+		// Before an attempt is charged: a scheme this server does not offer the
+		// connection is `unsupported` (§3.2), even one the spec does not define
+		// (such as an `ext:` name), and so are `email` (no mail here), `external`
+		// (unless EXTERNAL_SIGN_IN), and `webauthn` from an origin not configured
+		// for passkeys without the passkey page.
 		const offered = request.params.scheme;
 		if (typeof offered === "string") {
-			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
+			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "unsupported", message: "Unknown authentication scheme" } satisfies ProtocolError;
 			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "external" && !this.externalOrigin(attachment)) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "webauthn") {
@@ -5511,7 +5511,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const messageId = optionalString(request.params, "message_id");
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
-		await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
+		try {
+			await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
+		} catch (error) {
+			// An empty new message is refused (§3.5.1), but not as a policy violation:
+			// it used to be accepted, and people send one by mistake (EMPTY_MESSAGE).
+			if (!(error instanceof StoreError && error.code === "invalid_params" && error.message === EMPTY_MESSAGE)) throw error;
+			this.fail(socket, request, { name: "invalid_params", message: EMPTY_MESSAGE });
+		}
 	}
 
 	private async handleReactions(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {

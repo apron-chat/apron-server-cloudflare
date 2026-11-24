@@ -58,7 +58,7 @@ import {
   BOOTSTRAP_ROW_RESERVATION, DEGRADE_SHARE, listedThreads, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_MEMBERSHIPS_PER_USER,
   SEEN_WRITE_GRANULARITY_MS, thresholdRecords,
 } from "../budget";
-import { StoreError } from "../store-error";
+import { EMPTY_MESSAGE, StoreError } from "../store-error";
 import {
   BOT_MODERATOR_ROLES, BOT_NAME_PATTERN, BOT_NAME_RULE, DEFAULT_JOINED_ROOMS, isPrivateRoomId, isProtocolId, MAX_CREATED_ROOMS,
   MAX_LISTED_USER_ROOMS, MAX_PASSKEYS_PER_USER, MAX_ROLES_PER_USER, MAX_ROOM_MUTES_PER_USER, MAX_USER_ROOMS, MODERATOR_ROLES,
@@ -3524,7 +3524,7 @@ export class SqliteStore {
     return { user_id: input.identity.user_id, ...(name ? { name } : {}) };
   }
 
-  /** A new message with no text and no embeds, which is neither logged nor broadcast (§3.5). */
+  /** A new message with no text and no embeds, which is `invalid_params` (§3.5.1). */
   private emptyNewMessage(params: Record<string, unknown>): boolean {
     if (params.message_id !== undefined || (params.deleted !== undefined && params.deleted !== false) || !isPlainObject(params.body)) return false;
     return isEmptyBody(must(this.content.body(params.body)));
@@ -4691,11 +4691,12 @@ export class SqliteStore {
     const method = this.mutationMethod(input.method);
     const operationNow = input.now ?? this.clock.now();
     if (method === "message" && this.emptyNewMessage(input.params)) {
-      // Nothing is logged, charged, or recorded; only the room is checked.
+      // Refused (§3.5.1): nothing is logged, charged, or recorded. The room is
+      // checked first, so a hidden room answers as a missing one does.
       return this.reserved("commitMutation", { reads: 8 }, false, operationNow, () => {
         const roomId = input.params.room_id === undefined ? ROOM_ID : input.params.room_id;
         if (typeof roomId !== "string" || !this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
-        return { result: {}, broadcasts: [] };
+        throw new StoreError("invalid_params", EMPTY_MESSAGE);
       });
     }
     const digest = input.digest ?? digestOperation(method, input.params);
