@@ -398,11 +398,16 @@ posts.
 - A sign-up with an `/invite-code` token is an `/invite-token` registration, plus
   up to 8 `user_id` availability probes (8 reads each, reserved), the new
   user's identity read, and one KV read and three KV writes (in one put),
-  reserved at their bound. `/invite-code` and `/invite-device add` are one KV read and
+  reserved at their bound. A sign-up whose sign-in then fails is undone: one
+  KV read and three writes (the token and pointer deleted, the use given back),
+  then the account purged. `/invite-code` and `/invite-device add` are one KV read and
   three writes, `/invite-device remove` one read and two writes,
   `/invite-device list` at most six reads, `/invite-token` two KV writes;
-  `/invite-purge` two KV reads and at most ten writes, plus deleting the
-  user's credential rows. Signing in with a device token is one KV read,
+  `/invite-reset` two KV reads and at most ten writes, plus deleting the
+  user's credential rows. Signing in with the one-time token it gives is
+  one KV read and three writes (it is deleted, and the user's own token and
+  pointer put), or one write to drop it once expired; six writes are reserved, three more than the spend uses, so a sign-in that then fails can put it back; `/rename` moves it
+  without reading it, since its pointer repeats its expiry. Signing in with a device token is one KV read,
   like a bot token, and one write on its first sign-in of a UTC day (its
   last use). A passkey session issued before sessions recorded their user
   handle costs one more KV read to resume, until the last of them expires.

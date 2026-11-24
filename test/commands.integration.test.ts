@@ -102,7 +102,7 @@ const LINES: Record<string, { run?: (users: Users) => string; target?: (users: U
 	'invite-bot': { usage: null },
 	'invite-code': { run: () => '/invite-code 2', target: () => undefined, usage: '/invite-code' },
 	'invite-device': { usage: '/invite-device' },
-	'invite-purge': { run: (u) => `/invite-purge ${u.resetting}`, target: (u) => u.resetting, usage: '/invite-purge' },
+	'invite-reset': { run: (u) => `/invite-reset ${u.resetting}`, target: (u) => u.resetting, usage: '/invite-reset' },
 	'invite-token': { run: (u) => `/invite-token ${u.invited}`, target: (u) => u.invited, usage: '/invite-token' },
 	'kick': { run: (u) => `/kick ${u.kicked}`, target: (u) => u.kicked, usage: '/kick' },
 	'passkeys': { usage: '/passkeys remove' },
@@ -187,7 +187,7 @@ describe('the command registry', () => {
 				// No token the command handed out, and nothing it set, is in the event.
 				expect(JSON.stringify(event)).not.toMatch(SECRET);
 				// Those that hand out a token or set text did, so the check above means something.
-				if (['invite-code', 'invite-token', 'invite-purge', 'server'].includes(spec.name)) expect(JSON.stringify(skipped)).toMatch(SECRET);
+				if (['invite-code', 'invite-token', 'invite-reset', 'server'].includes(spec.name)) expect(JSON.stringify(skipped)).toMatch(SECRET);
 			}
 			// A failure after authorization is recorded with the error's name, not its message.
 			events = [];
@@ -388,7 +388,7 @@ describe('the source', () => {
 		}
 		// The privileged methods all take one.
 		const index = files.find(([path]) => path === 'src/index.ts')![1];
-		for (const method of ['purge', 'rename', 'grantAdmin', 'role', 'changeRole', 'kick', 'toggle', 'inviteToken', 'invitePurge', 'invite', 'serverCommand', 'sendStatus', 'historyCommand', 'historyJob']) {
+		for (const method of ['purge', 'rename', 'grantAdmin', 'role', 'changeRole', 'kick', 'toggle', 'inviteToken', 'inviteReset', 'invite', 'serverCommand', 'sendStatus', 'historyCommand', 'historyJob']) {
 			expect(index, method).toMatch(new RegExp(`^\\t(?:private )?(?:async )?${method}\\(cap: AdminCapability, `, 'm'));
 		}
 		expect(index).toMatch(/^\tprivate async emojiCommand\(grant: RoleCapability, /m);

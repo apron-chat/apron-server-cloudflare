@@ -608,6 +608,8 @@ const MAX_JOIN_USES = 50;
 /** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
 const JOIN_DEFAULT_NAME = MEMBER_NAME;
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
+/** How long the one-time token `/invite-reset` mints may be used. */
+const RESET_TOKEN_TTL_MS = 7 * 86_400_000;
 /** Device tokens one user may hold at once, each under its own id. */
 const MAX_DEVICE_TOKENS = 5;
 /**
@@ -808,7 +810,7 @@ const DEVICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
 /** A credential's storage key, as a connection keeps it (ConnectionAttachment.credential): its prefix and a SHA-256. */
 const CREDENTIAL_KEY_PATTERN = /^(session|bot-token|invite-token|device-token):[0-9a-f]{64}$/;
 /**
- * Key prefix for the time of a user's last `/invite-purge`, which ends the
+ * Key prefix for the time of a user's last `/invite-reset`, which ends the
  * passkey sessions issued before sessions carried their user handle.
  */
 const AUTH_RESET_KEY_PREFIX = "auth-reset:";
@@ -829,7 +831,7 @@ interface StoredSession {
 	expiresMs: number;
 	/**
 	 * The account's WebAuthn user handle when the session was issued: once
-	 * `/invite-purge` clears it, the session no longer resumes. Sessions
+	 * `/invite-reset` clears it, the session no longer resumes. Sessions
 	 * issued before this was stored have none.
 	 */
 	handle?: string;
@@ -855,11 +857,24 @@ interface StoredBot {
 /**
  * An invite token (`/invite-token`), stored only as its SHA-256 under
  * INVITE_TOKEN_KEY_PREFIX: the registered user it signs in as. The user's
- * INVITE_KEY_PREFIX entry is a StoredBot-shaped pointer back to it.
+ * INVITE_KEY_PREFIX entry is a StoredInvitePointer back to it. One
+ * `/invite-reset` mints has an `expiresMs`: it signs in once before then,
+ * and the sign-in replaces it with the user's own token that does not
+ * expire (handleInviteToken).
  */
 interface StoredInviteToken {
 	v: 1;
 	userId: string;
+	expiresMs?: number;
+}
+
+/**
+ * A user's pointer to their invite token, so the next one revokes it. It
+ * repeats a one-time token's `expiresMs`, so `/rename` moves the token
+ * without reading it.
+ */
+interface StoredInvitePointer extends StoredBot {
+	expiresMs?: number;
 }
 
 /**
@@ -884,7 +899,7 @@ interface StoredDeviceToken {
  */
 const SESSION_HANDLES_SINCE = Date.parse("2026-10-31T00:00:00Z");
 
-/** A user's last `/invite-purge`, under AUTH_RESET_KEY_PREFIX. */
+/** A user's last `/invite-reset`, under AUTH_RESET_KEY_PREFIX. */
 interface StoredAuthReset {
 	v: 1;
 	resetMs: number;
@@ -4104,7 +4119,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 			registerCredential: (input) => {
 				if (input.adds) {
-					// `/invite-purge` may have cleared the account's user handle (and
+					// `/invite-reset` may have cleared the account's user handle (and
 					// closed this connection) while the ceremony was verifying; the
 					// handle it began under must not come back with a new passkey.
 					if (connectionAttachment(socket)?.closing || !this.store.accounts.get(input.userId)?.userHandle) {
@@ -4162,7 +4177,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const token = await this.issueSession(finished.identity.user_id, options.origin, nowMs(), signIn.handle);
 		const sessionCredential = await sessionKey(token);
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		// A passkey `/invite-purge` removed while the ceremony was verifying
+		// A passkey `/invite-reset` removed while the ceremony was verifying
 		// signs nobody in; with no await from here, a later purge finds this
 		// connection signed in and closes it.
 		if (finished.credential && !this.store.credentials.get(finished.credential.credentialId)) {
@@ -4258,7 +4273,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (record?.v !== 1 || typeof record.userId !== "string" || !(record.expiresMs > now)) return undefined;
 		const identity = this.store.accounts.get(record.userId);
 		// The account must still be one that adds passkeys (§4.10): not a bot or
-		// `admin`, and still under its user handle, which `/invite-purge` changes.
+		// `admin`, and still under its user handle, which `/invite-reset` changes.
 		if (!identity || identity.userId === ADMIN_USER_ID || (identity.roles ?? []).includes("bot") || isBotId(identity.userId)) return undefined;
 		if (record.userHandle && identity.userHandle !== record.userHandle) return undefined;
 		return { record, identity };
@@ -4783,7 +4798,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const identity = this.store.accounts.get(session.userId);
 		const lifetimeMs = this.config.limits.sessionTtlSeconds * 1_000;
 		// A session carries the user handle it was issued under, which
-		// `/invite-purge` clears, and an account later created under a freed
+		// `/invite-reset` clears, and an account later created under a freed
 		// `user_id` never has. One from before sessions carried it is checked
 		// against the purge's marker instead, and only for an account from
 		// before then (SESSION_HANDLES_SINCE): a new account under a retired id
@@ -4853,8 +4868,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Signs a user in with the token an admin made for them (`/invite-token`),
-	 * through the `token` scheme (§3.2), from any origin like a bot token.
+	 * Signs a user in with the token an admin made for them (`/invite-token`,
+	 * or `/invite-reset`'s one-time token), through the `token` scheme
+	 * (§3.2), from any origin like a bot token.
 	 */
 	private async handleInviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
 		return this.withSessionLock(async () => {
@@ -4866,7 +4882,56 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string") throw invalid;
 			const identity = this.store.accounts.get(stored.userId);
 			if (!identity) throw invalid;
-			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
+			if (stored.expiresMs === undefined) return void await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
+			// A one-time token from `/invite-reset`: an expired one is dropped when
+			// tried; a live one is spent, and the user gets their own token, which
+			// the result carries, as a sign-up's does.
+			if (!(stored.expiresMs > nowMs())) {
+				await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.delete(key));
+				throw { name: "denied", message: "This reset token has expired; ask an admin for a new one" } satisfies ProtocolError;
+			}
+			// The sign-in's reads come before the spend, so their failure spends nothing.
+			const status = { stored: this.readStatusInputs(identity.userId, identity.seen) };
+			const own = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+			const ownKey = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(own);
+			// A connection gone before the sign-in leaves the token unspent.
+			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+			// Six writes: the spend's three, and the three that put it back if the
+			// sign-in then fails, so that restore needs no reservation of its own.
+			await this.store.meter.foreground({ writes: 6 }, async () => {
+				// No await between them, so they commit together: the one-time
+				// token never outlives the pointer moving off it.
+				const spent = this.ctx.storage.delete(key);
+				const replaced = this.ctx.storage.put({
+					[ownKey]: { v: 1, userId: identity.userId } satisfies StoredInviteToken,
+					[INVITE_KEY_PREFIX + identity.userId]: { v: 1, tokenKey: ownKey } satisfies StoredInvitePointer,
+				});
+				await Promise.all([spent, replaced]);
+			});
+			try {
+				await this.signInKeyless(socket, attachment, request, identity, own, false, ownKey, status);
+			} finally {
+				// A sign-in that did not happen (the connection closed, or the
+				// account changed, during the spend) puts the reset token back,
+				// so the user can try again. Still under the session lock, so a
+				// `/purge`, `/rename` or `/invite-reset` waiting on it acts on
+				// what this restores. Once signed in, the reply is sent with the
+				// user's own token; a reply lost after that spends the token.
+				// Its writes were reserved with the spend's; a failure is logged, so
+				// the sign-in's own error is the one the client sees.
+				if (connectionAttachment(socket)?.credential !== ownKey) {
+					try {
+						const dropped = this.ctx.storage.delete(ownKey);
+						const restored = this.ctx.storage.put({
+							[key]: stored,
+							[INVITE_KEY_PREFIX + identity.userId]: { v: 1, tokenKey: key, expiresMs: stored.expiresMs } satisfies StoredInvitePointer,
+						});
+						await Promise.all([dropped, restored]);
+					} catch (error) {
+						console.warn(JSON.stringify({ event: "reset_token_restore_failed", reason: errorToProtocol(error).message }));
+					}
+				}
+			}
 		});
 	}
 
@@ -4959,10 +5024,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * invite, or a user's other `device`): the connection becomes the
 	 * identity, and the guest it replaces leaves as guestLeaves has it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown>; seen?: number }, token?: string, created = false, credential?: string): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown>; seen?: number }, token?: string, created = false, credential?: string, status?: { stored: SignInStatus | undefined }): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		// Read before the connection changes, so a failure leaves it as it was.
-		const stored = this.readStatusInputs(identity.userId, identity.seen);
+		// Read before the connection changes, so a failure leaves it as it was;
+		// `status` when the caller read them before spending something.
+		const stored = status ? status.stored : this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
 		this.becomeRegistered(socket, attachment, identity, this.liveRoomsOf(identity.userId, socket) ?? identity.rooms, credential);
 		this.prepareStatus(socket, stored);
@@ -5012,10 +5078,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// The new user's logged joins reach this connection after its
 				// `auth` result (§3.2); signInKeyless releases them.
 				this.holdDeliveries(socket);
-				await this.runMutation(async () => {
-					const created = this.store.accounts.createInvited({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
-					for (const record of created.broadcasts) this.broadcastHeld(socket, record);
-				});
+				try {
+					await this.runMutation(async () => {
+						const created = this.store.accounts.createInvited({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
+						for (const record of created.broadcasts) this.broadcastHeld(socket, record);
+					});
+				} catch (error) {
+					// No account: the guest gets what it was sent meanwhile.
+					this.releaseDeliveries(socket);
+					throw error;
+				}
 				// One put of three keys, with no await between creation and it: the
 				// new user's token and pointer, and the invite counted down (a
 				// used-up invite is pruned on its next try).
@@ -5027,12 +5099,55 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return userId;
 			});
 			if (userId === null) return;
-			const identity = this.store.accounts.get(userId);
-			if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
-			// A reply lost after this point costs one use: the user exists, with a
-			// token nobody received, until an admin /purges them.
-			await this.signInKeyless(socket, attachment, request, identity, own, true, ownKey);
+			try {
+				const identity = this.store.accounts.get(userId);
+				if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
+				await this.signInKeyless(socket, attachment, request, identity, own, true, ownKey);
+			} finally {
+				// A sign-up whose sign-in did not happen (a failed read, or the
+				// connection closed while the account was made) is undone, so the
+				// person can try again with the use it gave back. Once signed in,
+				// the reply is sent with their token; a reply lost after that
+				// costs one use, and the account stays until an admin /purges it.
+				if (connectionAttachment(socket)?.credential !== ownKey) await this.undoSignUp(socket, userId, key, ownKey);
+			}
 		});
+	}
+
+	/**
+	 * Undoes a sign-up (handleJoinToken) whose sign-in did not happen, under
+	 * the session lock it holds: the new user's token first, so a `user_id`
+	 * the account frees never comes with a live token, and the use given back
+	 * in the same commit; then the account; and the connection, still a
+	 * guest, gets what was held for it. A failure here is logged, not
+	 * thrown, so the sign-in's own error is the one the client sees. If the
+	 * first step is refused (an exhausted budget), nothing is undone: the
+	 * account stays with a token nobody received and the use stays spent,
+	 * as before undoing existed, until an admin /purges it; if the purge
+	 * fails, the account stays without a token.
+	 */
+	private async undoSignUp(socket: WebSocketConnection, userId: string, inviteKey: string, ownKey: string): Promise<void> {
+		this.releaseDeliveries(socket);
+		// None should be signed in as the account, but none may stay if one is.
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (state) this.closePolicy(peer, state, 1008, "Sign-up undone");
+		}
+		try {
+			await this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
+				const invite = await this.ctx.storage.get<StoredJoinInvite>(inviteKey);
+				const dropped = this.ctx.storage.delete([ownKey, INVITE_KEY_PREFIX + userId]);
+				// The same invite, as the session lock kept it: a new one, or a
+				// revocation, would have replaced it under that lock.
+				const restored = invite?.v === 1 ? this.ctx.storage.put<StoredJoinInvite>(inviteKey, { ...invite, remaining: invite.remaining + 1 }) : undefined;
+				await Promise.all([dropped, restored]);
+			});
+			await this.runMutation(async () => {
+				this.store.accounts.purge({ userIds: [userId], now: nowMs() });
+			});
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "sign_up_undo_failed", reason: errorToProtocol(error).message }));
+		}
 	}
 
 	/**
@@ -5059,7 +5174,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, uses === 0 ? "The sign-up invite is revoked." : [
 			`This invite signs up ${uses} new user${uses === 1 ? "" : "s"} until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and replaces any earlier one. Each gets their own token to sign in again with, and can add a passkey after.`,
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, "Or send this link, which signs each of them up with any Apron app"),
+			...this.tokenLink(socket, token, "Or send this link, which signs each of them up with any Apron app", undefined, true),
 			`To sign up, authenticate with the token scheme and a name: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}", "name": "Ada"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -7991,7 +8106,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				: runtime.removeDevice(socket, attachment, request, roomId, args.id),
 		}),
 		adminCommand({
-			name: "invite-purge", usageErrors: "reply",
+			name: "invite-reset", usageErrors: "reply",
 			forms: [{ hint: "@user", description: "Sign a user out everywhere, remove their passkeys and tokens, and get a new token for them" }],
 			// A second leading `@` is taken off too, as this command always has.
 			parse: ({ words, usage }) => {
@@ -7999,7 +8114,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return userIdArg(requiredArg(words[1], usage));
 			},
 			audit: (userId) => ({ target: userId }),
-			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.invitePurge(cap, socket, attachment, request, roomId, userId),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.inviteReset(cap, socket, attachment, request, roomId, userId),
 		}),
 		adminCommand({
 			name: "invite-token", usageErrors: "reply",
@@ -9133,29 +9248,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, [
 			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
+			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint, true),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
 	}
 
 	/**
-	 * `/invite-purge <user_id>` (a leading `@` is allowed): takes away every
+	 * `/invite-reset <user_id>` (a leading `@` is allowed): takes away every
 	 * way a registered user signs in (their passkeys, passkey sessions,
 	 * device tokens and invite token), closes their connections, deletes
 	 * their push registrations, and mints them a new invite token, which the
-	 * sender gets in a `~private` notice before the result (§1), as
-	 * `/invite-token` gives it. Their account, posts and bot stay. Not the
+	 * sender gets in a `~private` notice before the result (§1): first in a
+	 * link that any Apron app opens (Appendix A.4), in code so it is copied
+	 * rather than opened, then on its own. The token signs in once within
+	 * RESET_TOKEN_TTL_MS, and gives the user their own token that does not
+	 * expire (handleInviteToken). Their account, posts and bot stay. Not the
 	 * sender, `admin`, or a bot; an unknown user is `invalid_params`.
 	 */
-	private async invitePurge(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+	private async inviteReset(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
 		assertAdmin(cap);
-		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-purge yourself" } satisfies ProtocolError;
+		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-reset yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only" } satisfies ProtocolError;
 		if (isBotId(userId)) throw { name: "denied", message: "A bot signs in with its token only; its owner replaces it with /invite-bot" } satisfies ProtocolError;
 		if (!this.store.accounts.exists(userId)) throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		const expiresMs = nowMs() + RESET_TOKEN_TTL_MS;
 		let passkeys = 0;
 		try {
 			await this.withSessionLock(async () => {
@@ -9172,8 +9291,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					if (devices.length) await this.ctx.storage.delete(DEVICES_KEY_PREFIX + userId);
 					// Ends the sessions from before sessions carried their user handle (handleTokenResume).
 					await this.ctx.storage.put<StoredAuthReset>(AUTH_RESET_KEY_PREFIX + userId, { v: 1, resetMs: now });
-					await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
-					await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
+					await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId, expiresMs });
+					await this.ctx.storage.put<StoredInvitePointer>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key, expiresMs });
 				});
 				// Clearing the user handle ends the passkey sessions issued under it.
 				passkeys = this.store.credentials.resetAuth({ userId, now });
@@ -9186,10 +9305,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		}
 		this.store.push?.clearSubscriptions(userId, nowMs());
+		// The link in code, not a live link: it is for sending on, and opening it
+		// here would sign the admin's own app in as them.
+		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint;
+		const removed = `Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had.`;
+		const once = `It works once, until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and whoever uses it first signs in as \`${userId}\`, so hand it over privately. Signing in with it gives them their own token to sign in again with, and they can add a passkey once they're in.`;
 		this.sendNotice(socket, roomId, [
-			`Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had. This new token signs in as them; it does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately.`,
+			endpoint
+				? `${removed} Send them this link, which signs them in with any Apron app, or the token after it if they'd rather paste it in. ${once}`
+				: `${removed} Send them this token, which signs in as them. ${once}`,
+			...endpoint ? ["`" + apronLink(endpoint, { token }) + "`"] : [],
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -9198,19 +9324,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `lead` and a link that brings `token` to any Apron app (Appendix A.4),
 	 * for the WebSocket URL this connection reached, as one line of a notice;
-	 * none when that URL isn't known.
+	 * none when that URL isn't known. With `code`, the link is written as
+	 * code: one for sending on, which opened here would sign this app in
+	 * with someone else's token.
 	 */
-	private tokenLink(socket: WebSocketConnection, token: string, lead: string, fallback?: string): string[] {
+	private tokenLink(socket: WebSocketConnection, token: string, lead: string, fallback?: string, code = false): string[] {
 		const endpoint = connectionAttachment(socket)?.endpoint ?? fallback;
-		return endpoint ? [`${lead}: <${apronLink(endpoint, { token })}>`] : [];
+		if (!endpoint) return [];
+		const link = apronLink(endpoint, { token });
+		return [code ? `${lead}: \`${link}\`` : `${lead}: <${link}>`];
 	}
 
 	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
 	private async moveInviteToken(from: string, to: string): Promise<void> {
 		await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
-			const pointer = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + from);
+			const pointer = await this.ctx.storage.get<StoredInvitePointer>(INVITE_KEY_PREFIX + from);
 			if (pointer?.v !== 1 || typeof pointer.tokenKey !== "string") return;
-			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to });
+			// An expired one-time token is dropped, not moved, since its sign-in
+			// may have dropped it already.
+			if (typeof pointer.expiresMs === "number" && !(pointer.expiresMs > nowMs())) {
+				await this.ctx.storage.delete([pointer.tokenKey, INVITE_KEY_PREFIX + from]);
+				return;
+			}
+			// A one-time token keeps its expiry, which the pointer repeats.
+			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to, ...(typeof pointer.expiresMs === "number" ? { expiresMs: pointer.expiresMs } : {}) });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + to, pointer);
 			await this.ctx.storage.delete(INVITE_KEY_PREFIX + from);
 		}));
@@ -9837,7 +9974,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * user's other connections that signed in with the old one close. The
 	 * token goes to this connection only, in a `~private` notice before the
 	 * result (§1). It does not expire; `/invite-device remove`,
-	 * `/invite-purge` and `/purge` revoke it, and `/rename` moves it.
+	 * `/invite-reset` and `/purge` revoke it, and `/rename` moves it.
 	 */
 	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, requested: string | undefined): Promise<void> {
 		const userId = attachment.userId!;

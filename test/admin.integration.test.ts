@@ -70,7 +70,7 @@ it('lists and runs the admin commands for admins only', async () => {
 		expect(help.notice!.params.body.text).toContain('/rename @user <new_user_id>');
 		// Admins' commands say so; everyone else's don't.
 		expect(help.notice!.params.body.text).toContain('- `/kick @user`: Remove a user from this room (admin-only)');
-		expect(help.notice!.params.body.text).toContain('/invite-purge @user');
+		expect(help.notice!.params.body.text).toContain('/invite-reset @user');
 		expect(help.notice!.params.body.text).not.toMatch(/`\/invite-bot`.*\(admin-only\)/);
 		// Listed alphabetically.
 		const listed = [...help.notice!.params.body.text.matchAll(/^- `\/([a-z-]+(?: [a-z]+)?)/gm)].map((match) => match[1]);
@@ -132,7 +132,7 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		expect(all.map((form) => form.name).filter((name) => name.startsWith('invite-device'))).toEqual(['invite-device list']);
 		expect(['history export', 'history import', 'history status'].map((name) => byName.get(name)?.hint)).toEqual(['[<room_id>...]', '<key> [dry-run] [match|new] [renumber] [restart]', undefined]);
 		// The user-target commands read the user from the text alone.
-		for (const name of ['admin', 'invite-purge', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
+		for (const name of ['admin', 'invite-reset', 'invite-token', 'purge', 'rename', 'role', 'history import']) expect(byName.get(name)!.uses).toBeUndefined();
 
 		// A command's forms share its group: the audience it is for.
 		expect(Object.fromEntries(['help', 'embed-append', 'avatar', 'invite-bot', 'invite-device list', 'emoji remove', 'history status', 'toggle'].map((name) => [name, byName.get(name)!.group]))).toEqual({
@@ -514,7 +514,9 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 		expect(text).toContain(`Created \`${userId}\``);
 		const token = text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1];
 		// The same token in a link that any Apron app opens (Appendix A.4).
-		expect(text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${token}>`);
+		// Written as code, to send on rather than open here (which would sign this app in as them).
+		expect(text).toContain(`: \`https://link.apron.chat/#server=wss://demo.test/ws&token=${token}\``);
+		expect(text).not.toContain('<https://link.apron.chat/');
 
 		// The token signs in from any origin, as a registered user in general.
 		const first = await signIn(token);
@@ -724,7 +726,7 @@ it('/invite-device remove revokes a token and closes what signed in with it', as
 	} finally { phone?.close(); owner.close(); }
 });
 
-it('/invite-purge removes every way a user signs in and gives the admin a new token for them', async () => {
+it('/invite-reset removes every way a user signs in and gives the admin a new token for them', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('target');
 	// A session from before sessions carried their user handle, and one after.
@@ -750,10 +752,14 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		const onDevice = await signIn(device);
 		expect(onDevice.reply.result.you.user_id).toBe(userId);
 
-		const purged = await command(admin, 'invite-purge', `/invite-purge @${userId}`);
+		const purged = await command(admin, 'invite-reset', `/invite-reset @${userId}`);
 		expect(purged.frame.result).toEqual({});
 		expect(purged.notice!.params.body.text).toContain(`Signed \`${userId}\` out everywhere and removed 1 passkey`);
 		const fresh = purged.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		// The link comes first, in code so it is copied and sent on rather than opened, then the token on its own.
+		expect(purged.notice!.params.body.text).toContain(`\n\n\`https://link.apron.chat/#server=wss://demo.test/ws&token=${fresh}\`\n\n\`\`\`\n${fresh}\n\`\`\`\n\n`);
+		expect(purged.notice!.params.body.text).not.toContain('<https://link.apron.chat/');
+		expect(purged.notice!.params.body.text).toMatch(/It works once, until \d{4}-\d\d-\d\d \d\d:\d\d UTC/);
 		for (const peer of [legacy, onSession.peer, onDevice.peer]) await vi.waitFor(() => expect(peer.closed()?.code).toBe(1008));
 		expect(admin.closed()).toBeUndefined();
 
@@ -765,25 +771,46 @@ it('/invite-purge removes every way a user signs in and gives the admin a new to
 		expect(onFresh.reply.result.you.user_id).toBe(userId);
 		expect((await command(onFresh.peer, 'list', '/invite-device list')).notice!.params.body.text).toContain('no device tokens');
 
-		// Again, the token it gave before stops working too.
-		const again = await command(admin, 'invite-purge-2', `/invite-purge ${userId}`);
-		expect(again.notice!.params.body.text).toContain('removed 0 passkeys');
-		await vi.waitFor(() => expect(onFresh.peer.closed()?.code).toBe(1008));
+		// The reset token works once; the sign-in gives them their own token, which keeps working.
+		const own = onFresh.reply.result.token as string;
+		expect(own).toMatch(/^apron_invite_[A-Za-z0-9_-]{43}$/);
+		expect(own).not.toBe(fresh);
 		expect((await signIn(fresh)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+		const onOwn = await signIn(own);
+		expect(onOwn.reply.result.you.user_id).toBe(userId);
+		expect(onOwn.reply.result.token).toBeUndefined();
+		expect((await signIn(own)).reply.result.you.user_id).toBe(userId);
+
+		// Again, the token they got from the last one stops working too.
+		const again = await command(admin, 'invite-reset-2', `/invite-reset ${userId}`);
+		expect(again.notice!.params.body.text).toContain('removed 0 passkeys');
+		await vi.waitFor(() => expect(onOwn.peer.closed()?.code).toBe(1008));
+		expect((await signIn(own)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+
+		// An expired reset token is refused, and dropped.
+		const expired = again.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		const tokenKey = await runInDurableObject(stub(), async (_instance, state) => {
+			const pointer = (await state.storage.get<{ v: 1; tokenKey: string; expiresMs: number }>(`invite:${userId}`))!;
+			expect(pointer.expiresMs).toBeGreaterThan(Date.now());
+			await state.storage.put(pointer.tokenKey, { v: 1, userId, expiresMs: Date.now() - 1 });
+			return pointer.tokenKey;
+		});
+		expect((await signIn(expired)).reply.error.message).toBe('This reset token has expired; ask an admin for a new one');
+		expect(await runInDurableObject(stub(), (_instance, state) => state.storage.get(tokenKey))).toBeUndefined();
 
 		// Not oneself, the admin user, a bot or an unknown user; and only for admins.
 		const otherAdminId = unique('admin');
 		const otherAdmin = await signedIn(otherAdminId);
 		opened.push(otherAdmin);
 		await command(admin, 'grant', `/admin ${otherAdminId}`);
-		expect((await command(otherAdmin, 'self', `/invite-purge ${otherAdminId}`)).frame.error.message).toBe("You can't /invite-purge yourself");
-		expect((await command(admin, 'admin-user', '/invite-purge admin')).frame.error.code).toBe(-32001);
-		expect((await command(admin, 'bot', `/invite-purge bot_${userId}`)).frame.error.code).toBe(-32001);
-		expect((await command(admin, 'unknown', `/invite-purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
-		expect((await command(admin, 'usage', '/invite-purge')).frame.error.message).toBe('Usage: /invite-purge @user');
+		expect((await command(otherAdmin, 'self', `/invite-reset ${otherAdminId}`)).frame.error.message).toBe("You can't /invite-reset yourself");
+		expect((await command(admin, 'admin-user', '/invite-reset admin')).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'bot', `/invite-reset bot_${userId}`)).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'unknown', `/invite-reset ${unique('nobody')}`)).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'usage', '/invite-reset')).frame.error.message).toBe('Usage: /invite-reset @user');
 		const plain = await signedIn(unique('plain'));
 		opened.push(plain);
-		expect((await command(plain, 'plain', `/invite-purge ${otherAdminId}`)).frame.error.message).toMatch(/Only an admin/);
+		expect((await command(plain, 'plain', `/invite-reset ${otherAdminId}`)).frame.error.message).toMatch(/Only an admin/);
 	} finally {
 		for (const peer of opened) peer.close();
 		admin.close();
@@ -1187,7 +1214,112 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>, ed
 	} finally { peer.close(); }
 }
 
-it('a passkey ceremony verifying while /invite-purge runs signs nobody in and adds no passkey', async () => {
+it('/rename moves a reset token, which still works once and expires', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('reset');
+	const renamedId = unique('moved');
+	const user = await signedIn(userId);
+	const opened: Peer[] = [user];
+	const signIn = async (token: string) => {
+		const peer = await connect(null);
+		opened.push(peer);
+		await peer.next();
+		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
+	};
+	try {
+		const reset = await command(admin, 'reset', `/invite-reset ${userId}`);
+		const token = reset.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		await command(admin, 'rename', `/rename ${userId} ${renamedId}`);
+		const expiresMs = await runInDurableObject(stub(), async (_instance, state) => {
+			const pointer = (await state.storage.get<{ tokenKey: string; expiresMs: number }>(`invite:${renamedId}`))!;
+			expect(await state.storage.get(pointer.tokenKey)).toEqual({ v: 1, userId: renamedId, expiresMs: pointer.expiresMs });
+			return pointer.expiresMs;
+		});
+		expect(expiresMs).toBeGreaterThan(Date.now());
+		const first = await signIn(token);
+		expect(first.reply.result.you.user_id).toBe(renamedId);
+		expect(first.reply.result.token).toMatch(/^apron_invite_/);
+		expect((await signIn(token)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+	} finally {
+		for (const peer of opened) peer.close();
+		admin.close();
+	}
+});
+
+it('a reset token survives a sign-in that fails before or after it is spent', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('retry');
+	const user = await signedIn(userId);
+	const opened: Peer[] = [user];
+	const signIn = async (token: string) => {
+		const peer = await connect(null);
+		opened.push(peer);
+		await peer.next();
+		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
+	};
+	type Patchable = Record<'readStatusInputs' | 'becomeRegistered', (...args: unknown[]) => unknown>;
+	// Makes the named step of the next sign-in fail once.
+	const failOnce = (method: keyof Patchable) => runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as Patchable;
+		const original = runtime[method];
+		runtime[method] = function () {
+			runtime[method] = original;
+			throw { name: 'internal_error', message: 'Could not read your status and mutes; sign in again' };
+		};
+	});
+	try {
+		const reset = await command(admin, 'reset', `/invite-reset ${userId}`);
+		const token = reset.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		const tokenKey = await runInDurableObject(stub(), async (_instance, state) => (await state.storage.get<{ tokenKey: string }>(`invite:${userId}`))!.tokenKey);
+
+		// Before the spend: the status read.
+		await failOnce('readStatusInputs');
+		expect((await signIn(token)).reply.error.code).toBe(-32603);
+		// After it: the connection becoming the user. The token is put back, and its pointer.
+		await failOnce('becomeRegistered');
+		expect((await signIn(token)).reply.error.code).toBe(-32603);
+		await runInDurableObject(stub(), async (_instance, state) => {
+			expect(await state.storage.get(tokenKey)).toEqual({ v: 1, userId, expiresMs: expect.any(Number) });
+			expect((await state.storage.get<{ tokenKey: string }>(`invite:${userId}`))!.tokenKey).toBe(tokenKey);
+		});
+
+		const signedInAgain = await signIn(token);
+		expect(signedInAgain.reply.result.you.user_id).toBe(userId);
+		const own = signedInAgain.reply.result.token as string;
+		expect((await signIn(token)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+		expect((await signIn(own)).reply.result.you.user_id).toBe(userId);
+	} finally {
+		for (const peer of opened) peer.close();
+		admin.close();
+	}
+});
+
+it('/rename drops an expired reset token rather than moving it', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('stale');
+	const renamedId = unique('stalemoved');
+	const user = await signedIn(userId);
+	try {
+		await command(admin, 'reset', `/invite-reset ${userId}`);
+		const tokenKey = await runInDurableObject(stub(), async (_instance, state) => {
+			const pointer = (await state.storage.get<{ v: 1; tokenKey: string; expiresMs: number }>(`invite:${userId}`))!;
+			await state.storage.put(`invite:${userId}`, { ...pointer, expiresMs: Date.now() - 1 });
+			await state.storage.delete(pointer.tokenKey);
+			return pointer.tokenKey;
+		});
+		await command(admin, 'rename', `/rename ${userId} ${renamedId}`);
+		await runInDurableObject(stub(), async (_instance, state) => {
+			expect(await state.storage.get(tokenKey)).toBeUndefined();
+			expect(await state.storage.get(`invite:${userId}`)).toBeUndefined();
+			expect(await state.storage.get(`invite:${renamedId}`)).toBeUndefined();
+		});
+	} finally {
+		user.close();
+		admin.close();
+	}
+});
+
+it('a passkey ceremony verifying while /invite-reset runs signs nobody in and adds no passkey', async () => {
 	const userId = unique('raced');
 	const user = await signedIn(userId);
 	type Patchable = { updateCredentialCounter: (...args: unknown[]) => void; resetAuth(input: { userId: string }): number };
@@ -1296,7 +1428,8 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		const minted = await command(admin, 'invite', '/invite-code 2');
 		expect(minted.frame.result).toEqual({});
 		const invite = /apron_join_[A-Za-z0-9_-]+/.exec(minted.notice!.params.body.text)![0];
-		expect(minted.notice!.params.body.text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${invite}>`);
+		expect(minted.notice!.params.body.text).toContain(`: \`https://link.apron.chat/#server=wss://demo.test/ws&token=${invite}\``);
+		expect(minted.notice!.params.body.text).not.toContain('<https://link.apron.chat/');
 
 		// A guest signs up with it: a new registered user, named as asked, with its own token.
 		const ada = await fresh();
@@ -1347,6 +1480,33 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Broke' })).error).toBeDefined();
 		expect(await identities()).toBe(before);
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Fine' })).result.you.name).toBe('Fine');
+
+		// A sign-in that fails once the account is made undoes the sign-up: no
+		// account, no token, and the use given back for the retry.
+		const retried = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-retry', '/invite-code 1')).notice!.params.body.text)![0];
+		const tokens = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'invite-token:' })).size);
+		const pointers = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'invite:' })).size);
+		const [identitiesBefore, tokensBefore, pointersBefore] = [await identities(), await tokens(), await pointers()];
+		await runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Record<'becomeRegistered', (...args: unknown[]) => unknown>;
+			const original = runtime.becomeRegistered;
+			runtime.becomeRegistered = () => {
+				runtime.becomeRegistered = original;
+				throw { name: 'denied', message: 'That account changed; try again' };
+			};
+		});
+		const failing = await fresh();
+		await request(failing, 'guest', 'auth', { scheme: 'guest' });
+		expect((await request(failing, 'join', 'auth', { scheme: 'token', token: retried, name: 'Retry' })).error.message).toBe('That account changed; try again');
+		expect(await identities()).toBe(identitiesBefore);
+		expect(await tokens()).toBe(tokensBefore);
+		expect(await pointers()).toBe(pointersBefore);
+		// The guest connection still gets what is sent to general.
+		await request(ada, 'post-to-guest', 'message', { room_id: 'general', body: { text: 'still there?' } });
+		await until(failing, (frame) => frame.method === 'message' && frame.params?.body?.text === 'still there?');
+		const retry = await request(failing, 'retry', 'auth', { scheme: 'token', token: retried, name: 'Retry' });
+		expect(retry.result.you.name).toBe('Retry');
+		expect(await identities()).toBe(identitiesBefore + 1);
 
 		// A new invite replaces the last; /invite-code 0 revokes it.
 		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite-code 1')).notice!.params.body.text)![0];
