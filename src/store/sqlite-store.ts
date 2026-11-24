@@ -58,7 +58,7 @@ import {
   BOOTSTRAP_ROW_RESERVATION, DEGRADE_SHARE, listedThreads, MAX_MEMBERSHIPS_PER_USER, MAX_PRIVATE_MEMBERSHIPS_PER_USER,
   SEEN_WRITE_GRANULARITY_MS, thresholdRecords,
 } from "../budget";
-import { StoreError } from "../store-error";
+import { EMPTY_MESSAGE, StoreError } from "../store-error";
 import {
   BOT_MODERATOR_ROLES, BOT_NAME_PATTERN, BOT_NAME_RULE, DEFAULT_JOINED_ROOMS, isPrivateRoomId, isProtocolId, MAX_CREATED_ROOMS,
   MAX_LISTED_USER_ROOMS, MAX_PASSKEYS_PER_USER, MAX_ROLES_PER_USER, MAX_ROOM_MUTES_PER_USER, MAX_USER_ROOMS, MODERATOR_ROLES,
@@ -3524,7 +3524,7 @@ export class SqliteStore {
     return { user_id: input.identity.user_id, ...(name ? { name } : {}) };
   }
 
-  /** A new message with no text and no embeds, which is neither logged nor broadcast (§3.5). */
+  /** A new message with no text and no embeds, which is `invalid_params` (§3.5.1). */
   private emptyNewMessage(params: Record<string, unknown>): boolean {
     if (params.message_id !== undefined || (params.deleted !== undefined && params.deleted !== false) || !isPlainObject(params.body)) return false;
     return isEmptyBody(must(this.content.body(params.body)));
@@ -4402,8 +4402,14 @@ export class SqliteStore {
     // description is no description.
     const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
     const fallbackTitle = isPrivate ? undefined : existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
-    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle;
-    const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
+    // A save merges into the room's client fields (§4.2.4): a field it leaves
+    // out keeps its value, and an empty one clears it.
+    const stored = existing ? parseJson<Record<string, unknown>>(existing.fields_json, {}) : {};
+    const keptTitle = existing && titleParam === undefined && typeof stored.title === "string" ? stored.title : undefined;
+    const title = keptTitle ?? (typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle);
+    const description = existing && descriptionParam === undefined
+      ? (typeof stored.description === "string" ? stored.description : undefined)
+      : typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
     // `ext` merges into the room's current one (§4.13, §4.2.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
       const ext = mergeExt(stored, write);
@@ -4481,7 +4487,7 @@ export class SqliteStore {
       this.checkRoomFields(fields);
       this.checkRoomFieldsTotal(fields, existing);
       logId = this.allocateLogId(context);
-      // A save replaces the client fields; the creator stays.
+      // A save merges into the client fields; the creator stays.
       const creator = storedCreator(existing.fields_json);
       const fieldsJson = JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator });
       this.rawExec(
@@ -4691,11 +4697,12 @@ export class SqliteStore {
     const method = this.mutationMethod(input.method);
     const operationNow = input.now ?? this.clock.now();
     if (method === "message" && this.emptyNewMessage(input.params)) {
-      // Nothing is logged, charged, or recorded; only the room is checked.
+      // Refused (§3.5.1): nothing is logged, charged, or recorded. The room is
+      // checked first, so a hidden room answers as a missing one does.
       return this.reserved("commitMutation", { reads: 8 }, false, operationNow, () => {
         const roomId = input.params.room_id === undefined ? ROOM_ID : input.params.room_id;
         if (typeof roomId !== "string" || !this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
-        return { result: {}, broadcasts: [] };
+        throw new StoreError("invalid_params", EMPTY_MESSAGE);
       });
     }
     const digest = input.digest ?? digestOperation(method, input.params);

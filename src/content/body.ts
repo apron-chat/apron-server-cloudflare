@@ -72,7 +72,7 @@ export function sharedTextBody(current: Record<string, unknown> | undefined, val
 	return accept({ ...cloneJson(current ?? {}), text: text.value });
 }
 
-/** Whether a kept body says nothing: no text and no embeds (§3.5: a new one is neither logged nor broadcast). */
+/** Whether a kept body says nothing: no text and no embeds (§3.5.1: a new one is `invalid_params`). */
 export function isEmptyBody(body: Pick<MessageBody, "text" | "embeds">): boolean {
 	return body.text === "" && body.embeds.length === 0;
 }

@@ -123,15 +123,16 @@ it('admits clients without Origin as guests without advertising or allowing pass
 	} finally { peer.close(); }
 });
 
-it('rejects an auth scheme the spec does not define as invalid_params, and email and external as unsupported', async () => {
+it('rejects an auth scheme the spec does not define, email, and external as unsupported', async () => {
 	const peer = await connect({ path: '/' });
 	try {
 		const { auth } = (await greeting(peer)).server.params;
 		expect(auth).not.toContain('email');
 		expect(auth).not.toContain('external');
-		// An unknown name that the request depends on is invalid_params (§1), before and after sign-in.
+		// A scheme the server does not offer is unsupported, even one the spec does not define (§3.2),
+		// before and after sign-in.
 		peer.send({ id: 'ext', method: 'auth', params: { scheme: 'ext:foo' } });
-		expect((await peer.next()).error.code).toBe(-32602);
+		expect((await peer.next()).error.code).toBe(-32601);
 		// `email` and `external` are defined, but not offered here: unsupported (§3.2),
 		// proposals and approvals alike.
 		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com', state: 'q8Rz' } });
@@ -145,7 +146,7 @@ it('rejects an auth scheme the spec does not define as invalid_params, and email
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 		peer.send({ id: 'ext2', method: 'auth', params: { scheme: 'ext:foo' } });
-		expect((await peer.next()).error.code).toBe(-32602);
+		expect((await peer.next()).error.code).toBe(-32601);
 		// Still unsupported once signed in, where a proposal would be an addition (§4.11.1).
 		peer.send({ id: 'external2', method: 'auth', params: { scheme: 'external' } });
 		expect((await peer.next()).error.code).toBe(-32601);
@@ -419,7 +420,7 @@ it('pipelined guest auth precedes mutation and errors preserve identifiable IDs'
 	} finally { peer.close(); }
 });
 
-it('posts to the default room without room_id, pages it among the joined rooms without room_id, and neither logs nor delivers an empty message', async () => {
+it('posts to the default room without room_id, pages it among the joined rooms without room_id, and refuses an empty message', async () => {
 	const alice = await connect();
 	const bob = await connect();
 	try {
@@ -430,9 +431,9 @@ it('posts to the default room without room_id, pages it among the joined rooms w
 		expect(snapshot).toMatchObject({ message_id: posted.result.message_id, room_id: 'general', from: aliceId });
 		const page = await request(bob, 'default-history', 'history', { after: snapshot.log_id });
 		expect(page.result.messages).toEqual([snapshot]);
-		// An empty new message: result `{}`, nothing logged or broadcast (§3.5).
+		// An empty new message is invalid_params, and nothing is logged or broadcast (§3.5.1).
 		for (const [id, params] of [['empty', { body: { text: '' } }], ['blank', { room_id: 'general', body: { embeds: [] } }]] as const) {
-			expect((await request(alice, id, 'message', params)).result).toEqual({});
+			expect((await request(alice, id, 'message', params)).error.code).toBe(-32602);
 		}
 		expect((await request(alice, 'empty-missing-room', 'message', { room_id: 'missing', body: {} })).error.code).toBe(-32602);
 		expect((await drain(alice)).filter((frame) => frame.method === 'message')).toEqual([]);
@@ -589,9 +590,8 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		const renamedReply = await until(bob, (frame) => frame.id === 'rename');
 		expect(renamedReply.frame.result).toEqual({ room_id: roomId });
 		const renamed = renamedReply.skipped.find((frame) => frame.method === 'room_update')!.params.updated[0];
-		// A save replaces every client field: the description is gone.
-		expect(renamed).toMatchObject({ room_id: roomId, parent_room_id: 'general', title: 'Deploys' });
-		expect(renamed.description).toBeUndefined();
+		// A save merges into the client fields (§4.2.4): the description stays.
+		expect(renamed).toMatchObject({ room_id: roomId, parent_room_id: 'general', title: 'Deploys', description: 'Why the *4pm* deploy failed' });
 		expect((await until(alice, (frame) => frame.method === 'room_update')).frame.params).toEqual({ updated: [renamed] });
 
 		// Now a member, Bob receives the thread's messages.

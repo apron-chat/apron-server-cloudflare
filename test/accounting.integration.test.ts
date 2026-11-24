@@ -1028,7 +1028,7 @@ describe('measured storage accounting', () => {
 			const clock = new FakeClock(futureUtcNoon());
 			const store = openStore(state, config, clock);
 			store.lifecycle.initialize();
-			const { costs, measure, measureAsync } = costLog(store);
+			const { costs, measure, measureAsync, measureFailure } = costLog(store);
 
 			measure('auth attempt reservation', () => store.admission.reserveAuthAttempt({ ipKey: 'matrix-auth', now: clock.now() }));
 			measure('frame reservation', () => store.admission.reserveFrames({ ipKey: 'matrix-frame-ip', now: clock.now(), count: 1 }));
@@ -1105,10 +1105,11 @@ describe('measured storage accounting', () => {
 			const guestMembership = () => store.rooms.chargeGuestMembership({ ipKey: 'matrix-guest-ip', now: clock.now() });
 			measure('guest room join (creates its limiter rows)', guestMembership);
 			measure('guest room leave (limiter rows cached)', guestMembership);
-			expect(measure('empty new message', () => store.messages.commit({
+			const empty = measureFailure('empty new message', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-empty', method: 'message', now: clock.now(),
 				params: { body: { text: '' } }, identity,
-			}))).toEqual({ result: {}, broadcasts: [] });
+			}));
+			expect(empty instanceof StoreError && empty.code).toBe('invalid_params');
 			measure('message move with reactions', () => store.messages.commit({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-move', method: 'message', now: clock.now(),
 				params: { message_id: messageId, room_id: threadId, body: { text: 'matrix moved', format: 'plain' } }, identity,
