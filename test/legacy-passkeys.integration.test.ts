@@ -405,7 +405,7 @@ it('makes every new passkey for the new RP ID: in the client, on the passkey pag
  * passkeys the device holds, by RP ID; a prompt for another RP ID is closed
  * empty (NotAllowedError), as a real one is. Returns its controls.
  */
-async function signInPage(has: Record<string, Passkey>, storage: Map<string, string>, options: { saves?: Passkey; finish?: (body: Record<string, unknown>) => Promise<unknown> | undefined } = {}) {
+async function signInPage(has: Record<string, Passkey>, storage: Map<string, string>, options: { saves?: Passkey; finish?: (body: Record<string, unknown>) => Promise<unknown> | undefined; clock?: { now: number } } = {}) {
 	const { url } = await loginQuery(NEW);
 	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
 	const config = html.match(/<script type="application\/json" id="config">(.*?)<\/script>/s)![1];
@@ -446,17 +446,23 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	const PublicKeyCredential = { parseRequestOptionsFromJSON: (json: unknown) => json, parseCreationOptionsFromJSON: (json: unknown) => json };
 	const localStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => { storage.set(key, value); } };
 	const assigned: string[] = [];
+	const begins: unknown[] = [];
+	const timers: (() => void)[] = [];
+	const clock = options.clock;
+	const time = clock ? { now: () => clock.now } : Date;
+	const later = clock ? (run: () => void) => { timers.push(run); } : setTimeout;
 	const fetch = (path: string, init: { body: string }) => {
 		const body = JSON.parse(init.body);
+		if (path.endsWith('/begin')) begins.push(body);
 		const instead = path.endsWith('/finish') ? options.finish?.(body) : undefined;
 		return instead ? instead.then((answer) => new Response(JSON.stringify(answer), { status: 200 })) : post(NEW, path, body);
 	};
-	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', 'localStorage', scripts.join('\n'))(
-		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) }, localStorage,
+	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', 'localStorage', 'Date', 'setTimeout', scripts.join('\n'))(
+		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) }, localStorage, time, later,
 	);
 	// Its ceremonies are begun as the page shows; a tap waits for none.
 	await new Promise((resolve) => setTimeout(resolve, 200));
-	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), proceed: () => onward.listeners[0](), status, upgrade, unsaved, prompts, assigned };
+	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), proceed: () => onward.listeners[0](), status, upgrade, unsaved, prompts, assigned, begins, timers };
 }
 
 it('finds the passkey whichever RP ID it is for, from one button, without asking which', async () => {
@@ -580,9 +586,37 @@ it('answers the same finish again with its first answer, as the page retries one
 	// Another credential for the same challenge is no retry.
 	const other = await (await softPasskey(NEW)).register(begun.body.public_key);
 	expect(await finish(NEW, begun.body.challenge_id, other)).toEqual({ status: 400, body: { error: 'This passkey request expired. Try again.' } });
-	// Nor is the same one from another origin.
-	const elsewhere = await SELF.fetch(`${OLD}/passkey/finish`, { method: 'POST', body: JSON.stringify({ challenge_id: begun.body.challenge_id, credential: made }), headers: { 'CF-Connecting-IP': ip(), 'Content-Type': 'application/json', Origin: OLD } });
-	expect(elsewhere.status).not.toBe(200);
+	// Nor is the same one from another origin that the page is served on.
+	const SIDE = 'https://x.chat.localhost';
+	const elsewhere = await SELF.fetch(`${SIDE}/passkey/finish`, { method: 'POST', body: JSON.stringify({ challenge_id: begun.body.challenge_id, credential: made }), headers: { 'CF-Connecting-IP': ip(), 'Content-Type': 'application/json', Origin: SIDE } });
+	expect(elsewhere.status).toBe(400);
+	// What is kept opens only with the credential: no code in it as stored.
+	const stored = await runInDurableObject(stub(), async (_instance, state) => JSON.stringify([...(await state.storage.list({ prefix: 'signin-finished:' })).values()]));
+	const code = new URL(first.body.redirect!).searchParams.get('code')!;
+	expect(stored).not.toContain(code);
+});
+
+it('answers a retried finish even once the address has used up its sign-in attempts', async () => {
+	await rpIds('chat.localhost', 'localhost');
+	const app = await client(NEW);
+	const query = app.url(`${NEW}/passkey?action=register&name=Grace`).searchParams.toString();
+	// Straight to the object, as the entry Worker forwards a request it admitted: the object's own
+	// per-address attempts, not the entry's limiter, are what this counts.
+	const send = (route: 'begin' | 'finish', body: unknown) => stub().fetch(new Request(`https://signin.internal/__signin/${route}`, {
+		method: 'POST', body: JSON.stringify(body),
+		headers: { 'X-Apron-Trusted-IP-Key': 'retryingAddress0000000', 'X-Apron-Server-Origin': NEW, Origin: NEW, 'Content-Type': 'application/json' },
+	}));
+	const begun = await (await send('begin', { page: 'passkey', query })).json() as { challenge_id: string; public_key: any };
+	const made = await (await softPasskey(NEW)).register(begun.public_key);
+	const first = await send('finish', { challenge_id: begun.challenge_id, credential: made });
+	expect(first.status).toBe(200);
+	const answer = await first.json();
+	let limited = false;
+	for (let n = 0; n < 200 && !limited; n++) limited = (await send('finish', { challenge_id: `bogus${n}`, credential: made })).status === 429;
+	expect(limited).toBe(true);
+	const again = await send('finish', { challenge_id: begun.challenge_id, credential: made });
+	expect(again.status).toBe(200);
+	expect(await again.json()).toEqual(answer);
 });
 
 it("sends a finish again after the server couldn't be reached, and says so when the new passkey wasn't saved", async () => {
@@ -612,6 +646,25 @@ it("sends a finish again after the server couldn't be reached, and says so when 
 	expect(page.assigned).toEqual([]);
 	page.proceed();
 	expect(page.assigned).toEqual([redirect]);
+});
+
+it('begins a held ceremony again before it is too old, and on a tap after that, before the prompt', async () => {
+	const { passkey } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const clock = { now: 0 };
+	const page = await signInPage({ localhost: passkey }, new Map(), { clock });
+	expect(page.begins).toHaveLength(1);
+	// Its timer begins it again while it is still fresh, so a later tap still goes straight to the prompt.
+	expect(page.timers).toHaveLength(1);
+	page.timers.shift()!();
+	await vi.waitFor(() => expect(page.begins).toHaveLength(2));
+	// One held past freshness (its timer not run, as in a throttled tab) is begun again at the tap.
+	clock.now = PAGE_PREPARED_FRESH_MS + 1;
+	page.tap();
+	await vi.waitFor(() => expect(page.upgrade.hidden).toBe(false));
+	// Three for the sign-in (the first, its refresh, and the tap's), then the upgrade's, prepared as it shows.
+	expect(page.begins).toMatchObject([{ legacy: true }, { legacy: true }, { legacy: true }, { upgrade: expect.any(String) }]);
+	expect(page.prompts).toEqual(['localhost']);
 });
 
 it('reads a credential a password manager hands back, as apron-web does', () => {

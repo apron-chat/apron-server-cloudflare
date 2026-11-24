@@ -245,6 +245,7 @@ ${PAGE_HELPERS}
 const primary = config.start === "login" ? "login" : "register";
 let prepared = null;
 let preparing = null;
+let refreshes = 0;
 
 function prepare(action) {
 	prepared = null;
@@ -254,7 +255,10 @@ function prepare(action) {
 		if (preparing !== mine) return;
 		preparing = null;
 		if (result.error) { status(result.error); return; }
-		prepared = { action, options: result, at: Date.now() };
+		const held = { action, options: result, at: Date.now() };
+		prepared = held;
+		// Begun again before it is too old to use, so a later tap still goes straight to the prompt (for half an hour).
+		if (refreshes < 5) setTimeout(() => { if (prepared === held) { refreshes++; prepare(action); } }, ${PAGE_PREPARED_FRESH_MS});
 	});
 	return mine.done;
 }

@@ -68,9 +68,16 @@ async function begin(kind) {
 	if (result.error) { status(result.error); return null; }
 	return result;
 }
+let refreshes = 0;
 function prepare(kind) {
 	ready = null;
-	begin(kind).then((options) => { if (options) ready = { kind, options, at: Date.now() }; });
+	begin(kind).then((options) => {
+		if (!options) return;
+		const held = { kind, options, at: Date.now() };
+		ready = held;
+		// Begun again before it is too old to use, so a later tap still goes straight to the prompt (for half an hour).
+		if (refreshes < 5) setTimeout(() => { if (ready === held) { refreshes++; prepare(kind); } }, ${PAGE_PREPARED_FRESH_MS});
+	});
 }
 async function run(kind) {
 	status("");
