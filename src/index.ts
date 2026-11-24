@@ -4890,10 +4890,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.store.meter.foreground({ writes: 1 }, () => this.ctx.storage.delete(key));
 				throw { name: "denied", message: "This reset token has expired; ask an admin for a new one" } satisfies ProtocolError;
 			}
-			// A connection gone before the sign-in leaves the token unspent.
-			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+			// The sign-in's reads come before the spend, so their failure spends nothing.
+			const status = { stored: this.readStatusInputs(identity.userId, identity.seen) };
 			const own = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 			const ownKey = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(own);
+			// A connection gone before the sign-in leaves the token unspent.
+			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			await this.store.meter.foreground({ writes: 3 }, async () => {
 				// No await between them, so they commit together: the one-time
 				// token never outlives the pointer moving off it.
@@ -4904,8 +4906,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 				});
 				await Promise.all([spent, replaced]);
 			});
-			// A reply lost after this point spends the token: the admin resets them again.
-			await this.signInKeyless(socket, attachment, request, identity, own, false, ownKey);
+			try {
+				await this.signInKeyless(socket, attachment, request, identity, own, false, ownKey, status);
+			} finally {
+				// A sign-in that did not happen (the connection closed, or the
+				// account changed, during the spend) puts the reset token back,
+				// so the user can try again. Still under the session lock, so a
+				// `/purge`, `/rename` or `/invite-reset` waiting on it acts on
+				// what this restores. Once signed in, the reply is sent with the
+				// user's own token; a reply lost after that spends the token.
+				if (connectionAttachment(socket)?.credential !== ownKey) {
+					await this.store.meter.foreground({ writes: 3 }, async () => {
+						const dropped = this.ctx.storage.delete(ownKey);
+						const restored = this.ctx.storage.put({
+							[key]: stored,
+							[INVITE_KEY_PREFIX + identity.userId]: { v: 1, tokenKey: key, expiresMs: stored.expiresMs } satisfies StoredInvitePointer,
+						});
+						await Promise.all([dropped, restored]);
+					});
+				}
+			}
 		});
 	}
 
@@ -4998,10 +5018,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * invite, or a user's other `device`): the connection becomes the
 	 * identity, and the guest it replaces leaves as guestLeaves has it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown>; seen?: number }, token?: string, created = false, credential?: string): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown>; seen?: number }, token?: string, created = false, credential?: string, status?: { stored: SignInStatus | undefined }): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		// Read before the connection changes, so a failure leaves it as it was.
-		const stored = this.readStatusInputs(identity.userId, identity.seen);
+		// Read before the connection changes, so a failure leaves it as it was;
+		// `status` when the caller read them before spending something.
+		const stored = status ? status.stored : this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
 		this.becomeRegistered(socket, attachment, identity, this.liveRoomsOf(identity.userId, socket) ?? identity.rooms, credential);
 		this.prepareStatus(socket, stored);
@@ -9260,6 +9281,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.withSessionLock(() => this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
 			const pointer = await this.ctx.storage.get<StoredInvitePointer>(INVITE_KEY_PREFIX + from);
 			if (pointer?.v !== 1 || typeof pointer.tokenKey !== "string") return;
+			// An expired one-time token is dropped, not moved, since its sign-in
+			// may have dropped it already.
+			if (typeof pointer.expiresMs === "number" && !(pointer.expiresMs > nowMs())) {
+				await this.ctx.storage.delete([pointer.tokenKey, INVITE_KEY_PREFIX + from]);
+				return;
+			}
 			// A one-time token keeps its expiry, which the pointer repeats.
 			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to, ...(typeof pointer.expiresMs === "number" ? { expiresMs: pointer.expiresMs } : {}) });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + to, pointer);

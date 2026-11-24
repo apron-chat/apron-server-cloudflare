@@ -1244,6 +1244,79 @@ it('/rename moves a reset token, which still works once and expires', async () =
 	}
 });
 
+it('a reset token survives a sign-in that fails before or after it is spent', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('retry');
+	const user = await signedIn(userId);
+	const opened: Peer[] = [user];
+	const signIn = async (token: string) => {
+		const peer = await connect(null);
+		opened.push(peer);
+		await peer.next();
+		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
+	};
+	type Patchable = Record<'readStatusInputs' | 'becomeRegistered', (...args: unknown[]) => unknown>;
+	// Makes the named step of the next sign-in fail once.
+	const failOnce = (method: keyof Patchable) => runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as Patchable;
+		const original = runtime[method];
+		runtime[method] = function () {
+			runtime[method] = original;
+			throw { name: 'internal_error', message: 'Could not read your status and mutes; sign in again' };
+		};
+	});
+	try {
+		const reset = await command(admin, 'reset', `/invite-reset ${userId}`);
+		const token = reset.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		const tokenKey = await runInDurableObject(stub(), async (_instance, state) => (await state.storage.get<{ tokenKey: string }>(`invite:${userId}`))!.tokenKey);
+
+		// Before the spend: the status read.
+		await failOnce('readStatusInputs');
+		expect((await signIn(token)).reply.error.code).toBe(-32603);
+		// After it: the connection becoming the user. The token is put back, and its pointer.
+		await failOnce('becomeRegistered');
+		expect((await signIn(token)).reply.error.code).toBe(-32603);
+		await runInDurableObject(stub(), async (_instance, state) => {
+			expect(await state.storage.get(tokenKey)).toEqual({ v: 1, userId, expiresMs: expect.any(Number) });
+			expect((await state.storage.get<{ tokenKey: string }>(`invite:${userId}`))!.tokenKey).toBe(tokenKey);
+		});
+
+		const signedInAgain = await signIn(token);
+		expect(signedInAgain.reply.result.you.user_id).toBe(userId);
+		const own = signedInAgain.reply.result.token as string;
+		expect((await signIn(token)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+		expect((await signIn(own)).reply.result.you.user_id).toBe(userId);
+	} finally {
+		for (const peer of opened) peer.close();
+		admin.close();
+	}
+});
+
+it('/rename drops an expired reset token rather than moving it', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('stale');
+	const renamedId = unique('stalemoved');
+	const user = await signedIn(userId);
+	try {
+		await command(admin, 'reset', `/invite-reset ${userId}`);
+		const tokenKey = await runInDurableObject(stub(), async (_instance, state) => {
+			const pointer = (await state.storage.get<{ v: 1; tokenKey: string; expiresMs: number }>(`invite:${userId}`))!;
+			await state.storage.put(`invite:${userId}`, { ...pointer, expiresMs: Date.now() - 1 });
+			await state.storage.delete(pointer.tokenKey);
+			return pointer.tokenKey;
+		});
+		await command(admin, 'rename', `/rename ${userId} ${renamedId}`);
+		await runInDurableObject(stub(), async (_instance, state) => {
+			expect(await state.storage.get(tokenKey)).toBeUndefined();
+			expect(await state.storage.get(`invite:${userId}`)).toBeUndefined();
+			expect(await state.storage.get(`invite:${renamedId}`)).toBeUndefined();
+		});
+	} finally {
+		user.close();
+		admin.close();
+	}
+});
+
 it('a passkey ceremony verifying while /invite-reset runs signs nobody in and adds no passkey', async () => {
 	const userId = unique('raced');
 	const user = await signedIn(userId);
