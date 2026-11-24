@@ -9,7 +9,7 @@
  * shown which account it is.
  */
 import { legacyPageParts } from "./legacy-passkeys-page";
-import { PAGE_BEGIN_PATH, PAGE_FINISH_PATH, type SignInPage } from "./oauth";
+import { PAGE_BEGIN_PATH, PAGE_FINISH_PATH, PAGE_PREPARED_FRESH_MS, type SignInPage } from "./oauth";
 
 /** What a sign-in page shows: everything is text, escaped here. */
 export interface SignInPageView {
@@ -145,7 +145,14 @@ const $ = (id) => document.getElementById(id);
 const status = (text) => { $("status").className = "status"; $("status").textContent = text; };
 const hint = (text) => { $("status").className = "status hint"; $("status").textContent = text; };
 const fromB64 = (text) => Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
-const toB64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+// Binary data, whichever realm made it: a password manager's ArrayBuffer fails \`instanceof\` here.
+const isBinary = (value) => ArrayBuffer.isView(value) || Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+const toB64 = (value) => {
+	const bytes = ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value);
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+};
 function requestOptions(json) {
 	if (PublicKeyCredential.parseRequestOptionsFromJSON) return PublicKeyCredential.parseRequestOptionsFromJSON(json);
 	return { ...json, challenge: fromB64(json.challenge), allowCredentials: (json.allowCredentials || []).map((c) => ({ ...c, id: fromB64(c.id) })) };
@@ -154,15 +161,49 @@ function creationOptions(json) {
 	if (PublicKeyCredential.parseCreationOptionsFromJSON) return PublicKeyCredential.parseCreationOptionsFromJSON(json);
 	return { ...json, challenge: fromB64(json.challenge), user: { ...json.user, id: fromB64(json.user.id) }, excludeCredentials: (json.excludeCredentials || []).map((c) => ({ ...c, id: fromB64(c.id) })) };
 }
+// The credential's own fields, each read on its own: a password manager's credential (1Password's in
+// Firefox, notably) may throw from one, hide it behind a getter, or deny access after a while.
+function readCredential(credential) {
+	const read = (property, getter) => {
+		try { const value = property(); if (value !== undefined && value !== null) return value; } catch {}
+		try { const value = getter ? getter() : undefined; return value === null ? undefined : value; } catch { return undefined; }
+	};
+	const r = read(() => credential.response) || {};
+	const response = {};
+	const put = (key, value) => { if (isBinary(value)) response[key] = toB64(value); };
+	put("clientDataJSON", read(() => r.clientDataJSON));
+	put("attestationObject", read(() => r.attestationObject));
+	put("authenticatorData", read(() => r.authenticatorData, () => r.getAuthenticatorData()));
+	put("signature", read(() => r.signature));
+	put("userHandle", read(() => r.userHandle));
+	put("publicKey", read(() => undefined, () => r.getPublicKey()));
+	const algorithm = read(() => undefined, () => r.getPublicKeyAlgorithm());
+	if (typeof algorithm === "number") response.publicKeyAlgorithm = algorithm;
+	const transports = read(() => undefined, () => r.getTransports());
+	if (Array.isArray(transports)) response.transports = [...transports];
+	const rawId = read(() => credential.rawId);
+	const id = read(() => credential.id) || (isBinary(rawId) ? toB64(rawId) : "");
+	const attachment = read(() => credential.authenticatorAttachment);
+	const extensions = read(() => credential.getClientExtensionResults());
+	const convert = (entry) => isBinary(entry) ? toB64(entry) : Array.isArray(entry) ? entry.map(convert) : entry && typeof entry === "object" ? Object.fromEntries(Object.entries(entry).map(([key, inner]) => [key, convert(inner)])) : entry;
+	return { id, rawId: isBinary(rawId) ? toB64(rawId) : id, type: "public-key", response, clientExtensionResults: extensions && typeof extensions === "object" ? convert(extensions) : {}, ...(attachment ? { authenticatorAttachment: attachment } : {}) };
+}
+// The credential in WebAuthn JSON: its toJSON() where that agrees with its own fields, else the
+// fields (a password manager's toJSON may throw, or encode them another way), as apron-web does.
 function credentialJson(credential) {
-	try { if (credential.toJSON) return credential.toJSON(); } catch {}
-	const r = credential.response;
-	const response = { clientDataJSON: toB64(r.clientDataJSON) };
-	if (r.attestationObject) { response.attestationObject = toB64(r.attestationObject); if (r.getTransports) response.transports = r.getTransports(); }
-	if (r.authenticatorData) response.authenticatorData = toB64(r.authenticatorData);
-	if (r.signature) response.signature = toB64(r.signature);
-	if (r.userHandle) response.userHandle = toB64(r.userHandle);
-	return { id: credential.id, rawId: toB64(credential.rawId), type: credential.type, response, clientExtensionResults: credential.getClientExtensionResults(), authenticatorAttachment: credential.authenticatorAttachment || undefined };
+	const fields = readCredential(credential);
+	let json;
+	try {
+		if (typeof credential.toJSON !== "function") return fields;
+		json = credential.toJSON();
+	} catch { return fields; }
+	if (!json || typeof json !== "object" || !json.response || typeof json.response !== "object") return fields;
+	for (const key of ["clientDataJSON", "attestationObject", "authenticatorData", "signature", "userHandle"]) {
+		if (typeof fields.response[key] === "string" && json.response[key] !== fields.response[key]) return fields;
+	}
+	if (fields.rawId && json.rawId !== fields.rawId) return fields;
+	if (!json.clientExtensionResults || typeof json.clientExtensionResults !== "object") return { ...json, clientExtensionResults: fields.clientExtensionResults };
+	return json;
 }
 
 async function post(path, body) {
@@ -172,8 +213,18 @@ async function post(path, body) {
 		if (!response.ok) return { error: json.error || "Something went wrong. Try again.", unknownCredential: json.unknown_credential === true };
 		return json;
 	} catch {
-		return { error: "Could not reach the server. Check your connection and try again." };
+		return { error: "Could not reach the server. Check your connection and try again.", network: true };
 	}
+}
+// A finish, sent again while the server couldn't be reached: the passkey is already made, and the
+// server answers the same finish again with its first answer (one that was lost on the way).
+async function finish(body) {
+	let result = await post(${JSON.stringify(PAGE_FINISH_PATH)}, body);
+	for (let wait = 1_000; result.network && wait <= 4_000; wait *= 2) {
+		await new Promise((resolve) => setTimeout(resolve, wait));
+		result = await post(${JSON.stringify(PAGE_FINISH_PATH)}, body);
+	}
+	return result;
 }
 function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
 `;
@@ -194,6 +245,7 @@ ${PAGE_HELPERS}
 const primary = config.start === "login" ? "login" : "register";
 let prepared = null;
 let preparing = null;
+let refreshes = 0;
 
 function prepare(action) {
 	prepared = null;
@@ -203,7 +255,10 @@ function prepare(action) {
 		if (preparing !== mine) return;
 		preparing = null;
 		if (result.error) { status(result.error); return; }
-		prepared = { action, options: result };
+		const held = { action, options: result, at: Date.now() };
+		prepared = held;
+		// Begun again before it is too old to use, so a later tap still goes straight to the prompt (for half an hour).
+		if (refreshes < 5) setTimeout(() => { if (prepared === held) { refreshes++; prepare(action); } }, ${PAGE_PREPARED_FRESH_MS});
 	});
 	return mine.done;
 }
@@ -221,6 +276,8 @@ function forget(rpId, credentialId) {
 async function passkey(action) {
 	status("");
 	if (!window.PublicKeyCredential || !navigator.credentials) { status("This browser cannot use passkeys."); return; }
+	// One begun so long ago that it could expire before the passkey is back: begun again.
+	if (prepared && Date.now() - prepared.at > ${PAGE_PREPARED_FRESH_MS}) prepared = null;
 	if (!prepared || prepared.action !== action) {
 		busy(true);
 		await (preparing && preparing.action === action ? preparing.done : prepare(action));
@@ -241,7 +298,7 @@ async function passkey(action) {
 		prepare(primary);
 		return;
 	}
-	const result = await post(${JSON.stringify(PAGE_FINISH_PATH)}, { challenge_id: options.challenge_id, credential: credentialJson(credential) });
+	const result = await finish({ challenge_id: options.challenge_id, credential: credentialJson(credential) });
 	if (result.unknownCredential && action === "login") forget(options.public_key.rpId, credential.id);
 	if (result.error) { busy(false); status(result.error); prepare(primary); return; }
 	location.assign(result.redirect);

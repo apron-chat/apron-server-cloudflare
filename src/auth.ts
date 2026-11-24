@@ -10,7 +10,7 @@ import {
 import type { RuntimeConfig } from "./config";
 import type { Identity, StoredCredential } from "./domain";
 import { legacyRpIdAllowed } from "./legacy-passkeys";
-import { clientDataFramed, pageOriginServes } from "./oauth";
+import { clientDataFramed, PAGE_CHALLENGE_TTL_MS, PAGE_PREPARED_FRESH_MS, pageOriginServes } from "./oauth";
 
 type WebAuthnAction = "register" | "login";
 
@@ -329,7 +329,11 @@ export class WebAuthnService {
 				...(candidateUserId ? { userId: candidateUserId, userHandle: candidateUserHandle, userName: candidateName } : {}),
 				...(adds ? { adds: true } : {}),
 				...(ceremony.page ? { page: true } : {}),
-				expiresAt: now + this.config.limits.challengeTtlSeconds * 1_000,
+				// A sign-in page's lasts longer, from before its tap (PAGE_CHALLENGE_TTL_MS), and always
+				// long enough for the browser's whole timeout after the page last uses one it holds.
+				expiresAt: now + (ceremony.page
+					? Math.max(PAGE_CHALLENGE_TTL_MS, PAGE_PREPARED_FRESH_MS + this.config.limits.challengeTtlSeconds * 1_000 + 60_000)
+					: this.config.limits.challengeTtlSeconds * 1_000),
 			},
 			publicKey: options as unknown as Record<string, unknown>,
 		};

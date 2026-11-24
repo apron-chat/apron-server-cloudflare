@@ -188,6 +188,8 @@ const PAGE_CEREMONY_KEY_PREFIX = "signin-ceremony:";
 const REQUEST_HANDLE_KEY_PREFIX = "signin-request:";
 /** A new passkey that a code from the passkey page holds, under the SHA-256 of its credential ID (pendingCredential). */
 const PENDING_CREDENTIAL_KEY_PREFIX = "signin-pending:";
+/** A page finish's answer, kept for a retry of it (`pageFinish`). */
+const PAGE_FINISHED_KEY_PREFIX = "signin-finished:";
 /**
  * How long a pending passkey outlasts its code: a redemption takes the code
  * before it writes the passkey, so the passkey is never unknown in between.
@@ -201,9 +203,11 @@ const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
  * whose entry is still indexed, those of the page's new passkeys since the
  * last sweep (at most hourly, SESSION_SWEEP_INTERVAL_MS, but a quiet server's
  * full alarms may be a day apart). Each is small, and any later version
- * reads one as expired.
+ * reads one as expired. The same holds for `finished` records (a page
+ * finish's sealed answer, kept for a code's lifetime) past a version
+ * without them.
  */
-const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending|upgrade):[0-9a-f]{64}$/;
+const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending|upgrade|finished):[0-9a-f]{64}$/;
 /**
  * The path the entry Worker forwards the sign-in pages' requests to the
  * object on, with the route after it, and the header that carries the
@@ -971,6 +975,21 @@ interface StoredPageCeremony {
 	expiresMs: number;
 }
 
+/**
+ * A page finish's answer, under its challenge: sent again to the same finish
+ * (the same credential, from the same origin), whose answer the page never
+ * got. Its passkey is already made, so a second one would only be refused.
+ */
+interface StoredPageFinished {
+	v: 1;
+	origin: string;
+	/** The answer, sealed under a key from the credential as sent (`sealFinishAnswer`), with a check of that credential. */
+	check: string;
+	iv: string;
+	sealed: string;
+	expiresMs: number;
+}
+
 /** A new passkey a code holds, until its code (and a grace) expires: not yet an account's, but it may become one. */
 interface StoredPendingCredential {
 	v: 1;
@@ -1009,6 +1028,40 @@ function bytesToBase64Url(bytes: Uint8Array): string {
 	let binary = "";
 	for (const byte of bytes) binary += String.fromCharCode(byte);
 	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+/**
+ * A page finish's answer, sealed under a key only its credential gives
+ * (`StoredPageFinished`): the server never keeps the credential, so its
+ * storage alone opens no code or upgrade token in it.
+ */
+async function sealFinishAnswer(credential: string, answer: Record<string, unknown>): Promise<{ check: string; iv: string; sealed: string }> {
+	const key = await finishAnswerKey(credential, "encrypt");
+	const iv = crypto.getRandomValues(new Uint8Array(12));
+	const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(answer))));
+	return { check: await sha256Hex(`apron:finish-check\u0000${credential}`), iv: bytesToBase64Url(iv), sealed: bytesToBase64Url(sealed) };
+}
+
+/** The answer `sealFinishAnswer` sealed, for the same credential; else undefined. */
+async function openFinishAnswer(credential: string, stored: { check: string; iv: string; sealed: string }): Promise<Record<string, unknown> | undefined> {
+	if (stored.check !== await sha256Hex(`apron:finish-check\u0000${credential}`)) return undefined;
+	try {
+		const key = await finishAnswerKey(credential, "decrypt");
+		const opened = await crypto.subtle.decrypt({ name: "AES-GCM", iv: base64UrlBytes(stored.iv) }, key, base64UrlBytes(stored.sealed));
+		const answer: unknown = JSON.parse(new TextDecoder().decode(opened));
+		return answer && typeof answer === "object" && !Array.isArray(answer) ? answer as Record<string, unknown> : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function finishAnswerKey(credential: string, use: "encrypt" | "decrypt"): Promise<CryptoKey> {
+	const raw = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`apron:finish-key\u0000${credential}`));
+	return await crypto.subtle.importKey("raw", raw, "AES-GCM", false, [use]);
+}
+
+function base64UrlBytes(text: string): Uint8Array<ArrayBuffer> {
+	return Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/")), (character) => character.charCodeAt(0));
 }
 
 async function sha256Hex(token: string): Promise<string> {
@@ -4550,17 +4603,40 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const challengeId = typeof body.challenge_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(body.challenge_id) ? body.challenge_id : undefined;
 		if (!challengeId) return pageJson(400, { error: "The request was not understood." });
 		const now = nowMs();
+		const finishedKey = PAGE_FINISHED_KEY_PREFIX + await sha256Hex(challengeId);
+		const sent = JSON.stringify(body.credential ?? null);
+		// The same finish again, whose answer was lost on the way (the page retries it): that answer
+		// again, before the attempt is charged, so a retry is never refused for the first one.
+		const earlier = await this.store.meter.foreground({ reads: 1 }, () => this.ctx.storage.get<StoredPageFinished>(finishedKey));
+		if (earlier?.v === 1 && earlier.expiresMs > now && earlier.origin === origin) {
+			const answer = await openFinishAnswer(sent, earlier);
+			if (answer) return pageJson(200, answer);
+		}
 		this.store.admission.reserveAuthAttempt({ ipKey, now });
 		const ceremony = await this.takeSignInRecord<StoredPageCeremony>(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(challengeId));
 		if (ceremony?.v !== 1 || !(ceremony.expiresMs > now) || ceremony.challenge.challengeId !== challengeId || ceremony.request.resource !== origin) {
 			return pageJson(400, { error: "This passkey request expired. Try again." });
 		}
+		const answer = await this.finishPageCeremony(ceremony, challengeId, body, origin, ipKey, now);
+		// Kept for a retry of this finish, as long as a code lasts: the page can't tell an answer lost
+		// on the way from no answer, and its passkey is made. Best effort: the finish itself worked.
+		if (answer.status === 200) {
+			try {
+				await this.putSignInRecord(finishedKey, { v: 1, origin, ...await sealFinishAnswer(sent, answer.body), expiresMs: now + CODE_TTL_MS } satisfies StoredPageFinished);
+			} catch { /* a retry then finds the ceremony used up, as before */ }
+		}
+		return pageJson(answer.status, answer.body);
+	}
+
+	/** The page's finish, once its ceremony is taken: the answer, for `pageFinish` to send and keep. */
+	private async finishPageCeremony(ceremony: StoredPageCeremony, challengeId: string, body: Record<string, unknown>, origin: string, ipKey: string, now: number): Promise<{ status: number; body: Record<string, unknown> }> {
+		const out = (status: number, answer: Record<string, unknown>) => ({ status, body: answer });
 		const action = ceremony.challenge.action;
 		let credential: Record<string, unknown>;
 		try {
 			credential = passkeyCredentialParam(body, action);
 		} catch {
-			return pageJson(400, { error: "The passkey's answer was not understood. Try again." });
+			return out(400, { error: "The passkey's answer was not understood. Try again." });
 		}
 		let created: { userId: string; name: string; userHandle: string; credential: StoredCredential } | undefined;
 		const repository: CredentialRepository = {
@@ -4588,14 +4664,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// device to drop it. Anything else, or a failed read, is the usual error.
 			// Never for a passkey for LEGACY_RP_ID, which other sites may have made.
 			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && ceremony.challenge.rpId === this.config.rpId && !await this.pendingCredential(error.credentialId)) {
-				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
+				return out(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
 			}
 			throw error;
 		}
 		// The upgrade after a sign-in with a passkey for LEGACY_RP_ID (src/legacy-passkeys.ts).
 		if (ceremony.upgrade) {
 			const answer = await finishUpgrade(this.legacyPort(), ceremony.upgrade, created, origin, { now, ipKey });
-			return pageJson(answer.status, answer.body);
+			return out(answer.status, answer.body);
 		}
 		const record: Omit<StoredSignInCode, "expiresMs"> = {
 			v: 1, page: ceremony.page, action, ...ceremony.request,
@@ -4608,9 +4684,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// first, and the code is issued when that ends (src/legacy-passkeys.ts).
 		if (ceremony.challenge.rpId !== this.config.rpId) {
 			const upgrade = await offerUpgrade(this.legacyPort(), record.userId, record as unknown as Record<string, unknown>, { origin, page: ceremony.page, request: ceremony.request }, now);
-			if (upgrade) return pageJson(200, { upgrade });
+			if (upgrade) return out(200, { upgrade });
 		}
-		return pageJson(200, { redirect: await this.issuePageCode(record, origin) });
+		return out(200, { redirect: await this.issuePageCode(record, origin) });
 	}
 
 	/**

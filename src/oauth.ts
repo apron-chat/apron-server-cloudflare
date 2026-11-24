@@ -29,6 +29,16 @@ export const METADATA_PATH = "/.well-known/oauth-authorization-server";
 /** The page script's own requests: begin and finish a ceremony on the page. */
 export const PAGE_BEGIN_PATH = "/passkey/begin";
 export const PAGE_FINISH_PATH = "/passkey/finish";
+/**
+ * How long a sign-in page's ceremony lasts on the server. The page begins
+ * one as it shows, before the tap, and the browser's `timeout` only starts
+ * at the tap; a password manager may then take its time (unlocking, a sync,
+ * choosing where to save). A passkey made after its ceremony expired is
+ * already saved on the device, so the server's lifetime is the longer one.
+ */
+export const PAGE_CHALLENGE_TTL_MS = 10 * 60_000;
+/** How long the page uses a ceremony it began ahead of the tap: long enough before expiry for the browser's whole `timeout`. */
+export const PAGE_PREPARED_FRESH_MS = 6 * 60_000;
 
 /** Bounds on what a request may carry, so nothing unbounded reaches storage. */
 const MAX_CLIENT_ID_CHARS = 512;
