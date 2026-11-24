@@ -5072,10 +5072,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// The new user's logged joins reach this connection after its
 				// `auth` result (§3.2); signInKeyless releases them.
 				this.holdDeliveries(socket);
-				await this.runMutation(async () => {
-					const created = this.store.accounts.createInvited({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
-					for (const record of created.broadcasts) this.broadcastHeld(socket, record);
-				});
+				try {
+					await this.runMutation(async () => {
+						const created = this.store.accounts.createInvited({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
+						for (const record of created.broadcasts) this.broadcastHeld(socket, record);
+					});
+				} catch (error) {
+					// No account: the guest gets what it was sent meanwhile.
+					this.releaseDeliveries(socket);
+					throw error;
+				}
 				// One put of three keys, with no await between creation and it: the
 				// new user's token and pointer, and the invite counted down (a
 				// used-up invite is pruned on its next try).
@@ -5087,12 +5093,47 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return userId;
 			});
 			if (userId === null) return;
-			const identity = this.store.accounts.get(userId);
-			if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
-			// A reply lost after this point costs one use: the user exists, with a
-			// token nobody received, until an admin /purges them.
-			await this.signInKeyless(socket, attachment, request, identity, own, true, ownKey);
+			try {
+				const identity = this.store.accounts.get(userId);
+				if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
+				await this.signInKeyless(socket, attachment, request, identity, own, true, ownKey);
+			} finally {
+				// A sign-up whose sign-in did not happen (a failed read, or the
+				// connection closed while the account was made) is undone, so the
+				// person can try again with the use it gave back. Once signed in,
+				// the reply is sent with their token; a reply lost after that
+				// costs one use, and the account stays until an admin /purges it.
+				if (connectionAttachment(socket)?.credential !== ownKey) await this.undoSignUp(socket, userId, key, ownKey);
+			}
 		});
+	}
+
+	/**
+	 * Undoes a sign-up (handleJoinToken) whose sign-in did not happen, under
+	 * the session lock it holds: the new user's token first, so a `user_id`
+	 * the account frees never comes with a live token, and the use given back
+	 * in the same commit; then the account; and the connection, still a
+	 * guest, gets what was held for it. A failure here is logged, not
+	 * thrown, so the sign-in's own error is the one the client sees; it
+	 * leaves at worst the account without a token, as before.
+	 */
+	private async undoSignUp(socket: WebSocketConnection, userId: string, inviteKey: string, ownKey: string): Promise<void> {
+		this.releaseDeliveries(socket);
+		try {
+			await this.store.meter.foreground({ reads: 1, writes: 3 }, async () => {
+				const invite = await this.ctx.storage.get<StoredJoinInvite>(inviteKey);
+				const dropped = this.ctx.storage.delete([ownKey, INVITE_KEY_PREFIX + userId]);
+				// The same invite, as the session lock kept it: a new one, or a
+				// revocation, would have replaced it under that lock.
+				const restored = invite?.v === 1 ? this.ctx.storage.put<StoredJoinInvite>(inviteKey, { ...invite, remaining: invite.remaining + 1 }) : undefined;
+				await Promise.all([dropped, restored]);
+			});
+			await this.runMutation(async () => {
+				this.store.accounts.purge({ userIds: [userId], now: nowMs() });
+			});
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "sign_up_undo_failed", reason: errorToProtocol(error).message }));
+		}
 	}
 
 	/**
@@ -5119,7 +5160,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, uses === 0 ? "The sign-up invite is revoked." : [
 			`This invite signs up ${uses} new user${uses === 1 ? "" : "s"} until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and replaces any earlier one. Each gets their own token to sign in again with, and can add a passkey after.`,
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, "Or send this link, which signs each of them up with any Apron app"),
+			...this.tokenLink(socket, token, "Or send this link, which signs each of them up with any Apron app", undefined, true),
 			`To sign up, authenticate with the token scheme and a name: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}", "name": "Ada"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -9193,7 +9234,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, [
 			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
+			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint, true),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -9269,11 +9310,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `lead` and a link that brings `token` to any Apron app (Appendix A.4),
 	 * for the WebSocket URL this connection reached, as one line of a notice;
-	 * none when that URL isn't known.
+	 * none when that URL isn't known. With `code`, the link is written as
+	 * code: one for sending on, which opened here would sign this app in
+	 * with someone else's token.
 	 */
-	private tokenLink(socket: WebSocketConnection, token: string, lead: string, fallback?: string): string[] {
+	private tokenLink(socket: WebSocketConnection, token: string, lead: string, fallback?: string, code = false): string[] {
 		const endpoint = connectionAttachment(socket)?.endpoint ?? fallback;
-		return endpoint ? [`${lead}: <${apronLink(endpoint, { token })}>`] : [];
+		if (!endpoint) return [];
+		const link = apronLink(endpoint, { token });
+		return [code ? `${lead}: \`${link}\`` : `${lead}: <${link}>`];
 	}
 
 	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */

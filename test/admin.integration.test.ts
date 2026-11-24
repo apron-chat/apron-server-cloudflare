@@ -514,7 +514,9 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 		expect(text).toContain(`Created \`${userId}\``);
 		const token = text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1];
 		// The same token in a link that any Apron app opens (Appendix A.4).
-		expect(text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${token}>`);
+		// Written as code, to send on rather than open here (which would sign this app in as them).
+		expect(text).toContain(`: \`https://link.apron.chat/#server=wss://demo.test/ws&token=${token}\``);
+		expect(text).not.toContain('<https://link.apron.chat/');
 
 		// The token signs in from any origin, as a registered user in general.
 		const first = await signIn(token);
@@ -1426,7 +1428,8 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		const minted = await command(admin, 'invite', '/invite-code 2');
 		expect(minted.frame.result).toEqual({});
 		const invite = /apron_join_[A-Za-z0-9_-]+/.exec(minted.notice!.params.body.text)![0];
-		expect(minted.notice!.params.body.text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${invite}>`);
+		expect(minted.notice!.params.body.text).toContain(`: \`https://link.apron.chat/#server=wss://demo.test/ws&token=${invite}\``);
+		expect(minted.notice!.params.body.text).not.toContain('<https://link.apron.chat/');
 
 		// A guest signs up with it: a new registered user, named as asked, with its own token.
 		const ada = await fresh();
@@ -1477,6 +1480,31 @@ it('/invite-code mints a sign-up token that creates a user per use, each with it
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Broke' })).error).toBeDefined();
 		expect(await identities()).toBe(before);
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Fine' })).result.you.name).toBe('Fine');
+
+		// A sign-in that fails once the account is made undoes the sign-up: no
+		// account, no token, and the use given back for the retry.
+		const retried = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-retry', '/invite-code 1')).notice!.params.body.text)![0];
+		const tokens = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'invite-token:' })).size);
+		const [identitiesBefore, tokensBefore] = [await identities(), await tokens()];
+		await runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Record<'becomeRegistered', (...args: unknown[]) => unknown>;
+			const original = runtime.becomeRegistered;
+			runtime.becomeRegistered = () => {
+				runtime.becomeRegistered = original;
+				throw { name: 'denied', message: 'That account changed; try again' };
+			};
+		});
+		const failing = await fresh();
+		await request(failing, 'guest', 'auth', { scheme: 'guest' });
+		expect((await request(failing, 'join', 'auth', { scheme: 'token', token: retried, name: 'Retry' })).error.message).toBe('That account changed; try again');
+		expect(await identities()).toBe(identitiesBefore);
+		expect(await tokens()).toBe(tokensBefore);
+		// The guest connection still gets what is sent to general.
+		await request(ada, 'post-to-guest', 'message', { room_id: 'general', body: { text: 'still there?' } });
+		await until(failing, (frame) => frame.method === 'message' && frame.params?.body?.text === 'still there?');
+		const retry = await request(failing, 'retry', 'auth', { scheme: 'token', token: retried, name: 'Retry' });
+		expect(retry.result.you.name).toBe('Retry');
+		expect(await identities()).toBe(identitiesBefore + 1);
 
 		// A new invite replaces the last; /invite-code 0 revokes it.
 		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite-code 1')).notice!.params.body.text)![0];

@@ -398,7 +398,9 @@ posts.
 - A sign-up with an `/invite-code` token is an `/invite-token` registration, plus
   up to 8 `user_id` availability probes (8 reads each, reserved), the new
   user's identity read, and one KV read and three KV writes (in one put),
-  reserved at their bound. `/invite-code` and `/invite-device add` are one KV read and
+  reserved at their bound. A sign-up whose sign-in then fails is undone: one
+  KV read and three writes (the token and pointer deleted, the use given back),
+  then the account purged. `/invite-code` and `/invite-device add` are one KV read and
   three writes, `/invite-device remove` one read and two writes,
   `/invite-device list` at most six reads, `/invite-token` two KV writes;
   `/invite-reset` two KV reads and at most ten writes, plus deleting the
