@@ -463,7 +463,11 @@ regenerate the edge rules (`npm run budget:generate`), which let it through.
 `SIGNAL_UNKNOWN_PASSKEYS` never signals a previous-kind passkey, which other
 sites may have made. History and backups are named by the server's own host
 (`PUBLIC_ORIGIN`'s, else `RP_ID`), not by the RP ID, so a move does not rename
-them.
+them. A server that ran a version that named them by `RP_ID`, such as one with
+the parent domain as `RP_ID`, starts new backup names once, with the version
+that names them by host: once 14 new backups exist, delete the old
+`backups/<old RP_ID>-*` objects, which are no longer pruned. History chunks
+keep their stored keys and need nothing.
 
 ## Operations and secrets
 

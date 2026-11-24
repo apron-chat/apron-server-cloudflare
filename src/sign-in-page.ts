@@ -249,7 +249,8 @@ async function passkey(action) {
 
 for (const button of document.querySelectorAll("[data-passkey]")) button.addEventListener("click", () => passkey(button.dataset.passkey || primary));
 for (const button of document.querySelectorAll("[data-cancel]")) button.addEventListener("click", () => { busy(true); location.assign(config.deny); });
-prepare(primary);
+// With LEGACY_RP_ID, the page's sign-in button is the legacy script's, which prepares its own ceremony.
+if (document.querySelector('[data-passkey=""]')) prepare(primary);
 `;
 
 /** A sign-in page, ready for `navigator.credentials` on the server's origin. */

@@ -203,7 +203,7 @@ const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
  * full alarms may be a day apart). Each is small, and any later version
  * reads one as expired.
  */
-const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending):[0-9a-f]{64}$/;
+const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending|upgrade):[0-9a-f]{64}$/;
 /**
  * The path the entry Worker forwards the sign-in pages' requests to the
  * object on, with the route after it, and the header that carries the

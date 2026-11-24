@@ -25,6 +25,7 @@ export function loadLegacyRpId(value: string | undefined, rpId: string, passkeyP
 	const legacy = String(value ?? "").trim().toLowerCase();
 	if (!legacy) return {};
 	if (legacy.includes("://") || legacy.includes("/") || legacy.includes(" ")) return { error: "LEGACY_RP_ID must be a host name" };
+	if (!legacy.includes(".")) return { error: "LEGACY_RP_ID must be a registrable domain, such as apron.chat, not a public suffix" };
 	if (!rpId.endsWith(`.${legacy}`)) return { error: "LEGACY_RP_ID must be a domain RP_ID is under, such as apron.chat for server.apron.chat" };
 	if (!passkeyPage) return { error: "LEGACY_RP_ID needs PASSKEY_PAGE, whose page signs in with its passkeys" };
 	return { legacyRpId: legacy };

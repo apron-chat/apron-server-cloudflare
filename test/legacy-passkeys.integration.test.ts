@@ -258,6 +258,7 @@ it('takes a legacy RP ID that RP_ID is under, for the passkey page', () => {
 	expect(() => config({ LEGACY_RP_ID: 'pron.chat' })).toThrow(/domain RP_ID is under/);
 	expect(() => config({ LEGACY_RP_ID: 'web.apron.chat' })).toThrow(/domain RP_ID is under/);
 	expect(() => config({ LEGACY_RP_ID: 'https://apron.chat' })).toThrow(/must be a host name/);
+	expect(() => config({ LEGACY_RP_ID: 'chat' })).toThrow(/not a public suffix/);
 	expect(() => config({ LEGACY_RP_ID: 'apron.chat', PASSKEY_PAGE: 'false' })).toThrow(/needs PASSKEY_PAGE/);
 });
 
@@ -296,7 +297,9 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 	screen.parentElement = main;
 	const document = {
 		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? screen : status,
-		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [legacyButton, createButton] : selector === '[data-passkey]' ? [element()] : [],
+		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [legacyButton, createButton] : [],
+		// The page's own sign-in button gives way to this module's.
+		querySelector: () => null,
 	};
 	const fresh = await softPasskey(NEW);
 	const PublicKeyCredential = { parseRequestOptionsFromJSON: (json: unknown) => json, parseCreationOptionsFromJSON: (json: unknown) => json };
@@ -312,12 +315,20 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 			return { id: created.id, toJSON: () => created };
 		},
 	} };
-	const fetch = (path: string, init: { body: string }) => post(NEW, path, JSON.parse(init.body));
+	const begins: unknown[] = [];
+	const fetch = (path: string, init: { body: string }) => {
+		if (path.endsWith('/begin')) begins.push(JSON.parse(init.body));
+		return post(NEW, path, JSON.parse(init.body));
+	};
 	const assigned: string[] = [];
 	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', scripts.join('\n'))(
 		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) },
 	);
 
+	// One ceremony begun ahead of the tap, for the legacy RP ID, and none that no button could use.
+	await vi.waitFor(() => expect(begins).toHaveLength(1));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	expect(begins).toMatchObject([{ legacy: true }]);
 	legacyButton.listeners[0]();
 	// Signed in: the screen offering a new passkey, in place of the rest.
 	await vi.waitFor(() => expect(screen.hidden).toBe(false));
@@ -399,6 +410,7 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	const document = {
 		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? upgrade : status,
 		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [auto, save] : [],
+		querySelector: () => null,
 	};
 	const prompts: string[] = [];
 	const navigator = { credentials: {
@@ -457,4 +469,24 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	await vi.waitFor(() => expect(old.upgrade.hidden).toBe(false));
 	expect(old.prompts).toEqual(['chat.localhost', 'localhost']);
 	expect(old.assigned).toEqual([]);
+});
+
+it('sweeps a sign-in with a legacy passkey whose new passkey was never saved', async () => {
+	const { passkey } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	// Earlier tests recorded the switch: this account's passkey counts as made before it, as a legacy one is.
+	await runInDurableObject(stub(), (instance) => { (instance as unknown as { legacySince?: number }).legacySince = Date.now() + 3_600_000; });
+	const { query } = await loginQuery(NEW);
+	await legacySignIn(passkey, query);
+	const left = await runInDurableObject(stub(), async (instance, state) => {
+		const count = async () => (await state.storage.list({ prefix: 'signin-upgrade:' })).size;
+		const before = await count();
+		const server = instance as unknown as { sweepSignIn(now: number): Promise<boolean> };
+		while (await server.sweepSignIn(Date.now() + 3_600_000)) { /* the next batch */ }
+		return { before, after: await count() };
+	});
+	// This one, and any an earlier test left the same way.
+	expect(left.before).toBeGreaterThanOrEqual(1);
+	expect(left.after).toBe(0);
+	await runInDurableObject(stub(), (instance) => { (instance as unknown as { legacySince?: number }).legacySince = undefined; });
 });

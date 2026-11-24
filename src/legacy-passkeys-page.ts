@@ -82,9 +82,12 @@ async function run(kind) {
 		busy(false);
 		const refused = error && error.name === "NotAllowedError";
 		if (kind === "upgrade") { status(refused ? "Your passkey wasn’t saved. Try again." : "Your browser could not use a passkey" + (error && error.message ? ": " + error.message : ".")); prepare("upgrade"); return; }
-		if (refused && step === 0) {
+		// The first try may fail for its RP ID alone (refused, or a browser or passkey manager that cannot use it): the next tap tries the other.
+		if (step === 0) {
 			step = 1;
-			hint(order[1] === "legacy" ? "Tap Continue with passkey again to look for an older passkey." : "Tap Continue with passkey again to look once more.");
+			const again = order[1] === "legacy" ? "Tap Continue with passkey again to look for an older passkey." : "Tap Continue with passkey again to look once more.";
+			if (refused) hint(again);
+			else status("Your browser could not use a passkey" + (error && error.message ? ": " + error.message : ".") + " " + again);
 		} else {
 			step = 0;
 			status(refused ? "No passkey for this account was found on this device." : "Your browser could not use a passkey" + (error && error.message ? ": " + error.message : "."));
@@ -95,7 +98,8 @@ async function run(kind) {
 	const result = await post(${JSON.stringify(paths.finish)}, { challenge_id: options.challenge_id, credential: credentialJson(credential) });
 	if (result.unknownCredential && kind === "login") forget(options.public_key.rpId, credential.id);
 	// An upgrade's answer carries the sign-in's code even when its passkey could not be added.
-	if (result.redirect) { if (kind !== "legacy") remember(); location.assign(result.redirect); return; }
+	// The device holds a passkey the server knows for the new RP ID only after a sign-in with one, or an upgrade that added one.
+	if (result.redirect) { if (kind === "login" || (kind === "upgrade" && result.added)) remember(); location.assign(result.redirect); return; }
 	if (result.error || !result.upgrade) { busy(false); status(result.error || "Something went wrong. Try again."); prepare(kind === "upgrade" ? "upgrade" : order[step]); return; }
 	upgrade = result.upgrade;
 	const screen = $("upgrade");
