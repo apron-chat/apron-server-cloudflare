@@ -8,7 +8,7 @@
  * back to the client with its code; the device's passkey sheet has already
  * shown which account it is.
  */
-import { legacyPageParts } from "./legacy-passkeys-page"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+import { legacyPageParts } from "./legacy-passkeys-page";
 import { PAGE_BEGIN_PATH, PAGE_FINISH_PATH, type SignInPage } from "./oauth";
 
 /** What a sign-in page shows: everything is text, escaped here. */
@@ -28,7 +28,7 @@ export interface SignInPageView {
 	recognised: boolean;
 	/** The account an addition adds to. */
 	account?: { userId: string; name: string };
-	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). On a sign-in screen, the RP ID passkeys were made for before. */
+	/** On a sign-in screen, a previous RP ID (`LEGACY_RP_ID`) whose passkeys it also finds (src/legacy-passkeys-page.ts). */
 	legacyRpId?: string;
 	/** The page's own query, which its script sends back with begin. */
 	query: string;
@@ -260,7 +260,7 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 	const caution = `${view.recognised ? "" : `<p class="warn">${e(view.host)} has not verified this app.</p>`}
 <p class="muted">Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
-	// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with its four uses below; keep the page's own button.
+	// With LEGACY_RP_ID, a "Continue with passkey" that finds either kind, and the upgrade after an old one.
 	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;
 	const signIn = legacy?.button ?? `<button type="button" class="primary" data-passkey>Continue with passkey</button>`;
 	const account = view.account ? `${view.account.name} (@${view.account.userId})` : "";

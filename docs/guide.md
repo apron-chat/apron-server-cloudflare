@@ -420,18 +420,21 @@ and fall back to `external.url` when it throws `SecurityError`. A
 `NotAllowedError` is the person cancelling or having no passkey for the RP
 ID, not a missing feature: offer the page then, but don't open it unasked.
 
-<!-- LEGACY_RP_ID begin: remove through "end LEGACY_RP_ID" after 2026-12-22 (src/legacy-passkeys.ts) -->
-Until 2026-12-22 the page also signs in with production's passkeys made for
-`apron.chat` ([Moving `RP_ID`](#moving-rp_id)).
+### Choosing `RP_ID`
+
+Make `RP_ID` the server's own host, such as `server.apron.chat`. A passkey
+for a parent domain (`apron.chat`) can be made and used by any site under
+it, so only choose one where you run every site there. Servers that share a
+domain, such as tenants at `<name>.example.host`, each take their own host,
+and the shared domain belongs on the Public Suffix List, so browsers keep the
+servers apart. A shared web client is a related origin of each: list it in
+each server's `RP_ORIGINS`.
 
 ### Moving `RP_ID`
 
-Temporary: this section and `LEGACY_RP_ID` are removed after 2026-12-22,
-30 days after production moved.
-
-A server whose `RP_ID` is a parent domain (`apron.chat`) can move to its own
-host (`server.apron.chat`) without stranding its passkeys: set the old one as
-`LEGACY_RP_ID`.
+A server can move from one RP ID to another it is under, such as from
+`apron.chat` to `server.apron.chat`, without stranding its passkeys: set the
+previous one as `LEGACY_RP_ID`.
 
 ```toml
 [vars]
@@ -440,36 +443,27 @@ LEGACY_RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ```
 
-New passkeys are made for `RP_ID`. Nobody is asked which kind of passkey
-they have, or when they made it:
+New passkeys are made for `RP_ID`. Passkeys made for the previous one keep
+working, and nobody is asked which kind they have:
 
-- A sign-in from a related origin (`web.apron.chat`) goes to the passkey
-  page, as it would in a browser without related origins: a ceremony in the
-  client could only find passkeys for `RP_ID`, and someone with only an old
-  one would be told they have none.
 - The passkey page, whose host is under both RP IDs, has one "Continue with
   passkey". It asks the device for the kind it last signed in with there,
-  else the old kind; when the device has none, the next tap asks for the
-  other ("Tap Continue with passkey again…"). An old passkey then brings
-  "Save a new passkey", added to the account at once ("Not now" goes back
-  without it).
-- Accounts with only old passkeys get a private notice when they sign in (at
-  most once a day): "Your passkey needs a one-time update… Update it now",
-  linking to `https://server.apron.chat/passkey?action=replace`, which does
-  the same with no client, or says the account already has a new one.
+  else the previous kind; when the device has none, the next tap asks for the
+  other ("Tap Continue with passkey again…").
+- A sign-in with a previous-kind passkey then offers "Save a new passkey",
+  added to the account at once ("Not now" goes back without it). An account
+  that already has a passkey made since the move is not asked again.
+- Clients' own ceremonies use `RP_ID` only, so someone with only an old
+  passkey finds none there. A client that offers the passkey page after a
+  sign-in that finds nothing ([above](#native-passkeys-or-the-passkey-page))
+  reaches it in one more tap.
 
-An account then signs in with either passkey. The Worker answers `/.well-known/webauthn` on the new RP ID's host,
-so regenerate the edge rules (`npm run budget:generate`), which let it
-through. `SIGNAL_UNKNOWN_PASSKEYS` never signals a legacy passkey, which
-other sites may have made.
-
-Unset `LEGACY_RP_ID` once its users have moved; those who never came back
-then sign in another way, such as with a device token. History and backups
-are named by the server's own host (`PUBLIC_ORIGIN`'s, else `RP_ID`), not by
-the RP ID: chunks already written keep their keys, and the old
-`backups/<old>-…` files are no longer pruned, so delete them by hand once
-`BACKUP_KEEP` new ones exist.
-<!-- end LEGACY_RP_ID -->
+The Worker answers `/.well-known/webauthn` on the new RP ID's host, so
+regenerate the edge rules (`npm run budget:generate`), which let it through.
+`SIGNAL_UNKNOWN_PASSKEYS` never signals a previous-kind passkey, which other
+sites may have made. History and backups are named by the server's own host
+(`PUBLIC_ORIGIN`'s, else `RP_ID`), not by the RP ID, so a move does not rename
+them.
 
 ## Operations and secrets
 
@@ -611,11 +605,9 @@ budget:check` refuses a production config without that); its
 domain. `wrangler.toml` sets neither, so turn them off before deploying it
 anywhere.
 
-The RP ID is `server.apron.chat`, the server's own host.
-<!-- LEGACY_RP_ID begin: remove through "end LEGACY_RP_ID" after 2026-12-22 (src/legacy-passkeys.ts) -->
-Until 2026-12-22, passkeys made before for `apron.chat` still sign in on the
-passkey page (`LEGACY_RP_ID`, [Moving `RP_ID`](#moving-rp_id)).
-<!-- end LEGACY_RP_ID -->
+The RP ID is `server.apron.chat`, the server's own host. Passkeys made
+before for `apron.chat` still sign in on the passkey page (`LEGACY_RP_ID`,
+[Moving `RP_ID`](#moving-rp_id)).
 Guest connections accept every origin, including localhost, LAN frontends,
 local files (opaque origins), and clients without Origin. Passkey
 verification allows only the exact `https://web.apron.chat` origin.

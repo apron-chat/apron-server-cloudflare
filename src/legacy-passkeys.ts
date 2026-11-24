@@ -1,39 +1,19 @@
 /*
- * TEMPORARY: REMOVE AFTER 2026-12-22.
- *
- * Passkeys made for production's old RP ID, `apron.chat`, before it moved to
- * the server's own host, `server.apron.chat`, on 2026-11-22 (LEGACY_RP_ID).
- * For 30 days:
- *   - the passkey page still signs in with them, and then offers a
- *     passkey for the new RP ID, added to the account at once;
- *   - its replace screen (`/passkey?action=replace`) does the same with no
- *     client involved, or says the account already has a new one;
- *   - accounts with only old passkeys get a private notice when they sign
- *     in, at most once a day, linking to it;
- *   - a sign-in from a related origin (web.apron.chat) goes to the passkey
- *     page, whose "Continue with passkey" finds either kind of passkey
- *     without asking which (src/legacy-passkeys-page.ts).
- * Nobody is asked which kind of passkey they have, or when they made it.
- * Clients' own ceremonies never use the old RP ID. An old passkey is one
- * made before this server first ran with LEGACY_RP_ID (`since`).
- *
- * Everything this needs is here and in src/legacy-passkeys-page.ts (the
- * replace screen), but for a few call sites marked `LEGACY_RP_ID`
- * elsewhere. To remove it:
- *   1. delete this file, src/legacy-passkeys-page.ts and
- *      test/legacy-passkeys.integration.test.ts;
- *   2. `grep -rn LEGACY_RP_ID src test docs SPEC.md wrangler*.toml worker-configuration.d.ts`
- *      and delete each marked line or block, keeping what its comment says to keep
- *      (in docs, everything from a `LEGACY_RP_ID begin` comment to its `end LEGACY_RP_ID`);
- *   3. delete the `backups/apron.chat-*` objects in the apron-history bucket
- *      (no longer pruned since history is named by the server's host).
- * Accounts that never signed in with a new passkey by then sign in another
- * way, such as with a device token.
+ * A previous RP ID (LEGACY_RP_ID), such as production's `apron.chat` before
+ * its RP ID became the server's own host, `server.apron.chat`. New passkeys
+ * are made for RP_ID; passkeys made for the previous one keep working:
+ *   - the passkey page's "Continue with passkey" finds either kind without
+ *     asking which (src/legacy-passkeys-page.ts): it asks the device for the
+ *     kind it last signed in with there, else the previous one, and the next
+ *     tap for the other;
+ *   - after a sign-in with an old one, it offers "Save a new passkey", added
+ *     to the account at once ("Not now" skips it), unless the account
+ *     already has one made since (`since`).
+ * Only the passkey page takes the previous RP ID, for sign-ins only;
+ * clients' own ceremonies and every new passkey use RP_ID. An old passkey
+ * is one made before this server first ran with LEGACY_RP_ID (`since`).
  */
 import type { StoredCredential } from "./domain";
-
-/** The date after which this module and its call sites go. */
-export const LEGACY_PASSKEYS_REMOVE_AFTER = "2026-12-22";
 
 /**
  * `LEGACY_RP_ID`: unset or empty for none, else a host name that `rpId` is
@@ -48,23 +28,6 @@ export function loadLegacyRpId(value: string | undefined, rpId: string, passkeyP
 	if (!rpId.endsWith(`.${legacy}`)) return { error: "LEGACY_RP_ID must be a domain RP_ID is under, such as apron.chat for server.apron.chat" };
 	if (!passkeyPage) return { error: "LEGACY_RP_ID needs PASSKEY_PAGE, whose page signs in with its passkeys" };
 	return { legacyRpId: legacy };
-}
-
-/**
- * Whether a sign-in from `origin`, one of RP_ORIGINS, goes to the passkey
- * page rather than running in the client: while LEGACY_RP_ID is set, for an
- * origin outside RP_ID (a related origin, such as web.apron.chat). Its
- * ceremony could only find passkeys for RP_ID, and a person with only a
- * legacy one would be told they have none; the page offers both.
- */
-export function loginOnPage(legacyRpId: string | undefined, rpId: string, origin: string): boolean {
-	if (!legacyRpId) return false;
-	try {
-		const host = new URL(origin).hostname;
-		return host !== rpId && !host.endsWith(`.${rpId}`);
-	} catch {
-		return false;
-	}
 }
 
 /** Whether a ceremony may be for the legacy RP ID: only a sign-in, only on the passkey page. */
@@ -90,20 +53,11 @@ export function legacyBegin(body: Record<string, unknown>, legacyRpId: string | 
 /** How long the page offers the upgrade after a legacy sign-in; a sign-in's code is issued when it ends. */
 export const UPGRADE_TTL_MS = 10 * 60_000;
 const UPGRADE_KEY_PREFIX = "signin-upgrade:";
-/** When this server first ran with LEGACY_RP_ID (ms), and each account's last notice (a UTC day): object storage keys. */
+/** When this server first ran with LEGACY_RP_ID (ms): an object storage key. */
 export const SINCE_KEY = "legacy-rp:since";
-export const NOTICE_KEY_PREFIX = "legacy-rp:notice:";
 
 function validToken(value: unknown): value is string {
 	return typeof value === "string" && /^up_[A-Za-z0-9_-]{43}$/.test(value);
-}
-
-/** The page the replace screen is (`/passkey?action=replace`), apart from the passkey page's sign-in screens. */
-export const REPLACE_PAGE = "replace";
-
-/** The replace screen's stand-in for a client's request: none, on this server's origin. */
-export function replaceRequest(origin: string): UpgradeBinding["request"] {
-	return { clientId: "", redirectUri: "", codeChallenge: "", state: "", resource: origin };
 }
 
 /** What binds an upgrade to the page it was offered on: the server's origin, the page, and the client's request. */
@@ -116,16 +70,16 @@ export interface UpgradeBinding {
 /**
  * An upgrade, offered after a legacy sign-in: single use, kept under the
  * SHA-256 of its token (`up_…`, never a `request` handle, which addition
- * links carry). On a sign-in screen it holds the sign-in's code record,
- * issued only when the upgrade ends (finishUpgrade, skipUpgrade), so the
- * code's 5 minutes start then; the replace screen has none.
+ * links carry). It holds the sign-in's code record, issued only when the
+ * upgrade ends (finishUpgrade, skipUpgrade), so the code's 5 minutes start
+ * then.
  */
 export interface StoredUpgrade extends UpgradeBinding {
 	v: 1;
 	userId: string;
 	userHandle: string;
 	/** The sign-in code's record, without its expiry. */
-	code?: Record<string, unknown>;
+	code: Record<string, unknown>;
 	expiresMs: number;
 }
 
@@ -154,9 +108,6 @@ export interface LegacyPort {
 	tellAdded(userId: string): void;
 	/** Issues a sign-in code from its record; the redirect back to the client with it. */
 	issueCode(code: Record<string, unknown>, origin: string): Promise<string>;
-	/** The UTC day the account was last sent the notice (NOTICE_KEY_PREFIX), and recording today's. */
-	noticedDay(userId: string): Promise<number | undefined>;
-	noteNoticed(userId: string, day: number): Promise<void>;
 }
 
 async function upgradeKey(token: string): Promise<string> {
@@ -188,9 +139,9 @@ function newToken(): string {
 	return `up_${btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")}`;
 }
 
-async function storeUpgrade(port: LegacyPort, account: LegacyAccount & { userHandle: string }, userId: string, binding: UpgradeBinding, now: number, code?: Record<string, unknown>): Promise<string> {
+async function storeUpgrade(port: LegacyPort, account: LegacyAccount & { userHandle: string }, userId: string, binding: UpgradeBinding, now: number, code: Record<string, unknown>): Promise<string> {
 	const token = newToken();
-	await port.put(await upgradeKey(token), { v: 1, ...binding, userId, userHandle: account.userHandle, ...(code ? { code } : {}), expiresMs: now + UPGRADE_TTL_MS });
+	await port.put(await upgradeKey(token), { v: 1, ...binding, userId, userHandle: account.userHandle, code, expiresMs: now + UPGRADE_TTL_MS });
 	return token;
 }
 
@@ -204,22 +155,6 @@ export async function offerUpgrade(port: LegacyPort, userId: string, code: Recor
 	const account = port.account(userId);
 	if (!upgradable(account) || newPasskeyMs(account, await port.since()) !== undefined) return undefined;
 	return await storeUpgrade(port, account, userId, binding, now, code);
-}
-
-/**
- * The replace screen's answer to a legacy sign-in: `create` (a new passkey
- * to make), `already` (the account has one for the new RP ID, made at
- * `added_at`; `upgrade` adds another for this device), or `full` (it
- * cannot take another), with the account.
- */
-export async function replaceSignedIn(port: LegacyPort, userId: string, binding: UpgradeBinding, now: number): Promise<Record<string, unknown>> {
-	const account = port.account(userId);
-	if (!account) return { error: "That account is gone." };
-	const shown = { user_id: userId, name: account.name };
-	const added = newPasskeyMs(account, await port.since());
-	const upgrade = upgradable(account) ? await storeUpgrade(port, account, userId, binding, now) : undefined;
-	if (added !== undefined) return { state: "already", account: shown, added_at: new Date(added).toISOString(), ...(upgrade ? { upgrade } : {}) };
-	return upgrade ? { state: "create", account: shown, upgrade } : { state: "full", account: shown };
 }
 
 /**
@@ -241,9 +176,8 @@ export async function beginUpgrade(port: LegacyPort, token: string, binding: Upg
  * An upgrade's finish, its passkey verified: the upgrade is used up, the
  * passkey added to the account at once (the person just proved the account
  * on this page) under the user handle it began with, the account's
- * connections told, and a sign-in's code issued, where it holds one. On a
- * sign-in screen, a passkey that cannot be added still lets the sign-in go
- * back to the client.
+ * connections told, and the sign-in's code issued: a passkey that cannot be
+ * added still lets the sign-in go back to the client.
  */
 export async function finishUpgrade(port: LegacyPort, key: string, created: { userId: string; userHandle: string; credential: StoredCredential } | undefined, origin: string, input: { now: number; ipKey: string }):
 	Promise<{ status: number; body: Record<string, unknown> }> {
@@ -257,41 +191,12 @@ export async function finishUpgrade(port: LegacyPort, key: string, created: { us
 		} catch { /* below */ }
 	}
 	if (added) port.tellAdded(record.userId);
-	const failed = { error: "The new passkey could not be added." };
-	if (!record.code) return added ? { status: 200, body: { added: true } } : { status: 400, body: failed };
-	return { status: 200, body: { redirect: await port.issueCode(record.code, origin), ...(added ? { added: true } : failed) } };
+	return { status: 200, body: { redirect: await port.issueCode(record.code, origin), ...(added ? { added: true } : { error: "The new passkey could not be added." }) } };
 }
 
-/** "Not now" on a sign-in screen: the upgrade is used up and the sign-in's code issued. */
+/** "Not now": the upgrade is used up and the sign-in's code issued. */
 export async function skipUpgrade(port: LegacyPort, body: Record<string, unknown>, origin: string, now: number): Promise<{ status: number; body: Record<string, unknown> }> {
 	const record = validToken(body.upgrade) ? await port.take(await upgradeKey(body.upgrade)) : undefined;
-	if (record?.v !== 1 || !(record.expiresMs > now) || record.origin !== origin || !record.code) return { status: 400, body: { error: "This sign-in expired. Start again from the app." } };
+	if (record?.v !== 1 || !(record.expiresMs > now) || record.origin !== origin) return { status: 400, body: { error: "This sign-in expired. Start again from the app." } };
 	return { status: 200, body: { redirect: await port.issueCode(record.code, origin) } };
 }
-
-/** The replace screen's address on this server's `origin`. */
-export function replaceUrl(origin: string): string {
-	return `${origin}/passkey?action=replace`;
-}
-
-/** The removal date as people read it ("December 22"). */
-function cutoffDay(): string {
-	return new Date(`${LEGACY_PASSKEYS_REMOVE_AFTER}T12:00:00Z`).toLocaleDateString("en-US", { month: "long", day: "numeric", timeZone: "UTC" });
-}
-
-/**
- * The `~private` notice for an account signing in with only passkeys for
- * the legacy RP ID (none made since `since`), at most once a UTC day; else
- * undefined. Accounts without passkeys (bots, invited users) get none.
- */
-export async function signInNotice(port: LegacyPort, userId: string, origin: string, now: number): Promise<string | undefined> {
-	const since = await port.since();
-	const account = port.account(userId);
-	if (!account?.passkeys.length) return undefined;
-	if (since === undefined || newPasskeyMs(account, since) !== undefined) return undefined;
-	const day = Math.floor(now / 86_400_000);
-	if (await port.noticedDay(userId) === day) return undefined;
-	await port.noteNoticed(userId, day);
-	return `Your passkey needs a one-time update to keep working after ${cutoffDay()}. [Update it now](${replaceUrl(origin)}): it takes a minute.`;
-}
-

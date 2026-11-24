@@ -41,7 +41,7 @@ declare global {
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
-		/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). */
+		/** A previous RP ID whose passkeys the passkey page still signs in with (src/legacy-passkeys.ts). */
 		LEGACY_RP_ID?: string;
 		RP_ORIGINS?: string;
 		RP_NAME?: string;
@@ -99,7 +99,7 @@ declare global {
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;
-			LEGACY_RP_ID?: string; // LEGACY_RP_ID: remove after 2026-12-22
+			LEGACY_RP_ID?: string;
 			RP_ORIGINS?: string;
 			RP_NAME?: string;
 			SERVER_TITLE?: string;

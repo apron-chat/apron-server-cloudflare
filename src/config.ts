@@ -1,4 +1,4 @@
-import { loadLegacyRpId } from "./legacy-passkeys.ts"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+import { loadLegacyRpId } from "./legacy-passkeys.ts";
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
@@ -18,7 +18,11 @@ export interface RuntimeConfig {
 	backups: BackupSettings;
 	allowedOrigins: readonly string[];
 	rpId: string;
-	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). The RP ID passkeys were made for before `rpId`. */
+	/**
+	 * A previous RP ID (`LEGACY_RP_ID`), a domain `rpId` is under, that
+	 * passkeys were made for before: the passkey page still signs in with
+	 * them, and offers a passkey for `rpId` after (src/legacy-passkeys.ts).
+	 */
 	legacyRpId?: string;
 	rpOrigins: readonly string[];
 	rpName: string;
@@ -273,7 +277,7 @@ type EnvLike = {
 	BILL_CAP_MONTH?: string;
 	ALLOWED_ORIGINS?: string;
 	RP_ID?: string;
-	LEGACY_RP_ID?: string; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+	LEGACY_RP_ID?: string;
 	RP_ORIGINS?: string;
 	RP_NAME?: string;
 	SERVER_TITLE?: string;
@@ -671,7 +675,6 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", false);
 	const externalSignIn = parseSwitch(env.EXTERNAL_SIGN_IN, "EXTERNAL_SIGN_IN", false);
 	if (externalSignIn && !passkeyPage) throw new ConfigError("EXTERNAL_SIGN_IN needs PASSKEY_PAGE, whose passkey ceremony its page runs");
-	// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with `legacyRpId` below.
 	const { legacyRpId, error: legacyRpIdError } = loadLegacyRpId(env.LEGACY_RP_ID, rpId, passkeyPage);
 	if (legacyRpIdError) throw new ConfigError(legacyRpIdError);
 	const serverHost = loadServerHost(env.PUBLIC_ORIGIN, rpId);
@@ -704,7 +707,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		backups,
 		allowedOrigins,
 		rpId,
-		...(legacyRpId ? { legacyRpId } : {}), // LEGACY_RP_ID: remove after 2026-12-22
+		...(legacyRpId ? { legacyRpId } : {}),
 		rpOrigins,
 		rpName,
 		serverHost,

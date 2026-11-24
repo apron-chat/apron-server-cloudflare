@@ -47,9 +47,9 @@ new_sqlite_classes = ["ApronDemoServer"]
 # Worker answers with RP_ORIGINS); the others use the passkey page here.
 # SIGNAL_UNKNOWN_PASSKEYS stays unset (off): see docs/configuration.md.
 RP_ID = "server.apron.chat"
-# LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). Passkeys
-# made before the move (2026-11-22) are for the parent domain: for 30 days
-# the passkey page still signs in with them and offers one for RP_ID.
+# Passkeys made before the move are for the parent domain, LEGACY_RP_ID: the
+# passkey page still signs in with them, without asking which kind anyone
+# has, and offers to save one for RP_ID (docs/guide.md, Moving RP_ID).
 LEGACY_RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
