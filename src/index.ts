@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { beginUpgrade, finishUpgrade, legacyBegin, NOTICE_KEY_PREFIX, offerUpgrade, REPLACE_PAGE, replaceRequest, replaceSignedIn, signInNotice, SINCE_KEY, skipUpgrade, welcomeLine, LEGACY_PASSKEYS_REMOVE_AFTER, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
+import { beginUpgrade, finishUpgrade, legacyBegin, loginOnPage, NOTICE_KEY_PREFIX, offerUpgrade, REPLACE_PAGE, replaceRequest, replaceSignedIn, signInNotice, SINCE_KEY, skipUpgrade, LEGACY_PASSKEYS_REMOVE_AFTER, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
 import { renderReplacePage } from "./legacy-passkeys-page"; // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts)
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
@@ -3459,7 +3459,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// connection, not an account, so `guest` is listed only in `auth`.
 				signup: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: this.withLegacyWelcome(general ?? this.signInWelcome(origin, endpoint), endpoint), // LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts); keep the argument
+				welcome: general ?? this.signInWelcome(origin, endpoint),
 				// What the server is, for lists of servers (§3.1): what admins set
 				// with `/server`, else SERVER_TITLE, SERVER_DESCRIPTION and
 				// SERVER_AVATAR (config.ts), else for the description `general`'s.
@@ -3582,12 +3582,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
 		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
 		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`.`;
-	}
-
-	/** LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts). The welcome, with a line linking to the replace screen where this host serves it. */
-	private withLegacyWelcome(welcome: string, endpoint: string | undefined): string {
-		const server = originOfEndpoint(endpoint);
-		return this.config.legacyRpId && server !== undefined && this.pageServes(server) ? `${welcome}\n\n${welcomeLine(this.config.legacyRpId, server)}` : welcome;
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
@@ -3995,8 +3989,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const origin = this.requestOrigin(socket);
 		// A ceremony in the client needs one of RP_ORIGINS; the passkey page
 		// serves every other client, on the server's own origin (protocol §4.10.1).
-		const local = origin !== null && this.config.rpOrigins.includes(origin);
 		const pageOrigin = this.passkeyPageOrigin(attachment);
+		// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts); keep `origin !== null && this.config.rpOrigins.includes(origin)`.
+		const local = origin !== null && this.config.rpOrigins.includes(origin) && !(action === "login" && pageOrigin !== undefined && loginOnPage(this.config.legacyRpId, this.config.rpId, origin));
 		if (!local && !pageOrigin) throw passkeyOriginRefusal(origin);
 		if (step === "begin") {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
@@ -6249,7 +6244,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await port.since();
 			const origin = this.passkeyPageOrigin(attachment);
 			if (!origin) return;
-			const text = await signInNotice(port, attachment.userId, this.config.legacyRpId, origin, nowMs());
+			const text = await signInNotice(port, attachment.userId, origin, nowMs());
 			if (text && openSocket(socket)) this.deliverTo(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
 		} catch { /* skipped */ }
 	}

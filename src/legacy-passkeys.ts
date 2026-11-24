@@ -4,14 +4,16 @@
  * Passkeys made for production's old RP ID, `apron.chat`, before it moved to
  * the server's own host, `server.apron.chat`, on 2026-11-22 (LEGACY_RP_ID).
  * For 30 days:
- *   - the passkey page still signs in with them ("Use one made for
- *     apron.chat"), and then offers a passkey for the new RP ID, added to
- *     the account at once;
+ *   - the passkey page still signs in with them, and then offers a
+ *     passkey for the new RP ID, added to the account at once;
  *   - its replace screen (`/passkey?action=replace`) does the same with no
  *     client involved, or says the account already has a new one;
  *   - accounts with only old passkeys get a private notice when they sign
- *     in, at most once a day, linking to it, and the sign-in screen's
- *     welcome links to it too.
+ *     in, at most once a day, linking to it;
+ *   - a sign-in from a related origin (web.apron.chat) goes to the passkey
+ *     page, whose "Continue with passkey" finds either kind of passkey
+ *     without asking which (src/legacy-passkeys-page.ts).
+ * Nobody is asked which kind of passkey they have, or when they made it.
  * Clients' own ceremonies never use the old RP ID. An old passkey is one
  * made before this server first ran with LEGACY_RP_ID (`since`).
  *
@@ -46,6 +48,23 @@ export function loadLegacyRpId(value: string | undefined, rpId: string, passkeyP
 	if (!rpId.endsWith(`.${legacy}`)) return { error: "LEGACY_RP_ID must be a domain RP_ID is under, such as apron.chat for server.apron.chat" };
 	if (!passkeyPage) return { error: "LEGACY_RP_ID needs PASSKEY_PAGE, whose page signs in with its passkeys" };
 	return { legacyRpId: legacy };
+}
+
+/**
+ * Whether a sign-in from `origin`, one of RP_ORIGINS, goes to the passkey
+ * page rather than running in the client: while LEGACY_RP_ID is set, for an
+ * origin outside RP_ID (a related origin, such as web.apron.chat). Its
+ * ceremony could only find passkeys for RP_ID, and a person with only a
+ * legacy one would be told they have none; the page offers both.
+ */
+export function loginOnPage(legacyRpId: string | undefined, rpId: string, origin: string): boolean {
+	if (!legacyRpId) return false;
+	try {
+		const host = new URL(origin).hostname;
+		return host !== rpId && !host.endsWith(`.${rpId}`);
+	} catch {
+		return false;
+	}
 }
 
 /** Whether a ceremony may be for the legacy RP ID: only a sign-in, only on the passkey page. */
@@ -265,7 +284,7 @@ function cutoffDay(): string {
  * the legacy RP ID (none made since `since`), at most once a UTC day; else
  * undefined. Accounts without passkeys (bots, invited users) get none.
  */
-export async function signInNotice(port: LegacyPort, userId: string, legacyRpId: string, origin: string, now: number): Promise<string | undefined> {
+export async function signInNotice(port: LegacyPort, userId: string, origin: string, now: number): Promise<string | undefined> {
 	const since = await port.since();
 	const account = port.account(userId);
 	if (!account?.passkeys.length) return undefined;
@@ -273,10 +292,6 @@ export async function signInNotice(port: LegacyPort, userId: string, legacyRpId:
 	const day = Math.floor(now / 86_400_000);
 	if (await port.noticedDay(userId) === day) return undefined;
 	await port.noteNoticed(userId, day);
-	return `Your passkey was made for ${legacyRpId}, which this server stops accepting after ${cutoffDay()}. [Replace your passkey](${replaceUrl(origin)}) to keep signing in.`;
+	return `Your passkey needs a one-time update to keep working after ${cutoffDay()}. [Update it now](${replaceUrl(origin)}): it takes a minute.`;
 }
 
-/** The sign-in screen's welcome line (`server.welcome`) while LEGACY_RP_ID is set. */
-export function welcomeLine(legacyRpId: string, origin: string): string {
-	return `Passkey from before we moved to ${new URL(origin).host}? [Replace it](${replaceUrl(origin)}) to keep signing in after ${cutoffDay()}; passkeys made for ${legacyRpId} stop working then.`;
-}

@@ -440,18 +440,25 @@ LEGACY_RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ```
 
-New passkeys are made for `RP_ID`, and clients' own ceremonies use only
-`RP_ID`. The passkey page, whose host is under both, adds "Passkey not
-listed? Use one made for apron.chat" to its sign-in screens: that sign-in
-uses the old RP ID, and before going back to the client the page offers
-"Add a passkey for server.apron.chat", which is added to the account at
-once ("Not now" goes back without it). The replace screen,
-`https://server.apron.chat/passkey?action=replace`, does the same with no
-client: sign in with the old passkey, make the new one, or learn the
-account already has one. Accounts with only old passkeys get a private
-notice linking to it when they sign in (at most once a day), and the sign-in
-screen's welcome links to it too. An account then signs in with either
-passkey. The Worker answers `/.well-known/webauthn` on the new RP ID's host,
+New passkeys are made for `RP_ID`. Nobody is asked which kind of passkey
+they have, or when they made it:
+
+- A sign-in from a related origin (`web.apron.chat`) goes to the passkey
+  page, as it would in a browser without related origins: a ceremony in the
+  client could only find passkeys for `RP_ID`, and someone with only an old
+  one would be told they have none.
+- The passkey page, whose host is under both RP IDs, has one "Continue with
+  passkey". It asks the device for the kind it last signed in with there,
+  else the old kind; when the device has none, the next tap asks for the
+  other ("Tap Continue with passkey again…"). An old passkey then brings
+  "Save a new passkey", added to the account at once ("Not now" goes back
+  without it).
+- Accounts with only old passkeys get a private notice when they sign in (at
+  most once a day): "Your passkey needs a one-time update… Update it now",
+  linking to `https://server.apron.chat/passkey?action=replace`, which does
+  the same with no client, or says the account already has a new one.
+
+An account then signs in with either passkey. The Worker answers `/.well-known/webauthn` on the new RP ID's host,
 so regenerate the edge rules (`npm run budget:generate`), which let it
 through. `SIGNAL_UNKNOWN_PASSKEYS` never signals a legacy passkey, which
 other sites may have made.

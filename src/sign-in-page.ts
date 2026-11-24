@@ -260,6 +260,9 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 	const caution = `${view.recognised ? "" : `<p class="warn">${e(view.host)} has not verified this app.</p>`}
 <p class="muted">Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
+	// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with its four uses below; keep the page's own button.
+	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;
+	const signIn = legacy?.button ?? `<button type="button" class="primary" data-passkey>Continue with passkey</button>`;
 	const account = view.account ? `${view.account.name} (@${view.account.userId})` : "";
 	const screens = {
 		// `/oauth/authorize` is always this screen, with a new account's passkey besides.
@@ -267,7 +270,7 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 <p>It will be able to read and send messages as you.</p>
 ${chips(`${e(view.client)} signing in to ${e(view.title)}`, [chip({ icon: "app", name: e(view.client), note: "Wants to sign in as you" })])}
 ${caution}
-<div class="actions"><button type="button" class="primary" data-passkey>Continue with passkey</button>${cancel}</div>
+<div class="actions">${signIn}${cancel}</div>
 ${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}`,
 		register: `<h1>Create an account on ${e(view.title)}</h1>
 <p>${who} wants to create an account for you on ${host}, with a new passkey. It will be able to read and send messages as you.</p>
@@ -280,8 +283,6 @@ ${chips(`${e(view.client)} adding a passkey`, [chip({ icon: "app", name: e(view.
 ${caution}
 <div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>`,
 	};
-	// LEGACY_RP_ID: remove after 2026-12-22 (src/legacy-passkeys.ts), with its three uses below.
-	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : { link: "", screen: "", script: "" };
 	const pageTitle = view.start === "add" ? "Add a passkey" : view.start === "register" ? `Create an account on ${view.title}` : `Sign in to ${view.title}`;
 	return `<!doctype html>
 <html lang="en">
@@ -296,14 +297,13 @@ ${caution}
 <main>
 ${brand(e(view.title), e(view.host))}
 ${screens[view.start]}
-${legacy.link}
-${legacy.screen}
+${legacy?.screen ?? ""}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
 <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
 <script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny })}</script>
 <script nonce="${nonce}">${SCRIPT}</script>
-${legacy.script}
+${legacy?.script ?? ""}
 </body>
 </html>`;
 }
