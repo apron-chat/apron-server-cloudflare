@@ -91,12 +91,20 @@ p { margin: 0 0 12px; }
 .key.past { opacity: 0.6; }
 .key.gone { border-style: dashed; background: none; color: var(--muted); }
 .key.ok em, .key.ok > .i { color: var(--ok); }
-/* The RP IDs tried on a sign-in (src/legacy-passkeys-page.ts): a key, or once it found none, a cross and a Retry. */
-.tries { margin: 16px 0 20px; }
+/* The RP IDs tried on a sign-in (src/legacy-passkeys-page.ts): a key, or once it found none, a cross and a Retry.
+   A list, not cards: lighter than the client's card above, so it reads as progress, not another party. */
+.tries { margin: 20px 0 0; gap: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.tries .key { border: 0; border-radius: 0; background: none; padding: 10px 14px; font-size: 0.9375rem; }
+.tries .key + .key { border-top: 1px solid var(--line); }
+.tries .key.pick { border: 0; padding: 10px 14px; background: var(--chip); }
+.tries .key.pick b { color: var(--accent); }
+.tries .key.gone { border-style: none; color: var(--muted); }
+.tries .key.gone + .key, .tries .key + .key.gone { border-top-style: solid; }
+.tries + .status { margin: 12px 0 0; }
+.tries + .status + .actions, .tries + .actions { margin-top: 20px; }
 .tries .key > .i:nth-of-type(2), .tries .key.gone > .i:first-of-type { display: none; }
 .tries .key.gone > .i:nth-of-type(2) { display: block; }
 .tries .key .retry { margin-left: auto; font-size: 0.8125rem; min-width: 44px; min-height: 32px; }
-.tries .key.gone em { display: none; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
 button { font: inherit; font-size: 1rem; font-weight: 600; border-radius: 999px; padding: 12px 22px; min-height: 48px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }

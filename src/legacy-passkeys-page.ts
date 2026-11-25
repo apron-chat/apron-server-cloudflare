@@ -21,13 +21,13 @@ export function legacyPageParts(view: { legacyRpId: string; rpId: string; host: 
 	const e = escape;
 	const legacy = e(view.legacyRpId);
 	const host = e(view.host);
-	// One row for each RP ID, in the order tried (the script puts them in it): its name, what it is, and a Retry once it found none.
-	const row = (kind: "login" | "legacy", name: string, note: string) => `<div class="key" data-try="${kind}" data-note="${note}">${icon("key")}${icon("miss")}<span><b>${name}</b><small>${note}</small></span><em></em><button type="button" class="link retry" data-retry="${kind}" aria-label="Retry ${name}" hidden>Retry</button></div>`;
+	// One row for each RP ID, in the order tried (the script puts them in it): its name, what checking it does, and a Retry once it found none.
+	const row = (kind: "login" | "legacy", name: string, note: string) => `<div class="key" data-try="${kind}" data-note="${note}">${icon("key")}${icon("miss")}<span><b>${name}</b><small>${note}</small></span><button type="button" class="link retry" data-retry="${kind}" aria-label="Retry ${name}" hidden>Retry</button></div>`;
 	return {
 		button: `<button type="button" class="primary" data-legacy="auto">Continue with passkey</button>`,
 		tries: `<div id="tries" class="keys tries" hidden>
-${row("login", e(view.rpId), "Your passkey")}
-${row("legacy", legacy, "Your older passkey")}
+${row("login", e(view.rpId), "Check for passkey")}
+${row("legacy", legacy, "Check for older passkey")}
 </div>`,
 		screen: `<div id="upgrade" hidden>
 <h1 tabindex="-1">Save a new passkey</h1>
@@ -82,22 +82,25 @@ function mark() {
 		const kind = row.dataset.try;
 		const gone = missed.has(kind);
 		row.className = gone ? "key gone" : kind === upcoming ? "key pick" : "key";
-		row.querySelector("small").textContent = gone ? "No passkey used" : row.dataset.note;
-		row.querySelector("em").textContent = kind === upcoming ? "Next" : "";
+		row.querySelector("small").textContent = gone ? "None selected" : row.dataset.note;
 		row.querySelector("[data-retry]").hidden = !gone;
 	}
 	for (const button of document.querySelectorAll('[data-legacy="auto"]')) button.hidden = !upcoming;
-	if (!upcoming) status("No passkey for this account was used on this device. Retry one, or cancel to go back.");
 }
-// After a miss: said (the checklist isn't a live region), and focus where the next step is: the button, or once
-// both missed, the first Retry (the focused button may have just been hidden).
+// After a miss: said, as the question the button answers (it's also how a screen reader hears of it: the
+// checklist isn't a live region), and focus where the next step is: the button, or once both missed, the first
+// Retry (the focused button may have just been hidden). "None selected": the browser doesn't say whether
+// there was none or the prompt was closed.
 function missedSaid(kind) {
 	const upcoming = order.find((each) => !missed.has(each));
+	// Said right under the checklist it's about, above the button it asks about.
+	$("tries").after($("status"));
 	if (upcoming) {
-		hint("No passkey used for " + NAMES[kind] + ". Continue with passkey asks for " + NAMES[upcoming] + ".");
+		hint("Checked " + NAMES[kind] + " for passkey, none selected. Check " + NAMES[upcoming] + " for passkey?");
 		const button = document.querySelector('[data-legacy="auto"]');
 		if (button && button.focus) button.focus();
 	} else {
+		hint("Checked " + NAMES[order[0]] + " and " + NAMES[order[1]] + " for passkey, none selected. Retry either, or cancel to go back.");
 		const retry = $("tries").querySelector('[data-retry="' + order[0] + '"]');
 		if (retry && retry.focus) retry.focus();
 	}

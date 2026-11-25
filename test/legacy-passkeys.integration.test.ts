@@ -416,12 +416,13 @@ function triesList() {
 		parts.small.textContent = note;
 		return { dataset: { try: kind, note }, className: 'key', hidden: false, parts, querySelector: (selector: string) => selector === 'small' ? parts.small : selector === 'em' ? parts.em : parts.retry };
 	};
-	const rows = [row('login', 'Your passkey'), row('legacy', 'Your older passkey')];
+	const rows = [row('login', 'Check for passkey'), row('legacy', 'Check for older passkey')];
 	const list = {
 		hidden: true, rows,
 		append: (moved: Row) => { rows.splice(rows.indexOf(moved), 1); rows.push(moved); },
 		querySelector: (selector: string) => rows.find((each) => selector.includes(`"${each.dataset.try}"`)),
 		querySelectorAll: () => [...rows],
+		after: () => {},
 		/** What a reader sees: each row's RP ID kind, note, tag, and whether it has a Retry. */
 		seen: () => rows.map((each) => [each.dataset.try, each.parts.small.textContent, each.parts.em.textContent, !each.parts.retry.hidden]),
 		retry: (kind: string) => rows.find((each) => each.dataset.try === kind)!.parts.retry.listeners[0](),
@@ -513,9 +514,9 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	first.tap();
 	// The checklist: the old kind found none (with a Retry), and the button asks for the new one next.
 	await vi.waitFor(() => expect(first.tries.hidden).toBe(false));
-	expect(first.tries.seen()).toEqual([['legacy', 'No passkey used', '', true], ['login', 'Your passkey', 'Next', false]]);
+	expect(first.tries.seen()).toEqual([['legacy', 'None selected', '', true], ['login', 'Check for passkey', '', false]]);
 	// Said too, since the checklist isn't a live region.
-	expect(first.status.textContent).toBe('No passkey used for localhost. Continue with passkey asks for chat.localhost.');
+	expect(first.status.textContent).toBe('Checked localhost for passkey, none selected. Check chat.localhost for passkey?');
 	first.tap();
 	await vi.waitFor(() => expect(first.assigned).toHaveLength(1));
 	expect(first.prompts).toEqual(['localhost', 'chat.localhost']);
@@ -530,7 +531,7 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	// finds the old one, and the page offers a new passkey.
 	const old = await signInPage({ localhost: other.passkey }, new Map([['apron-passkey-kind', 'new']]));
 	old.tap();
-	await vi.waitFor(() => expect(old.tries.seen()).toEqual([['login', 'No passkey used', '', true], ['legacy', 'Your older passkey', 'Next', false]]));
+	await vi.waitFor(() => expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', '', false]]));
 	old.tap();
 	await vi.waitFor(() => expect(old.upgrade.hidden).toBe(false));
 	expect(old.prompts).toEqual(['chat.localhost', 'localhost']);
@@ -718,11 +719,11 @@ it('retries an RP ID that found none, and says so when neither did', async () =>
 	const has: Record<string, Passkey> = {};
 	const page = await signInPage(has, new Map());
 	page.tap();
-	await vi.waitFor(() => expect(page.tries.seen()[0]).toEqual(['legacy', 'No passkey used', '', true]));
+	await vi.waitFor(() => expect(page.tries.seen()[0]).toEqual(['legacy', 'None selected', '', true]));
 	page.tap();
-	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['legacy', 'No passkey used', '', true], ['login', 'No passkey used', '', true]]));
+	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['legacy', 'None selected', '', true], ['login', 'None selected', '', true]]));
 	expect(page.auto.hidden).toBe(true);
-	expect(page.status.textContent).toBe('No passkey for this account was used on this device. Retry one, or cancel to go back.');
+	expect(page.status.textContent).toBe('Checked localhost and chat.localhost for passkey, none selected. Retry either, or cancel to go back.');
 	// One ceremony held for each RP ID, for its Retry, and none begun twice: the first, the next, and each one again.
 	await vi.waitFor(() => expect(page.begins).toHaveLength(4));
 	await new Promise((resolve) => setTimeout(resolve, 50));
