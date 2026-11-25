@@ -95,7 +95,7 @@ p { margin: 0 0 12px; }
 .tries { margin: 16px 0 20px; }
 .tries .key > .i:nth-of-type(2), .tries .key.gone > .i:first-of-type { display: none; }
 .tries .key.gone > .i:nth-of-type(2) { display: block; }
-.tries .key .retry { margin-left: auto; font-size: 0.8125rem; }
+.tries .key .retry { margin-left: auto; font-size: 0.8125rem; min-width: 44px; min-height: 32px; }
 .tries .key.gone em { display: none; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
 button { font: inherit; font-size: 1rem; font-weight: 600; border-radius: 999px; padding: 12px 22px; min-height: 48px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
@@ -370,7 +370,7 @@ ${legacy?.screen ?? ""}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
 <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
-<script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny, ...(view.first ? { first: view.first } : {}) })}</script>
+<script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny, ...(view.first ? { first: view.first } : {}), ...(view.legacyRpId ? { names: { login: view.rpId ?? view.host, legacy: view.legacyRpId } } : {}) })}</script>
 <script nonce="${nonce}">${SCRIPT}</script>
 ${legacy?.script ?? ""}
 </body>

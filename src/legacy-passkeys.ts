@@ -165,8 +165,10 @@ export async function offerUpgrade(port: LegacyPort, userId: string, code: Recor
  * to ask for last, which a client sends where its own ceremony for it just
  * found no passkey. Undefined leaves it to the device.
  * Only an order: both RP IDs are always offered, so a wrong or stale hint
- * costs one more tap, never a sign-in. It does show anyone who names an
- * account whether that account has a passkey for RP_ID yet.
+ * costs one more tap, never a sign-in. It does show anyone who names a
+ * `user_id` whether that account exists with a passkey, and whether it has
+ * one for RP_ID yet: a `user_id` is public in chat, as every message names
+ * its sender.
  */
 export function firstKind(input: { passkeys?: readonly { createdMs: number }[]; since: number | undefined; last?: string; rpId: string; legacyRpId: string }): "login" | "legacy" | undefined {
 	const passkeys = input.since === undefined ? [] : input.passkeys ?? [];

@@ -4530,12 +4530,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async firstOnPage(query: URLSearchParams, legacyRpId: string): Promise<{ first?: "login" | "legacy" }> {
 		const hint = query.getAll("login_hint").length === 1 ? query.get("login_hint")! : undefined;
 		const last = query.getAll("rp_id_last").length === 1 ? query.get("rp_id_last")! : undefined;
-		const account = hint && hint.length <= 128 ? this.legacyPort().account(hint) : undefined;
-		const first = firstKind({
-			passkeys: account?.passkeys, since: account ? await this.legacyPort().since() : undefined,
-			...(last === this.config.rpId || last === legacyRpId ? { last } : {}), rpId: this.config.rpId, legacyRpId,
-		});
-		return first ? { first } : {};
+		// Only hints: one that can't be read (the store refusing a metered read, say) says nothing.
+		try {
+			const account = hint && hint.length <= 128 ? this.legacyPort().account(hint) : undefined;
+			const first = firstKind({
+				passkeys: account?.passkeys, since: account ? await this.legacyPort().since() : undefined,
+				...(last === this.config.rpId || last === legacyRpId ? { last } : {}), rpId: this.config.rpId, legacyRpId,
+			});
+			return first ? { first } : {};
+		} catch {
+			return {};
+		}
 	}
 
 	/**

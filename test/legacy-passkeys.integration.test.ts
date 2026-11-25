@@ -514,7 +514,8 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	// The checklist: the old kind found none (with a Retry), and the button asks for the new one next.
 	await vi.waitFor(() => expect(first.tries.hidden).toBe(false));
 	expect(first.tries.seen()).toEqual([['legacy', 'No passkey used', '', true], ['login', 'Your passkey', 'Next', false]]);
-	expect(first.status.textContent).toBe('');
+	// Said too, since the checklist isn't a live region.
+	expect(first.status.textContent).toBe('No passkey used for localhost. Continue with passkey asks for chat.localhost.');
 	first.tap();
 	await vi.waitFor(() => expect(first.assigned).toHaveLength(1));
 	expect(first.prompts).toEqual(['localhost', 'chat.localhost']);
@@ -697,8 +698,15 @@ it('begins a held ceremony again before it is too old, and on a tap after that, 
 	page.tap();
 	await vi.waitFor(() => expect(page.upgrade.hidden).toBe(false));
 	// Three for the sign-in (the first, its refresh, and the tap's), then the upgrade's, prepared as it shows.
+	await vi.waitFor(() => expect(page.begins).toHaveLength(4));
 	expect(page.begins).toMatchObject([{ legacy: true }, { legacy: true }, { legacy: true }, { upgrade: expect.any(String) }]);
 	expect(page.prompts).toEqual(['localhost']);
+	// The sign-in's timers left behind begin nothing more; the upgrade's own still refreshes it.
+	for (const run of page.timers.splice(0)) run();
+	await vi.waitFor(() => expect(page.begins).toHaveLength(5));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	expect(page.begins).toHaveLength(5);
+	expect(page.begins[4]).toMatchObject({ upgrade: expect.any(String) });
 });
 
 it('retries an RP ID that found none, and says so when neither did', async () => {
@@ -713,11 +721,18 @@ it('retries an RP ID that found none, and says so when neither did', async () =>
 	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['legacy', 'No passkey used', '', true], ['login', 'No passkey used', '', true]]));
 	expect(page.auto.hidden).toBe(true);
 	expect(page.status.textContent).toBe('No passkey for this account was used on this device. Retry one, or cancel to go back.');
+	// One ceremony held for each RP ID, for its Retry, and none begun twice: the first, the next, and each one again.
+	await vi.waitFor(() => expect(page.begins).toHaveLength(4));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	expect(page.begins).toMatchObject([{ legacy: true }, { action: 'login' }, { legacy: true }, { action: 'login' }]);
 	// Retry the old one, this time not closed.
 	has.localhost = passkey;
 	page.tries.retry('legacy');
 	await vi.waitFor(() => expect(page.upgrade.hidden).toBe(false));
 	expect(page.prompts).toEqual(['localhost', 'chat.localhost', 'localhost']);
+	// On the upgrade screen, only the upgrade's own ceremony is held: the other RP ID's is dropped.
+	await vi.waitFor(() => expect(page.begins.at(-1)).toMatchObject({ upgrade: expect.any(String) }));
+	expect(page.begins).toHaveLength(5);
 });
 
 it("asks first for the RP ID the client's hints point to", async () => {
