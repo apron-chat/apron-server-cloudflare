@@ -702,6 +702,8 @@ it('begins a held ceremony again before it is too old, and on a tap after that, 
 	expect(page.begins).toMatchObject([{ legacy: true }, { legacy: true }, { legacy: true }, { upgrade: expect.any(String) }]);
 	expect(page.prompts).toEqual(['localhost']);
 	// The sign-in's timers left behind begin nothing more; the upgrade's own still refreshes it.
+	// Both set by now: the sign-in refresh's, and the upgrade's once its begin is answered.
+	await vi.waitFor(() => expect(page.timers).toHaveLength(2));
 	for (const run of page.timers.splice(0)) run();
 	await vi.waitFor(() => expect(page.begins).toHaveLength(5));
 	await new Promise((resolve) => setTimeout(resolve, 50));
