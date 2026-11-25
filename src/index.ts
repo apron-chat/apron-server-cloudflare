@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { beginUpgrade, finishUpgrade, legacyBegin, offerUpgrade, passkeysForRpId, SINCE_KEY, skipUpgrade, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys";
+import { beginUpgrade, finishUpgrade, firstKind, legacyBegin, offerUpgrade, passkeysForRpId, SINCE_KEY, skipUpgrade, type LegacyPort, type StoredUpgrade } from "./legacy-passkeys";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
@@ -4513,12 +4513,34 @@ export class ApronDemoServer extends DurableObject<Env> {
 			who, client, where,
 			recognised: recognisedClient(redirect, this.config.rpOrigins),
 			...(account ? { account } : {}),
-			// A sign-in screen that also finds passkeys for LEGACY_RP_ID (src/legacy-passkeys.ts).
-			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId } : {}),
+			// A sign-in screen that also finds passkeys for LEGACY_RP_ID (src/legacy-passkeys.ts), asking first
+			// for the RP ID the client's hints point to (`login_hint`, `rp_id_last`), where they do.
+			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId, rpId: this.config.rpId, ...await this.firstOnPage(query, this.config.legacyRpId) } : {}),
 			query: query.toString(),
 			deny: redirectWith(value.redirectUri, { error: "access_denied", state: value.state, iss: origin }),
 		};
 		return new Response(renderSignInPage(view, nonce), { headers: pageHeaders(nonce) });
+	}
+
+	/**
+	 * Which RP ID a sign-in page with LEGACY_RP_ID asks for first, from the
+	 * client's hints (`firstKind`): `login_hint`, a `user_id`, and
+	 * `rp_id_last`, an RP ID to ask for last. Anything else, or a hint naming no account, says nothing.
+	 */
+	private async firstOnPage(query: URLSearchParams, legacyRpId: string): Promise<{ first?: "login" | "legacy" }> {
+		const hint = query.getAll("login_hint").length === 1 ? query.get("login_hint")! : undefined;
+		const last = query.getAll("rp_id_last").length === 1 ? query.get("rp_id_last")! : undefined;
+		// Only hints: one that can't be read (the store refusing a metered read, say) says nothing.
+		try {
+			const account = hint && hint.length <= 128 ? this.legacyPort().account(hint) : undefined;
+			const first = firstKind({
+				passkeys: account?.passkeys, since: account ? await this.legacyPort().since() : undefined,
+				...(last === this.config.rpId || last === legacyRpId ? { last } : {}), rpId: this.config.rpId, legacyRpId,
+			});
+			return first ? { first } : {};
+		} catch {
+			return {};
+		}
 	}
 
 	/**

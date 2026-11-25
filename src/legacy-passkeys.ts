@@ -159,6 +159,28 @@ export async function offerUpgrade(port: LegacyPort, userId: string, code: Recor
 }
 
 /**
+ * Which RP ID a sign-in page asks for first, from the client's hints, where
+ * they say more than the device's own memory: `login_hint`'s account (its
+ * passkeys, old and new by `since`), then `rp_id_last` (`last`), an RP ID
+ * to ask for last, which a client sends where its own ceremony for it just
+ * found no passkey. Undefined leaves it to the device.
+ * Only an order: both RP IDs are always offered, so a wrong or stale hint
+ * costs one more tap, never a sign-in. It does show anyone who names a
+ * `user_id` whether that account exists with a passkey, and whether it has
+ * one for RP_ID yet: a `user_id` is public in chat, as every message names
+ * its sender.
+ */
+export function firstKind(input: { passkeys?: readonly { createdMs: number }[]; since: number | undefined; last?: string; rpId: string; legacyRpId: string }): "login" | "legacy" | undefined {
+	const passkeys = input.since === undefined ? [] : input.passkeys ?? [];
+	const current = passkeys.some((passkey) => passkey.createdMs >= input.since!);
+	const old = passkeys.some((passkey) => passkey.createdMs < input.since!);
+	if (current !== old) return current ? "login" : "legacy";
+	if (input.last === input.rpId) return "legacy";
+	if (input.last === input.legacyRpId) return "login";
+	return current ? "login" : undefined;
+}
+
+/**
  * Of an account's passkeys, those for RP_ID: made since the switch
  * (`since`), as every passkey made since is; none while `since` is unknown.
  * Only these go in a new passkey's `excludeCredentials`. The spec matches
