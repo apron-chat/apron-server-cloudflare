@@ -335,8 +335,10 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 		return post(NEW, path, JSON.parse(init.body));
 	};
 	const assigned: string[] = [];
-	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', scripts.join('\n'))(
-		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) },
+	// A device that last signed in here with this old passkey.
+	const localStorage = { getItem: (key: string) => key === 'apron-passkey-kind' ? 'old' : null, setItem: () => {} };
+	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', 'localStorage', scripts.join('\n'))(
+		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) }, localStorage,
 	);
 
 	// One ceremony begun ahead of the tap, for the legacy RP ID, and none that no button could use.
@@ -501,41 +503,42 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	const { passkey } = await legacyAccount();
 	const other = await legacyAccount();
 	await rpIds('chat.localhost', 'localhost');
-	// Someone with a new passkey, on a device that has not signed in here: the old kind is asked
-	// for first, finds nothing, and the next tap of the same button asks for the new one.
+	// Someone with a new passkey, on a device that has not signed in here: the new kind is asked
+	// for first, so one tap signs in.
 	const fresh = await softPasskey(NEW);
 	const { query } = await loginQuery(NEW);
 	const token = await legacySignIn(passkey, query);
 	const added = await begin(NEW, { query, upgrade: token });
 	expect((await finish(NEW, added.body.challenge_id, await fresh.register(added.body.public_key))).status).toBe(200);
-	const device = new Map<string, string>();
-	const first = await signInPage({ 'chat.localhost': fresh }, device);
+	const first = await signInPage({ 'chat.localhost': fresh }, new Map());
 	expect(first.tries.hidden).toBe(true);
 	first.tap();
-	// The checklist: the old kind found none (with a Retry), and the button asks for the new one next.
-	await vi.waitFor(() => expect(first.tries.hidden).toBe(false));
-	expect(first.tries.seen()).toEqual([['legacy', 'None selected', '', true], ['login', 'Check for passkey', '', false]]);
-	// Said too, since the checklist isn't a live region.
-	expect(first.status.textContent).toBe('Checked localhost for passkey, none selected. Check chat.localhost for passkey?');
-	first.tap();
 	await vi.waitFor(() => expect(first.assigned).toHaveLength(1));
-	expect(first.prompts).toEqual(['localhost', 'chat.localhost']);
-	// This device now asks for the new kind first.
-	expect(device.get('apron-passkey-kind')).toBe('new');
-	const again = await signInPage({ 'chat.localhost': fresh }, device);
-	again.tap();
-	await vi.waitFor(() => expect(again.assigned).toHaveLength(1));
-	expect(again.prompts).toEqual(['chat.localhost']);
+	expect(first.prompts).toEqual(['chat.localhost']);
 
-	// Someone with only an old passkey on such a device: the new kind finds nothing, the next tap
-	// finds the old one, and the page offers a new passkey.
-	const old = await signInPage({ localhost: other.passkey }, new Map([['apron-passkey-kind', 'new']]));
+	// Someone with only an old passkey on such a device: the new kind finds nothing, and the
+	// checklist says so (with a Retry); the next tap of the same button finds the old one.
+	const device = new Map<string, string>();
+	const old = await signInPage({ localhost: other.passkey }, device);
 	old.tap();
-	await vi.waitFor(() => expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', '', false]]));
+	await vi.waitFor(() => expect(old.tries.hidden).toBe(false));
+	expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', '', false]]);
+	// Said too, since the checklist isn't a live region.
+	expect(old.status.textContent).toBe('Checked chat.localhost for passkey, none selected. Check localhost for passkey?');
 	old.tap();
 	await vi.waitFor(() => expect(old.upgrade.hidden).toBe(false));
 	expect(old.prompts).toEqual(['chat.localhost', 'localhost']);
 	expect(old.assigned).toEqual([]);
+	// Until it saves a new passkey, this device asks for the old kind first.
+	expect(device.get('apron-passkey-kind')).toBe('old');
+	const again = await signInPage({ localhost: other.passkey }, device, { saves: await softPasskey(NEW) });
+	again.tap();
+	await vi.waitFor(() => expect(again.upgrade.hidden).toBe(false));
+	expect(again.prompts).toEqual(['localhost']);
+	// Once it does, the new kind.
+	again.save();
+	await vi.waitFor(() => expect(again.assigned).toHaveLength(1));
+	expect(device.get('apron-passkey-kind')).toBe('new');
 });
 
 it('excludes no legacy passkey from an addition, on the passkey page or in a client from RP_ORIGINS', async () => {
@@ -661,7 +664,7 @@ it("sends a finish again after the server couldn't be reached, and says so when 
 	const fresh = await softPasskey(NEW);
 	let finishes = 0;
 	const redirect = 'com.example.myapp:/signed-in?code=kept&state=s';
-	const page = await signInPage({ localhost: passkey }, new Map(), {
+	const page = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'old']]), {
 		saves: fresh,
 		finish: () => {
 			finishes++;
@@ -688,7 +691,7 @@ it('begins a held ceremony again before it is too old, and on a tap after that, 
 	const { passkey } = await legacyAccount();
 	await rpIds('chat.localhost', 'localhost');
 	const clock = { now: 0 };
-	const page = await signInPage({ localhost: passkey }, new Map(), { clock });
+	const page = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'old']]), { clock });
 	expect(page.begins).toHaveLength(1);
 	// Its timer begins it again while it is still fresh, so a later tap still goes straight to the prompt.
 	expect(page.timers).toHaveLength(1);
@@ -719,20 +722,20 @@ it('retries an RP ID that found none, and says so when neither did', async () =>
 	const has: Record<string, Passkey> = {};
 	const page = await signInPage(has, new Map());
 	page.tap();
-	await vi.waitFor(() => expect(page.tries.seen()[0]).toEqual(['legacy', 'None selected', '', true]));
+	await vi.waitFor(() => expect(page.tries.seen()[0]).toEqual(['login', 'None selected', '', true]));
 	page.tap();
-	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['legacy', 'None selected', '', true], ['login', 'None selected', '', true]]));
+	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'None selected', '', true]]));
 	expect(page.auto.hidden).toBe(true);
-	expect(page.status.textContent).toBe('Checked localhost and chat.localhost for passkey, none selected. Retry either, or cancel to go back.');
+	expect(page.status.textContent).toBe('Checked chat.localhost and localhost for passkey, none selected. Retry either, or cancel to go back.');
 	// One ceremony held for each RP ID, for its Retry, and none begun twice: the first, the next, and each one again.
 	await vi.waitFor(() => expect(page.begins).toHaveLength(4));
 	await new Promise((resolve) => setTimeout(resolve, 50));
-	expect(page.begins).toMatchObject([{ legacy: true }, { action: 'login' }, { legacy: true }, { action: 'login' }]);
+	expect(page.begins).toMatchObject([{ action: 'login' }, { legacy: true }, { action: 'login' }, { legacy: true }]);
 	// Retry the old one, this time not closed.
 	has.localhost = passkey;
 	page.tries.retry('legacy');
 	await vi.waitFor(() => expect(page.upgrade.hidden).toBe(false));
-	expect(page.prompts).toEqual(['localhost', 'chat.localhost', 'localhost']);
+	expect(page.prompts).toEqual(['chat.localhost', 'localhost', 'localhost']);
 	// On the upgrade screen, only the upgrade's own ceremony is held: the other RP ID's is dropped.
 	await vi.waitFor(() => expect(page.begins.at(-1)).toMatchObject({ upgrade: expect.any(String) }));
 	expect(page.begins).toHaveLength(5);
@@ -759,9 +762,9 @@ it("asks first for the RP ID the client's hints point to", async () => {
 	await vi.waitFor(() => expect(last.assigned).toHaveLength(1));
 	expect(last.prompts).toEqual(['localhost']);
 	// A hint that isn't one of this server's RP IDs, or names no account, says nothing.
-	const ignored = await signInPage({}, new Map([['apron-passkey-kind', 'new']]), { hints: { rp_id_last: 'elsewhere.example', login_hint: 'nobody' } });
+	const ignored = await signInPage({}, new Map([['apron-passkey-kind', 'old']]), { hints: { rp_id_last: 'elsewhere.example', login_hint: 'nobody' } });
 	ignored.tap();
-	await vi.waitFor(() => expect(ignored.prompts).toEqual(['chat.localhost']));
+	await vi.waitFor(() => expect(ignored.prompts).toEqual(['localhost']));
 });
 
 it('orders by the account first, then by the RP ID the client asks to be last', () => {

@@ -53,8 +53,8 @@ ${chips(`Older passkey used; next a new one for ${host}`, [
  * The sign-in, whichever RP ID the person's passkey is for: one ceremony
  * can ask for one RP ID only, so "Continue with passkey" asks first for the
  * one the server says (`config.first`, from the client's hints), else the
- * one this device last signed in with here (`localStorage`), else the
- * legacy one, which nearly every returning account has. When it ends with no
+ * one this device last signed in with here (`localStorage`), else RP_ID, so
+ * an account made since the switch is asked once only. When it ends with no
  * passkey (none, or the prompt closed: the browser does not say which), the
  * checklist shows that RP ID as "No passkey used", with a Retry, and the
  * next one, which the same button asks for. A legacy one then offers a new passkey (`upgrade`).
@@ -68,10 +68,11 @@ function legacyScript(paths: { begin: string; finish: string }): string {
 const KEY = "apron-passkey-kind";
 // Each kind's RP ID, as the page shows it (config.names).
 const NAMES = config.names || { login: "", legacy: "" };
-const remember = () => { try { localStorage.setItem(KEY, "new"); } catch {} };
-let order = ["legacy", "login"];
+// The kind this device last signed in with here: "new", or "old" for a legacy passkey with none saved since.
+const remember = (kind) => { try { localStorage.setItem(KEY, kind); } catch {} };
+let order = ["login", "legacy"];
 if (config.first === "login" || config.first === "legacy") order = config.first === "login" ? ["login", "legacy"] : ["legacy", "login"];
-else try { if (localStorage.getItem(KEY) === "new") order = ["login", "legacy"]; } catch {}
+else try { if (localStorage.getItem(KEY) === "old") order = ["legacy", "login"]; } catch {}
 // The RP IDs tried that found no passkey; the button asks for the first of the rest.
 const missed = new Set();
 const next = () => order.find((kind) => !missed.has(kind)) || order[0];
@@ -173,10 +174,13 @@ async function run(kind) {
 	if (result.unknownCredential && kind === "login") forget(options.public_key.rpId, credential.id);
 	// An upgrade's answer carries the sign-in's code even when its passkey could not be added: said, not passed over.
 	if (result.redirect && kind === "upgrade" && !result.added) { show("unsaved"); onward = result.redirect; return; }
-	// The device holds a passkey the server knows for the new RP ID only after a sign-in with one, or an upgrade that added one.
-	if (result.redirect) { if (kind === "login" || kind === "upgrade") remember(); location.assign(result.redirect); return; }
+	// The device holds a passkey the server knows for the new RP ID only after a sign-in with one, or an upgrade that added one;
+	// a legacy one that signed in, and wasn't replaced, is asked for first next time.
+	if (result.redirect) { remember(kind === "legacy" ? "old" : "new"); location.assign(result.redirect); return; }
 	if (result.error || !result.upgrade) { busy(false); status(result.error || "Something went wrong. Try again."); if (kind === "upgrade") prepare("upgrade"); else { ensure(kind); ensure(next()); } return; }
 	upgrade = result.upgrade;
+	// Until a new passkey is saved, this device's is the legacy one.
+	remember("old");
 	// The sign-in's other ceremonies are done with: dropped, so they stop being begun again.
 	ready.clear();
 	show("upgrade");
