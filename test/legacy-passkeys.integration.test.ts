@@ -734,30 +734,30 @@ it("asks first for the RP ID the client's hints point to", async () => {
 	hinted.tap();
 	await vi.waitFor(() => expect(hinted.assigned).toHaveLength(1));
 	expect(hinted.prompts).toEqual(['chat.localhost']);
-	// `tried`: the client's own ceremony for RP_ID just found none, so the old kind first, even where this device would ask for the new.
-	const tried = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'new']]), { hints: { tried: 'chat.localhost' } });
-	tried.tap();
+	// `rp_id_last`: the client's own ceremony for RP_ID just found none, so the old kind first, even where this device would ask for the new.
+	const last = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'new']]), { hints: { rp_id_last: 'chat.localhost' } });
+	last.tap();
 	// Its account already has a new passkey, so no upgrade: straight back to the client.
-	await vi.waitFor(() => expect(tried.assigned).toHaveLength(1));
-	expect(tried.prompts).toEqual(['localhost']);
+	await vi.waitFor(() => expect(last.assigned).toHaveLength(1));
+	expect(last.prompts).toEqual(['localhost']);
 	// A hint that isn't one of this server's RP IDs, or names no account, says nothing.
-	const ignored = await signInPage({}, new Map([['apron-passkey-kind', 'new']]), { hints: { tried: 'elsewhere.example', login_hint: 'nobody' } });
+	const ignored = await signInPage({}, new Map([['apron-passkey-kind', 'new']]), { hints: { rp_id_last: 'elsewhere.example', login_hint: 'nobody' } });
 	ignored.tap();
 	await vi.waitFor(() => expect(ignored.prompts).toEqual(['chat.localhost']));
 });
 
-it('orders by the account first, then by what the client tried', () => {
+it('orders by the account first, then by the RP ID the client asks to be last', () => {
 	const ids = { rpId: 'server.example', legacyRpId: 'example' };
 	const old = { createdMs: 1 };
 	const current = { createdMs: 3 };
 	expect(firstKind({ ...ids, since: 2, passkeys: [current] })).toBe('login');
 	expect(firstKind({ ...ids, since: 2, passkeys: [old] })).toBe('legacy');
-	// Both kinds: what the client just tried goes last, else the newest.
-	expect(firstKind({ ...ids, since: 2, passkeys: [old, current], tried: 'server.example' })).toBe('legacy');
+	// Both kinds: the RP ID the client asks to be last goes last, else the newest.
+	expect(firstKind({ ...ids, since: 2, passkeys: [old, current], last: 'server.example' })).toBe('legacy');
 	expect(firstKind({ ...ids, since: 2, passkeys: [old, current] })).toBe('login');
-	// No account: only what was tried.
-	expect(firstKind({ ...ids, since: undefined, tried: 'server.example' })).toBe('legacy');
-	expect(firstKind({ ...ids, since: undefined, tried: 'example' })).toBe('login');
+	// No account: only the RP ID to ask for last.
+	expect(firstKind({ ...ids, since: undefined, last: 'server.example' })).toBe('legacy');
+	expect(firstKind({ ...ids, since: undefined, last: 'example' })).toBe('login');
 	expect(firstKind({ ...ids, since: undefined })).toBeUndefined();
 });
 

@@ -4514,7 +4514,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			recognised: recognisedClient(redirect, this.config.rpOrigins),
 			...(account ? { account } : {}),
 			// A sign-in screen that also finds passkeys for LEGACY_RP_ID (src/legacy-passkeys.ts), asking first
-			// for the RP ID the client's hints point to (`login_hint`, `tried`), where they do.
+			// for the RP ID the client's hints point to (`login_hint`, `rp_id_last`), where they do.
 			...(!account && value.action === "login" && this.config.legacyRpId ? { legacyRpId: this.config.legacyRpId, rpId: this.config.rpId, ...await this.firstOnPage(query, this.config.legacyRpId) } : {}),
 			query: query.toString(),
 			deny: redirectWith(value.redirectUri, { error: "access_denied", state: value.state, iss: origin }),
@@ -4524,16 +4524,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Which RP ID a sign-in page with LEGACY_RP_ID asks for first, from the
-	 * client's hints (`firstKind`): `login_hint`, a `user_id`, and `tried`,
-	 * an RP ID. Anything else, or a hint naming no account, says nothing.
+	 * client's hints (`firstKind`): `login_hint`, a `user_id`, and
+	 * `rp_id_last`, an RP ID to ask for last. Anything else, or a hint naming no account, says nothing.
 	 */
 	private async firstOnPage(query: URLSearchParams, legacyRpId: string): Promise<{ first?: "login" | "legacy" }> {
 		const hint = query.getAll("login_hint").length === 1 ? query.get("login_hint")! : undefined;
-		const tried = query.getAll("tried").length === 1 ? query.get("tried")! : undefined;
+		const last = query.getAll("rp_id_last").length === 1 ? query.get("rp_id_last")! : undefined;
 		const account = hint && hint.length <= 128 ? this.legacyPort().account(hint) : undefined;
 		const first = firstKind({
 			passkeys: account?.passkeys, since: account ? await this.legacyPort().since() : undefined,
-			...(tried === this.config.rpId || tried === legacyRpId ? { tried } : {}), rpId: this.config.rpId, legacyRpId,
+			...(last === this.config.rpId || last === legacyRpId ? { last } : {}), rpId: this.config.rpId, legacyRpId,
 		});
 		return first ? { first } : {};
 	}
