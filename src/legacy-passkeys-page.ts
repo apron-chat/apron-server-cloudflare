@@ -26,11 +26,12 @@ export function legacyPageParts(view: { legacyRpId: string; rpId: string; host: 
 	return {
 		button: `<button type="button" class="primary" data-legacy="auto">Continue with passkey</button>`,
 		// Shown with the checklist: why there's more than one place to look.
-		tries: `<p id="tries-why" class="muted tries-why" hidden>This server supports additional passkey namespaces for accounts that haven’t migrated yet.</p>
+		tries: `<p id="tries-why" class="muted tries-why" hidden>This server supports additional passkey namespaces for older accounts.</p>
 <div id="tries" class="keys tries" hidden>
-${row("login", e(view.rpId), "Check for passkey")}
-${row("legacy", legacy, "Check for older passkey")}
-</div>`,
+${row("login", e(view.rpId), "Check for passkey?")}
+${row("legacy", legacy, "Check for older passkey?")}
+</div>
+<p id="tries-said" class="sr-only" role="status" aria-live="polite"></p>`,
 		screen: `<div id="upgrade" hidden>
 <h1 tabindex="-1">Save a new passkey</h1>
 <p>You signed in with an older passkey. ${e(view.title)} has moved to <strong>${host}</strong>: save a new passkey for it, and use that one from now on.</p>
@@ -94,20 +95,19 @@ function mark() {
 	}
 	for (const button of document.querySelectorAll('[data-legacy="auto"]')) button.hidden = !upcoming;
 }
-// After a miss: said, as the question the button answers (it's also how a screen reader hears of it: the
-// checklist isn't a live region), and focus where the next step is: the button, or once both missed, the first
-// Retry (the focused button may have just been hidden). "None selected": the browser doesn't say whether
-// there was none or the prompt was closed.
+// After a miss: said to a screen reader, as the question the button answers (the checklist shows it, but isn't a
+// live region), and focus where the next step is: the button, or once both missed, the first Retry (the focused
+// button may have just been hidden). "None selected": the browser doesn't say whether there was none or the
+// prompt was closed.
 function missedSaid(kind) {
 	const upcoming = order.find((each) => !missed.has(each));
-	// Said right under the checklist it's about, above the button it asks about: the status is rendered there,
-	// not moved there now, as a screen reader may not read a live region inserted just before its text.
+	const said = (text) => { if ($("tries-said")) $("tries-said").textContent = text; };
 	if (upcoming) {
-		hint("Checked " + NAMES[kind] + " for passkey, none selected. Check " + NAMES[upcoming] + " for passkey?");
+		said("Checked " + NAMES[kind] + " for passkey, none selected. Check " + NAMES[upcoming] + " for passkey?");
 		const button = document.querySelector('[data-legacy="auto"]');
 		if (button && button.focus) button.focus();
 	} else {
-		hint("Checked " + NAMES[order[0]] + " and " + NAMES[order[1]] + " for passkey, none selected. Retry either, or cancel to go back.");
+		said("Checked " + NAMES[order[0]] + " and " + NAMES[order[1]] + " for passkey, none selected. Retry either, or cancel to go back.");
 		const retry = $("tries").querySelector('[data-retry="' + order[0] + '"]');
 		if (retry && retry.focus) retry.focus();
 	}

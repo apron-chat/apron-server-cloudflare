@@ -418,7 +418,7 @@ function triesList() {
 		parts.small.textContent = note;
 		return { dataset: { try: kind, note }, className: 'key', hidden: false, parts, querySelector: (selector: string) => selector === 'small' ? parts.small : parts.retry };
 	};
-	const rows = [row('login', 'Check for passkey'), row('legacy', 'Check for older passkey')];
+	const rows = [row('login', 'Check for passkey?'), row('legacy', 'Check for older passkey?')];
 	const list = {
 		hidden: true, rows,
 		append: (moved: Row) => { rows.splice(rows.indexOf(moved), 1); rows.push(moved); },
@@ -463,11 +463,13 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	const tries = triesList();
 	// The caption shown with the checklist, and the warning it takes the place of.
 	const why = { ...node('tries-why'), hidden: true };
+	// What a screen reader is told of a miss (the checklist shows it).
+	const said = node('tries-said');
 	const warning = node();
 	const onward = node();
 	upgrade.parentElement = { children: [upgrade, unsaved, status] };
 	unsaved.parentElement = upgrade.parentElement;
-	const byId: Record<string, unknown> = { config: { textContent: config }, upgrade, unsaved, tries, 'tries-why': why, status };
+	const byId: Record<string, unknown> = { config: { textContent: config }, upgrade, unsaved, tries, 'tries-why': why, 'tries-said': said, status };
 	const document = {
 		getElementById: (id: string) => byId[id] ?? null,
 		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [auto, save] : selector === '[data-continue]' ? [onward] : selector === '[data-skip]' ? [skip] : selector === '[data-only-continue]' ? [warning] : selector === '[data-retry]' ? tries.rows.map((each) => each.parts.retry) : selector === '[data-legacy="auto"]' ? [auto] : [],
@@ -509,7 +511,7 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	if (options.tapAtOnce) auto.listeners[0]();
 	// Its ceremonies are begun as the page shows; a tap waits for none.
 	await new Promise((resolve) => setTimeout(resolve, 200));
-	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), skip: () => skip.listeners[0](), proceed: () => onward.listeners[0](), status, where, why, warning, html, upgrade, unsaved, tries, auto, prompts, assigned, begins, timers };
+	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), skip: () => skip.listeners[0](), proceed: () => onward.listeners[0](), status, said, where, why, warning, html, upgrade, unsaved, tries, auto, prompts, assigned, begins, timers };
 }
 
 it('finds the passkey whichever RP ID it is for, from one button, without asking which', async () => {
@@ -544,12 +546,13 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	expect(old.warning.hidden).toBe(false);
 	old.tap();
 	await vi.waitFor(() => expect(old.tries.hidden).toBe(false));
-	expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', 'next', false]]);
+	expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey?', 'next', false]]);
 	// Why there's more than one place to look, in place of the warning read before the first tap.
 	expect(old.why.hidden).toBe(false);
 	expect(old.warning.hidden).toBe(true);
-	// Said too, since the checklist isn't a live region.
-	expect(old.status.textContent).toBe('Checked chat.localhost for passkey, none selected. Check localhost for passkey?');
+	// Said to a screen reader too, since the checklist isn't a live region; nothing more on screen.
+	expect(old.said.textContent).toBe('Checked chat.localhost for passkey, none selected. Check localhost for passkey?');
+	expect(old.status.textContent).toBe('');
 	old.tap();
 	await vi.waitFor(() => expect(old.upgrade.hidden).toBe(false));
 	expect(old.prompts).toEqual(['chat.localhost', 'localhost']);
@@ -769,11 +772,11 @@ it('retries an RP ID that found none, and says so when neither did', async () =>
 	const has: Record<string, Passkey> = {};
 	const page = await signInPage(has, new Map());
 	page.tap();
-	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', 'next', false]]));
+	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey?', 'next', false]]));
 	page.tap();
 	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'None selected', '', true]]));
 	expect(page.auto.hidden).toBe(true);
-	expect(page.status.textContent).toBe('Checked chat.localhost and localhost for passkey, none selected. Retry either, or cancel to go back.');
+	expect(page.said.textContent).toBe('Checked chat.localhost and localhost for passkey, none selected. Retry either, or cancel to go back.');
 	// One ceremony held for each RP ID, for its Retry, and none begun twice: the first, the next, and each one again.
 	await vi.waitFor(() => expect(page.begins).toHaveLength(4));
 	await new Promise((resolve) => setTimeout(resolve, 50));

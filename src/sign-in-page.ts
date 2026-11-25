@@ -73,13 +73,13 @@ main { max-width: 26rem; margin: 0 auto; }
 .mark { width: 24px; height: 24px; flex: none; }
 .mark rect { fill: var(--accent); }
 .mark path { fill: var(--bg); }
-h1 { font-size: 1.875rem; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 12px; }
+h1 { font-size: 1.875rem; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 8px; }
 h1:focus { outline: none; }
 p { margin: 0 0 12px; }
 .muted { color: var(--muted); font-size: 0.9375rem; }
 .warn { color: var(--warn); font-size: 0.9375rem; }
 .i { width: 22px; height: 22px; }
-.keys { margin: 24px 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; justify-items: center; }
+.keys { margin: 24px 0 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; justify-items: center; }
 .keys > .i { width: 18px; height: 18px; color: var(--muted); }
 .key { width: 100%; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--chip); font-size: 0.9375rem; line-height: 1.3; overflow-wrap: anywhere; }
 .key > .i { flex: none; color: var(--muted); }
@@ -93,29 +93,27 @@ p { margin: 0 0 12px; }
 .key.ok em, .key.ok > .i { color: var(--ok); }
 /* The RP IDs tried on a sign-in (src/legacy-passkeys-page.ts): a key, or once it found none, a cross and a Retry.
    A list, not cards: lighter than the client's card above, so it reads as progress, not another party. */
-.tries-why { margin: 20px 0 8px; }
-.tries-why + .tries { margin-top: 0; }
-.tries { margin: 20px 0 0; gap: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.tries-why { margin: 16px 0 8px; }
+.tries { margin: 0; gap: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .tries .key { border: 0; border-radius: 0; background: none; padding: 10px 14px; font-size: 0.9375rem; }
 .tries .key + .key { border-top: 1px solid var(--line); }
 .tries .key.pick { border: 0; padding: 10px 14px; background: var(--chip); }
 .tries .key.pick b { color: var(--accent); }
 .tries .key.gone { border-style: none; color: var(--muted); }
 .tries .key.gone + .key, .tries .key + .key.gone { border-top: 1px solid var(--line); }
-.tries + .status { margin: 12px 0 0; }
-.tries + .status + .actions, .tries + .actions { margin-top: 20px; }
 .tries .key > .i:nth-of-type(2), .tries .key.gone > .i:first-of-type { display: none; }
 .tries .key.gone > .i:nth-of-type(2) { display: block; }
 .tries .key .retry { margin-left: auto; font-size: 0.8125rem; min-width: 44px; min-height: 32px; }
-.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
 button { font: inherit; font-size: 1rem; font-weight: 600; border-radius: 999px; padding: 12px 22px; min-height: 48px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 button.link { border: 0; padding: 0; min-height: 0; border-radius: 0; font-size: inherit; font-weight: 500; background: none; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 button:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
 button:disabled { opacity: 0.6; cursor: default; }
-.status { margin: 20px 0 0; font-size: 0.9375rem; color: var(--err); font-weight: 600; }
+.status { margin: 16px 0 0; font-size: 0.9375rem; color: var(--err); font-weight: 600; }
 .status.hint { color: var(--muted); font-weight: 400; }
 .status:empty { display: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .switch { margin: 24px 0 0; }
 code { font-size: 0.9em; }
 @media (max-width: 30rem) { h1 { font-size: 1.625rem; } .actions button { flex: 1 1 100%; } }
