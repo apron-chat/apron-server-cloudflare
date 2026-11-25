@@ -93,6 +93,8 @@ p { margin: 0 0 12px; }
 .key.ok em, .key.ok > .i { color: var(--ok); }
 /* The RP IDs tried on a sign-in (src/legacy-passkeys-page.ts): a key, or once it found none, a cross and a Retry.
    A list, not cards: lighter than the client's card above, so it reads as progress, not another party. */
+.tries-why { margin: 20px 0 8px; }
+.tries-why + .tries { margin-top: 0; }
 .tries { margin: 20px 0 0; gap: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .tries .key { border: 0; border-radius: 0; background: none; padding: 10px 14px; font-size: 0.9375rem; }
 .tries .key + .key { border-top: 1px solid var(--line); }
@@ -334,7 +336,7 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 	const who = `<strong>${e(view.who)}</strong>`;
 	const host = `<strong>${e(view.host)}</strong>`;
 	const caution = `${view.recognised ? "" : `<p class="warn">${e(view.host)} has not verified this app.</p>`}
-<p class="muted">Only continue if you just started signing in on ${e(view.where)}.</p>`;
+<p class="muted" data-only-continue>Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
 	// With LEGACY_RP_ID, a "Continue with passkey" that finds either kind, and the upgrade after an old one.
 	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, rpId: view.rpId ?? view.host, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;

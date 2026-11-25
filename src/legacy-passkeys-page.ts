@@ -25,7 +25,9 @@ export function legacyPageParts(view: { legacyRpId: string; rpId: string; host: 
 	const row = (kind: "login" | "legacy", name: string, note: string) => `<div class="key" data-try="${kind}" data-note="${note}">${icon("key")}${icon("miss")}<span><b>${name}</b><small>${note}</small></span><button type="button" class="link retry" data-retry="${kind}" aria-label="Retry ${name}" hidden>Retry</button></div>`;
 	return {
 		button: `<button type="button" class="primary" data-legacy="auto">Continue with passkey</button>`,
-		tries: `<div id="tries" class="keys tries" hidden>
+		// Shown with the checklist: why there's more than one place to look.
+		tries: `<p id="tries-why" class="muted tries-why" hidden>${e(view.title)} moved from ${legacy} to ${e(view.rpId)}. Passkeys for either work here.</p>
+<div id="tries" class="keys tries" hidden>
 ${row("login", e(view.rpId), "Check for passkey")}
 ${row("legacy", legacy, "Check for older passkey")}
 </div>`,
@@ -78,6 +80,10 @@ for (const kind of order) $("tries").append($("tries").querySelector('[data-try=
 function mark() {
 	const upcoming = order.find((kind) => !missed.has(kind));
 	$("tries").hidden = missed.size === 0;
+	// Once the checklist shows, why there's more than one place to look takes the warning's place: it was read
+	// before the first tap, and the person has already chosen to continue.
+	if ($("tries-why")) $("tries-why").hidden = missed.size === 0;
+	for (const warning of document.querySelectorAll("[data-only-continue]")) warning.hidden = missed.size > 0;
 	for (const row of $("tries").querySelectorAll("[data-try]")) {
 		const kind = row.dataset.try;
 		const gone = missed.has(kind);
