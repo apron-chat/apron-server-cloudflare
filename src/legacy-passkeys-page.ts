@@ -21,14 +21,17 @@ export function legacyPageParts(view: { legacyRpId: string; rpId: string; host: 
 	const e = escape;
 	const legacy = e(view.legacyRpId);
 	const host = e(view.host);
-	// One row for each RP ID, in the order tried (the script puts them in it): its name, what it is, and a Retry once it found none.
-	const row = (kind: "login" | "legacy", name: string, note: string) => `<div class="key" data-try="${kind}" data-note="${note}">${icon("key")}${icon("miss")}<span><b>${name}</b><small>${note}</small></span><em></em><button type="button" class="link retry" data-retry="${kind}" aria-label="Retry ${name}" hidden>Retry</button></div>`;
+	// One row for each RP ID, in the order tried (the script puts them in it): its name, what checking it does, and a Retry once it found none.
+	const row = (kind: "login" | "legacy", name: string, note: string) => `<div class="key" data-try="${kind}" data-note="${note}">${icon("key")}${icon("miss")}<span><b>${name}</b><small>${note}</small></span><button type="button" class="link retry" data-retry="${kind}" aria-label="Retry ${name}" hidden>Retry</button></div>`;
 	return {
 		button: `<button type="button" class="primary" data-legacy="auto">Continue with passkey</button>`,
-		tries: `<div id="tries" class="keys tries" hidden>
-${row("login", e(view.rpId), "Your passkey")}
-${row("legacy", legacy, "Your older passkey")}
-</div>`,
+		// Shown with the checklist: why there's more than one place to look.
+		tries: `<p id="tries-why" class="muted tries-why" hidden>This server supports additional passkey namespaces for older accounts.</p>
+<div id="tries" class="keys tries" hidden>
+${row("login", e(view.rpId), "Check for passkey?")}
+${row("legacy", legacy, "Check for older passkey?")}
+</div>
+<p id="tries-said" class="sr-only" role="status" aria-live="polite"></p>`,
 		screen: `<div id="upgrade" hidden>
 <h1 tabindex="-1">Save a new passkey</h1>
 <p>You signed in with an older passkey. ${e(view.title)} has moved to <strong>${host}</strong>: save a new passkey for it, and use that one from now on.</p>
@@ -51,10 +54,10 @@ ${chips(`Older passkey used; next a new one for ${host}`, [
  * The sign-in, whichever RP ID the person's passkey is for: one ceremony
  * can ask for one RP ID only, so "Continue with passkey" asks first for the
  * one the server says (`config.first`, from the client's hints), else the
- * one this device last signed in with here (`localStorage`), else the
- * legacy one, which nearly every returning account has. When it ends with no
+ * one this device last signed in with here (`localStorage`), else RP_ID, so
+ * an account made since the switch is asked once only. When it ends with no
  * passkey (none, or the prompt closed: the browser does not say which), the
- * checklist shows that RP ID as "No passkey used", with a Retry, and the
+ * checklist shows that RP ID as "None selected", with a Retry, and the
  * next one, which the same button asks for. A legacy one then offers a new passkey (`upgrade`).
  * Each ceremony is begun before its tap, so the tap goes straight to the
  * device's prompt, which some browsers require.
@@ -66,10 +69,11 @@ function legacyScript(paths: { begin: string; finish: string }): string {
 const KEY = "apron-passkey-kind";
 // Each kind's RP ID, as the page shows it (config.names).
 const NAMES = config.names || { login: "", legacy: "" };
-const remember = () => { try { localStorage.setItem(KEY, "new"); } catch {} };
-let order = ["legacy", "login"];
+// The kind this device last signed in with here: "new", or "old" for a legacy passkey with none saved since.
+const remember = (kind) => { try { localStorage.setItem(KEY, kind); } catch {} };
+let order = ["login", "legacy"];
 if (config.first === "login" || config.first === "legacy") order = config.first === "login" ? ["login", "legacy"] : ["legacy", "login"];
-else try { if (localStorage.getItem(KEY) === "new") order = ["login", "legacy"]; } catch {}
+else try { if (localStorage.getItem(KEY) === "old") order = ["legacy", "login"]; } catch {}
 // The RP IDs tried that found no passkey; the button asks for the first of the rest.
 const missed = new Set();
 const next = () => order.find((kind) => !missed.has(kind)) || order[0];
@@ -78,26 +82,32 @@ for (const kind of order) $("tries").append($("tries").querySelector('[data-try=
 function mark() {
 	const upcoming = order.find((kind) => !missed.has(kind));
 	$("tries").hidden = missed.size === 0;
+	// Once the checklist shows, why there's more than one place to look takes the warning's place: it was read
+	// before the first tap, and the person has already chosen to continue.
+	if ($("tries-why")) $("tries-why").hidden = missed.size === 0;
+	for (const warning of document.querySelectorAll("[data-only-continue]")) warning.hidden = missed.size > 0;
 	for (const row of $("tries").querySelectorAll("[data-try]")) {
 		const kind = row.dataset.try;
 		const gone = missed.has(kind);
 		row.className = gone ? "key gone" : kind === upcoming ? "key pick" : "key";
-		row.querySelector("small").textContent = gone ? "No passkey used" : row.dataset.note;
-		row.querySelector("em").textContent = kind === upcoming ? "Next" : "";
+		row.querySelector("small").textContent = gone ? "None selected" : row.dataset.note;
 		row.querySelector("[data-retry]").hidden = !gone;
 	}
 	for (const button of document.querySelectorAll('[data-legacy="auto"]')) button.hidden = !upcoming;
-	if (!upcoming) status("No passkey for this account was used on this device. Retry one, or cancel to go back.");
 }
-// After a miss: said (the checklist isn't a live region), and focus where the next step is: the button, or once
-// both missed, the first Retry (the focused button may have just been hidden).
+// After a miss: said to a screen reader, as the question the button answers (the checklist shows it, but isn't a
+// live region), and focus where the next step is: the button, or once both missed, the first Retry (the focused
+// button may have just been hidden). "None selected": the browser doesn't say whether there was none or the
+// prompt was closed.
 function missedSaid(kind) {
 	const upcoming = order.find((each) => !missed.has(each));
+	const said = (text) => { if ($("tries-said")) $("tries-said").textContent = text; };
 	if (upcoming) {
-		hint("No passkey used for " + NAMES[kind] + ". Continue with passkey asks for " + NAMES[upcoming] + ".");
+		said("Checked " + NAMES[kind] + " for passkey, none selected. Check " + NAMES[upcoming] + " for passkey?");
 		const button = document.querySelector('[data-legacy="auto"]');
 		if (button && button.focus) button.focus();
 	} else {
+		said("Checked " + NAMES[order[0]] + " and " + NAMES[order[1]] + " for passkey, none selected. Retry either, or cancel to go back.");
 		const retry = $("tries").querySelector('[data-retry="' + order[0] + '"]');
 		if (retry && retry.focus) retry.focus();
 	}
@@ -112,14 +122,15 @@ async function begin(kind) {
 	if (result.error) { status(result.error); return null; }
 	return result;
 }
-// How often each kind's held ceremony was begun again, and the kinds being begun now.
+// How often each kind's held ceremony was begun again, and the begins on their way, by kind.
 const refreshes = new Map();
-const beginning = new Set();
+const beginning = new Map();
 function prepare(kind) {
 	ready.delete(kind);
-	beginning.add(kind);
-	begin(kind).then((options) => {
-		beginning.delete(kind);
+	const begun = begin(kind);
+	beginning.set(kind, begun);
+	begun.then((options) => {
+		if (beginning.get(kind) === begun) beginning.delete(kind);
 		if (!options) return;
 		const held = { options, at: Date.now() };
 		ready.set(kind, held);
@@ -135,9 +146,10 @@ async function run(kind) {
 	status("");
 	if (!window.PublicKeyCredential || !navigator.credentials) { status("This browser cannot use passkeys."); return; }
 	busy(true);
-	// One begun so long ago that it could expire before the passkey is back is begun again.
+	// One begun so long ago that it could expire before the passkey is back is begun again; a tap before one
+	// begun ahead is answered waits for it rather than begin another (each begin is charged as a sign-in attempt).
 	const held = ready.get(kind);
-	const options = held && Date.now() - held.at <= ${PAGE_PREPARED_FRESH_MS} ? held.options : await begin(kind);
+	const options = held && Date.now() - held.at <= ${PAGE_PREPARED_FRESH_MS} ? held.options : await (beginning.get(kind) || begin(kind));
 	ready.delete(kind);
 	if (!options) { busy(false); return; }
 	let credential;
@@ -164,21 +176,27 @@ async function run(kind) {
 	if (result.unknownCredential && kind === "login") forget(options.public_key.rpId, credential.id);
 	// An upgrade's answer carries the sign-in's code even when its passkey could not be added: said, not passed over.
 	if (result.redirect && kind === "upgrade" && !result.added) { show("unsaved"); onward = result.redirect; return; }
-	// The device holds a passkey the server knows for the new RP ID only after a sign-in with one, or an upgrade that added one.
-	if (result.redirect) { if (kind === "login" || kind === "upgrade") remember(); location.assign(result.redirect); return; }
+	// The device holds a passkey the server knows for the new RP ID only after a sign-in with one, or an upgrade that added one;
+	// a legacy one that signed in, and wasn't replaced, is asked for first next time.
+	if (result.redirect) { remember(kind === "legacy" ? "old" : "new"); location.assign(result.redirect); return; }
 	if (result.error || !result.upgrade) { busy(false); status(result.error || "Something went wrong. Try again."); if (kind === "upgrade") prepare("upgrade"); else { ensure(kind); ensure(next()); } return; }
 	upgrade = result.upgrade;
+	// Until a new passkey is saved, this device's is the legacy one.
+	remember("old");
 	// The sign-in's other ceremonies are done with: dropped, so they stop being begun again.
 	ready.clear();
 	show("upgrade");
 	prepare("upgrade");
 }
-// Shows the screen \`id\` in place of the rest, keeping the brand line and the status.
+// Shows the screen \`id\` in place of the rest, keeping the brand line and the status, which moves (empty) above
+// the screen's buttons, so what it says next is under the screen's heading.
 function show(id) {
 	const screen = $(id);
 	for (const element of screen.parentElement.children) if (element !== screen && element.id !== "status" && !element.classList.contains("brand")) element.hidden = true;
 	screen.hidden = false;
 	status("");
+	const actions = screen.querySelector(".actions");
+	if (actions) actions.before($("status"));
 	screen.querySelector("h1").focus();
 	busy(false);
 }

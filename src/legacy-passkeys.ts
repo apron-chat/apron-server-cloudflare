@@ -163,7 +163,9 @@ export async function offerUpgrade(port: LegacyPort, userId: string, code: Recor
  * they say more than the device's own memory: `login_hint`'s account (its
  * passkeys, old and new by `since`), then `rp_id_last` (`last`), an RP ID
  * to ask for last, which a client sends where its own ceremony for it just
- * found no passkey. Undefined leaves it to the device.
+ * found no passkey. Undefined leaves it to the device: so does an account
+ * with both kinds, as a device that signed in with the old one and has
+ * not saved a new one is asked for the old one first.
  * Only an order: both RP IDs are always offered, so a wrong or stale hint
  * costs one more tap, never a sign-in. It does show anyone who names a
  * `user_id` whether that account exists with a passkey, and whether it has
@@ -177,7 +179,7 @@ export function firstKind(input: { passkeys?: readonly { createdMs: number }[]; 
 	if (current !== old) return current ? "login" : "legacy";
 	if (input.last === input.rpId) return "legacy";
 	if (input.last === input.legacyRpId) return "login";
-	return current ? "login" : undefined;
+	return undefined;
 }
 
 /**
