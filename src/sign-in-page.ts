@@ -28,8 +28,11 @@ export interface SignInPageView {
 	recognised: boolean;
 	/** The account an addition adds to. */
 	account?: { userId: string; name: string };
-	/** On a sign-in screen, a previous RP ID (`LEGACY_RP_ID`) whose passkeys it also finds (src/legacy-passkeys-page.ts). */
+	/** On a sign-in screen, a previous RP ID (`LEGACY_RP_ID`) whose passkeys it also finds (src/legacy-passkeys-page.ts), beside `rpId`. */
 	legacyRpId?: string;
+	rpId?: string;
+	/** With `legacyRpId`, which RP ID to ask for first where the server knows (`firstKind`); else the device's choice. */
+	first?: "login" | "legacy";
 	/** The page's own query, which its script sends back with begin. */
 	query: string;
 	/** Where Cancel goes: the redirect with `error=access_denied`. */
@@ -88,6 +91,12 @@ p { margin: 0 0 12px; }
 .key.past { opacity: 0.6; }
 .key.gone { border-style: dashed; background: none; color: var(--muted); }
 .key.ok em, .key.ok > .i { color: var(--ok); }
+/* The RP IDs tried on a sign-in (src/legacy-passkeys-page.ts): a key, or once it found none, a cross and a Retry. */
+.tries { margin: 16px 0 20px; }
+.tries .key > .i:nth-of-type(2), .tries .key.gone > .i:first-of-type { display: none; }
+.tries .key.gone > .i:nth-of-type(2) { display: block; }
+.tries .key .retry { margin-left: auto; font-size: 0.8125rem; }
+.tries .key.gone em { display: none; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
 button { font: inherit; font-size: 1rem; font-weight: 600; border-radius: 999px; padding: 12px 22px; min-height: 48px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
@@ -109,6 +118,7 @@ const ICONS = {
 	search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4M8.8 11h4.4"/>',
 	app: '<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 8h18M8 21h8"/>',
 	down: '<path d="M12 5v14m-5-5 5 5 5-5"/>',
+	miss: '<circle cx="12" cy="12" r="9"/><path d="m9.2 9.2 5.6 5.6m0-5.6-5.6 5.6"/>',
 } as const;
 
 export function icon(name: keyof typeof ICONS): string {
@@ -319,7 +329,7 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 <p class="muted">Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
 	// With LEGACY_RP_ID, a "Continue with passkey" that finds either kind, and the upgrade after an old one.
-	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;
+	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, rpId: view.rpId ?? view.host, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;
 	const signIn = legacy?.button ?? `<button type="button" class="primary" data-passkey>Continue with passkey</button>`;
 	const account = view.account ? `${view.account.name} (@${view.account.userId})` : "";
 	const screens = {
@@ -328,6 +338,7 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 <p>It will be able to read and send messages as you.</p>
 ${chips(`${e(view.client)} signing in to ${e(view.title)}`, [chip({ icon: "app", name: e(view.client), note: "Wants to sign in as you" })])}
 ${caution}
+${legacy?.tries ?? ""}
 <div class="actions">${signIn}${cancel}</div>
 ${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}`,
 		register: `<h1>Create an account on ${e(view.title)}</h1>
@@ -359,7 +370,7 @@ ${legacy?.screen ?? ""}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
 <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
-<script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny })}</script>
+<script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny, ...(view.first ? { first: view.first } : {}) })}</script>
 <script nonce="${nonce}">${SCRIPT}</script>
 ${legacy?.script ?? ""}
 </body>
