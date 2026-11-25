@@ -26,7 +26,7 @@ export function legacyPageParts(view: { legacyRpId: string; rpId: string; host: 
 	return {
 		button: `<button type="button" class="primary" data-legacy="auto">Continue with passkey</button>`,
 		// Shown with the checklist: why there's more than one place to look.
-		tries: `<p id="tries-why" class="muted tries-why" hidden>${e(view.title)} moved from ${legacy} to ${e(view.rpId)}. Passkeys for either work here.</p>
+		tries: `<p id="tries-why" class="muted tries-why" hidden>This server supports additional passkey namespaces for accounts that haven’t migrated yet.</p>
 <div id="tries" class="keys tries" hidden>
 ${row("login", e(view.rpId), "Check for passkey")}
 ${row("legacy", legacy, "Check for older passkey")}
