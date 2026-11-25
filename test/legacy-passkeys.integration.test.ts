@@ -288,14 +288,14 @@ it("runs the page's scripts: the legacy sign-in, then the new passkey, then back
 	type Element = {
 		hidden: boolean; disabled: boolean; dataset: Record<string, string>; textContent: string; className: string; id: string;
 		classList: { contains(name: string): boolean }; parentElement?: { children: Element[] }; listeners: (() => void)[];
-		addEventListener(type: string, listener: () => void): void; querySelector(selector: string): { focus(): void }; focus(): void;
+		addEventListener(type: string, listener: () => void): void; querySelector(selector: string): { focus(): void; before(moved: unknown): void }; focus(): void;
 	};
 	const element = (id = '', dataset: Record<string, string> = {}): Element => {
 		const made: Element = {
 			id, hidden: false, disabled: false, dataset, textContent: '', className: '', listeners: [],
 			classList: { contains: (name) => made.className.split(' ').includes(name) },
 			addEventListener: (_type, listener) => made.listeners.push(listener),
-			querySelector: () => ({ focus: () => {} }), focus: () => {},
+			querySelector: () => ({ focus: () => {}, before: () => {} }), focus: () => {},
 		};
 		return made;
 	};
@@ -436,7 +436,7 @@ function triesList() {
  * passkeys the device holds, by RP ID; a prompt for another RP ID is closed
  * empty (NotAllowedError), as a real one is. Returns its controls.
  */
-async function signInPage(has: Record<string, Passkey>, storage: Map<string, string>, options: { saves?: Passkey; finish?: (body: Record<string, unknown>) => Promise<unknown> | undefined; clock?: { now: number }; hints?: Record<string, string> } = {}) {
+async function signInPage(has: Record<string, Passkey>, storage: Map<string, string>, options: { saves?: Passkey; finish?: (body: Record<string, unknown>) => Promise<unknown> | undefined; clock?: { now: number }; hints?: Record<string, string>; tapAtOnce?: boolean } = {}) {
 	const { url } = await loginQuery(NEW);
 	for (const [key, value] of Object.entries(options.hints ?? {})) url.searchParams.set(key, value);
 	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
@@ -505,6 +505,8 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', 'localStorage', 'Date', 'setTimeout', scripts.join('\n'))(
 		{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: (to: string) => assigned.push(to) }, localStorage, time, later,
 	);
+	// A tap as the page shows, before the ceremony it begins is answered.
+	if (options.tapAtOnce) auto.listeners[0]();
 	// Its ceremonies are begun as the page shows; a tap waits for none.
 	await new Promise((resolve) => setTimeout(resolve, 200));
 	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), skip: () => skip.listeners[0](), proceed: () => onward.listeners[0](), status, where, why, warning, html, upgrade, unsaved, tries, auto, prompts, assigned, begins, timers };
@@ -728,6 +730,8 @@ it('begins a held ceremony again before it is too old, and on a tap after that, 
 	expect(page.timers).toHaveLength(1);
 	page.timers.shift()!();
 	await vi.waitFor(() => expect(page.begins).toHaveLength(2));
+	// Held once answered, which sets its own timer.
+	await vi.waitFor(() => expect(page.timers).toHaveLength(1));
 	// One held past freshness (its timer not run, as in a throttled tab) is begun again at the tap.
 	clock.now = PAGE_PREPARED_FRESH_MS + 1;
 	page.tap();
@@ -744,6 +748,18 @@ it('begins a held ceremony again before it is too old, and on a tap after that, 
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	expect(page.begins).toHaveLength(5);
 	expect(page.begins[4]).toMatchObject({ upgrade: expect.any(String) });
+});
+
+it('waits for the ceremony begun as the page shows, on a tap before it is answered, rather than begin another', async () => {
+	const { passkey } = await legacyAccount();
+	await rpIds('chat.localhost', 'localhost');
+	const page = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'old']]), { tapAtOnce: true });
+	await vi.waitFor(() => expect(page.upgrade.hidden).toBe(false));
+	await vi.waitFor(() => expect(page.begins).toHaveLength(2));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	// Each begin is charged as a sign-in attempt: one for the sign-in, one for the upgrade.
+	expect(page.begins).toMatchObject([{ legacy: true }, { upgrade: expect.any(String) }]);
+	expect(page.prompts).toEqual(['localhost']);
 });
 
 it('retries an RP ID that found none, and says so when neither did', async () => {

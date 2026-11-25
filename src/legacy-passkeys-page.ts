@@ -122,14 +122,15 @@ async function begin(kind) {
 	if (result.error) { status(result.error); return null; }
 	return result;
 }
-// How often each kind's held ceremony was begun again, and the kinds being begun now.
+// How often each kind's held ceremony was begun again, and the begins on their way, by kind.
 const refreshes = new Map();
-const beginning = new Set();
+const beginning = new Map();
 function prepare(kind) {
 	ready.delete(kind);
-	beginning.add(kind);
-	begin(kind).then((options) => {
-		beginning.delete(kind);
+	const begun = begin(kind);
+	beginning.set(kind, begun);
+	begun.then((options) => {
+		if (beginning.get(kind) === begun) beginning.delete(kind);
 		if (!options) return;
 		const held = { options, at: Date.now() };
 		ready.set(kind, held);
@@ -145,9 +146,10 @@ async function run(kind) {
 	status("");
 	if (!window.PublicKeyCredential || !navigator.credentials) { status("This browser cannot use passkeys."); return; }
 	busy(true);
-	// One begun so long ago that it could expire before the passkey is back is begun again.
+	// One begun so long ago that it could expire before the passkey is back is begun again; a tap before one
+	// begun ahead is answered waits for it rather than begin another (each begin is charged as a sign-in attempt).
 	const held = ready.get(kind);
-	const options = held && Date.now() - held.at <= ${PAGE_PREPARED_FRESH_MS} ? held.options : await begin(kind);
+	const options = held && Date.now() - held.at <= ${PAGE_PREPARED_FRESH_MS} ? held.options : await (beginning.get(kind) || begin(kind));
 	ready.delete(kind);
 	if (!options) { busy(false); return; }
 	let credential;
