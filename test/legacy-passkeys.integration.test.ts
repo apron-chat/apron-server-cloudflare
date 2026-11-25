@@ -414,9 +414,9 @@ function triesList() {
 		return made;
 	};
 	const row = (kind: string, note: string): Row => {
-		const parts = { small: part(), em: part(), retry: part({ retry: kind }) };
+		const parts = { small: part(), retry: part({ retry: kind }) };
 		parts.small.textContent = note;
-		return { dataset: { try: kind, note }, className: 'key', hidden: false, parts, querySelector: (selector: string) => selector === 'small' ? parts.small : selector === 'em' ? parts.em : parts.retry };
+		return { dataset: { try: kind, note }, className: 'key', hidden: false, parts, querySelector: (selector: string) => selector === 'small' ? parts.small : parts.retry };
 	};
 	const rows = [row('login', 'Check for passkey'), row('legacy', 'Check for older passkey')];
 	const list = {
@@ -424,9 +424,8 @@ function triesList() {
 		append: (moved: Row) => { rows.splice(rows.indexOf(moved), 1); rows.push(moved); },
 		querySelector: (selector: string) => rows.find((each) => selector.includes(`"${each.dataset.try}"`)),
 		querySelectorAll: () => [...rows],
-		after: () => {},
-		/** What a reader sees: each row's RP ID kind, note, tag, and whether it has a Retry. */
-		seen: () => rows.map((each) => [each.dataset.try, each.parts.small.textContent, each.parts.em.textContent, !each.parts.retry.hidden]),
+		/** What a reader sees: each row's RP ID kind, note, whether the button checks it next, and whether it has a Retry. */
+		seen: () => rows.map((each) => [each.dataset.try, each.parts.small.textContent, each.className.split(' ').includes('pick') ? 'next' : '', !each.parts.retry.hidden]),
 		retry: (kind: string) => rows.find((each) => each.dataset.try === kind)!.parts.retry.listeners[0](),
 	};
 	return list;
@@ -443,7 +442,7 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	const html = await (await SELF.fetch(url.href, { headers: { 'CF-Connecting-IP': ip() } })).text();
 	const config = html.match(/<script type="application\/json" id="config">(.*?)<\/script>/s)![1];
 	const scripts = [...html.matchAll(/<script nonce="[^"]*">(.*?)<\/script>/gs)].map((match) => match[1]);
-	type Node = { id: string; hidden: boolean; disabled: boolean; textContent: string; className: string; dataset: Record<string, string>; listeners: (() => void)[]; classList: { contains(name: string): boolean }; parentElement?: { children: Node[] }; addEventListener(type: string, listener: () => void): void; querySelector(): { focus(): void } };
+	type Node = { id: string; hidden: boolean; disabled: boolean; textContent: string; className: string; dataset: Record<string, string>; listeners: (() => void)[]; classList: { contains(name: string): boolean }; parentElement?: { children: Node[] }; addEventListener(type: string, listener: () => void): void; querySelector(selector?: string): { focus(): void; before?(moved: unknown): void } };
 	const node = (id = '', dataset: Record<string, string> = {}): Node => {
 		const made: Node = { id, hidden: false, disabled: false, textContent: '', className: '', dataset, listeners: [], classList: { contains: (name) => made.className.split(' ').includes(name) }, addEventListener: (_type, listener) => made.listeners.push(listener), querySelector: () => ({ focus: () => {} }) };
 		return made;
@@ -451,15 +450,27 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	const status = node('status');
 	const auto = node('', { legacy: 'auto' });
 	const save = node('', { legacy: 'upgrade' });
-	const upgrade = { ...node('upgrade'), hidden: true };
-	const unsaved = { ...node('unsaved'), hidden: true };
+	const skip = node();
+	// Where the status is: rendered under the checklist; a screen shown moves it above its own buttons.
+	const where = { status: 'login' };
+	const screen = (id: string) => {
+		const made = { ...node(id), hidden: true };
+		made.querySelector = (selector?: string) => selector === '.actions' ? { before: (moved: unknown) => { if (moved === status) where.status = id; }, focus: () => {} } : { focus: () => {} };
+		return made;
+	};
+	const upgrade = screen('upgrade');
+	const unsaved = screen('unsaved');
 	const tries = triesList();
+	// The caption shown with the checklist, and the warning it takes the place of.
+	const why = { ...node('tries-why'), hidden: true };
+	const warning = node();
 	const onward = node();
 	upgrade.parentElement = { children: [upgrade, unsaved, status] };
 	unsaved.parentElement = upgrade.parentElement;
+	const byId: Record<string, unknown> = { config: { textContent: config }, upgrade, unsaved, tries, 'tries-why': why, status };
 	const document = {
-		getElementById: (id: string) => id === 'config' ? { textContent: config } : id === 'upgrade' ? upgrade : id === 'unsaved' ? unsaved : id === 'tries' ? tries : status,
-		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [auto, save] : selector === '[data-continue]' ? [onward] : selector === '[data-retry]' ? tries.rows.map((each) => each.parts.retry) : selector === '[data-legacy="auto"]' ? [auto] : [],
+		getElementById: (id: string) => byId[id] ?? null,
+		querySelectorAll: (selector: string) => selector === '[data-legacy]' ? [auto, save] : selector === '[data-continue]' ? [onward] : selector === '[data-skip]' ? [skip] : selector === '[data-only-continue]' ? [warning] : selector === '[data-retry]' ? tries.rows.map((each) => each.parts.retry) : selector === '[data-legacy="auto"]' ? [auto] : [],
 		querySelector: () => null,
 	};
 	const prompts: string[] = [];
@@ -496,7 +507,7 @@ async function signInPage(has: Record<string, Passkey>, storage: Map<string, str
 	);
 	// Its ceremonies are begun as the page shows; a tap waits for none.
 	await new Promise((resolve) => setTimeout(resolve, 200));
-	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), proceed: () => onward.listeners[0](), status, upgrade, unsaved, tries, auto, prompts, assigned, begins, timers };
+	return { tap: () => auto.listeners[0](), save: () => save.listeners[0](), skip: () => skip.listeners[0](), proceed: () => onward.listeners[0](), status, where, why, warning, html, upgrade, unsaved, tries, auto, prompts, assigned, begins, timers };
 }
 
 it('finds the passkey whichever RP ID it is for, from one button, without asking which', async () => {
@@ -510,35 +521,52 @@ it('finds the passkey whichever RP ID it is for, from one button, without asking
 	const token = await legacySignIn(passkey, query);
 	const added = await begin(NEW, { query, upgrade: token });
 	expect((await finish(NEW, added.body.challenge_id, await fresh.register(added.body.public_key))).status).toBe(200);
-	const first = await signInPage({ 'chat.localhost': fresh }, new Map());
+	const device = new Map<string, string>();
+	const first = await signInPage({ 'chat.localhost': fresh }, device);
 	expect(first.tries.hidden).toBe(true);
+	// The status is rendered under the checklist, above the buttons, so it isn't moved as it speaks.
+	const markup = first.html.slice(first.html.indexOf('id="tries"'));
+	expect(markup.indexOf('id="status"')).toBeGreaterThan(0);
+	expect(markup.indexOf('id="status"')).toBeLessThan(markup.indexOf('class="actions"'));
+	expect(first.html.match(/id="status"/g)).toHaveLength(1);
 	first.tap();
 	await vi.waitFor(() => expect(first.assigned).toHaveLength(1));
 	expect(first.prompts).toEqual(['chat.localhost']);
+	expect(device.get('apron-passkey-kind')).toBe('new');
 
 	// Someone with only an old passkey on such a device: the new kind finds nothing, and the
 	// checklist says so (with a Retry); the next tap of the same button finds the old one.
-	const device = new Map<string, string>();
-	const old = await signInPage({ localhost: other.passkey }, device);
+	const oldDevice = new Map<string, string>();
+	const old = await signInPage({ localhost: other.passkey }, oldDevice);
+	expect(old.why.hidden).toBe(true);
+	expect(old.warning.hidden).toBe(false);
 	old.tap();
 	await vi.waitFor(() => expect(old.tries.hidden).toBe(false));
-	expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', '', false]]);
+	expect(old.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', 'next', false]]);
+	// Why there's more than one place to look, in place of the warning read before the first tap.
+	expect(old.why.hidden).toBe(false);
+	expect(old.warning.hidden).toBe(true);
 	// Said too, since the checklist isn't a live region.
 	expect(old.status.textContent).toBe('Checked chat.localhost for passkey, none selected. Check localhost for passkey?');
 	old.tap();
 	await vi.waitFor(() => expect(old.upgrade.hidden).toBe(false));
 	expect(old.prompts).toEqual(['chat.localhost', 'localhost']);
 	expect(old.assigned).toEqual([]);
-	// Until it saves a new passkey, this device asks for the old kind first.
-	expect(device.get('apron-passkey-kind')).toBe('old');
-	const again = await signInPage({ localhost: other.passkey }, device, { saves: await softPasskey(NEW) });
+	// The status moved, empty, above the upgrade screen's buttons: what it says next is under that screen's heading.
+	expect(old.where.status).toBe('upgrade');
+	// Until it saves a new passkey, this device asks for the old kind first: "Not now" keeps it so.
+	expect(oldDevice.get('apron-passkey-kind')).toBe('old');
+	old.skip();
+	await vi.waitFor(() => expect(old.assigned).toHaveLength(1));
+	expect(oldDevice.get('apron-passkey-kind')).toBe('old');
+	const again = await signInPage({ localhost: other.passkey }, oldDevice, { saves: await softPasskey(NEW) });
 	again.tap();
 	await vi.waitFor(() => expect(again.upgrade.hidden).toBe(false));
 	expect(again.prompts).toEqual(['localhost']);
 	// Once it does, the new kind.
 	again.save();
 	await vi.waitFor(() => expect(again.assigned).toHaveLength(1));
-	expect(device.get('apron-passkey-kind')).toBe('new');
+	expect(oldDevice.get('apron-passkey-kind')).toBe('new');
 });
 
 it('excludes no legacy passkey from an addition, on the passkey page or in a client from RP_ORIGINS', async () => {
@@ -664,7 +692,8 @@ it("sends a finish again after the server couldn't be reached, and says so when 
 	const fresh = await softPasskey(NEW);
 	let finishes = 0;
 	const redirect = 'com.example.myapp:/signed-in?code=kept&state=s';
-	const page = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'old']]), {
+	const device = new Map([['apron-passkey-kind', 'old']]);
+	const page = await signInPage({ localhost: passkey }, device, {
 		saves: fresh,
 		finish: () => {
 			finishes++;
@@ -685,6 +714,8 @@ it("sends a finish again after the server couldn't be reached, and says so when 
 	expect(page.assigned).toEqual([]);
 	page.proceed();
 	expect(page.assigned).toEqual([redirect]);
+	// The new passkey wasn't saved: this device still asks for the old one first.
+	expect(device.get('apron-passkey-kind')).toBe('old');
 });
 
 it('begins a held ceremony again before it is too old, and on a tap after that, before the prompt', async () => {
@@ -722,7 +753,7 @@ it('retries an RP ID that found none, and says so when neither did', async () =>
 	const has: Record<string, Passkey> = {};
 	const page = await signInPage(has, new Map());
 	page.tap();
-	await vi.waitFor(() => expect(page.tries.seen()[0]).toEqual(['login', 'None selected', '', true]));
+	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'Check for older passkey', 'next', false]]));
 	page.tap();
 	await vi.waitFor(() => expect(page.tries.seen()).toEqual([['login', 'None selected', '', true], ['legacy', 'None selected', '', true]]));
 	expect(page.auto.hidden).toBe(true);
@@ -743,8 +774,14 @@ it('retries an RP ID that found none, and says so when neither did', async () =>
 
 it("asks first for the RP ID the client's hints point to", async () => {
 	const { passkey } = await legacyAccount();
+	const unmigrated = await legacyAccount();
 	await rpIds('chat.localhost', 'localhost');
-	// An account with a new passkey (its upgrade done), named by login_hint: the new kind first, on a device with no memory.
+	// An account with old passkeys only, named by login_hint: the old kind first, even where this device would ask for the new.
+	const named = await signInPage({ localhost: unmigrated.passkey }, new Map([['apron-passkey-kind', 'new']]), { hints: { login_hint: unmigrated.userId } });
+	named.tap();
+	await vi.waitFor(() => expect(named.upgrade.hidden).toBe(false));
+	expect(named.prompts).toEqual(['localhost']);
+	// An account with a new passkey (its upgrade done), named by login_hint, on a device with no memory: the new kind first.
 	const fresh = await softPasskey(NEW);
 	const { query } = await loginQuery(NEW);
 	const token = await legacySignIn(passkey, query);
@@ -756,11 +793,18 @@ it("asks first for the RP ID the client's hints point to", async () => {
 	await vi.waitFor(() => expect(hinted.assigned).toHaveLength(1));
 	expect(hinted.prompts).toEqual(['chat.localhost']);
 	// `rp_id_last`: the client's own ceremony for RP_ID just found none, so the old kind first, even where this device would ask for the new.
-	const last = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'new']]), { hints: { rp_id_last: 'chat.localhost' } });
+	const lastDevice = new Map([['apron-passkey-kind', 'new']]);
+	const last = await signInPage({ localhost: passkey }, lastDevice, { hints: { rp_id_last: 'chat.localhost' } });
 	last.tap();
-	// Its account already has a new passkey, so no upgrade: straight back to the client.
+	// Its account already has a new passkey, so no upgrade: straight back to the client, and this device's is the old one.
 	await vi.waitFor(() => expect(last.assigned).toHaveLength(1));
 	expect(last.prompts).toEqual(['localhost']);
+	expect(lastDevice.get('apron-passkey-kind')).toBe('old');
+	// An account with both kinds, named with no `rp_id_last`: the device decides.
+	const both = await signInPage({ localhost: passkey }, new Map([['apron-passkey-kind', 'old']]), { hints: { login_hint: userId } });
+	both.tap();
+	await vi.waitFor(() => expect(both.assigned).toHaveLength(1));
+	expect(both.prompts).toEqual(['localhost']);
 	// A hint that isn't one of this server's RP IDs, or names no account, says nothing.
 	const ignored = await signInPage({}, new Map([['apron-passkey-kind', 'old']]), { hints: { rp_id_last: 'elsewhere.example', login_hint: 'nobody' } });
 	ignored.tap();
@@ -773,9 +817,9 @@ it('orders by the account first, then by the RP ID the client asks to be last', 
 	const current = { createdMs: 3 };
 	expect(firstKind({ ...ids, since: 2, passkeys: [current] })).toBe('login');
 	expect(firstKind({ ...ids, since: 2, passkeys: [old] })).toBe('legacy');
-	// Both kinds: the RP ID the client asks to be last goes last, else the newest.
+	// Both kinds: the RP ID the client asks to be last goes last, else the device decides.
 	expect(firstKind({ ...ids, since: 2, passkeys: [old, current], last: 'server.example' })).toBe('legacy');
-	expect(firstKind({ ...ids, since: 2, passkeys: [old, current] })).toBe('login');
+	expect(firstKind({ ...ids, since: 2, passkeys: [old, current] })).toBeUndefined();
 	// No account: only the RP ID to ask for last.
 	expect(firstKind({ ...ids, since: undefined, last: 'server.example' })).toBe('legacy');
 	expect(firstKind({ ...ids, since: undefined, last: 'example' })).toBe('login');

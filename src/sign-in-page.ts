@@ -101,7 +101,7 @@ p { margin: 0 0 12px; }
 .tries .key.pick { border: 0; padding: 10px 14px; background: var(--chip); }
 .tries .key.pick b { color: var(--accent); }
 .tries .key.gone { border-style: none; color: var(--muted); }
-.tries .key.gone + .key, .tries .key + .key.gone { border-top-style: solid; }
+.tries .key.gone + .key, .tries .key + .key.gone { border-top: 1px solid var(--line); }
 .tries + .status { margin: 12px 0 0; }
 .tries + .status + .actions, .tries + .actions { margin-top: 20px; }
 .tries .key > .i:nth-of-type(2), .tries .key.gone > .i:first-of-type { display: none; }
@@ -338,6 +338,8 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 	const caution = `${view.recognised ? "" : `<p class="warn">${e(view.host)} has not verified this app.</p>`}
 <p class="muted" data-only-continue>Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
+	// The page's status (a live region): with LEGACY_RP_ID, on the login screen, under the checklist it speaks for.
+	const statusLine = `<p id="status" class="status" role="status" aria-live="polite"></p>`;
 	// With LEGACY_RP_ID, a "Continue with passkey" that finds either kind, and the upgrade after an old one.
 	const legacy = view.legacyRpId ? legacyPageParts({ legacyRpId: view.legacyRpId, rpId: view.rpId ?? view.host, host: view.host, title: view.title }, e, { begin: PAGE_BEGIN_PATH, finish: PAGE_FINISH_PATH }, nonce) : undefined;
 	const signIn = legacy?.button ?? `<button type="button" class="primary" data-passkey>Continue with passkey</button>`;
@@ -348,7 +350,7 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 <p>It will be able to read and send messages as you.</p>
 ${chips(`${e(view.client)} signing in to ${e(view.title)}`, [chip({ icon: "app", name: e(view.client), note: "Wants to sign in as you" })])}
 ${caution}
-${legacy?.tries ?? ""}
+${legacy ? `${legacy.tries}\n${statusLine}` : ""}
 <div class="actions">${signIn}${cancel}</div>
 ${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}`,
 		register: `<h1>Create an account on ${e(view.title)}</h1>
@@ -378,7 +380,7 @@ ${brand(e(view.title), e(view.host))}
 ${screens[view.start]}
 ${legacy?.screen ?? ""}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
-<p id="status" class="status" role="status" aria-live="polite"></p>
+${legacy && view.start === "login" ? "" : statusLine}
 </main>
 <script type="application/json" id="config">${scriptJson({ page: view.page, start: view.start, query: view.query, deny: view.deny, ...(view.first ? { first: view.first } : {}), ...(view.legacyRpId ? { names: { login: view.rpId ?? view.host, legacy: view.legacyRpId } } : {}) })}</script>
 <script nonce="${nonce}">${SCRIPT}</script>

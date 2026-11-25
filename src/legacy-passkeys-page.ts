@@ -56,7 +56,7 @@ ${chips(`Older passkey used; next a new one for ${host}`, [
  * one this device last signed in with here (`localStorage`), else RP_ID, so
  * an account made since the switch is asked once only. When it ends with no
  * passkey (none, or the prompt closed: the browser does not say which), the
- * checklist shows that RP ID as "No passkey used", with a Retry, and the
+ * checklist shows that RP ID as "None selected", with a Retry, and the
  * next one, which the same button asks for. A legacy one then offers a new passkey (`upgrade`).
  * Each ceremony is begun before its tap, so the tap goes straight to the
  * device's prompt, which some browsers require.
@@ -100,8 +100,8 @@ function mark() {
 // there was none or the prompt was closed.
 function missedSaid(kind) {
 	const upcoming = order.find((each) => !missed.has(each));
-	// Said right under the checklist it's about, above the button it asks about.
-	$("tries").after($("status"));
+	// Said right under the checklist it's about, above the button it asks about: the status is rendered there,
+	// not moved there now, as a screen reader may not read a live region inserted just before its text.
 	if (upcoming) {
 		hint("Checked " + NAMES[kind] + " for passkey, none selected. Check " + NAMES[upcoming] + " for passkey?");
 		const button = document.querySelector('[data-legacy="auto"]');
@@ -186,12 +186,15 @@ async function run(kind) {
 	show("upgrade");
 	prepare("upgrade");
 }
-// Shows the screen \`id\` in place of the rest, keeping the brand line and the status.
+// Shows the screen \`id\` in place of the rest, keeping the brand line and the status, which moves (empty) above
+// the screen's buttons, so what it says next is under the screen's heading.
 function show(id) {
 	const screen = $(id);
 	for (const element of screen.parentElement.children) if (element !== screen && element.id !== "status" && !element.classList.contains("brand")) element.hidden = true;
 	screen.hidden = false;
 	status("");
+	const actions = screen.querySelector(".actions");
+	if (actions) actions.before($("status"));
 	screen.querySelector("h1").focus();
 	busy(false);
 }
