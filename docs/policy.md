@@ -494,6 +494,9 @@ but do consume frame and lookup resources.
 Guest posting allowances (with `GUEST_POSTING=true`) are shared across a
 normalized IP; native IPv6 addresses share a /56 bucket. Registered users
 also share the aggregate IP limit. NAT users can therefore limit one another.
+A bot on Cloudflare Workers has no address of its own, so it is keyed by the
+zone that owns it ([SPEC section 5](../SPEC.md#ip-key)): every Worker on one
+account's `workers.dev` shares one bucket, as users behind one NAT do.
 Passkeys do not provide one-person-one-account or prevent Sybil attacks.
 
 ## Server settings and extensions

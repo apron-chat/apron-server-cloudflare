@@ -2290,7 +2290,7 @@ function refusedPath(request: Request): string {
  * before it can cost a Durable Object request. Null when it may go on.
  */
 async function liveAdmission(request: Request, env: Env, read = false): Promise<{ refused: Response } | { ipKey: string }> {
-	const clientIp = extractClientIp(request.headers);
+	const clientIp = extractClientIp(request.headers, new URL(request.url).hostname);
 	if (!clientIp) return { refused: liveAnswer(403, "Trusted client address unavailable") };
 	const key = await hashIpKey(clientIp);
 	try {
@@ -2591,7 +2591,7 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		return responseError(400, "WebSocket upgrade must not contain a body");
 	}
 	if (!isUpgrade(request) && !status) return responseError(400, "WebSocket upgrade required");
-	const clientIp = extractClientIp(request.headers);
+	const clientIp = extractClientIp(request.headers, url.hostname);
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
 	let config: RuntimeConfig;
 	try {

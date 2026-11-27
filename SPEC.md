@@ -450,6 +450,8 @@ Extract Cloudflare's client address in the public entry Worker. Strip any incomi
 
 Canonicalize IPv4 and IPv4-mapped IPv6 to the same IPv4 key; group native IPv6 by /56, the size ISPs most often delegate to one site, so one subscriber cannot multiply its per-IP limits across its /64s. The entry Worker also limits a native IPv6 /48's attempts together. Store the first 128 bits of SHA-256 of the canonical key, encoded as unpadded base64url. This requires no server secret and is a compact internal identifier, not anonymization. Keep the hash format stable across daily rollover and deployments to preserve active rolling windows. Public users behind NAT share IP limits; explain this tradeoff in the demo help text.
 
+A Cloudflare Worker in another zone (a bot hosted on Workers) arrives from `2a06:98c0:3600::103`, the address Cloudflare gives every such Worker, with `CF-Worker` naming the zone that owns it, which the Worker cannot change. Key it by that zone (`worker:<zone>`, hashed as above, with no /48) and treat it as any client: one zone, such as one account's `<account>.workers.dev`, is one principal. `CF-Worker` is trusted only at that shared address, and never for the server's own zone, where a Worker chooses its client address; the shared address without `CF-Worker` identifies no one. Both fail admission.
+
 Reference: [Cloudflare request headers](https://developers.cloudflare.com/fundamentals/reference/http-headers/).
 
 ## 6. Default limits

@@ -10,6 +10,7 @@ import { StoreError } from '../src/store';
 import { apronLink, DEFAULT_PARSE_OPTIONS, FrameError, parseFrame } from '../src/protocol';
 
 // Independent boundary cases from the implementation specification.
+const HOST = 'server.apron.chat';
 describe('trusted IP boundaries', () => {
 	it('keeps compact rate-limit keys stable', async () => {
 		// Pin the persisted format so a refactor cannot silently reset IP quotas.
@@ -37,18 +38,41 @@ describe('trusted IP boundaries', () => {
 	});
 	it('does not let an unrelated IPv6 header change a real IPv4 principal', () => {
 		const headers = new Headers({ 'CF-Connecting-IP': '192.0.2.10', 'CF-Connecting-IPv6': '2001:db8::1' });
-		expect(extractClientIp(headers)?.key).toBe(canonicalizeIp('192.0.2.10')?.key);
+		expect(extractClientIp(headers, HOST)?.key).toBe(canonicalizeIp('192.0.2.10')?.key);
 	});
 	it('uses the real IPv6 address for pseudo IPv4 and fails without it', () => {
-		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '240.1.2.3' }))).toBeNull();
-		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '240.1.2.3', 'CF-Connecting-IPv6': '2001:db8::1' }))?.key)
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '240.1.2.3' }), HOST)).toBeNull();
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '240.1.2.3', 'CF-Connecting-IPv6': '2001:db8::1' }), HOST)?.key)
 			.toBe(canonicalizeIp('2001:db8::2')?.key);
 	});
 	it('rejects absent metadata and the cross-zone Worker sentinel', () => {
-		expect(extractClientIp(new Headers({ 'X-Forwarded-For': '192.0.2.1' }))).toBeNull();
-		expect(extractClientIp(new Headers({ 'CF-Connecting-IPv6': '2001:db8::1' }))).toBeNull();
-		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '192.0.2.1', 'CF-Worker': 'example.test' }))).toBeNull();
-		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103' }))).toBeNull();
+		expect(extractClientIp(new Headers({ 'X-Forwarded-For': '192.0.2.1' }), HOST)).toBeNull();
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IPv6': '2001:db8::1' }), HOST)).toBeNull();
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103' }), HOST)).toBeNull();
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600:0:0:0:0:103' }), HOST)).toBeNull();
+	});
+	it('keys a cross-zone Worker by its zone, and only at the address all Workers share', async () => {
+		const worker = extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': 'Bots.Example.workers.dev' }), 'server.apron.chat');
+		expect(worker).toEqual({ kind: 'worker', key: 'worker:bots.example.workers.dev' });
+		// Any spelling of the address, and the Pseudo IPv4 form, are the same Worker.
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600:0::103', 'CF-Worker': 'bots.example.workers.dev' }), 'server.apron.chat')?.key).toBe(worker!.key);
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '240.1.2.3', 'CF-Connecting-IPv6': '2a06:98c0:3600::103', 'CF-Worker': 'bots.example.workers.dev' }), 'server.apron.chat')?.key).toBe(worker!.key);
+		// The key is not an address's, and has no IPv6 /48.
+		expect(await hashIpKey(worker!)).not.toBe(await hashIpKey(canonicalizeIp('2a06:98c0:3600::103')!));
+		expect(await hashIpv6PrefixKey(worker!)).toBeNull();
+		// A same-zone subrequest, whose address the Worker chooses, is not one, and is no direct client either.
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '192.0.2.1', 'CF-Worker': 'example.test' }), 'server.apron.chat')).toBeNull();
+		// Nor is the shared address without a zone, or with one that is not a hostname.
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103' }), 'server.apron.chat')).toBeNull();
+		for (const zone of ['', 'localhost', 'a b.example', 'example.com:443', '-x.example', `${'a'.repeat(64)}.example`]) {
+			expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': zone }), 'server.apron.chat')).toBeNull();
+		}
+		// Nor is a Worker in the server's own zone, which may choose the shared address itself.
+		for (const zone of ['apron.chat', 'server.apron.chat', 'APRON.chat']) {
+			expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': zone }), 'server.apron.chat')).toBeNull();
+		}
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': 'chat' }), 'server.apron.chat')).toBeNull();
+		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': 'notapron.chat' }), 'server.apron.chat')?.key).toBe('worker:notapron.chat');
 	});
 });
 

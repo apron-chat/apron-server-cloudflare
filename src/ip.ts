@@ -125,27 +125,63 @@ function isPseudoIpv4(value: string): boolean {
 	return parsed !== null && parsed[0] >= 240;
 }
 
-/** Cloudflare's canonical client address headers, with Pseudo IPv4 handling. */
-export function extractClientIp(headers: Headers): CanonicalIp | null {
-	// Subrequest attribution is not equivalent to a direct visitor address.
-	if (headers.has("CF-Worker")) return null;
+/**
+ * The address Cloudflare puts in `CF-Connecting-IP` for a subrequest from a
+ * Worker in another zone, whoever the Worker's visitor was. It is shared by
+ * every Worker on Cloudflare, so it never identifies a client by itself.
+ */
+const WORKER_CLIENT_ADDRESS = "2a06:98c0:3600::103";
+
+/** A zone name as Cloudflare writes it in `CF-Worker` (`example.com`, `<account>.workers.dev`). */
+const ZONE_PATTERN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+/** A Cloudflare Worker in another zone (workerClient), keyed by its zone. */
+export type WorkerClient = { kind: "worker"; key: string };
+
+/**
+ * Cloudflare's canonical client address headers, with Pseudo IPv4 handling,
+ * or for a Cloudflare Worker in another zone, its zone (workerClient). `host`
+ * is the hostname the request reached.
+ */
+export function extractClientIp(headers: Headers, host: string): CanonicalIp | WorkerClient | null {
+	if (headers.has("CF-Worker")) return workerClient(headers, host);
 	const connectingIpv6 = headers.get("CF-Connecting-IPv6");
 	const connectingIp = headers.get("CF-Connecting-IP");
 	const parsedV4Header = connectingIp ? canonicalizeIp(connectingIp) : null;
 	const pseudoV4 = !!connectingIp && isPseudoIpv4(connectingIp);
-	if (parsedV4Header && !pseudoV4) {
-		if (parsedV4Header.address.toLowerCase() === "2a06:98c0:3600::103") return null;
-		return parsedV4Header;
-	}
+	// The shared Worker address without a zone identifies no one.
+	if (parsedV4Header && !pseudoV4) return parsedV4Header.address === WORKER_CLIENT_ADDRESS ? null : parsedV4Header;
 	if (connectingIpv6) {
 		const parsed = canonicalizeIp(connectingIpv6);
 		// Only Pseudo IPv4 establishes this header as the original address.
-		if (parsed?.kind === "ipv6" && pseudoV4) {
-			if (parsed.address.toLowerCase() === "2a06:98c0:3600::103") return null;
-			return parsed;
-		}
+		if (parsed?.kind === "ipv6" && pseudoV4) return parsed.address === WORKER_CLIENT_ADDRESS ? null : parsed;
 	}
 	return null;
+}
+
+/**
+ * A Cloudflare Worker in another zone, such as a bot hosted on Workers, has
+ * no visitor address: Cloudflare gives all of them the one in
+ * WORKER_CLIENT_ADDRESS. So it is keyed by the zone that owns it, which
+ * Cloudflare writes in `CF-Worker` and the Worker cannot change (an
+ * `<account>.workers.dev` zone is one account's), and is otherwise treated
+ * as any client: one zone, one principal, as one address is.
+ *
+ * Only the shared address, which a direct client cannot present, makes
+ * `CF-Worker` trusted. In the server's own zone a Worker chooses
+ * `CF-Connecting-IP`, the shared address included, so a zone that `host` is
+ * in is refused.
+ */
+function workerClient(headers: Headers, host: string): WorkerClient | null {
+	const zone = headers.get("CF-Worker")!.trim().toLowerCase();
+	if (!ZONE_PATTERN.test(zone)) return null;
+	const server = host.toLowerCase();
+	if (server === zone || server.endsWith(`.${zone}`)) return null;
+	const connectingIp = headers.get("CF-Connecting-IP");
+	// With Pseudo IPv4, the IPv6 address is in its own header.
+	const address = connectingIp && isPseudoIpv4(connectingIp) ? headers.get("CF-Connecting-IPv6") : connectingIp;
+	if (address === null || canonicalizeIp(address)?.address !== WORKER_CLIENT_ADDRESS) return null;
+	return { kind: "worker", key: `worker:${zone}` };
 }
 
 function bytesToBase64Url(bytes: ArrayBuffer): string {
@@ -155,12 +191,12 @@ function bytesToBase64Url(bytes: ArrayBuffer): string {
 }
 
 /** Compact, deterministic rate-limit key. This unkeyed hash is not anonymization. */
-export async function hashIpKey(canonical: CanonicalIp): Promise<string> {
+export async function hashIpKey(canonical: CanonicalIp | WorkerClient): Promise<string> {
 	return hashKey(canonical.key);
 }
 
 /** The rate-limit key of a native IPv6 address's /48, hashed like `hashIpKey`; none for IPv4. */
-export async function hashIpv6PrefixKey(canonical: CanonicalIp): Promise<string | null> {
+export async function hashIpv6PrefixKey(canonical: CanonicalIp | WorkerClient): Promise<string | null> {
 	return canonical.kind === "ipv6" ? hashKey(canonical.prefixKey) : null;
 }
 
