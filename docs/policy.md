@@ -374,8 +374,16 @@ no `signup`; a guest, a passkey, `external`, or a sign-up invite is
 `unsupported` or `denied` there, since a zone's key would let it create
 accounts and guests on everyone's behalf. It may stream a live text it was
 given a `write_url` for, but not read a live `url` or use the sign-in pages.
-A session token from a passkey in a browser client resumes only from that
-client's origin, which a Worker does not send, so it does not work here.
+A Worker in this server's own zone is not one of these: there, Cloudflare
+lets the Worker choose the client address, so it is refused.
+
+Its limits are those of one address, shared by everything in its zone: bots
+of several people hosted on one account's `workers.dev` share them, a
+platform that runs many customers' Workers in one zone shares them among
+all of them, and once signed in, commands that create accounts
+(`/invite-bot`, `/invite-token`, `/invite-code`) charge the zone's
+registration caps. Distinct zones are distinct principals, as distinct
+addresses are, and nothing groups them the way an IPv6 /48 is grouped.
 
 The canonical begin/finish exchange, JSON credential encoding, and verification
 rules are defined in protocol [§4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication). This demo limits challenges to 120

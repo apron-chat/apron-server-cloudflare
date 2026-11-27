@@ -2308,7 +2308,7 @@ function refusedPath(request: Request): string {
  * `write_url` already authorizes.
  */
 async function liveAdmission(request: Request, env: Env, read = false, workers = false): Promise<{ refused: Response } | { ipKey: string }> {
-	const clientIp = extractClientIp(request.headers) ?? (workers ? extractWorkerClient(request.headers) : null);
+	const clientIp = extractClientIp(request.headers) ?? (workers ? extractWorkerClient(request.headers, new URL(request.url).hostname) : null);
 	if (!clientIp) return { refused: liveAnswer(403, "Trusted client address unavailable") };
 	const key = await hashIpKey(clientIp);
 	try {
@@ -2612,7 +2612,7 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (!isUpgrade(request) && !status) return responseError(400, "WebSocket upgrade required");
 	// A bot hosted on Cloudflare Workers has no address of its own here, only
 	// its zone; it may connect, and sign in only with a token (handleAuth).
-	const worker = extractWorkerClient(request.headers);
+	const worker = extractWorkerClient(request.headers, url.hostname);
 	const clientIp = extractClientIp(request.headers) ?? worker;
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
 	let config: RuntimeConfig;
@@ -3027,7 +3027,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Appendix B): to this connection only, with no room_id, since the
 		// client knows no rooms yet. A deploy closes every socket, so each
 		// reconnect after one shows the new version.
-		this.send(server, this.welcome(origin, endpoint));
+		this.send(server, this.welcome(origin, endpoint, worker));
 		await this.rescheduleAlarm();
 		return new Response(null, { status: 101, webSocket: pair[0] });
 	}
@@ -3690,9 +3690,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
-	private welcome(origin: string | null, endpoint: string | undefined): Record<string, unknown> {
+	private welcome(origin: string | null, endpoint: string | undefined, worker = false): Record<string, unknown> {
 		const lines = [`Welcome to Apron Chat. Server version: \`${this.serverVersion()}\``];
-		if (!this.config.guestPosting) {
+		// A Cloudflare Worker's connection is never a guest, and signs in with a token alone.
+		if (worker) lines.push("This connection comes from a Cloudflare Worker: sign in with a token, such as a bot token from `/invite-bot`.");
+		else if (!this.config.guestPosting) {
 			lines.push(this.passkeysOfferedTo(origin, endpoint)
 				? "Guests can read. *Sign in with passkey* to participate."
 				: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.");

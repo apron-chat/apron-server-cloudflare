@@ -174,11 +174,15 @@ export function extractClientIp(headers: Headers): CanonicalIp | null {
  *
  * Only that shared address, which a direct client cannot present, makes
  * `CF-Worker` trusted. A same-zone subrequest, whose `CF-Connecting-IP` the
- * Worker chooses, is neither this nor a direct client.
+ * Worker chooses (even the shared address), is neither this nor a direct
+ * client: a `CF-Worker` zone that `host`, the server's hostname, is in is
+ * refused.
  */
-export function extractWorkerClient(headers: Headers): WorkerClient | null {
+export function extractWorkerClient(headers: Headers, host: string): WorkerClient | null {
 	const zone = headers.get("CF-Worker")?.trim().toLowerCase();
 	if (!zone || !ZONE_PATTERN.test(zone)) return null;
+	const server = host.toLowerCase();
+	if (server === zone || server.endsWith(`.${zone}`)) return null;
 	const connectingIp = headers.get("CF-Connecting-IP");
 	// With Pseudo IPv4, the IPv6 address is in its own header.
 	const address = connectingIp && isPseudoIpv4(connectingIp) ? headers.get("CF-Connecting-IPv6") : connectingIp;

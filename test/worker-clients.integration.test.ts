@@ -62,7 +62,8 @@ describe('connections from Cloudflare Workers', () => {
 	it('are admitted under their zone, offered token sign-in alone', async () => {
 		const peer = await fromWorker();
 		try {
-			const { server } = await greeting(peer);
+			const { server, welcome } = await greeting(peer);
+			expect(welcome.params.body.text).toContain('sign in with a token');
 			expect(server.params.auth).toEqual(['token']);
 			expect(server.params.signup).toEqual([]);
 		} finally {
@@ -145,6 +146,8 @@ describe('connections from Cloudflare Workers', () => {
 		const upgrade = (headers: Record<string, string>) => SELF.fetch('https://demo.test/ws', { headers: { Upgrade: 'websocket', ...headers } });
 		// In its own zone a Worker chooses CF-Connecting-IP, so it proves nothing.
 		expect((await upgrade({ 'CF-Connecting-IP': '198.51.103.250', 'CF-Worker': 'demo.test' })).status).toBe(403);
+		// Even at the shared address, which it may choose too.
+		expect((await upgrade({ 'CF-Connecting-IP': WORKER_ADDRESS, 'CF-Worker': 'demo.test' })).status).toBe(403);
 		expect((await upgrade({ 'CF-Connecting-IP': WORKER_ADDRESS })).status).toBe(403);
 	});
 
