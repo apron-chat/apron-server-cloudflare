@@ -9279,9 +9279,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/purge <user_id>`: disconnects a user and their bot, then deletes them
 	 * and everything they posted, reacted, or uploaded (Store.purgeUsers),
-	 * silently: no records announce it, so clients showing their content keep
-	 * it until they load history again. They may register a new passkey. The
-	 * sender gets a `~private` notice before the result (§1).
+	 * with no new records: a `user` notification with `new: {}` tells those
+	 * who shared a room with them to forget them and their records (§3.3.3).
+	 * They may register a new passkey. The sender gets a `~private` notice
+	 * before the result (§1).
 	 */
 	/** `lease`: an import must not run meanwhile (its later writes would put back what this removes). */
 	private async purge(cap: AdminCapability, _lease: RewriteLease, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
@@ -9292,10 +9293,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
 		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
-		// The rooms they are in, stored or on their connections, read before
+		// The rooms each is in, stored or on their connections, read before
 		// those close: a thread the purge leaves nobody in is removed after it.
-		const rooms = new Set<string>();
-		for (const id of userIds) for (const roomId of [...(this.liveRoomsOf(id) ?? []), ...(this.store.accounts.get(id)?.rooms ?? [])]) rooms.add(roomId);
+		const roomsOf = new Map<string, Set<string>>();
+		for (const id of userIds) roomsOf.set(id, new Set([...(this.liveRoomsOf(id) ?? []), ...(this.store.accounts.get(id)?.rooms ?? [])]));
+		const rooms = new Set([...roomsOf.values()].flatMap((ids) => [...ids]));
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);
@@ -9306,6 +9308,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			purged = this.store.accounts.purge({ userIds, now: nowMs() });
 		});
+		// Everyone who shared a room with them forgets them and what they left
+		// (§3.3.3): `new` of `{}`, and `old` with only the user_id. Not logged.
+		for (const [id, theirs] of roomsOf) {
+			if (theirs.size) this.deliver({ method: "user", params: { new: {}, old: { user_id: id } } }, [...theirs], (state) => !userIds.includes(state.userId ?? ""));
+		}
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
 		// The tiers below purge what they hold on the next alarm, in a second.

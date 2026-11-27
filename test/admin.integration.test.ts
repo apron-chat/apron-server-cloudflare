@@ -1045,6 +1045,11 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 		expect((await request(carol, 'join-shared', 'room_join', { room_id: shared })).result).toEqual({});
 
 		expect((await command(admin, 'purge', `/purge ${bobId}`)).frame.result).toEqual({});
+		// Carol, who shared rooms with Bob, is told to forget him and what he left (§3.3.3),
+		// with only his user_id; he had no bot, so nothing is sent for one.
+		const removed = await until(carol, (frame) => frame.method === 'user' && frame.params?.old !== undefined);
+		expect(removed.frame.params).toEqual({ new: {}, old: { user_id: bobId } });
+		expect(removed.skipped.some((frame) => frame.method === 'user' && frame.params?.old?.user_id === `bot_${bobId}`)).toBe(false);
 		// The thread only Bob was in goes with him; the one Carol is in stays.
 		expect(await exists(alone)).toBe(false);
 		expect(await exists(shared)).toBe(true);
