@@ -16,6 +16,8 @@ export type ConnectOptions = {
 	 * leave. Left out by default, for tests about anything else.
 	 */
 	statuses?: boolean;
+	/** Other request headers, such as a Cloudflare Worker's `CF-Worker`. */
+	headers?: Record<string, string>;
 };
 
 /** Whether a frame only tells another user's `status` (§4.5), with its `seen` (§4.5.2). */
@@ -26,9 +28,9 @@ export function statusOnly(frame: Frame): boolean {
 }
 
 /** Opens a WebSocket to the Worker and queues its frames for `next()`. */
-export async function connect({ ip, origin = "http://localhost:5173", path = "/ws", host = "demo.test", statuses = false }: ConnectOptions) {
+export async function connect({ ip, origin = "http://localhost:5173", path = "/ws", host = "demo.test", statuses = false, headers = {} }: ConnectOptions) {
 	const response = await SELF.fetch(`https://${host}${path}`, { headers: {
-		Upgrade: "websocket", ...(origin === null ? {} : { Origin: origin }), "CF-Connecting-IP": ip,
+		Upgrade: "websocket", ...(origin === null ? {} : { Origin: origin }), "CF-Connecting-IP": ip, ...headers,
 	} });
 	expect(response.status).toBe(101);
 	const socket = response.webSocket!;

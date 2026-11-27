@@ -361,6 +361,22 @@ live invite at a time). Each sign-up gets its own `apron_invite_` token in
 the `auth` result to sign in with afterwards. Other tokens only sign in, and
 `guest` is not an account.
 
+### Bots on Cloudflare Workers
+
+A Cloudflare Worker in another zone has no address of its own: every such
+Worker reaches the server from the one address Cloudflare gives them all. So
+its limits are keyed by the zone that owns it, from Cloudflare's `CF-Worker`
+header (an `<account>.workers.dev` zone is one account's), and it signs in
+only to an existing account: with a bot token from `/invite-bot`, a device
+token from `/invite-device`, an invite token from `/invite-token`, or a
+session from the passkey page. Its `server` frame offers `auth: ["token"]` and
+no `signup`; a guest, a passkey, `external`, or a sign-up invite is
+`unsupported` or `denied` there, since a zone's key would let it create
+accounts and guests on everyone's behalf. It may stream a live text it was
+given a `write_url` for, but not read a live `url` or use the sign-in pages.
+A session token from a passkey in a browser client resumes only from that
+client's origin, which a Worker does not send, so it does not work here.
+
 The canonical begin/finish exchange, JSON credential encoding, and verification
 rules are defined in protocol [§4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication). This demo limits challenges to 120
 seconds and requires user presence and verification. A new begin replaces the
