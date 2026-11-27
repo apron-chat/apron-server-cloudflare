@@ -55,13 +55,13 @@ async function signedIn(userId: string, roles: string[] = []): Promise<Peer> {
 }
 
 /** A streaming `PUT` to a write URL: write chunks with `send`, end it with `end`, and await `response`. */
-function streamTo(url: string, headers: Record<string, string> = { 'CF-Connecting-IP': ip() }) {
+function streamTo(url: string) {
 	const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
 	const writer = writable.getWriter();
 	// The server cancels the body when it ends the text early.
 	writer.closed.catch(() => undefined);
 	writer.ready.catch(() => undefined);
-	const response = SELF.fetch(url, { method: 'PUT', body: readable, headers, duplex: 'half' } as RequestInit);
+	const response = SELF.fetch(url, { method: 'PUT', body: readable, headers: { 'CF-Connecting-IP': ip() }, duplex: 'half' } as RequestInit);
 	return {
 		response,
 		send: (text: string | Uint8Array) => writer.write(typeof text === 'string' ? encode(text) : text).catch(() => undefined),
@@ -190,24 +190,6 @@ describe('live text end to end', () => {
 			expect((await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } })).status).toBe(404);
 			const again = await SELF.fetch(result.write_url, { method: 'PUT', body: 'again', headers: { 'CF-Connecting-IP': ip() } });
 			expect(again.status).toBe(409);
-		} finally { writer.close(); watcher.close(); }
-	});
-
-	it('takes a write from a bot on Cloudflare Workers, whose write_url authorizes it, but no read', async () => {
-		const worker = { 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': 'live-bot.example.workers.dev' };
-		const userId = unique('workerbot');
-		const writer = await signedIn(userId);
-		const watcher = await signedIn(unique('watcher'));
-		try {
-			const { frame } = await command(writer, 'term', '/embed-terminal from a Worker');
-			const put = streamTo(frame.result.embeds[0].write_url, worker);
-			await put.send('from a Worker\r\n');
-			const posted = (await until(watcher, fromUser(userId))).frame.params;
-			const url = posted.body.embeds[0].url;
-			// A read is anyone's with the url, so a Worker, which has no address, is refused.
-			expect((await SELF.fetch(url, { headers: worker })).status).toBe(403);
-			await put.end();
-			expect((await put.response).status).toBe(200);
 		} finally { writer.close(); watcher.close(); }
 	});
 

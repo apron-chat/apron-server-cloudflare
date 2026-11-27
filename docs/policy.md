@@ -361,30 +361,6 @@ live invite at a time). Each sign-up gets its own `apron_invite_` token in
 the `auth` result to sign in with afterwards. Other tokens only sign in, and
 `guest` is not an account.
 
-### Bots on Cloudflare Workers
-
-A Cloudflare Worker in another zone has no address of its own: every such
-Worker reaches the server from the one address Cloudflare gives them all. So
-its limits are keyed by the zone that owns it, from Cloudflare's `CF-Worker`
-header (an `<account>.workers.dev` zone is one account's), and it signs in
-only to an existing account: with a bot token from `/invite-bot`, a device
-token from `/invite-device`, an invite token from `/invite-token`, or a
-session from the passkey page. Its `server` frame offers `auth: ["token"]` and
-no `signup`; a guest, a passkey, `external`, or a sign-up invite is
-`unsupported` or `denied` there, since a zone's key would let it create
-accounts and guests on everyone's behalf. It may stream a live text it was
-given a `write_url` for, but not read a live `url` or use the sign-in pages.
-A Worker in this server's own zone is not one of these: there, Cloudflare
-lets the Worker choose the client address, so it is refused.
-
-Its limits are those of one address, shared by everything in its zone: bots
-of several people hosted on one account's `workers.dev` share them, a
-platform that runs many customers' Workers in one zone shares them among
-all of them, and once signed in, commands that create accounts
-(`/invite-bot`, `/invite-token`, `/invite-code`) charge the zone's
-registration caps. Distinct zones are distinct principals, as distinct
-addresses are, and nothing groups them the way an IPv6 /48 is grouped.
-
 The canonical begin/finish exchange, JSON credential encoding, and verification
 rules are defined in protocol [§4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication). This demo limits challenges to 120
 seconds and requires user presence and verification. A new begin replaces the
@@ -518,6 +494,9 @@ but do consume frame and lookup resources.
 Guest posting allowances (with `GUEST_POSTING=true`) are shared across a
 normalized IP; native IPv6 addresses share a /56 bucket. Registered users
 also share the aggregate IP limit. NAT users can therefore limit one another.
+A bot on Cloudflare Workers has no address of its own, so it is keyed by the
+zone that owns it ([SPEC section 5](../SPEC.md#ip-key)): every Worker on one
+account's `workers.dev` shares one bucket, as users behind one NAT do.
 Passkeys do not provide one-person-one-account or prevent Sybil attacks.
 
 ## Server settings and extensions

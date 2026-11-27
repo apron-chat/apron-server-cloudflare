@@ -475,9 +475,7 @@ keep their stored keys and need nothing.
 
 IP rate limits key on the first 128 bits of SHA-256 of the canonical address
 (IPv4-mapped IPv6 as its IPv4, native IPv6 by /56; see
-[SPEC section 5](../SPEC.md#ip-key)); a bot on Cloudflare Workers, which has
-no address of its own, by the zone that owns it, and it signs in with a token
-only. No IP secret or backup is needed. These
+[SPEC section 5](../SPEC.md#ip-key)). No IP secret or backup is needed. These
 internal hashes are compact identifiers, not anonymization: candidate IPs can
 be hashed to recover a match. Neither raw IPs nor these keys are sent to chat
 clients. Keep the hash format stable across deployments to preserve active IP

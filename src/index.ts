@@ -34,7 +34,7 @@ import { EMPTY_MESSAGE, limitData } from "./store-error";
 import { ADMIN_USER_ID } from "./user-ids";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
-import { extractClientIp, extractWorkerClient, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
+import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
 	apronLink,
 	DEFINED_AUTH_SCHEMES,
@@ -159,13 +159,6 @@ const HISTORY_STALL_ALERT_MS = 6 * 3_600_000;
 const META_SCHEDULED_BACKUP = "history:export:scheduled";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
 /**
- * Set by the entry Worker on a connection from a Cloudflare Worker in another
- * zone (extractWorkerClient), whose key is its zone's rather than an
- * address's. Such a connection signs in with a token only (handleAuth).
- * stripForwardingHeaders drops a client's copy.
- */
-const WORKER_CLIENT_HEADER = "X-Apron-Worker-Client";
-/**
  * The paths the entry Worker forwards live text to the object on (§4.8.3):
  * a write's `PUT` and a reader's `GET`. The Worker builds these requests
  * itself; it forwards only `/` and `/ws` from clients, so none reaches them.
@@ -253,11 +246,6 @@ interface ConnectionAttachment {
 	v: 1;
 	connId: string;
 	ipKey: string;
-	/**
-	 * A Cloudflare Worker in another zone (WORKER_CLIENT_HEADER): `ipKey` is
-	 * its zone's, and it may sign in only with a token for an existing account.
-	 */
-	worker?: true;
 	tier: "pending" | "anonymous" | "registered";
 	userId?: string;
 	name?: string;
@@ -618,8 +606,6 @@ const MAX_HELD_FRAMES = 256;
  * key of the one live invite by the token's SHA-256, and the pointer to it.
  */
 const JOIN_TOKEN_PREFIX = "apron_join_";
-/** Why a connection from a Cloudflare Worker (ConnectionAttachment.worker) may not sign in so. */
-const WORKER_SIGN_IN_MESSAGE = "A connection from a Cloudflare Worker signs in only with an existing account's token, such as a bot token from /invite-bot";
 const JOIN_TOKEN_KEY_PREFIX = "join-token:";
 const JOIN_INVITE_KEY = "join-invite";
 /** Sign-ups one `/invite-code` may allow, and how long it lasts. */
@@ -1359,7 +1345,6 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			v: 1,
 			connId: attachment.connId,
 			ipKey: attachment.ipKey,
-			...(attachment.worker === true ? { worker: true as const } : {}),
 			tier: attachment.tier === "anonymous" || attachment.tier === "registered" ? attachment.tier : "pending",
 			...(typeof attachment.userId === "string" ? { userId: attachment.userId } : {}),
 			...(typeof attachment.name === "string" ? { name: attachment.name } : {}),
@@ -2303,12 +2288,9 @@ function refusedPath(request: Request): string {
  * write's to the connection attempts, a read's to the live reads
  * (LIVE_READS), so a crowd reading a text leaves connections alone. All
  * before it can cost a Durable Object request. Null when it may go on.
- * With `workers`, a Cloudflare Worker in another zone is admitted under its
- * zone's key (extractWorkerClient): for a write, which its signed
- * `write_url` already authorizes.
  */
-async function liveAdmission(request: Request, env: Env, read = false, workers = false): Promise<{ refused: Response } | { ipKey: string }> {
-	const clientIp = extractClientIp(request.headers) ?? (workers ? extractWorkerClient(request.headers, new URL(request.url).hostname) : null);
+async function liveAdmission(request: Request, env: Env, read = false): Promise<{ refused: Response } | { ipKey: string }> {
+	const clientIp = extractClientIp(request.headers, new URL(request.url).hostname);
 	if (!clientIp) return { refused: liveAnswer(403, "Trusted client address unavailable") };
 	const key = await hashIpKey(clientIp);
 	try {
@@ -2341,8 +2323,7 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
 	// are read as UTF-8 whatever it says.
 	if (!request.body) return liveAnswer(400, "Send the text as the request body");
 	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
-	// A bot on Cloudflare Workers may stream a live text it was given a write_url for.
-	const admitted = await liveAdmission(request, env, false, true);
+	const admitted = await liveAdmission(request, env);
 	if ("refused" in admitted) return admitted.refused;
 	// Piped natively (an IdentityTransformStream: no JavaScript runs per
 	// chunk, so the Worker's CPU does not grow with the text) through a stream
@@ -2610,10 +2591,7 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		return responseError(400, "WebSocket upgrade must not contain a body");
 	}
 	if (!isUpgrade(request) && !status) return responseError(400, "WebSocket upgrade required");
-	// A bot hosted on Cloudflare Workers has no address of its own here, only
-	// its zone; it may connect, and sign in only with a token (handleAuth).
-	const worker = extractWorkerClient(request.headers, url.hostname);
-	const clientIp = extractClientIp(request.headers) ?? worker;
+	const clientIp = extractClientIp(request.headers, url.hostname);
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
 	let config: RuntimeConfig;
 	try {
@@ -2648,7 +2626,6 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (!env.DEMO) return responseError(503, "Demo capacity unavailable");
 	const headers = stripForwardingHeaders(request.headers);
 	headers.set(INTERNAL_IP_HEADER, key);
-	if (clientIp === worker) headers.set(WORKER_CLIENT_HEADER, "1");
 	headers.delete("content-length");
 	const forwarded = new Request(request, { headers });
 	const stub = env.DEMO.getByName(OBJECT_NAME);
@@ -3003,12 +2980,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const pair = new WebSocketPair();
 		const server = pair[1] as WebSocketConnection;
 		const endpoint = endpointOf(request);
-		const worker = request.headers.get(WORKER_CLIENT_HEADER) === "1";
 		const attachment: ConnectionAttachment = {
 			v: 1,
 			connId: randomId("c"),
 			ipKey,
-			...(worker ? { worker: true as const } : {}),
 			tier: "pending",
 			...(origin ? { origin } : {}),
 			...(endpoint ? { endpoint } : {}),
@@ -3022,12 +2997,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		this.ctx.acceptWebSocket(server);
 		writeAttachment(server, attachment);
-		this.send(server, this.serverAnnouncement(origin, endpoint, false, worker));
+		this.send(server, this.serverAnnouncement(origin, endpoint));
 		// A welcome with the deployed version, before any auth (§3.2,
 		// Appendix B): to this connection only, with no room_id, since the
 		// client knows no rooms yet. A deploy closes every socket, so each
 		// reconnect after one shows the new version.
-		this.send(server, this.welcome(origin, endpoint, worker));
+		this.send(server, this.welcome(origin, endpoint));
 		await this.rescheduleAlarm();
 		return new Response(null, { status: 101, webSocket: pair[0] });
 	}
@@ -3506,7 +3481,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return protocol.name === "retry_after" ? response : remembered(response, protocol.name);
 	}
 
-	private serverAnnouncement(origin: string | null, endpoint: string | undefined, wakeJoined = false, worker = false): Record<string, unknown> {
+	private serverAnnouncement(origin: string | null, endpoint: string | undefined, wakeJoined = false): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
 		const emoji = this.emojiCatalogUrl();
@@ -3555,14 +3530,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// tokens from anywhere (bots, invites, sessions from the page). No
 				// `email` (the demo has no way to send mail); `external` only with
 				// EXTERNAL_SIGN_IN, for clients that implement nothing else.
-				// A Cloudflare Worker in another zone (a hosted bot) signs in with a token alone.
-				auth: worker ? ["token"] : [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : []), "guest"],
+				auth: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : []), "guest"],
 				// Schemes that create an account (§3.2): a passkey registration (or
 				// `external`, whose page can create one), and a token only as an
 				// admin's sign-up invite (`/invite-code`); other tokens sign in to
 				// existing users. A guest is a throwaway identity for one
 				// connection, not an account, so `guest` is listed only in `auth`.
-				signup: worker ? [] : [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])],
+				signup: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
 				welcome: general ?? this.signInWelcome(origin, endpoint),
 				// What the server is, for lists of servers (§3.1): what admins set
@@ -3690,11 +3664,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
-	private welcome(origin: string | null, endpoint: string | undefined, worker = false): Record<string, unknown> {
+	private welcome(origin: string | null, endpoint: string | undefined): Record<string, unknown> {
 		const lines = [`Welcome to Apron Chat. Server version: \`${this.serverVersion()}\``];
-		// A Cloudflare Worker's connection is never a guest, and signs in with a token alone.
-		if (worker) lines.push("This connection comes from a Cloudflare Worker: sign in with a token, such as a bot token from `/invite-bot`.");
-		else if (!this.config.guestPosting) {
+		if (!this.config.guestPosting) {
 			lines.push(this.passkeysOfferedTo(origin, endpoint)
 				? "Guests can read. *Sign in with passkey* to participate."
 				: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.");
@@ -4032,9 +4004,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const offered = request.params.scheme;
 		if (typeof offered === "string") {
 			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "unsupported", message: "Unknown authentication scheme" } satisfies ProtocolError;
-			// A Cloudflare Worker in another zone shares its key with its whole
-			// zone, so it signs in to an existing account and creates nothing.
-			if (attachment.worker && offered !== "token") throw { name: "unsupported", message: WORKER_SIGN_IN_MESSAGE } satisfies ProtocolError;
 			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "external" && !this.externalOrigin(attachment)) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "webauthn") {
@@ -4074,11 +4043,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
 			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
 			else if (token.startsWith(DEVICE_TOKEN_PREFIX)) await this.handleDeviceToken(socket, attachment, request, token);
-			else if (token.startsWith(JOIN_TOKEN_PREFIX)) {
-				// A sign-up invite creates an account, which a Worker's connection may not.
-				if (attachment.worker) throw { name: "denied", message: WORKER_SIGN_IN_MESSAGE } satisfies ProtocolError;
-				await this.handleJoinToken(socket, attachment, request, token);
-			}
+			else if (token.startsWith(JOIN_TOKEN_PREFIX)) await this.handleJoinToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request, token.startsWith(SESSION_TOKEN_PREFIX));
 			return;
 		}
@@ -9270,10 +9235,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!state || state.closing) continue;
 			const origin = state.origin ?? null;
 			const joined = this.wakesJoined(state);
-			const cacheKey = `${joined ? 1 : 0}${state.worker ? 1 : 0} ${originOfEndpoint(state.endpoint) ?? ""} ${origin ?? ""}`;
+			const cacheKey = `${joined ? 1 : 0} ${originOfEndpoint(state.endpoint) ?? ""} ${origin ?? ""}`;
 			let frame = frames.get(cacheKey);
 			if (!frame) {
-				frame = this.serverAnnouncement(origin, state.endpoint, joined, state.worker);
+				frame = this.serverAnnouncement(origin, state.endpoint, joined);
 				frames.set(cacheKey, frame);
 			}
 			this.sendServer(socket, state, frame, joined);
@@ -9308,7 +9273,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!state || state.closing) return;
 		const joined = this.wakesJoined(state);
 		if (joined === (state.wakeJoined === true)) return;
-		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, state.endpoint, joined, state.worker), joined);
+		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, state.endpoint, joined), joined);
 	}
 
 	/**
