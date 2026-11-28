@@ -8204,8 +8204,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		this.reply(socket, request, this.boundedListing(result));
 		// Resuming from a position: what `/purge` removed since, which no record
-		// says, is told again as at the time (§3.3.3), after the listing.
-		if (filter !== "not_joined" && typeof params.latest_log_id === "string") {
+		// says, is told again as at the time (§3.3.3), after the listing. Only to
+		// registered users: a guest, whom anyone can be, keeps no history to clean,
+		// and needn't learn which ids were purged.
+		if (filter !== "not_joined" && attachment.tier === "registered" && typeof params.latest_log_id === "string") {
 			let removed: string[] = [];
 			try { removed = this.store.accounts.removedSince(Number(params.latest_log_id), MAX_REMOVALS_RESENT); } catch { /* a refused read leaves it untold */ }
 			for (const id of removed) {

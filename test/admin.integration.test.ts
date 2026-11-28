@@ -1075,6 +1075,15 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 			const next = await exchange(eve, 'after', 'room_list', { filter: 'joined' });
 			expect(next.skipped.some((frame) => frame.method === 'user' && frame.params?.old !== undefined)).toBe(false);
 		} finally { eve.close(); }
+		// A guest resuming from before it is not told which ids were purged.
+		const guest = await connect();
+		try {
+			await guest.next();
+			expect((await request(guest, 'guest-auth', 'auth', { scheme: 'guest' })).error).toBeUndefined();
+			await exchange(guest, 'guest-resume', 'room_list', { filter: 'joined', latest_log_id: before });
+			const later = await exchange(guest, 'guest-after', 'room_list', { filter: 'joined' });
+			expect(later.skipped.some((frame) => frame.method === 'user' && frame.params?.old !== undefined)).toBe(false);
+		} finally { guest.close(); }
 		// A user_id no one ever had is still unknown.
 		expect((await command(admin, 'purge-unknown', `/purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
 		// The thread only Bob was in goes with him; the one Carol is in stays.
