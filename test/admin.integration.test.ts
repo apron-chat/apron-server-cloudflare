@@ -1035,6 +1035,8 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 	const bob = await signedIn(bobId);
 	const carolId = unique('carol');
 	const carol = await signedIn(carolId);
+	const daveId = unique('dave');
+	const dave = await signedIn(daveId);
 	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.rooms.get(roomId) !== null);
 	// A second session Bob keeps on another device.
 	const token = await runInDurableObject(stub(), (instance) =>
@@ -1043,8 +1045,17 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 		const alone = (await request(bob, 'alone', 'room_set', { parent_room_id: 'general', title: 'Alone' })).result.room_id;
 		const shared = (await request(bob, 'shared', 'room_set', { parent_room_id: 'general', title: 'Shared' })).result.room_id;
 		expect((await request(carol, 'join-shared', 'room_join', { room_id: shared })).result).toEqual({});
+		// Dave shares no room with Bob any more, but may still have what Bob left in general.
+		expect((await request(dave, 'leave-general', 'room_leave', { room_id: 'general' })).result).toEqual({});
 
 		expect((await command(admin, 'purge', `/purge ${bobId}`)).frame.result).toEqual({});
+		// Carol, who shares rooms with Bob, is told to forget him and what he left (§3.3.3),
+		// with only his user_id; he had no bot, so nothing is sent for one.
+		const removed = await until(carol, (frame) => frame.method === 'user' && frame.params?.old !== undefined);
+		expect(removed.frame.params).toEqual({ new: {}, old: { user_id: bobId } });
+		expect(removed.skipped.some((frame) => frame.method === 'user' && frame.params?.old?.user_id === `bot_${bobId}`)).toBe(false);
+		// So is Dave, who shares no room with him now.
+		expect((await until(dave, (frame) => frame.method === 'user' && frame.params?.old !== undefined)).frame.params).toEqual({ new: {}, old: { user_id: bobId } });
 		// The thread only Bob was in goes with him; the one Carol is in stays.
 		expect(await exists(alone)).toBe(false);
 		expect(await exists(shared)).toBe(true);
@@ -1058,7 +1069,7 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 			await device.next();
 			expect((await request(device, 'resume', 'auth', { scheme: 'token', token })).error.code).toBe(-32001);
 		} finally { device.close(); }
-	} finally { admin.close(); bob.close(); carol.close(); }
+	} finally { admin.close(); bob.close(); carol.close(); dave.close(); }
 });
 
 it('removes a thread when the last one in it leaves, with any messages in it', async () => {

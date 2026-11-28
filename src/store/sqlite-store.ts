@@ -2489,9 +2489,9 @@ export class SqliteStore {
    * the log head, and with it anything that named it; sessions carry the user handle
    * they were issued under, so none carries over to a later account.
    * Removing the threads it leaves empty is the caller's (removeIfEmpty), as
-   * it knows the connections still in them. Clients that already have their content
-   * keep it until they load history again. Returns what went, and the R2
-   * objects the caller deletes.
+   * it knows the connections still in them, as is telling the clients connected
+   * to forget them (§3.3.3). Returns what went, and the R2 objects the caller
+   * deletes.
    */
   purgeUsers(input: { userIds: readonly string[]; now?: number }): { messages: number; reactions: number; deletedUploads: string[] } {
     this.ensureReady();
