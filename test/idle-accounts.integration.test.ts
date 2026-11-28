@@ -268,6 +268,11 @@ it('keeps every removal by position for a resume, newest first, leaving out ids 
 		// An id with an identity again (a bot made anew) is not told as removed.
 		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json, seen_ms) VALUES (?, '', 'bot', 'registered', ?, ?, '[\"bot\"]', 0)", ids[39], now, now);
 		expect(store.accounts.removedSince(at[38], 256)).toEqual([ids[38]]);
+		// A removal its purged: marker was raised past since (the idle prune of a bot made anew, keeping
+		// what it posted) is not one any more: not told, nor taken for one by /purge.
+		sql.exec("UPDATE _meta SET value = ? WHERE key = ?", String(at[38] + 1), `purged:${ids[38]}`);
+		expect(store.accounts.removed(ids[38])).toBe(false);
+		expect(store.accounts.removedSince(at[37], 256)).toEqual([ids[37]]);
 		// Removed again, it is at its new position only.
 		post('again');
 		store.accounts.purge({ userIds: [ids[39]], now });
@@ -278,6 +283,6 @@ it('keeps every removal by position for a resume, newest first, leaving out ids 
 		store.accounts.freeRetiredIds([ids[39], ids[0]], now);
 		expect(keys()).toEqual(ids.slice(1, 39));
 		expect(store.accounts.removed(ids[39])).toBe(false);
-		expect(store.accounts.removedSince(0, 256)).toEqual(ids.slice(1, 39).reverse());
+		expect(store.accounts.removedSince(0, 256)).toEqual(ids.slice(1, 38).reverse());
 	});
 });

@@ -1946,3 +1946,39 @@ it('lets no creator of a top-level room remove its members, a mod or a former on
 		expect((await remove('thread', threadId, carolId)).result).toEqual({});
 	} finally { admin.close(); bob.close(); }
 });
+
+it('/purge of an id the idle prune retired deletes what it kept and announces it; of an id only /rename retired, refuses', async () => {
+	const admin = await signedInAdmin();
+	const idlerId = unique('idler');
+	const idler = await signedIn(idlerId);
+	const carol = await signedIn(unique('carol'));
+	try {
+		const posted = (await request(idler, 'post', 'message', { room_id: 'general', body: { text: 'kept by the idle prune' } })).result.message_id;
+		idler.close();
+		// Retired as the idle prune retires: no identity, a purged: marker, what it posted kept.
+		await runInDurableObject(stub(), (instance, state) => {
+			const store = (instance as unknown as { store: Store }).store;
+			const head = state.storage.sql.exec<{ last: number }>('SELECT MAX(log_id) AS last FROM records').one().last;
+			state.storage.sql.exec('DELETE FROM credentials WHERE user_id = ?', idlerId);
+			state.storage.sql.exec('DELETE FROM identities WHERE user_id = ?', idlerId);
+			state.storage.sql.exec("INSERT INTO _meta (key, value) VALUES (?, ?)", `purged:${idlerId}`, String(head));
+			expect(store.accounts.purged(idlerId)).toBe(true);
+			expect(store.accounts.removed(idlerId)).toBe(false);
+		});
+		const purged = await command(admin, 'purge-idler', `/purge ${idlerId}`);
+		expect(purged.frame.result).toEqual({});
+		expect(purged.notice?.params.body.text).toContain('1 message');
+		expect((await until(carol, (frame) => frame.method === 'user' && frame.params?.old?.user_id === idlerId)).frame.params).toEqual({ new: {}, old: { user_id: idlerId } });
+		expect((await request(admin, 'lookup', 'message', { message_id: posted, room_id: 'general', body: { text: 'x' } })).error?.code).toBe(-32602);
+		await runInDurableObject(stub(), (instance) => {
+			expect((instance as unknown as { store: Store }).store.accounts.removed(idlerId)).toBe(true);
+		});
+
+		// An id /rename retired: its records moved to the new id, so there is nothing to purge under it.
+		const fromId = unique('from');
+		await registered(fromId);
+		const toId = unique('to');
+		expect((await command(admin, 'rename', `/rename @${fromId} @${toId}`)).frame.result).toEqual({});
+		expect((await command(admin, 'purge-renamed', `/purge ${fromId}`)).frame.error.code).toBe(-32602);
+	} finally { admin.close(); carol.close(); }
+});
