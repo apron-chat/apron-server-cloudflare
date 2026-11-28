@@ -239,3 +239,41 @@ it('marks removed what /purge removes, an idle-pruned id once purged, and frees 
 		expect(store.accounts.removedSince(0, 10)).toEqual([]);
 	});
 });
+
+it('keeps the newest removals by position for a resume, reading every marker only for a client from before those', async () => {
+	await withStore('removed-ring', {}, (store, sql, clock) => {
+		const now = clock.now;
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', '0')");
+		const user = seed(sql, now);
+		// Each from a poster of its own, so no posting limit is reached.
+		const post = (text: string) => store.messages.mutate({
+			userId: `poster ${text}`, ipKey: `ip ${text}`, requestId: text, method: 'message', now,
+			params: { room_id: 'general', body: { format: 'plain', text } }, identity: { user_id: `poster ${text}`, name: 'Poster' },
+		});
+		const ids = Array.from({ length: 34 }, (_, i) => `gone_${String(i).padStart(2, '0')}`);
+		const at: number[] = [];
+		for (const id of ids) {
+			user(id, { created: day });
+			post(`before ${id}`);
+			store.accounts.purge({ userIds: [id], now });
+			at.push(Number(sqliteOf(store).logBounds().latest_log_id));
+		}
+		const ring = () => sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key LIKE 'removed_at:%' ORDER BY key").toArray().map((row) => row.key.split(':')[2]);
+		const floor = () => sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'removed_floor'").toArray()[0]?.value;
+		// The newest 32 by position; the floor is the newest one dropped.
+		expect(ring()).toEqual(ids.slice(2));
+		expect(floor()).toBe(String(at[1]));
+		// Above the floor: from the ring, oldest first.
+		expect(store.accounts.removedSince(at[10], 256)).toEqual(ids.slice(10));
+		expect(store.accounts.removedSince(at[33] + 1, 256)).toEqual([]);
+		// At or below it some were dropped from the ring: every marker is read, oldest first.
+		expect(store.accounts.removedSince(at[1], 256)).toEqual(ids.slice(1));
+		expect(store.accounts.removedSince(0, 256)).toEqual(ids);
+		expect(store.accounts.removedSince(0, 5)).toEqual(ids.slice(0, 5));
+		// Freeing an id frees its place in the ring; the floor stays.
+		store.accounts.freeRetiredIds([ids[33], ids[0]], now);
+		expect(ring()).toEqual(ids.slice(2, 33));
+		expect(floor()).toBe(String(at[1]));
+		expect(store.accounts.removedSince(0, 256)).toEqual(ids.slice(1, 33));
+	});
+});

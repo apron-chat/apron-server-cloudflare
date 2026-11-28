@@ -98,6 +98,14 @@ export const META_PURGED_PREFIX = "purged:";
  * Freed with its `purged:` marker (freeRetiredUserIds).
  */
 export const META_REMOVED_PREFIX = "removed:";
+/**
+ * `_meta` key prefix of the newest removals by position, for a resuming
+ * `room_list`: `removed_at:<log position, 16 digits>:<user_id>`, empty, at
+ * most REMOVED_RING of them. Dropping an older one raises META_REMOVED_FLOOR.
+ */
+export const META_REMOVED_AT_PREFIX = "removed_at:";
+/** `_meta` key: the position of the newest removal dropped from `removed_at:`; absent while none was. */
+export const META_REMOVED_FLOOR = "removed_floor";
 /** `_meta` key: when the daily idle bot sweep (idleBots) is next due. */
 export const META_BOT_SWEEP = "bot_sweep_ms";
 
