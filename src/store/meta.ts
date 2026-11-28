@@ -90,6 +90,14 @@ export const META_RENAMED_PREFIX = "renamed:";
  * id is freed once history has expired past it (dueRetiredUserIds).
  */
 export const META_PURGED_PREFIX = "purged:";
+/**
+ * `_meta` key prefix recording that `/purge` removed a user and what they
+ * left: `removed:<user_id>` holds the log head then. Nothing is logged under
+ * the id again, so another `/purge` of it only announces the removal again,
+ * and a client resuming from a position before it is told (src/index.ts).
+ * Freed with its `purged:` marker (freeRetiredUserIds).
+ */
+export const META_REMOVED_PREFIX = "removed:";
 /** `_meta` key: when the daily idle bot sweep (idleBots) is next due. */
 export const META_BOT_SWEEP = "bot_sweep_ms";
 

@@ -19,6 +19,8 @@ export function sqliteAccounts(sqlite: SqliteStore): Accounts {
     get: (userId) => sqlite.getIdentity(userId),
     exists: (userId) => sqlite.identityExists(userId),
     purged: (userId) => sqlite.purgedUserId(userId),
+    removed: (userId) => sqlite.removedUserId(userId),
+    removedSince: (after, limit) => sqlite.removedSince(after, limit),
     idTaken: (userId) => sqlite.userIdTaken(userId),
     register: (input) => sqlite.registerIdentity(input),
     createInvited: (input) => sqlite.createInvitedIdentity(input),

@@ -65,6 +65,6 @@ export { StoreError } from "../store-error";
 /** A refusal's `reason` while storage is unavailable (accounting closed on a storage failure). */
 export { STORAGE_UNAVAILABLE } from "./accounting";
 /** How many retired IDs one accounts.dueRetiredIds returns at most: as many means more are due. */
-export { RETIRED_SWEEP_BATCH } from "./limits";
+export { MAX_REMOVALS_RESENT, RETIRED_SWEEP_BATCH } from "./limits";
 /** How many uploads one uploads.cleanup sweeps at most, and how long past its write expiry a pending upload is kept. */
 export { UPLOAD_SWEEP_BATCH, UPLOAD_WRITE_GRACE_MS } from "./limits";

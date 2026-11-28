@@ -209,3 +209,33 @@ it('revokes every token of a retired id, and of its bot, before freeing it', asy
 		expect(runtime.store.accounts.idTaken('gone')).toBe(false);
 	});
 });
+
+it('marks removed what /purge removes, an idle-pruned id once purged, and frees the mark with the id', async () => {
+	await withStore('removed-marks', { idleAccountMs: 30 * day, keptActiveAccounts: 0 }, (store, sql, clock) => {
+		const now = clock.now;
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', '0')");
+		const user = seed(sql, now);
+		user('idler', { created: 90 * day, seen: 80 * day });
+		user('purgee', { created: 2 * day });
+		const head = () => Number(sqliteOf(store).logBounds().latest_log_id);
+		// The idle prune retires an id, keeping what it left: no removal.
+		expect(store.accounts.pruneIdle(now).pruned).toEqual(['idler']);
+		expect(store.accounts.purged('idler')).toBe(true);
+		expect(store.accounts.removed('idler')).toBe(false);
+		expect(store.accounts.removedSince(0, 10)).toEqual([]);
+		// /purge removes for good: an account, and an id the idle prune retired; not an id no one had.
+		store.accounts.purge({ userIds: ['purgee', 'bot_purgee', 'idler', 'nobody'], now });
+		expect(store.accounts.removed('purgee')).toBe(true);
+		expect(store.accounts.removed('idler')).toBe(true);
+		expect(store.accounts.removed('bot_purgee')).toBe(false);
+		expect(store.accounts.removed('nobody')).toBe(false);
+		// Told again to a client at or before the position it happened at, not after.
+		expect(new Set(store.accounts.removedSince(head(), 10))).toEqual(new Set(['purgee', 'idler']));
+		expect(store.accounts.removedSince(head() + 1, 10)).toEqual([]);
+		expect(store.accounts.removedSince(0, 1)).toHaveLength(1);
+		// Freed with the retired id.
+		store.accounts.freeRetiredIds(['purgee', 'idler'], now);
+		expect(store.accounts.removed('purgee')).toBe(false);
+		expect(store.accounts.removedSince(0, 10)).toEqual([]);
+	});
+});

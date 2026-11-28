@@ -1048,6 +1048,9 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 		// Dave shares no room with Bob any more, but may still have what Bob left in general.
 		expect((await request(dave, 'leave-general', 'room_leave', { room_id: 'general' })).result).toEqual({});
 
+		// Where the log stood before the purge, as a client that drops now would resume from.
+		const listed = (await request(carol, 'list-before', 'room_list', { filter: 'joined' })).result.joined as Array<{ room_id: string; latest_log_id: string }>;
+		const before = listed.map((room) => room.latest_log_id).sort((a, b) => Number(a) - Number(b)).at(-1)!;
 		expect((await command(admin, 'purge', `/purge ${bobId}`)).frame.result).toEqual({});
 		// Carol, who shares rooms with Bob, is told to forget him and what he left (§3.3.3),
 		// with only his user_id; he had no bot, so nothing is sent for one.
@@ -1056,11 +1059,22 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 		expect(removed.skipped.some((frame) => frame.method === 'user' && frame.params?.old?.user_id === `bot_${bobId}`)).toBe(false);
 		// So is Dave, who shares no room with him now.
 		expect((await until(dave, (frame) => frame.method === 'user' && frame.params?.old !== undefined)).frame.params).toEqual({ new: {}, old: { user_id: bobId } });
-		// Purging him again tells everyone again, for a client that missed it; nothing is left to delete.
+		// Purging him again only tells everyone again, for a client that missed it: nothing is logged under him since.
 		const again = await command(admin, 'purge-again', `/purge @${bobId}`);
 		expect(again.frame.result).toEqual({});
-		expect(again.notice?.params.body.text).toContain('0 messages');
+		expect(again.notice?.params.body.text).toBe(`Purged \`${bobId}\` already: told every connection again.`);
 		expect((await until(carol, (frame) => frame.method === 'user' && frame.params?.old !== undefined)).frame.params).toEqual({ new: {}, old: { user_id: bobId } });
+		// A client resuming from before the purge is told after its listing; one from after it, not.
+		const eve = await signedIn(unique('eve'));
+		try {
+			const resumed = await exchange(eve, 'resume', 'room_list', { filter: 'joined', latest_log_id: before });
+			expect(resumed.frame.result.joined).toBeDefined();
+			expect((await until(eve, (frame) => frame.method === 'user' && frame.params?.old !== undefined)).frame.params).toEqual({ new: {}, old: { user_id: bobId } });
+			const latest = (resumed.frame.result.joined as Array<{ latest_log_id: string }>).map((room) => room.latest_log_id).sort((a, b) => Number(a) - Number(b)).at(-1)!;
+			await exchange(eve, 'resume-later', 'room_list', { filter: 'joined', latest_log_id: latest });
+			const next = await exchange(eve, 'after', 'room_list', { filter: 'joined' });
+			expect(next.skipped.some((frame) => frame.method === 'user' && frame.params?.old !== undefined)).toBe(false);
+		} finally { eve.close(); }
 		// A user_id no one ever had is still unknown.
 		expect((await command(admin, 'purge-unknown', `/purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
 		// The thread only Bob was in goes with him; the one Carol is in stays.
