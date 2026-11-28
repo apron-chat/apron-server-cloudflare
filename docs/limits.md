@@ -214,10 +214,11 @@ server offers `server.push.webhook`). Each limit is the server's policy
 | Who may register | Bots only: an owner's bot, or an account with the role `bot` | `denied` "Only bots may register a webhook here". |
 | `wake` | At least one of `mentions`, `replies`, `private`, `joined` (`records` is not offered) | `invalid_params` "wake selects no scope this server supports for webhooks". The same holds for `webpush`: a `wake` with none of its scopes, `[]` included, is `invalid_params`. |
 | Calls | 1,000 a UTC day per bot, 5,000 for the server; one at a time per webhook, at most 20 messages each | Left out, and counted in the next call's `skipped`. Catch up with `history`. |
-| Answer | 2xx within 30 seconds; redirects are not followed | A timeout, a failed connection, 429 or 5xx is retried after 5 and 30 seconds (a `Retry-After` of up to a minute is honoured, a longer one gives up); 3xx and other 4xx are not retried; 410 removes the registration. Five calls given up in a row make it `failing`: register again to be verified and called again. |
-| Frames in an answer | The first 10 lines of the first 64 KiB, run as the bot with the call token's powers, deduplicated by `id` | The rest are ignored, and the first that failed is kept in `error`; no results are sent. |
+| Answer | 2xx within 30 seconds; redirects are not followed | A timeout, a failed connection, 429 or 5xx is retried after 5 and 30 seconds (a `Retry-After` of up to a minute is honoured, a longer one gives up); 3xx and other 4xx are not retried; 410 removes the registration. A call given up makes it `failing`, with why in `error`; it is still called, and is `on` again after a success, until five are given up in a row: then register again to be verified and called again. |
+| Frames in an answer | The first 10 lines of the first 64 KiB, requests or notifications (such as `activity` typing), run as the bot with only the call token's powers, deduplicated by `id` | The rest are ignored, and the first the token does not allow or that failed is kept in `error`; no results are sent. |
 | Call token | Signs in until `token_expires` (15 minutes); `message`, `reactions`, `activity` and `history` only, in the bot's rooms | `denied` "A webhook token may only post, react, show typing and read history" or "acts only in the bot's rooms"; its first frame past expiry closes the connection (1008). |
-| Verification | Answered within 30 seconds, tried again after 5 and 30 seconds | `failing`, with why in `error`; register again to retry. |
+| Verification | Answered within 30 seconds, tried again after 5 and 30 seconds; its body is a `webhook` notification with only `server` and `you` | `failing`, with why in `error`. Registering again while `verifying` or `failing` sends a new verification. |
+| Owner pause (`/webhook pause`) | No calls, and the call tokens stop signing in | `state` is `paused` until `/webhook resume`, which verifies it again. |
 
 ### Uploads
 

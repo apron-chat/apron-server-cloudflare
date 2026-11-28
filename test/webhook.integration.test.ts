@@ -69,6 +69,8 @@ async function disconnected(userId: string): Promise<void> {
 }
 
 type Hit = { url: string; headers: Headers; body: string; json: any };
+/** A call, not a verification (which is a webhook notification too, with a challenge). */
+const isCall = (hit: Hit) => hit.json?.method === 'webhook' && hit.headers.get('webhook-challenge') === null;
 
 /**
  * A stand-in for every outbound request: verifications are answered with
@@ -222,6 +224,8 @@ describe('webhook registration', () => {
 			expect(Math.abs(timestamp - Date.now() / 1000)).toBeLessThan(60);
 			expect(base64Decode(verification.headers.get('webhook-challenge')!)?.byteLength).toBe(32);
 			expect(await verifyWebhookSignature([await publicKey()], endpointId, id, timestamp, verification.body, verification.headers.get('webhook-signature')!)).toBe(true);
+			// Its body is a webhook notification with only server and you: no attempt, no token, no records.
+			expect(verification.json).toEqual({ method: 'webhook', params: { server: 'wss://demo.test/ws', you: { user_id: botId, name: expect.any(String), roles: ['bot'] } } });
 			// Registering again keeps the endpoint_id and returns the state, verifying nothing again.
 			const before = hits.length;
 			const again = await request(bot, 'again', 'push_register', { kind: 'webhook', url, wake: ['mentions'] });
@@ -250,7 +254,31 @@ describe('webhook registration', () => {
 			vi.restoreAllMocks();
 			endpoint({ endpointId: () => endpointId });
 			const retried = await request(bot, 'retry', 'push_register', { kind: 'webhook', url });
-			expect(retried.result).toEqual({ endpoint_id: endpointId, state: 'verifying' });
+			expect(retried.result).toEqual({ endpoint_id: endpointId, state: 'verifying', error: expect.stringMatching(/verification failed/) });
+			await vi.waitFor(async () => expect((await hookOf(botId, url))?.state).toBe('on'));
+			// The last failure stays in `error`, whatever the state (§4.9.4).
+			expect((await request(bot, 'kept', 'push_register', { kind: 'webhook', url })).result).toEqual({ endpoint_id: endpointId, state: 'on', error: expect.stringMatching(/verification failed/) });
+		} finally { owner.close(); bot.close(); }
+	});
+
+	it('verifies again when registered again while still verifying', async () => {
+		const owner = await signedIn(unique('reverify'));
+		const { peer: bot, botId } = await botOf(owner);
+		// The first verification's retry is far off: the registration stays `verifying` meanwhile.
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).webhookRetryDelaysMs = [60_000, 60_000]; });
+		try {
+			const url = `https://bot.example/reverify/${crypto.randomUUID()}`;
+			let endpointId: string | undefined;
+			let known = false;
+			const hits = endpoint({ endpointId: () => known ? endpointId : undefined });
+			const challenges = () => hits.filter((hit) => hit.headers.get('webhook-challenge') !== null);
+			endpointId = (await request(bot, 'register', 'push_register', { kind: 'webhook', url })).result.endpoint_id;
+			await vi.waitFor(() => expect(challenges()).toHaveLength(1));
+			expect((await hookOf(botId, url))?.state).toBe('verifying');
+			// The bot has kept its endpoint_id now, and asks again: a new verification passes.
+			known = true;
+			expect((await request(bot, 'again', 'push_register', { kind: 'webhook', url })).result).toEqual({ endpoint_id: endpointId, state: 'verifying' });
+			await vi.waitFor(() => expect(challenges()).toHaveLength(2));
 			await vi.waitFor(async () => expect((await hookOf(botId, url))?.state).toBe('on'));
 		} finally { owner.close(); bot.close(); }
 	});
@@ -269,8 +297,8 @@ describe('webhook calls', () => {
 		try {
 			const posted = await request(owner, 'mention', 'message', { room_id: 'general', body: { text: `@${botId} hello`, mentions: [botId] } });
 			const messageId = posted.result.message_id;
-			await vi.waitFor(() => expect(hits.filter((hit) => hit.json?.method === 'webhook')).toHaveLength(1));
-			const call = hits.find((hit) => hit.json?.method === 'webhook')!;
+			await vi.waitFor(() => expect(hits.filter((hit) => isCall(hit))).toHaveLength(1));
+			const call = hits.find((hit) => isCall(hit))!;
 			expect(call.url).toBe(url);
 			expect(call.headers.get('content-type')).toMatch(/^application\/json/);
 			const id = call.headers.get('webhook-id')!;
@@ -305,8 +333,8 @@ describe('webhook calls', () => {
 			expect(reply.error).toBeUndefined();
 			// The owner replied to their own message: not to the bot, so still no call.
 			await request(owner, 'reply-bot', 'message', { room_id: 'general', reply_to: { message_id: botPost.message_id }, body: { text: 'tomorrow?' } });
-			await vi.waitFor(() => expect(hits.filter((hit) => hit.json?.method === 'webhook')).toHaveLength(2));
-			const second = hits.filter((hit) => hit.json?.method === 'webhook')[1].json.params;
+			await vi.waitFor(() => expect(hits.filter((hit) => isCall(hit))).toHaveLength(2));
+			const second = hits.filter((hit) => isCall(hit))[1].json.params;
 			expect(second.since).toBe(params.last_log_id);
 			const [answer] = second.messages;
 			expect(Object.values(second.wake)).toEqual([['replies']]);
@@ -323,7 +351,7 @@ describe('webhook calls', () => {
 			await request(owner, 'mention', 'message', { room_id: 'general', body: { text: `@${botId}`, mentions: [botId] } });
 			await until(bot, (frame) => frame.method === 'message' && frame.params.body?.text === `@${botId}`);
 			await new Promise((resolve) => setTimeout(resolve, 200));
-			expect(hits.filter((hit) => hit.json?.method === 'webhook')).toEqual([]);
+			expect(hits.filter((hit) => isCall(hit))).toEqual([]);
 		} finally { owner.close(); bot.close(); }
 	});
 
@@ -346,7 +374,7 @@ describe('webhook calls', () => {
 				return posted.result.message_id as string;
 			};
 			const messageId = await ask('first');
-			await vi.waitFor(() => expect(hits.filter((hit) => hit.json?.method === 'webhook')).toHaveLength(1));
+			await vi.waitFor(() => expect(hits.filter((hit) => isCall(hit))).toHaveLength(1));
 			const posted = await until(owner, (frame) => frame.method === 'message' && frame.params.from?.user_id === botId && frame.params.body?.text === 'Sunny, 21°C');
 			expect(posted.frame.params.reply_to).toEqual({ message_id: messageId });
 			await until(owner, (frame) => frame.method === 'reactions' && frame.params.message_id === messageId);
@@ -374,6 +402,22 @@ describe('webhook calls', () => {
 			const state = (await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.webhooks!.of(botId)[0]));
 			expect(state.error).toMatch(/frame 1 failed: A webhook token may only post, react, show typing and read history/);
 			expect(state.state).toBe('on');
+			// Notifications run too: typing reaches the room; one the token does not allow sets `error`.
+			await runInDurableObject(stub(), async (instance) => {
+				const server = instance as unknown as Runtime & { config: Record<string, unknown>; runWebhookFrames(hook: unknown, identity: unknown, text: string, until: number): Promise<void> };
+				server.config = { ...server.config, activityEnabled: true };
+				const hook = server.store.webhooks!.of(botId)[0];
+				const lines = [
+					JSON.stringify({ method: 'activity', params: { room_id: 'general', typing: 5 } }),
+					JSON.stringify({ method: 'activity', params: { room_id: 'private_elsewhere', typing: 5 } }),
+				];
+				await server.runWebhookFrames(hook, server.store.accounts.get(botId), lines.join('\n'), Date.now() + 60_000);
+				server.config = { ...server.config, activityEnabled: false };
+			});
+			const typing = await until(owner, (frame) => frame.method === 'activity');
+			expect(typing.frame.params).toMatchObject({ room_id: 'general', from: { user_id: botId }, typing: 5 });
+			const after = (await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.webhooks!.of(botId)[0]));
+			expect(after.error).toMatch(/frame 2 failed: A webhook token acts only in the bot's rooms/);
 		} finally { owner.close(); }
 	});
 
@@ -388,7 +432,7 @@ describe('webhook calls', () => {
 		await vi.waitFor(async () => expect((await hookOf(botId, url))?.state).toBe('on'));
 		bot.close();
 		await disconnected(botId);
-		const calls = () => hits.filter((hit) => hit.json?.method === 'webhook');
+		const calls = () => hits.filter((hit) => isCall(hit));
 		try {
 			await request(owner, 'one', 'message', { room_id: 'general', body: { text: `@${botId} one`, mentions: [botId] } });
 			await vi.waitFor(() => expect(calls()).toHaveLength(2));
@@ -401,6 +445,8 @@ describe('webhook calls', () => {
 			await request(owner, 'two', 'message', { room_id: 'general', body: { text: `@${botId} two`, mentions: [botId] } });
 			await vi.waitFor(() => expect(calls()).toHaveLength(3));
 			await vi.waitFor(async () => expect((await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.webhooks!.of(botId)[0])).error).toMatch(/call failed: HTTP 404/));
+			// Given up, it is `failing` (§4.9.4), and still called until five are given up in a row.
+			expect((await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.webhooks!.of(botId)[0])).state).toBe('failing');
 			await new Promise((resolve) => setTimeout(resolve, 100));
 			expect(calls()).toHaveLength(3);
 			// A 410 removes the registration.
@@ -418,8 +464,9 @@ describe('webhook calls', () => {
 		await disconnected(botId);
 		try {
 			const posted = await request(owner, 'mention', 'message', { room_id: 'general', body: { text: `@${botId}`, mentions: [botId] } });
-			await vi.waitFor(() => expect(hits.filter((hit) => hit.json?.method === 'webhook')).toHaveLength(1));
-			const params = hits.find((hit) => hit.json?.method === 'webhook')!.json.params;
+			await vi.waitFor(() => expect(hits.filter((hit) => isCall(hit))).toHaveLength(1));
+			const params = hits.find((hit) => isCall(hit))!.json.params;
+			// No records, and none of wake, rooms, joined, left or users (§4.9.4).
 			expect(Object.keys(params).sort()).toEqual(['attempt', 'latest_log_id', 'server', 'token', 'token_expires', 'you']);
 			expect(BigInt(params.latest_log_id)).toBeGreaterThan(0n);
 			expect(posted.result.message_id).toBeDefined();
@@ -458,8 +505,8 @@ describe('call tokens', () => {
 		await disconnected(botId);
 		try {
 			await request(owner, 'mention', 'message', { room_id: 'general', body: { text: `@${botId}`, mentions: [botId] } });
-			await vi.waitFor(() => expect(hits.filter((hit) => hit.json?.method === 'webhook')).toHaveLength(1));
-			const token = hits.find((hit) => hit.json?.method === 'webhook')!.json.params.token;
+			await vi.waitFor(() => expect(hits.filter((hit) => isCall(hit))).toHaveLength(1));
+			const token = hits.find((hit) => isCall(hit))!.json.params.token;
 			const peer = await connect(null);
 			try {
 				await peer.next();
@@ -502,12 +549,12 @@ describe('owner controls', () => {
 			expect(shown.notice!.params.body.text).toContain(endpointId);
 			expect(shown.notice!.params.body.text).toContain(': on,');
 			await command(owner, 'pause', '/webhook pause');
-			expect((await request(bot, 'paused', 'push_register', { kind: 'webhook', url })).result).toEqual({ endpoint_id: endpointId, state: 'failing', error: expect.stringMatching(/paused/) });
+			expect((await request(bot, 'paused', 'push_register', { kind: 'webhook', url })).result).toEqual({ endpoint_id: endpointId, state: 'paused' });
 			bot.close();
 			await disconnected(botId);
 			await request(owner, 'mention', 'message', { room_id: 'general', body: { text: `@${botId}`, mentions: [botId] } });
 			await new Promise((resolve) => setTimeout(resolve, 200));
-			expect(hits.filter((hit) => hit.json?.method === 'webhook')).toEqual([]);
+			expect(hits.filter((hit) => isCall(hit))).toEqual([]);
 			await command(owner, 'resume', '/webhook resume');
 			await vi.waitFor(async () => expect((await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.webhooks!.of(botId)[0])).state).toBe('on'));
 			await command(owner, 'remove', '/webhook remove');

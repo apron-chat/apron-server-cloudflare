@@ -17,7 +17,7 @@ import type { Sql, StoreCore } from "./core";
 import { MAX_PUSH_URL_BYTES } from "../domain";
 import { WEBHOOKS_DDL } from "./schema";
 
-/** The states a webhook is in: the protocol's three, and `paused` by its bot's owner (shown as `failing`). */
+/** The states a webhook is in (protocol §4.9.4); `paused` while its bot's owner paused it. */
 export type WebhookState = "verifying" | "on" | "failing" | "paused";
 export type WebhookFormat = "full" | "knock";
 
@@ -143,8 +143,9 @@ export class WebhooksModule {
    * `push_register` kind `webhook`: keeps the user's registration of `url`.
    * Only for accounts webhookAccount allows (`denied` otherwise), read from
    * the identity row. Registering a held `url` again keeps its `endpoint_id`
-   * and changes its scopes, format and server; one `failing` is verified
-   * again (`verifying`), one its owner paused stays paused. A new one starts
+   * and changes its scopes, format and server; one `verifying` or `failing`
+   * is verified again (as `verifying`, its last `error` kept), one its owner
+   * paused stays paused (protocol §4.9.4). A new one starts
    * `verifying`, with a fresh `endpoint_id`, within WEBHOOK_LIMITS.perUser
    * for the user and perServer for the server (`denied` past either).
    * `verify` says whether the caller sends an endpoint verification now.
@@ -182,15 +183,12 @@ export class WebhooksModule {
       const changed = held.wake !== input.wake || held.format !== input.format || held.server !== input.server || state !== held.state;
       if (changed) {
         sql.exec(
-          "UPDATE webhooks SET wake = ?, format = ?, server = ?, state = ?, error = CASE WHEN ? THEN '' ELSE error END, failures = CASE WHEN ? THEN 0 ELSE failures END, updated_ms = ? WHERE user_id = ? AND url = ?",
-          input.wake, input.format, input.server, state, state !== held.state ? 1 : 0, state !== held.state ? 1 : 0, effective, input.userId, input.url,
+          "UPDATE webhooks SET wake = ?, format = ?, server = ?, state = ?, failures = CASE WHEN ? THEN 0 ELSE failures END, updated_ms = ? WHERE user_id = ? AND url = ?",
+          input.wake, input.format, input.server, state, state !== held.state ? 1 : 0, effective, input.userId, input.url,
         );
       }
       const row: WebhookRecord = { ...held, wake: input.wake, format: input.format, server: input.server, state, ...(changed ? { updatedMs: effective } : {}) };
-      if (state !== held.state) {
-        delete row.error;
-        row.failures = 0;
-      }
+      if (state !== held.state) row.failures = 0;
       return { row, verify: state === "verifying" };
     }));
     this.invalidate();

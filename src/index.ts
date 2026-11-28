@@ -1960,13 +1960,26 @@ function webhookEndpointError(value: string): string | null {
 
 /**
  * A webhook registration as `push_register` answers it (§4.9.4): its
- * `endpoint_id` and `state`, with `error` when it has one. One its bot's
- * owner paused shows as `failing`, since the protocol has no other state
- * that calls nothing.
+ * `endpoint_id` and `state` (`verifying`, `on`, `paused` while its bot's
+ * owner paused it, or `failing`), with `error`, the last failed
+ * verification, call or answer frame, with any state.
  */
 function webhookResult(hook: WebhookRecord): Record<string, unknown> {
-	if (hook.state === "paused") return { endpoint_id: hook.endpointId, state: "failing", error: "paused by the bot's owner (/webhook resume)" };
 	return { endpoint_id: hook.endpointId, state: hook.state, ...(hook.error ? { error: hook.error } : {}) };
+}
+
+/** The account a webhook call or verification is for, as `you` (§4.9.4): its user object with `roles`. */
+function webhookYou(identity: { userId: string; name: string; roles: string[]; avatar?: string }): { user_id: string; name: string; roles: string[]; avatar?: string } {
+	return { user_id: identity.userId, name: identity.name, roles: identity.roles, ...(identity.avatar ? { avatar: identity.avatar } : {}) };
+}
+
+/**
+ * Whether a webhook is called: `on`, or `failing` from calls given up
+ * (`failures`) fewer than WEBHOOK_LIMITS.failingAfter in a row. One failing
+ * its verification (no failures counted) is not, nor one paused.
+ */
+function webhookCallable(hook: WebhookRecord): boolean {
+	return hook.state === "on" || (hook.state === "failing" && hook.failures > 0 && hook.failures < WEBHOOK_LIMITS.failingAfter);
 }
 
 /** The scope names of a WAKE_SCOPES bitmask, in their order. */
@@ -2003,6 +2016,8 @@ interface WebhookQueue {
 class WebhookSocket {
 	readyState = 1;
 	readonly sent: string[] = [];
+	/** The messages of the errors its frames failed with, notifications' included, which get no reply (ApronDemoServer.fail). */
+	readonly failures: string[] = [];
 	private attachment: unknown;
 	serializeAttachment(value: unknown): void { this.attachment = structuredClone(value); }
 	deserializeAttachment(): unknown { return structuredClone(this.attachment); }
@@ -3844,6 +3859,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private fail(socket: WebSocketConnection, request: RequestFrame | null, error: ProtocolError): void {
 		this.noteRefusal(request, error);
+		// A webhook answer's frame, request or notification, that failed: kept for the registration's `error`.
+		if (this.webhookSockets.has(socket)) (socket as unknown as WebhookSocket).failures.push(error.message);
 		if (request && request.id === undefined) return;
 		this.send(socket, protocolError(request?.id, error));
 		const retry = error.data?.retry_after;
@@ -7607,9 +7624,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * and `private`, and one that selects none of WEBHOOK_WAKE_SCOPES is
 	 * `invalid_params`; `format` is `full` (the default) or `knock`. The
 	 * result is `{endpoint_id, state, error?}`; a `url` registered again keeps
-	 * its `endpoint_id`. A new registration, or one that was `failing`, is
-	 * verified after the result (verifyWebhook), which carries what the
-	 * answer needs.
+	 * its `endpoint_id`. A new registration, or one still `verifying` or
+	 * `failing`, is verified after the result (verifyWebhook), which carries
+	 * what the answer needs; one paused by its bot's owner stays `paused`.
 	 */
 	private async handleWebhookRegister(webhooks: Webhooks, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!webhookAccount(attachment.userId!, attachment.tier, attachment.roles ?? [])) {
@@ -7643,7 +7660,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Verifies a webhook's url (Standard Webhooks endpoint verification): a
-	 * signed POST of `{}` with a fresh `webhook-challenge`, which passes on a
+	 * signed POST of a `webhook` notification with only `server` and `you`
+	 * (§4.9.4), so a url that serves several registrations can tell which
+	 * `endpoint_id` to answer with, and a fresh `webhook-challenge`; it passes on a
 	 * 2xx whose `webhook-challenge-response` answers it for one of the
 	 * signing keys and the `endpoint_id`. One that times out, cannot connect,
 	 * or gets 429 or 5xx is tried again on the retry schedule; a 410 removes
@@ -7656,13 +7675,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!webhooks || !keys) return;
 		let error = "verification failed";
 		try {
+			const identity = this.store.accounts.get(hook.userId);
+			if (!identity) return;
+			const body = JSON.stringify({ method: "webhook", params: { server: hook.server, you: webhookYou(identity) } });
 			for (let retry = 0; ; retry++) {
 				const challenge = newChallenge();
-				const outcome = await postWebhook({ url: hook.url, endpointId: hook.endpointId, msgId: newWebhookId("msg_"), body: "{}", keys, nowMs: nowMs(), challenge });
+				const outcome = await postWebhook({ url: hook.url, endpointId: hook.endpointId, msgId: newWebhookId("msg_"), body, keys, nowMs: nowMs(), challenge });
 				recordMetric(this.runtimeEnv.METRICS, "webhook", ["verify", String(outcome.status)], 1);
 				const answered = outcome.status >= 200 && outcome.status < 300;
 				if (answered && await checkVerificationResponse(keys, hook.endpointId, challenge, outcome.challengeResponse)) {
-					webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "on", error: null, failures: 0, now: nowMs() });
+					// `error` keeps the last failure, whatever the state (§4.9.4).
+					webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "on", failures: 0, now: nowMs() });
 					return;
 				}
 				if (outcome.status === 410) {
@@ -7678,7 +7701,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// Registered again or removed meanwhile: that registration's own verification decides.
 				if (!webhooks.all().some((entry) => entry.endpointId === hook.endpointId && entry.state === "verifying")) return;
 			}
-			webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "failing", error: `${new Date(nowMs()).toISOString()} ${error}`, now: nowMs() });
+			// Not called while it fails its verification (no failed calls counted: webhookCallable).
+			webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "failing", failures: 0, error: `${new Date(nowMs()).toISOString()} ${error}`, now: nowMs() });
 		} catch (failure) {
 			console.warn(JSON.stringify({ event: "webhook_verification_failed", reason: errorToProtocol(failure).message }));
 		}
@@ -7708,7 +7732,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!webhooks || !this.webhookSigning || !message.message_id || !message.log_id) return;
 		let live: WebhookRecord[];
 		try {
-			live = webhooks.all().filter((hook) => hook.state === "on" && hook.userId !== message.from.user_id);
+			live = webhooks.all().filter((hook) => webhookCallable(hook) && hook.userId !== message.from.user_id);
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "webhook_lookup_failed", reason: errorToProtocol(error).message }));
 			return;
@@ -7741,7 +7765,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!joined && !left) return;
 		let hooks: WebhookRecord[];
 		try {
-			hooks = webhooks.all().filter((hook) => hook.userId === userId && hook.state === "on");
+			hooks = webhooks.all().filter((hook) => hook.userId === userId && webhookCallable(hook));
 		} catch {
 			return;
 		}
@@ -7775,7 +7799,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			while (queue.items.length) {
 				const items = queue.items.splice(0, WEBHOOK_LIMITS.messagesPerCall);
 				const hook = this.store.webhooks?.all().find((entry) => entry.userId === userId && entry.endpointId === endpointId);
-				if (!hook || hook.state !== "on") {
+				if (!hook || !webhookCallable(hook)) {
 					queue.items.length = 0;
 					break;
 				}
@@ -7866,7 +7890,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			console.warn(JSON.stringify({ event: "webhook_allowance_reached", user_id: hook.userId }));
 			return;
 		}
-		const you: PublicUser = { user_id: identity.userId, name: identity.name, roles: identity.roles, ...(identity.avatar ? { avatar: identity.avatar } : {}) };
+		const you = webhookYou(identity);
 		const expires = now + WEBHOOK_TOKEN_TTL_MS;
 		const token = await signWebhookToken(keys[0], { userId: identity.userId, createdMs: identity.createdMs ?? 0, expiresMs: expires });
 		const since = queue.since;
@@ -7916,7 +7940,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const outcome = await postWebhook({ url: hook.url, endpointId: hook.endpointId, msgId, body, keys, nowMs: nowMs(), readBody: true });
 			recordMetric(this.runtimeEnv.METRICS, "webhook", ["call", String(outcome.status)], 1);
 			if (outcome.status >= 200 && outcome.status < 300) {
-				const current = hook.failures ? webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, failures: 0, error: null, now: nowMs() }) : hook;
+				// A success after calls given up is `on` again; `error` keeps the last failure (§4.9.4).
+				const current = hook.failures || hook.state !== "on" ? webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "on", failures: 0, now: nowMs() }) : hook;
 				if (current && outcome.body) await this.runWebhookFrames(current, identity, outcome.body, expires);
 				return;
 			}
@@ -7929,24 +7954,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (delay === undefined) break;
 			await this.webhookWait(delay);
 			const still = webhooks.all().find((entry) => entry.endpointId === hook.endpointId);
-			if (!still || still.state !== "on") return;
+			if (!still || !webhookCallable(still)) return;
 		}
-		const failures = hook.failures + 1;
+		// Given up: `failing` (§4.9.4), still called until WEBHOOK_LIMITS.failingAfter in a row (webhookCallable).
 		webhooks.update({
-			userId: hook.userId, endpointId: hook.endpointId, failures, error: `${new Date(nowMs()).toISOString()} ${error}`,
-			...(failures >= WEBHOOK_LIMITS.failingAfter ? { state: "failing" as const } : {}), now: nowMs(),
+			userId: hook.userId, endpointId: hook.endpointId, state: "failing", failures: hook.failures + 1, error: `${new Date(nowMs()).toISOString()} ${error}`, now: nowMs(),
 		});
 	}
 
 	/**
-	 * Runs the request frames a call's 2xx answer holds (§4.9.4), one a line,
+	 * Runs the frames a call's 2xx answer holds (§4.9.4), requests or
+	 * notifications (such as `activity` typing), one a line,
 	 * in order, at most WEBHOOK_LIMITS.framesPerResponse, as the bot with
 	 * the call token's limits (WEBHOOK_TOKEN_METHODS in its rooms, until the
 	 * token expires): on a connection in memory only (WebhookSocket), through
 	 * the same path as a socket's frames, so each is charged, limited and
 	 * deduplicated as any request (§1.2), and gets no result. The first one
-	 * that failed, or frames past the limit, are kept in the registration's
-	 * `error`.
+	 * that the token does not allow or that failed (a notification's
+	 * included, caught in `fail`), or frames past the limit, are kept in the
+	 * registration's `error`, whatever its state.
 	 */
 	private async runWebhookFrames(hook: WebhookRecord, identity: { userId: string; name: string; roles: string[]; rooms: string[]; avatar?: string; ext?: Record<string, unknown> }, text: string, until: number): Promise<void> {
 		const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -7972,11 +7998,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(connection, attachment);
 			for (const [index, line] of frames.entries()) {
 				if (socket.readyState !== 1) break;
-				const before = socket.sent.length;
+				const before = socket.failures.length;
 				await this.processFrame(connection, line);
-				const failed = socket.sent.slice(before).map((sent) => { try { return JSON.parse(sent) as Record<string, unknown>; } catch { return null; } })
-					.find((frame) => isObject(frame?.error));
-				if (failed && error === undefined) error = `frame ${index + 1} failed: ${String((failed.error as Record<string, unknown>).message ?? "error").slice(0, 120)}`;
+				const failed = socket.failures[before];
+				if (failed !== undefined && error === undefined) error = `frame ${index + 1} failed: ${failed.slice(0, 120)}`;
 			}
 		} catch (failure) {
 			error = `frames not run: ${errorToProtocol(failure).message}`;
@@ -8059,7 +8084,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const hook of hooks) {
 			if (action === "pause" && hook.state !== "paused") webhooks.update({ userId: botId, endpointId: hook.endpointId, state: "paused", now });
 			if (action === "resume" && hook.state === "paused") {
-				const resumed = webhooks.update({ userId: botId, endpointId: hook.endpointId, state: "verifying", error: null, failures: 0, now });
+				const resumed = webhooks.update({ userId: botId, endpointId: hook.endpointId, state: "verifying", failures: 0, now });
 				if (resumed) this.ctx.waitUntil(this.verifyWebhook(resumed));
 			}
 			if (action === "remove") webhooks.forget({ userId: botId, endpointId: hook.endpointId, now });

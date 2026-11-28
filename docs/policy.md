@@ -300,8 +300,11 @@ within it:
   with no wait, coalescing or mute. Each call carries the messages, their
   rooms and users with `roles`, the replied-to message, and a 15-minute
   token that signs in as the bot to post, react, show typing and read
-  history in its rooms. The bot may answer with up to 10 request frames,
-  which run as it. Webhooks do not lapse; a bot with one is not signed out
+  history in its rooms. The bot may answer with up to 10 frames, requests
+  or notifications, which run as it with only that token's powers. The
+  state is `verifying`, `on`, `paused` (by its owner) or `failing`, with
+  the last failure in `error`; registering again while `verifying` or
+  `failing` verifies again. Webhooks do not lapse; a bot with one is not signed out
   as idle. Its owner sees, pauses, resumes and removes it with `/webhook`.
   At most 1,000 calls a bot and 5,000 in all a day; see
   [SPEC section 4.4](../SPEC.md#webhooks) and [limits](limits.md#webhooks).
