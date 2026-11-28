@@ -74,10 +74,8 @@ export const HISTORY_TARGET_SCAN = 200;
 export const PRESSURE_CLEANUP_RETRY_MS = 5 * 60_000;
 /** Rewrites the log holds at most: a /purge or /rename past it waits for the links to catch up (retry_after). */
 export const MAX_HISTORY_REWRITES = 200;
-/** Removals (`removed:` markers) one resuming `room_list` announces at most. */
+/** Removals one resuming `room_list` announces at most, the newest. */
 export const MAX_REMOVALS_RESENT = 256;
-/** The newest removals kept by position (`removed_at:`), which a resuming `room_list` reads from where it stood. */
-export const REMOVED_RING = 32;
 /**
  * The records one restoreRoom call takes at most (an import's batch): a
  * room with more is restored over several calls, oldest records first.

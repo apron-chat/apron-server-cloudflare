@@ -240,8 +240,8 @@ it('marks removed what /purge removes, an idle-pruned id once purged, and frees 
 	});
 });
 
-it('keeps the newest removals by position for a resume, reading every marker only for a client from before those', async () => {
-	await withStore('removed-ring', {}, (store, sql, clock) => {
+it('keeps every removal by position for a resume, newest first, leaving out ids taken again and stale positions', async () => {
+	await withStore('removed-at', {}, (store, sql, clock) => {
 		const now = clock.now;
 		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', '0')");
 		const user = seed(sql, now);
@@ -250,7 +250,7 @@ it('keeps the newest removals by position for a resume, reading every marker onl
 			userId: `poster ${text}`, ipKey: `ip ${text}`, requestId: text, method: 'message', now,
 			params: { room_id: 'general', body: { format: 'plain', text } }, identity: { user_id: `poster ${text}`, name: 'Poster' },
 		});
-		const ids = Array.from({ length: 34 }, (_, i) => `gone_${String(i).padStart(2, '0')}`);
+		const ids = Array.from({ length: 40 }, (_, i) => `gone_${String(i).padStart(2, '0')}`);
 		const at: number[] = [];
 		for (const id of ids) {
 			user(id, { created: day });
@@ -258,22 +258,26 @@ it('keeps the newest removals by position for a resume, reading every marker onl
 			store.accounts.purge({ userIds: [id], now });
 			at.push(Number(sqliteOf(store).logBounds().latest_log_id));
 		}
-		const ring = () => sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key LIKE 'removed_at:%' ORDER BY key").toArray().map((row) => row.key.split(':')[2]);
-		const floor = () => sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'removed_floor'").toArray()[0]?.value;
-		// The newest 32 by position; the floor is the newest one dropped.
-		expect(ring()).toEqual(ids.slice(2));
-		expect(floor()).toBe(String(at[1]));
-		// Above the floor: from the ring, oldest first.
-		expect(store.accounts.removedSince(at[10], 256)).toEqual(ids.slice(10));
-		expect(store.accounts.removedSince(at[33] + 1, 256)).toEqual([]);
-		// At or below it some were dropped from the ring: every marker is read, oldest first.
-		expect(store.accounts.removedSince(at[1], 256)).toEqual(ids.slice(1));
-		expect(store.accounts.removedSince(0, 256)).toEqual(ids);
-		expect(store.accounts.removedSince(0, 5)).toEqual(ids.slice(0, 5));
-		// Freeing an id frees its place in the ring; the floor stays.
-		store.accounts.freeRetiredIds([ids[33], ids[0]], now);
-		expect(ring()).toEqual(ids.slice(2, 33));
-		expect(floor()).toBe(String(at[1]));
-		expect(store.accounts.removedSince(0, 256)).toEqual(ids.slice(1, 33));
+		const keys = () => sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key LIKE 'removed_at:%' ORDER BY key").toArray().map((row) => row.key.split(':')[2]);
+		// One for each removal, however many.
+		expect(keys()).toEqual(ids);
+		// From where a client stood, newest first; at most the limit, the newest.
+		expect(store.accounts.removedSince(at[30], 256)).toEqual(ids.slice(30).reverse());
+		expect(store.accounts.removedSince(at[39] + 1, 256)).toEqual([]);
+		expect(store.accounts.removedSince(0, 3)).toEqual(ids.slice(37).reverse());
+		// An id with an identity again (a bot made anew) is not told as removed.
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json, seen_ms) VALUES (?, '', 'bot', 'registered', ?, ?, '[\"bot\"]', 0)", ids[39], now, now);
+		expect(store.accounts.removedSince(at[38], 256)).toEqual([ids[38]]);
+		// Removed again, it is at its new position only.
+		post('again');
+		store.accounts.purge({ userIds: [ids[39]], now });
+		const again = Number(sqliteOf(store).logBounds().latest_log_id);
+		expect(keys().filter((id) => id === ids[39])).toHaveLength(1);
+		expect(store.accounts.removedSince(again, 256)).toEqual([ids[39]]);
+		// Freed with its id: both keys go.
+		store.accounts.freeRetiredIds([ids[39], ids[0]], now);
+		expect(keys()).toEqual(ids.slice(1, 39));
+		expect(store.accounts.removed(ids[39])).toBe(false);
+		expect(store.accounts.removedSince(0, 256)).toEqual(ids.slice(1, 39).reverse());
 	});
 });

@@ -9315,6 +9315,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The idle prune retired it, keeping what it left: that goes now, and the
 		// removal is announced as for any purge.
 		const known = (id: string) => present(id) || this.store.accounts.purged(id);
+		const retiredOnly = !present(userId);
 		if (!known(userId)) {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
@@ -9333,6 +9334,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let purged = { messages: 0, reactions: 0, deletedUploads: [] as string[] };
 		await this.runMutation(async () => {
+			// A retired id is checked again where nothing interleaves: the daily
+			// sweep may have freed it meanwhile, and a new account taken it.
+			if (retiredOnly && (this.store.accounts.exists(userId) || !this.store.accounts.purged(userId))) {
+				throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+			}
 			purged = this.store.accounts.purge({ userIds, now: nowMs() });
 		});
 		for (const id of existing) this.announceRemoved(id);

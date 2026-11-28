@@ -1,6 +1,6 @@
 {
-	"version": "161ee09-dirty",
-	"commit": "161ee09e1b56cd13805048784be89da0f52b617b",
+	"version": "21a5e06-dirty",
+	"commit": "21a5e06596d05629fdb3f060d4ea136f5ae87056",
 	"heldAlarms": 0,
 	"steps": [
 		{
@@ -189,9 +189,9 @@
 		},
 		{
 			"step": "room_list (joined, resuming)",
-			"reads": 11,
+			"reads": 10,
 			"writes": 4,
-			"reservedReads": 3595,
+			"reservedReads": 4075,
 			"reservedWrites": 32
 		},
 		{
