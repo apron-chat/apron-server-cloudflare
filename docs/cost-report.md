@@ -614,6 +614,31 @@ post anyway. `pushesPerDay` (5,000 on Paid, 1,000 on Free) bounds them; on
 Paid that is at most about 50,000 claim writes a day if every push were its
 own wake, about 7% of the foreground write ceiling.
 
+### Webhooks
+
+Push kind `webhook` (SPEC section 4.4, Webhooks) is matched from memory:
+an instance reads every registration once (at most 32 rows, one range of
+the `webhooks` table's key, which has no other index), on the first new
+message after a wake, and keeps them until it writes one. On a server with
+`WEBHOOK_SIGNING_KEY` set that read is in the cost profile's first post of
+the day (2 rows read and 1 written with its reservation, where the table is
+empty), and the table's creation in a new object's wake (1 row read, 2
+written). A message that calls no webhook reads nothing more; the replied-to
+author's lookup is shared with the web push wake.
+
+A call reads the bot's identity row, each message's room row and, for a
+reply, the replied-to message (one metered read each), and writes the two
+call counters (`principal_limits` scope `webhook`, `global` and
+`user:<bot>`). The registration is written only when its state, error or
+failure count changes: a verification, a failed or given-up call, the first
+success after failures, a frame of an answer that failed. The frames an
+answer holds cost what the same frames cost on a socket, and reserve a
+frame block of exactly their number. `callsPerDay` (5,000) bounds the
+counter writes at about 10,000 a day. The calls are outbound requests; the
+object stays awake while one waits for an answer (up to 30 seconds) or a
+retry (5 and 30 seconds), at most about two and a half minutes for a call
+that never answers.
+
 ## User status
 
 Measured with

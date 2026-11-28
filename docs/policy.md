@@ -113,7 +113,8 @@ within it:
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run. Registered users other than bots have `/invite-bot` (a bot
   token), `/invite-device add [<id>]`, `/invite-device list` and
-  `/invite-device remove <id>` (tokens for other devices), and `/passkeys`,
+  `/invite-device remove <id>` (tokens for other devices), `/passkeys`, and
+  with webhooks `/webhook [pause|resume|remove]` (their bot's webhooks),
   and all registered users, bots included, have `/avatar` with uploads (all
   below); anyone who may post has, with live text, `/embed-terminal
   [<title>]` and `/embed-append [<markdown>]` (below); those with the role
@@ -252,9 +253,11 @@ within it:
   1 to 64 letters, digits, `_` or `-`, and an optional `wake` list of
   scopes), at most 5 each; guests cannot. The scopes are `mentions` and
   `replies` (the default), `private`, and `joined`, which is kept only for an
-  `admin` or `mod` (not an owner's bot) and listed in `server.push.wake` only
-  on their connections; a sign-in or role change that changes that sends a
-  new `server` frame. Registrations are each user's own, and lapse after 7
+  `admin` or `mod` (not an owner's bot) and listed in
+  `server.push.webpush.wake` (and, for clients of protocol version 10, in
+  `server.push.wake`) only on their connections; a sign-in or role change
+  that changes that sends a new `server` frame. A `wake` with none of these
+  scopes, `[]` included, is refused (`invalid_params`). Registrations are each user's own, and lapse after 7
   days without being registered again (clients register on every
   connection). Endpoints must be public `https` hosts on an allowed push
   service (the browsers' own, plus `push.stupidtech.net` on the demo), not
@@ -285,6 +288,23 @@ within it:
   cursor), left out of a push only for `joined`; and the message without
   `log_id`, its text cut to 200 characters, without format or embeds, in at
   most 2048 bytes.
+- Webhooks (`server.push` kind `webhook`, where `WEBHOOK_SIGNING_KEY` is
+  set): only bots (an owner's bot, or an account with the role `bot`)
+  register one, `push_register` `{kind: "webhook", url, wake?, format?}`, on
+  any public `https` host, at most 2 a bot and 32 on the server. The server
+  verifies the url (Standard Webhooks endpoint verification) before calling
+  it, then calls it, signed with Ed25519 (`v2a`), for each new message that
+  mentions the bot, replies to it, or is in its private room (the default;
+  `joined` adds every message in its rooms), and when it is added to or
+  removed from a room, but only while the bot has no connection open, and
+  with no wait, coalescing or mute. Each call carries the messages, their
+  rooms and users with `roles`, the replied-to message, and a 15-minute
+  token that signs in as the bot to post, react, show typing and read
+  history in its rooms. The bot may answer with up to 10 request frames,
+  which run as it. Webhooks do not lapse; a bot with one is not signed out
+  as idle. Its owner sees, pauses, resumes and removes it with `/webhook`.
+  At most 1,000 calls a bot and 5,000 in all a day; see
+  [SPEC section 4.4](../SPEC.md#webhooks) and [limits](limits.md#webhooks).
 - Messages: a request without `room_id` is in `general`, except a command
   that requires one (`/kick`, `/embed-terminal`, `/embed-append`), which is
   refused without it. A new message with

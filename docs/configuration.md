@@ -681,6 +681,44 @@ Pushes are outbound requests from the Durable Object, which no Worker or
 Durable Object allowance counts and no edge rule needs to allow. Their SQL is
 in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
 
+## Webhooks
+
+Bots can be called instead of keeping a connection open: push kind
+`webhook` (protocol §4.9.4, [SPEC section 4.4](../SPEC.md#44-push),
+Webhooks). It is off, and `server.push.webhook` absent, until the
+`WEBHOOK_SIGNING_KEY` secret is set; it needs neither VAPID keys nor the
+plan's `push` policy, though `server.push` then carries only `webhook`.
+
+1. **Key.** `node scripts/webhook-key.mjs` prints a new Ed25519 key as
+   `WEBHOOK_SIGNING_KEY=whsk_…` (Standard Webhooks' serialization: the
+   32-byte seed in base64) and, as a comment, its `whpk_` public key.
+2. **Secret.** `npx wrangler secret put WEBHOOK_SIGNING_KEY --config
+   wrangler.production.toml`, pasting the `whsk_…` value. Never put it in
+   source. Locally, put it in `.dev.vars`.
+
+The public key is advertised to every client as
+`server.push.webhook.signature_keys`; bots trust it to check every call
+(`webhook-signature`, scheme `v2a`). The same key derives the HMAC key that
+signs each call's short-lived `apron_webhook_` token.
+
+**Rotating.** `WEBHOOK_SIGNING_KEY` takes up to three `whsk_` keys separated
+by spaces or commas, the new one first: every call and verification is then
+signed with each, `signature_keys` lists each, and tokens signed with any of
+them still sign in. Give bots time to trust the new public key, then remove
+the old one. Removing the secret turns webhooks off: stored registrations
+stay, uncalled, until it is set again. A malformed list fails the
+configuration check.
+
+Limits (fixed in `src/webhook.ts`, `WEBHOOK_LIMITS`; [limits](limits.md#webhooks)):
+2 webhooks a bot, 32 on the server, 1,000 calls a bot and 5,000 on the server
+each UTC day, 20 messages a call, 10 request frames run from an answer
+(of its first 64 KiB), 30 seconds to answer, and retries after 5 and 30
+seconds.
+
+Calls are outbound requests from the Durable Object, which no Worker or
+Durable Object allowance counts; the object stays awake while one waits for
+its answer or its retry, at most about two and a half minutes a call.
+
 ## User status (presence)
 
 With push on, the server advertises capability `status` (protocol §4.5):
@@ -1249,6 +1287,7 @@ implementation and recalibrating its resource model.
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
 | `MEDIA_NOSNIFF` | `true` once the media host sends `X-Content-Type-Options: nosniff` (the `apron_media_nosniff` edge rule): attachments may then be Markdown text, listed as `text/markdown` in `ext.media.upload`. Unset or `false`, text is refused, as nothing would stop a page loading an uploaded text as a script. Not needed where `MEDIA_ORIGIN` is `PUBLIC_ORIGIN`: the Worker serves its uploads with `nosniff` itself |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s and live text `url`s point at; with `UPLOAD_SIGNING_KEY`, configures live text |
+| `WEBHOOK_SIGNING_KEY` | Secret: up to three `whsk_` Ed25519 keys, the current one first, that sign webhook calls and their tokens; turns push kind `webhook` on (see [Webhooks](#webhooks)). Set with `npx wrangler secret put WEBHOOK_SIGNING_KEY --config wrangler.production.toml` |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s, of uploads and of live text; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
 | `VAPID_PUBLIC_KEY` | Uncompressed P-256 public key, unpadded base64url (`node scripts/vapid-keys.mjs`); with `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`, turns push on and is advertised as `server.push.webpush.key` |
 | `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |

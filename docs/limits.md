@@ -201,7 +201,23 @@ and time to quote to an admin. Show it like any other `~private` message.
 | `activity` `read_message_id` | 10 relayed a minute per account, apart from typing's, to its other connections and, in a private room, the other members' (read receipts); registered accounts only (a guest's is dropped, without an error) | Kept but not relayed: the account's other devices, and a private room's members, get it after their next `room_list` of joined rooms. Send it as a notification, only while signed in to an account, at most one a room every few seconds. |
 | `status` idle changes | 12 a minute per connection | `retry_after` "Idle changes limited". `idle: false` is never refused. |
 | `status` mute and `me` status changes | 6 a minute per account, together | `retry_after` "Mute changes limited" / "Status changes limited". |
-| `push_register` | 10 a minute per account | `retry_after` "Push registrations limited". |
+| `push_register` | 10 a minute per account, both kinds together | `retry_after` "Push registrations limited". |
+
+### Webhooks
+
+For bots registered with push kind `webhook` (protocol §4.9.4; where the
+server offers `server.push.webhook`). Each limit is the server's policy
+(`WEBHOOK_LIMITS` in `src/webhook.ts`).
+
+| What | Limit | Past it |
+| --- | --- | --- |
+| Who may register | Bots only: an owner's bot, or an account with the role `bot` | `denied` "Only bots may register a webhook here". |
+| `wake` | At least one of `mentions`, `replies`, `private`, `joined` (`records` is not offered) | `invalid_params` "wake selects no scope this server supports for webhooks". The same holds for `webpush`: a `wake` with none of its scopes, `[]` included, is `invalid_params`. |
+| Calls | 1,000 a UTC day per bot, 5,000 for the server; one at a time per webhook, at most 20 messages each | Left out, and counted in the next call's `skipped`. Catch up with `history`. |
+| Answer | 2xx within 30 seconds; redirects are not followed | A timeout, a failed connection, 429 or 5xx is retried after 5 and 30 seconds (a `Retry-After` of up to a minute is honoured, a longer one gives up); 3xx and other 4xx are not retried; 410 removes the registration. Five calls given up in a row make it `failing`: register again to be verified and called again. |
+| Frames in an answer | The first 10 lines of the first 64 KiB, run as the bot with the call token's powers, deduplicated by `id` | The rest are ignored, and the first that failed is kept in `error`; no results are sent. |
+| Call token | Signs in until `token_expires` (15 minutes); `message`, `reactions`, `activity` and `history` only, in the bot's rooms | `denied` "A webhook token may only post, react, show typing and read history" or "acts only in the bot's rooms"; its first frame past expiry closes the connection (1008). |
+| Verification | Answered within 30 seconds, tried again after 5 and 30 seconds | `failing`, with why in `error`; register again to retry. |
 
 ### Uploads
 
@@ -291,6 +307,7 @@ first.
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
+| Webhooks per bot / on the server | 2 / 32 |
 | Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
 The thread and private-room caps count the rooms started in the last 30 days: they limit how fast rooms are started, not how many exist. A room stops counting 30 days after it was started, or as soon as everyone has left it; posting in, joining or leaving a room never needs a slot, however old. Rooms are kept as long as their history. A room list names every top-level room and the most recently active threads, twice the server's thread limit (200); an older one is still there by its `room_id`. A user may be in at most 1,000 rooms; leave one to join another.
