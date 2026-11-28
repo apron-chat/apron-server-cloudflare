@@ -1802,6 +1802,16 @@ export class SqliteStore {
     return this.reserved("isRetiredUserId", { reads: 8 }, true, now, () => this.retiredUserId(userId));
   }
 
+  /**
+   * Whether `/purge` or the idle prune retired this `user_id` (`purged:`) and
+   * it is not yet freed: no identity has it, and what is still logged under
+   * it is its own. One `_meta` read.
+   */
+  purgedUserId(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved("purgedUserId", { reads: 4 }, true, now, () => this.metaValue(META_PURGED_PREFIX + userId) !== "");
+  }
+
   private retiredUserId(userId: string): boolean {
     return this.metaValue(META_RENAMED_PREFIX + userId) !== "" || this.metaValue(META_PURGED_PREFIX + userId) !== "";
   }

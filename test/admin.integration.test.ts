@@ -1056,6 +1056,13 @@ it('/purge removes the threads it leaves empty, and retires the user_id so a ses
 		expect(removed.skipped.some((frame) => frame.method === 'user' && frame.params?.old?.user_id === `bot_${bobId}`)).toBe(false);
 		// So is Dave, who shares no room with him now.
 		expect((await until(dave, (frame) => frame.method === 'user' && frame.params?.old !== undefined)).frame.params).toEqual({ new: {}, old: { user_id: bobId } });
+		// Purging him again tells everyone again, for a client that missed it; nothing is left to delete.
+		const again = await command(admin, 'purge-again', `/purge @${bobId}`);
+		expect(again.frame.result).toEqual({});
+		expect(again.notice?.params.body.text).toContain('0 messages');
+		expect((await until(carol, (frame) => frame.method === 'user' && frame.params?.old !== undefined)).frame.params).toEqual({ new: {}, old: { user_id: bobId } });
+		// A user_id no one ever had is still unknown.
+		expect((await command(admin, 'purge-unknown', `/purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
 		// The thread only Bob was in goes with him; the one Carol is in stays.
 		expect(await exists(alone)).toBe(false);
 		expect(await exists(shared)).toBe(true);

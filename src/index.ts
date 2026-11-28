@@ -9289,7 +9289,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
-		if (!this.store.accounts.exists(userId) && !this.connectionsOf(userId).length) {
+		// A user_id a purge or the idle prune retired may be purged again: what is
+		// still logged under it goes (all the idle prune kept), and every
+		// connection is told again, as a client that missed the first may need.
+		const known = (id: string) => this.store.accounts.exists(id) || this.connectionsOf(id).length > 0 || this.store.accounts.purged(id);
+		if (!known(userId)) {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
 		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
@@ -9298,8 +9302,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const roomsOf = new Map<string, Set<string>>();
 		for (const id of userIds) roomsOf.set(id, new Set([...(this.liveRoomsOf(id) ?? []), ...(this.store.accounts.get(id)?.rooms ?? [])]));
 		const rooms = new Set([...roomsOf.values()].flatMap((ids) => [...ids]));
-		// Those of them that exist (a user may have no bot): only they are announced gone.
-		const existing = userIds.filter((id) => this.store.accounts.exists(id) || this.connectionsOf(id).length > 0);
+		// Those of them that exist or were retired (a user may have no bot): only they are announced gone.
+		const existing = userIds.filter(known);
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);

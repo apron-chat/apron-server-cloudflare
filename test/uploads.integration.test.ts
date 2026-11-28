@@ -1232,7 +1232,10 @@ describe('uploads end to end', () => {
 			await expect.poll(async () => await media().head(url.slice('https://media.test/'.length))).toBeNull();
 			const history = await request(admin, 'history', 'history', { room_id: 'general', limit: 50 });
 			expect(JSON.stringify(history.result)).not.toContain(userId);
-			expect((await request(admin, 'again', 'command', { room_id: 'general', body: { text: `/purge ${userId}` } })).error.code).toBe(-32602);
+			// Purged again, the retired id has nothing left to delete; the purge is announced again.
+			const again = await exchange(admin, 'again', 'command', { room_id: 'general', body: { text: `/purge ${userId}` } });
+			expect(again.frame.result).toEqual({});
+			expect(again.skipped.find((candidate) => candidate.params?.from?.user_id === '~private')!.params.body.text).toBe(`Purged \`${userId}\`: 0 messages, 0 reaction sets, 0 uploads.`);
 			expect((await request(admin, 'self', 'command', { room_id: 'general', body: { text: '/purge admin' } })).error.code).toBe(-32001);
 		} finally { spammer.close(); admin.close(); }
 	});

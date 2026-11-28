@@ -29,6 +29,8 @@ export interface Accounts {
   get(userId: string): StoredIdentity | null;
   /** Whether an identity has this `user_id` now, one indexed read. */
   exists(userId: string): boolean;
+  /** Whether `/purge` or the idle prune retired this `user_id`, not yet freed: one `_meta` read. */
+  purged(userId: string): boolean;
   /**
    * Whether a `user_id` may not be issued: an identity has it, `/rename`
    * retired it, or `/purge` or the idle prune retired it and it is not yet
