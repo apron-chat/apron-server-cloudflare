@@ -51,8 +51,10 @@
 
 export { openStore } from "./open";
 export type {
-  Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Store, Uploads,
+  Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Store, Uploads, Webhooks,
 } from "./parts";
+export type { WebhookFormat, WebhookRecord, WebhookState } from "./webhooks";
+export { webhookAccount } from "./webhooks";
 export type {
   AccountingGuard, Broadcast, ClaimedPush, EmojiDraft, EmojiEdit, EmojiEntry, Identity, LiveEntry, LiveFinish, MessageSnapshot, OverrunNotice,
   PendingHistory, PendingUpload, PushCandidate, PushClaim, PushSubscriptionRecord, RoomMember, RoomNotesCheck, RoomRecord, StatusInputRecord,

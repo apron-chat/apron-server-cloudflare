@@ -30,6 +30,9 @@ const EXCEPTIONS: Record<string, Record<string, string>> = {
     room_mutes: "a claim lets only mentions through a room's mute",
     principal_limits: "the day's push counters and `unread` are rows of the limiter table",
   },
+  "webhooks.ts": {
+    principal_limits: "the day's webhook call counters are rows of the limiter table",
+  },
   "reads.ts": {
     _meta: "the presence toggle and when it was turned on, read in one statement",
     memberships: "read receipts list a private room's other members",

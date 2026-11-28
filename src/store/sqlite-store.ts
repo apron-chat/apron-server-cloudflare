@@ -20,6 +20,7 @@ import { UploadsModule } from "./uploads";
 import { ReadsModule } from "./reads";
 import { AdmissionModule } from "./admission";
 import { PushModule } from "./push";
+import { WebhooksModule } from "./webhooks";
 import type {
   AccountingGuard, Broadcast, PendingUpload, RoomMember, StoreCleanupResult, DurableSqlStorageLike, DurableStateLike, Identity, LiveEntry,
   MessageSnapshot, MutationMethod, OverrunNotice, RoomNotesCheck, RoomRecord, SqlCursorLike, SqlStorageLike, StoreClock, StoreMutationInput,
@@ -267,6 +268,8 @@ export class SqliteStore {
   readonly admission: AdmissionModule;
   /** Web Push registrations, wakes and claims (push.ts). */
   readonly pushes: PushModule;
+  /** Webhook registrations and their call counters (webhooks.ts). */
+  readonly webhooks: WebhooksModule;
 
   private makeCore(): StoreCore {
     // The getters read the store's config and clock as they are now (a test may replace them).
@@ -320,6 +323,7 @@ export class SqliteStore {
       markUnsafe: (error) => this.markAccountingUnsafe("uncertain", error),
     }, this.config);
     this.pushes = new PushModule(this.core);
+    this.webhooks = new WebhooksModule(this.core);
     this.admission = new AdmissionModule(this.core);
     this.readState = new ReadsModule(this.core, this.pushes);
     this.uploads = new UploadsModule(this.core);
@@ -2563,9 +2567,11 @@ export class SqliteStore {
         ...ids, ...ids,
       );
       this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
-      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+      this.webhooks.ensureTable(this.sqlHandle);
+      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "webhooks", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
+      this.webhooks.invalidate();
       // Their limiter rows, by primary key, and the count the cap reads lowered by as many.
       const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (${marks})`;
       const limiterKeys = [...USER_LIMIT_SCOPES, ...ids.map((id) => `user:${id}`)];
@@ -2667,7 +2673,8 @@ export class SqliteStore {
       const ids = [...candidates, ...bots];
       const list = JSON.stringify(ids);
       let rows = 0;
-      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests"]) {
+      this.webhooks.ensureTable(this.sqlHandle);
+      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "webhooks", "user_status", "room_mutes", "accepted_requests"]) {
         rows += integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN (SELECT value FROM json_each(?))`, list)[0]?.count);
       }
       return { ids, rows, full: candidates.length === IDLE_PRUNE_BATCH };
@@ -2694,9 +2701,10 @@ export class SqliteStore {
           list, list,
         );
         this.rawExec("UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (SELECT value FROM json_each(?))", list);
-        for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+        for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "webhooks", "user_status", "room_mutes", "accepted_requests", "identities"]) {
           this.rawExec(`DELETE FROM ${table} WHERE user_id IN (SELECT value FROM json_each(?))`, list);
         }
+        this.webhooks.invalidate();
         const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (SELECT value FROM json_each(?))`;
         const limiterKeys = [...USER_LIMIT_SCOPES, JSON.stringify(ids.map((id) => `user:${id}`))];
         const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);

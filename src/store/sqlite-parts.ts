@@ -10,7 +10,7 @@ import { newTerminalOutputKey } from "./rows";
 import { type HeadStore, type RestoreStore, storeExport, storeHead, storeRestore } from "./history";
 import type { SqliteStore } from "./sqlite-store";
 import type {
-  Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Uploads,
+  Accounts, Admission, Credentials, History, Lifecycle, LiveText, Messages, Meter, Ops, Push, Reads, Rooms, Server, Uploads, Webhooks,
 } from "./parts";
 
 /** Accounts over SqliteStore. */
@@ -234,6 +234,22 @@ export function sqliteHistory(sqlite: SqliteStore): History {
     setMeta: (key, value, now) => sqlite.historyLog.setHistoryMeta(key, value, now),
     importJournal: (now) => sqlite.historyLog.historyImportJournal(now),
     chunkIndex: (tier) => sqlite.historyLog.chunkIndex(tier),
+  };
+}
+
+/** Webhooks over SqliteStore. */
+export function sqliteWebhooks(sqlite: SqliteStore): Webhooks {
+  const hooks = sqlite.webhooks;
+  return {
+    all: (now) => hooks.all(now),
+    of: (userId, now) => hooks.of(userId, now),
+    register: (input) => hooks.register(input),
+    remove: (input) => hooks.remove(input),
+    forget: (input) => hooks.forget(input),
+    update: (input) => hooks.update(input),
+    chargeCall: (userId, now) => hooks.chargeCall(userId, now),
+    message: (messageId, now) => hooks.message(messageId, now),
+    callsToday: (now) => hooks.callsToday(now),
   };
 }
 

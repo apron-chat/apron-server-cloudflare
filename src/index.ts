@@ -34,6 +34,10 @@ import { EMPTY_MESSAGE, limitData } from "./store-error";
 import { ADMIN_USER_ID } from "./user-ids";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
+import {
+	describeOutcome, importWebhookSigningKey, newChallenge, newWebhookId, postWebhook, retryableOutcome, retryDelay, checkVerificationResponse,
+	signWebhookToken, verifyWebhookToken, WEBHOOK_LIMITS, WEBHOOK_TOKEN_PREFIX, WEBHOOK_TOKEN_TTL_MS, type WebhookOutcome, type WebhookSigningKey,
+} from "./webhook";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
 	apronLink,
@@ -64,6 +68,7 @@ import {
 	type LiveText,
 	type Push,
 	type Uploads,
+	type Webhooks,
 	type Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
@@ -85,6 +90,9 @@ import {
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
+	type WebhookFormat,
+	type WebhookRecord,
+	webhookAccount,
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import {
@@ -275,6 +283,12 @@ interface ConnectionAttachment {
 	challenge?: ChallengeRecord;
 	/** When the connection was accepted, which a connection that never pings is judged stale from (staleAfter). */
 	openedAt?: number;
+	/**
+	 * Signed in with a webhook call's short-lived token (§4.9.4): until when
+	 * it may send, and only WEBHOOK_TOKEN_METHODS in its rooms. Past it the
+	 * connection is closed at its next frame.
+	 */
+	webhookUntil?: number;
 	authDeadline: number;
 	pendingFrames: number;
 	pendingBytes: number;
@@ -668,6 +682,15 @@ function deviceArgs(words: readonly string[], usage: string): DeviceArgs {
 	return { action: "remove", id: words[2] };
 }
 
+/** `/webhook`'s action: show the owner's bot's webhooks, or pause, resume or remove them. */
+type WebhookAction = "show" | "pause" | "resume" | "remove";
+
+function webhookArgs(words: readonly string[], usage: string): WebhookAction {
+	if (words.length === 1) return "show";
+	if (words.length === 2 && (words[1] === "pause" || words[1] === "resume" || words[1] === "remove")) return words[1];
+	throw usageError(`Usage: ${usage}`);
+}
+
 /** `/passkeys`' arguments: list the sender's passkeys, or remove the one numbered `remove`. */
 type PasskeysArgs = { remove?: PasskeyNumber };
 
@@ -796,6 +819,19 @@ function isGuestId(userId: string): boolean {
 const ALERT_IP_KEY = "alert";
 /** Admins one alert mentions and pushes to: as many as one message may wake, which bounds the claim's reservation. */
 const MAX_ALERT_ADMINS = PUSH_POLICY?.wakesPerMessage ?? 10;
+/** The wake scopes this server supports for push kind `webhook` (§4.9.2): not `records`. */
+const WEBHOOK_WAKE_SCOPES = ["mentions", "replies", "private", "joined"] as const;
+/** Without `wake`, a webhook wakes for these (§4.9.2: `mentions`, `replies`, and `private` for a webhook). */
+const DEFAULT_WEBHOOK_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies | WAKE_SCOPES.private;
+/** The formats this server offers for webhook calls (§4.9.4). */
+const WEBHOOK_FORMATS: readonly WebhookFormat[] = ["full", "knock"];
+/**
+ * What a connection signed in with a webhook call's token may send
+ * (§4.9.4 `token`; recipes/bot.md): post, react, show typing and read
+ * history, in the account's rooms (webhookTokenRefusal); and `ping`, and
+ * `auth`, refused as on any connection already signed in.
+ */
+const WEBHOOK_TOKEN_METHODS: ReadonlySet<string> = new Set(["message", "reactions", "activity", "history", "ping", "auth"]);
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
 const BOT_TOKEN_PREFIX = "apron_bot_";
 /** Key prefix for bot tokens in key-value storage, by the token's SHA-256 like sessions. */
@@ -1300,6 +1336,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		ogMediaHosts: config.ogMediaHosts,
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
+		webhooks: !!config.webhook,
 		liveText: config.liveText ? { ...config.liveText.policy, publicOrigin: config.liveText.publicOrigin, enabled: config.liveTextEnabled } : null,
 		// A member listing is reused until anything it read is written, and
 		// never longer than a status change may wait.
@@ -1357,6 +1394,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
 			...(typeof attachment.credential === "string" && CREDENTIAL_KEY_PATTERN.test(attachment.credential) ? { credential: attachment.credential } : {}),
 			...(challenge ? { challenge } : {}),
+			...(Number.isSafeInteger(attachment.webhookUntil) ? { webhookUntil: attachment.webhookUntil } : {}),
 			...(Array.isArray(attachment.rooms) ? {
 				rooms: attachment.rooms.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64).slice(0, MAX_ATTACHED_ROOMS),
 			} : {}),
@@ -1552,7 +1590,7 @@ function connectionDeadlines(attachment: ConnectionAttachment): Array<[Connectio
  * connection now is, its rooms and credential, and the read cursors it
  * wrote for the user before.
  */
-const SIGN_IN_FIELDS = ["tier", "userId", "name", "avatar", "roles", "ext", "rooms", "listedJoined", "credential", "reads", "readsAt"] as const satisfies ReadonlyArray<keyof ConnectionAttachment>;
+const SIGN_IN_FIELDS = ["tier", "userId", "name", "avatar", "roles", "ext", "rooms", "listedJoined", "credential", "reads", "readsAt", "webhookUntil"] as const satisfies ReadonlyArray<keyof ConnectionAttachment>;
 
 /**
  * Writes the fields `owned` of a copy of a connection's attachment read
@@ -1907,6 +1945,69 @@ function pushEndpointError(value: string, hosts: RuntimeConfig["pushHosts"]): st
 	}
 	if (!pushHostAllowed(hosts, host)) return "push service not allowed here";
 	return null;
+}
+
+/**
+ * A webhook endpoint (§4.9.4): a public `https` URL with no credentials or
+ * port, like a push endpoint (pushEndpointError) but on any public host,
+ * since PUSH_HOSTS names push services. Endpoint verification (verifyWebhook)
+ * then shows that the URL answers for the account.
+ */
+function webhookEndpointError(value: string): string | null {
+	const problem = pushEndpointError(value, "*");
+	return problem === "url must name a public push service" ? "url must name a public host" : problem;
+}
+
+/**
+ * A webhook registration as `push_register` answers it (§4.9.4): its
+ * `endpoint_id` and `state`, with `error` when it has one. One its bot's
+ * owner paused shows as `failing`, since the protocol has no other state
+ * that calls nothing.
+ */
+function webhookResult(hook: WebhookRecord): Record<string, unknown> {
+	if (hook.state === "paused") return { endpoint_id: hook.endpointId, state: "failing", error: "paused by the bot's owner (/webhook resume)" };
+	return { endpoint_id: hook.endpointId, state: hook.state, ...(hook.error ? { error: hook.error } : {}) };
+}
+
+/** The scope names of a WAKE_SCOPES bitmask, in their order. */
+function scopeNames(mask: number): string[] {
+	return Object.entries(WAKE_SCOPES).flatMap(([name, bit]) => mask & bit ? [name] : []);
+}
+
+/** One thing a webhook call carries: a new message and the scopes it matched, or a change to the account's rooms (§4.2.3). */
+interface WebhookItem {
+	message?: MessageSnapshot;
+	reasons?: number;
+	joined?: unknown[];
+	left?: unknown[];
+	users?: unknown[];
+}
+
+/**
+ * One webhook's calls in memory: what waits for the next call, whether one
+ * is being made, where the last call ended (`since`), and how many were left
+ * out for a limit since (`skipped`).
+ */
+interface WebhookQueue {
+	items: WebhookItem[];
+	running: boolean;
+	since?: string;
+	skipped: number;
+}
+
+/**
+ * The connection a webhook response's frames run on (runWebhookFrames): in
+ * memory only, never accepted by the runtime, so no broadcast reaches it;
+ * it keeps what it is sent, to report a frame that failed.
+ */
+class WebhookSocket {
+	readyState = 1;
+	readonly sent: string[] = [];
+	private attachment: unknown;
+	serializeAttachment(value: unknown): void { this.attachment = structuredClone(value); }
+	deserializeAttachment(): unknown { return structuredClone(this.attachment); }
+	send(data: string): void { if (this.sent.length < 64) this.sent.push(data); }
+	close(): void { this.readyState = 3; }
 }
 
 /** Entries a `push_register` `wake` may list, known or not. */
@@ -2877,6 +2978,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private presenceBusy = false;
 	private readonly presenceQueue: Array<() => void> = [];
 
+	/** Push kind `webhook`'s signing keys (WEBHOOK_SIGNING_KEY), current first, imported as the object starts; undefined without webhooks. */
+	private webhookSigning: WebhookSigningKey[] | undefined;
+	/** Each webhook's calls waiting and its place (`since`), by endpoint ID, in memory (queueWebhook); a restart starts over. */
+	private readonly webhookQueues = new Map<string, WebhookQueue>();
+	/** The in-memory connections that run a webhook response's frames (runWebhookFrames). */
+	private readonly webhookSockets = new WeakSet<object>();
+	/** The waits before each retry of a webhook call or verification (WEBHOOK_LIMITS.retryDelaysMs); tests shorten them. */
+	private webhookRetryDelaysMs: readonly number[] = WEBHOOK_LIMITS.retryDelaysMs;
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.runtimeEnv = env;
@@ -2925,6 +3035,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// webSocketMessage; the time of the last answer tells a live peer from
 		// one that vanished without a close frame (see isStale).
 		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING_REQUEST, PING_RESPONSE));
+		// The webhook keys before any event: the server frame advertises their public halves.
+		const webhookKeys = this.config.webhook?.signingKeys;
+		if (webhookKeys) {
+			void ctx.blockConcurrencyWhile(async () => {
+				this.webhookSigning = await Promise.all(webhookKeys.map((key) => importWebhookSigningKey(key)));
+			});
+		}
 		if (this.store.lifecycle.requiresReset()) {
 			// Stored data from another schema version is wiped, not migrated. The
 			// input gate holds every event until the fresh schema exists.
@@ -3338,6 +3455,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		try {
 			for (const userId of this.store.accounts.idleBots({ now, before: now - BOT_IDLE_MS, limit: 4, intervalMs: BOT_SWEEP_INTERVAL_MS, graceMs: BOT_IDLE_MS }) ?? []) {
+				// A bot its webhook calls stays signed in however rarely it is called (recipes/bot.md): it counts as active instead.
+				if (this.store.webhooks?.of(userId).some((hook) => hook.state !== "paused")) {
+					this.store.accounts.markBotActive(userId, now);
+					continue;
+				}
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
@@ -3481,6 +3603,32 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return protocol.name === "retry_after" ? response : remembered(response, protocol.name);
 	}
 
+	/**
+	 * `server.push` (§4.9): each kind this server offers, with its public
+	 * configuration and the wake scopes it supports. `webpush` carries the
+	 * VAPID key browsers subscribe with, and `joined` only for a connection
+	 * whose user may wake for it (wakesJoined), since a server advertises
+	 * only the scopes it implements. For clients of protocol version 10 it
+	 * also carries the key as `key`, and the top-level `wake` the web push
+	 * scopes (§4.9: servers MAY; apron-web and StupidSocial still read them).
+	 * `webhook`, where WEBHOOK_SIGNING_KEY is set, carries the `whpk_` keys
+	 * that sign its calls, its scopes (`joined` for every bot, which alone
+	 * may register one) and its formats; never `records`, which this server
+	 * does not implement.
+	 */
+	private pushConfiguration(wakeJoined: boolean): Record<string, unknown> {
+		const push: Record<string, unknown> = {};
+		if (this.config.push) {
+			const wake = Object.keys(WAKE_SCOPES).filter((scope) => wakeJoined || scope !== "joined");
+			push.webpush = { vapid_key: this.config.push.publicKey, wake, key: this.config.push.publicKey };
+			push.wake = wake;
+		}
+		if (this.webhookSigning) {
+			push.webhook = { signature_keys: this.webhookSigning.map((key) => key.publicText), wake: [...WEBHOOK_WAKE_SCOPES], format: [...WEBHOOK_FORMATS] };
+		}
+		return push;
+	}
+
 	private serverAnnouncement(origin: string | null, endpoint: string | undefined, wakeJoined = false): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
@@ -3493,8 +3641,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			params: {
 				// The protocol version, the implementation string, and the
 				// capabilities (§3.1).
-				apron: 10,
-				agent: "apron-cloudflare-demo/10",
+				apron: 11,
+				agent: "apron-cloudflare-demo/11",
 				capabilities: [
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.activityOn() ? ["activity"] : []),
@@ -3545,11 +3693,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				...this.serverMetadata(general),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
-				// Web Push (§4.9), with the VAPID key browsers subscribe with and
-				// the wake scopes: `joined` only to a connection whose user may wake
-				// for it (wakesJoined), since a server advertises only the scopes it
-				// implements, and ignores the others in `wake`.
-				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES).filter((scope) => wakeJoined || scope !== "joined") } } : {}),
+				// Push (§4.9): each kind's configuration with the wake scopes it
+				// supports (pushConfiguration).
+				...(this.config.push || this.webhookSigning ? { push: this.pushConfiguration(wakeJoined) } : {}),
 				// The optional `status` values `me` accepts (§3.1, §4.5), only while
 				// others are shown them: with presence off a choice is still kept,
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
@@ -3766,7 +3912,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code, reason.slice(0, 120)); } catch { /* already closed */ }
-		if (!closed) {
+		// A webhook answer's connection (WebhookSocket) was never the user's: its close changes no status.
+		if (!closed && !this.webhookSockets.has(socket)) {
 			this.refusals.note("close", `${code} ${reason}`, detail, nowMs());
 			this.connectionGone(attachment);
 		}
@@ -3901,6 +4048,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A request method sent without an `id` is ignored, as §1.1 lets a
 		// server (REQUEST_METHODS): no change, and no reply.
 		if (request.id === undefined && REQUEST_METHODS.has(request.method)) return;
+		// A connection signed in with a webhook call's token: closed once it expires, limited until then (§4.9.4).
+		if (attachment.webhookUntil !== undefined) {
+			if (nowMs() >= attachment.webhookUntil) {
+				this.closePolicy(socket, attachment, 1008, "Webhook token expired; sign in again");
+				return;
+			}
+			const refusal = this.webhookTokenRefusal(attachment, request);
+			if (refusal) throw refusal;
+		}
 		// A frame from a connection not idle is its user attended (see attended),
 		// a stale one resuming included: what was pushed is unread no longer.
 		if (!attachment.idle) this.clearUnread(attachment);
@@ -3938,18 +4094,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!this.config.push) break;
 				this.handleStatus(socket, request);
 				return;
-			case "push_register": {
-				const push = this.store.push;
-				if (!push) break;
-				await this.handlePushRegister(push, socket, attachment, request);
+			case "push_register":
+				if (!this.store.push && !this.store.webhooks) break;
+				await this.handlePushRegister(socket, attachment, request);
 				return;
-			}
-			case "push_unregister": {
-				const push = this.store.push;
-				if (!push) break;
-				this.handlePushUnregister(push, socket, attachment, request);
+			case "push_unregister":
+				if (!this.store.push && !this.store.webhooks) break;
+				this.handlePushUnregister(socket, attachment, request);
 				return;
-			}
 			case "room_list":
 				await this.handleRoomList(socket, attachment, request);
 				return;
@@ -4041,6 +4193,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const token = requiredString(params, "token");
 			if (this.config.adminToken !== undefined && await sameToken(token, this.config.adminToken)) await this.handleAdminToken(socket, attachment, request);
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
+			else if (token.startsWith(WEBHOOK_TOKEN_PREFIX)) await this.handleWebhookToken(socket, attachment, request, token);
 			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
 			else if (token.startsWith(DEVICE_TOKEN_PREFIX)) await this.handleDeviceToken(socket, attachment, request, token);
 			else if (token.startsWith(JOIN_TOKEN_PREFIX)) await this.handleJoinToken(socket, attachment, request, token);
@@ -5990,6 +6143,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const state = peer ? connectionAttachment(peer) : null;
 				const joiner = state ? this.complete(state) : null;
 				if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), joiner, totals.get(room.room_id), change.membership));
+				else if (this.store.webhooks?.of(userId).length) {
+					// A bot away from its connections hears of it through its webhook (§4.9.4).
+					const stored = this.store.accounts.get(userId);
+					if (stored) this.webhookRoomChange(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), { user_id: userId, name: stored.name, roles: stored.roles }, totals.get(room.room_id), change.membership));
+				}
 				this.announceJoiner(userId, room.room_id);
 			}
 			this.reply(socket, request, {});
@@ -7340,15 +7498,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `push_register` (§4.9) for push kind `webpush`: `{kind: "webpush", url,
+	 * `push_register` (§4.9.1): kind `webhook` goes to handleWebhookRegister
+	 * where webhooks are on; this handles kind `webpush` (§4.9.3), and any
+	 * other kind is `invalid_params`. For `webpush`: `{kind: "webpush", url,
 	 * keys: {p256dh, auth}, push_id?}`, the browser's `PushSubscription.toJSON()`
 	 * with `kind` added (`expirationTime` is ignored). `push_id`, 1 to 64
 	 * letters, digits, `_` or `-`, goes unchanged into every push to this
 	 * registration. `wake` lists the scopes it wakes for (§4.9): at most
 	 * MAX_WAKE_ENTRIES strings of at most 64 characters; scopes this server
 	 * does not implement are ignored, and so is `joined` for a user without
-	 * one of JOINED_WAKE_ROLES (the store drops it); `[]` wakes for nothing,
-	 * and without it the registration wakes for `mentions` and `replies`. At most
+	 * one of JOINED_WAKE_ROLES (the store drops it); a `wake` left with no
+	 * scope, `[]` included, is `invalid_params` (§4.9.2, v11), and without it
+	 * the registration wakes for `mentions` and `replies`. At most
 	 * `registersPerUserMinute` a user, across their
 	 * connections; past that, `retry_after`. Registered users only; a
 	 * guest's identity lasts one connection, so there is no one to wake. The
@@ -7357,7 +7518,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * registering a `url` again replaces their own registration of it
 	 * (Store.registerPushSubscription).
 	 */
-	private async handlePushRegister(push: Push, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+	private async handlePushRegister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const now = nowMs();
@@ -7365,11 +7526,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.pushRegisters.take(attachment.userId!, now)) {
 			throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: this.pushRegisters.retry(attachment.userId!, now) ?? 1 } } satisfies ProtocolError;
 		}
+		const kind = requiredString(request.params, "kind");
+		const webhooks = this.store.webhooks;
+		if (kind === "webhook" && webhooks && this.webhookSigning) return this.handleWebhookRegister(webhooks, socket, attachment, request);
+		const push = this.store.push;
+		if (kind !== "webpush" || !push) {
+			const offered = [...(push ? ["webpush"] : []), ...(webhooks ? ["webhook"] : [])].join(" and ");
+			throw { name: "invalid_params", message: `Unknown push kind; this server offers ${offered}` } satisfies ProtocolError;
+		}
 		const params = request.params;
-		const kind = requiredString(params, "kind");
-		if (kind !== "webpush") throw { name: "invalid_params", message: "Unknown push kind; this server offers webpush" } satisfies ProtocolError;
 		const sent = requiredString(params, "url");
 		const wake = wakeParam(params.wake);
+		// A wake that selects no scope this server supports for the kind is refused (§4.9.2):
+		// `joined` counts only for a user who may wake for it, as the store checks again.
+		if (wake !== undefined && (wake & ~(this.wakesJoined(attachment) ? 0 : WAKE_SCOPES.joined)) === 0) {
+			throw { name: "invalid_params", message: "wake selects no scope this server supports for webpush" } satisfies ProtocolError;
+		}
 		const pushId = optionalString(params, "push_id");
 		if (pushId !== undefined && !PUSH_ID_PATTERN.test(pushId)) throw { name: "invalid_params", message: "push_id must be 1 to 64 letters, digits, _ or -" } satisfies ProtocolError;
 		// A url past the size limit is too_large (§1.1); other endpoint problems are invalid_params.
@@ -7391,6 +7563,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
 		push.register({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
+		// One registration a user and url (§4.9.1): a webhook of the same url gives way (no SQL when there is none).
+		this.store.webhooks?.remove({ userId: current.userId, url, now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -7399,7 +7573,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * an unknown one is already gone, as is one too long to have been
 	 * registered, which is answered without SQL.
 	 */
-	private handlePushUnregister(push: Push, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+	private handlePushUnregister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const sent = requiredString(request.params, "url");
@@ -7411,7 +7585,496 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// As registration stores it; an unparsable url was never registered.
 		let url = sent;
 		try { url = new URL(sent).href; } catch { /* removes nothing */ }
-		push.remove({ userId: attachment.userId!, url, now: nowMs() });
+		// Either kind's registration of the url: the protocol keys both by user and url (§4.9.1).
+		this.store.push?.remove({ userId: attachment.userId!, url, now: nowMs() });
+		this.store.webhooks?.remove({ userId: attachment.userId!, url, now: nowMs() });
+		this.reply(socket, request, {});
+	}
+
+	// Push kind `webhook` (§4.9.4). A bot registers a public https URL with
+	// `push_register`; the server verifies it with Standard Webhooks' endpoint
+	// verification, then POSTs it one signed `webhook` call for the new
+	// messages that match its scopes while the bot has no connection open,
+	// with a short-lived token, and runs the request frames its 2xx answer
+	// holds. Registrations are matched from memory (Webhooks.all), so a
+	// message that calls no webhook reads no row for it.
+
+	/**
+	 * `push_register` kind `webhook`: `{kind: "webhook", url, wake?, format?}`
+	 * from a bot (webhookAccount: an owner's bot, or a registered user with
+	 * the role `bot`); anyone else's is `denied`. The url is any public https
+	 * host (webhookEndpointError); `wake` defaults to `mentions`, `replies`
+	 * and `private`, and one that selects none of WEBHOOK_WAKE_SCOPES is
+	 * `invalid_params`; `format` is `full` (the default) or `knock`. The
+	 * result is `{endpoint_id, state, error?}`; a `url` registered again keeps
+	 * its `endpoint_id`. A new registration, or one that was `failing`, is
+	 * verified after the result (verifyWebhook), which carries what the
+	 * answer needs.
+	 */
+	private async handleWebhookRegister(webhooks: Webhooks, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		if (!webhookAccount(attachment.userId!, attachment.tier, attachment.roles ?? [])) {
+			throw { name: "denied", message: "Only bots may register a webhook here" } satisfies ProtocolError;
+		}
+		const params = request.params;
+		const sent = requiredString(params, "url");
+		const requested = wakeParam(params.wake);
+		const wake = requested ?? DEFAULT_WEBHOOK_WAKE;
+		if (wake === 0) throw { name: "invalid_params", message: "wake selects no scope this server supports for webhooks" } satisfies ProtocolError;
+		const format = optionalString(params, "format") ?? "full";
+		if (!WEBHOOK_FORMATS.includes(format as WebhookFormat)) throw { name: "invalid_params", message: `format must be one of ${WEBHOOK_FORMATS.join(", ")}` } satisfies ProtocolError;
+		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) throw { name: "too_large", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		const problem = webhookEndpointError(sent);
+		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
+		const url = new URL(sent).href;
+		if (utf8Bytes(url) > MAX_PUSH_URL_BYTES) throw { name: "too_large", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		const server = attachment.endpoint ?? `wss://${this.config.serverHost}/`;
+		const { hook, verify } = webhooks.register({ userId: attachment.userId!, url, server, wake, format: format as WebhookFormat, endpointId: newWebhookId("wh_"), now: nowMs() });
+		// One registration a user and url (§4.9.1): a web push one of the same url gives way.
+		this.store.push?.remove({ userId: attachment.userId!, url, now: nowMs() });
+		this.reply(socket, request, webhookResult(hook));
+		// After the result, which carries the endpoint_id the answer needs (§4.9.4).
+		if (verify) this.ctx.waitUntil(this.verifyWebhook(hook));
+	}
+
+	/** Waits `ms` within a webhook's delivery (kept alive by waitUntil), as Retry-After or the retry schedule asks. */
+	private webhookWait(ms: number): Promise<void> {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	/**
+	 * Verifies a webhook's url (Standard Webhooks endpoint verification): a
+	 * signed POST of `{}` with a fresh `webhook-challenge`, which passes on a
+	 * 2xx whose `webhook-challenge-response` answers it for one of the
+	 * signing keys and the `endpoint_id`. One that times out, cannot connect,
+	 * or gets 429 or 5xx is tried again on the retry schedule; a 410 removes
+	 * the registration. The registration is then `on`, or `failing` with why,
+	 * until it is registered again. Never throws.
+	 */
+	private async verifyWebhook(hook: WebhookRecord): Promise<void> {
+		const webhooks = this.store.webhooks;
+		const keys = this.webhookSigning;
+		if (!webhooks || !keys) return;
+		let error = "verification failed";
+		try {
+			for (let retry = 0; ; retry++) {
+				const challenge = newChallenge();
+				const outcome = await postWebhook({ url: hook.url, endpointId: hook.endpointId, msgId: newWebhookId("msg_"), body: "{}", keys, nowMs: nowMs(), challenge });
+				recordMetric(this.runtimeEnv.METRICS, "webhook", ["verify", String(outcome.status)], 1);
+				const answered = outcome.status >= 200 && outcome.status < 300;
+				if (answered && await checkVerificationResponse(keys, hook.endpointId, challenge, outcome.challengeResponse)) {
+					webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "on", error: null, failures: 0, now: nowMs() });
+					return;
+				}
+				if (outcome.status === 410) {
+					webhooks.forget({ userId: hook.userId, endpointId: hook.endpointId, now: nowMs() });
+					return;
+				}
+				// A wrong answer is tried again too: the first challenge can come before the
+				// account has kept the endpoint_id from the result.
+				error = answered ? "verification failed: webhook-challenge-response does not answer the challenge for this endpoint_id" : describeOutcome(outcome, "verification");
+				const delay = answered || retryableOutcome(outcome) ? this.webhookRetryDelay(outcome, retry) : undefined;
+				if (delay === undefined) break;
+				await this.webhookWait(delay);
+				// Registered again or removed meanwhile: that registration's own verification decides.
+				if (!webhooks.all().some((entry) => entry.endpointId === hook.endpointId && entry.state === "verifying")) return;
+			}
+			webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, state: "failing", error: `${new Date(nowMs()).toISOString()} ${error}`, now: nowMs() });
+		} catch (failure) {
+			console.warn(JSON.stringify({ event: "webhook_verification_failed", reason: errorToProtocol(failure).message }));
+		}
+	}
+
+	/** The wait before retry `index` (retryDelay over webhookRetryDelaysMs), or undefined to give up. */
+	private webhookRetryDelay(outcome: WebhookOutcome, index: number): number | undefined {
+		const base = this.webhookRetryDelaysMs[index];
+		if (base === undefined) return undefined;
+		const bounded = retryDelay(outcome, Math.min(index, WEBHOOK_LIMITS.retryDelaysMs.length - 1));
+		if (bounded === undefined) return undefined;
+		return outcome.retryAfterMs === undefined ? base : Math.max(base, Math.min(bounded, outcome.retryAfterMs));
+	}
+
+	/**
+	 * The webhooks a registered user's new message calls (§4.9.4): each
+	 * registration that is `on`, not the sender's, whose scopes the message
+	 * matches (`mentions` of the bot, `replies` to it, by the replied-to
+	 * author the push wake looked up, `private`, `joined`), while the bot has
+	 * no connection open, which gets the broadcast itself. Membership, for a
+	 * private room and for `joined`, is checked as the call is made. None of
+	 * the person-oriented waits, holds, coalescing, mutes or `dnd`. From
+	 * memory: no SQL unless a webhook may be called.
+	 */
+	private webhookFor(message: MessageSnapshot, replyAuthor: () => string | null): void {
+		const webhooks = this.store.webhooks;
+		if (!webhooks || !this.webhookSigning || !message.message_id || !message.log_id) return;
+		let live: WebhookRecord[];
+		try {
+			live = webhooks.all().filter((hook) => hook.state === "on" && hook.userId !== message.from.user_id);
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "webhook_lookup_failed", reason: errorToProtocol(error).message }));
+			return;
+		}
+		if (!live.length) return;
+		const mentions = new Set(Array.isArray(message.body?.mentions) ? (message.body.mentions as unknown[]).filter((id): id is string => typeof id === "string") : []);
+		const replying = message.reply_to?.message_id !== undefined;
+		for (const hook of live) {
+			let why = 0;
+			if (hook.wake & WAKE_SCOPES.mentions && mentions.has(hook.userId)) why |= WAKE_SCOPES.mentions;
+			if (hook.wake & WAKE_SCOPES.private && isPrivateRoomId(message.room_id)) why |= WAKE_SCOPES.private;
+			if (hook.wake & WAKE_SCOPES.joined) why |= WAKE_SCOPES.joined;
+			if (hook.wake & WAKE_SCOPES.replies && replying && replyAuthor() === hook.userId) why |= WAKE_SCOPES.replies;
+			if (!why || this.connectionsOf(hook.userId).length) continue;
+			this.queueWebhook(hook, { message, reasons: why });
+		}
+	}
+
+	/**
+	 * A change to a bot's rooms that its connections would get as
+	 * `room_update` (sendToUser), for a bot with none open: `joined` and
+	 * `left` always call its webhooks (§4.9.4). No SQL.
+	 */
+	private webhookRoomChange(userId: string, value: unknown): void {
+		const webhooks = this.store.webhooks;
+		if (!webhooks || !this.webhookSigning || !isObject(value) || value.method !== "room_update" || !isObject(value.params)) return;
+		const params = value.params;
+		const joined = Array.isArray(params.joined) ? params.joined : undefined;
+		const left = Array.isArray(params.left) ? params.left : undefined;
+		if (!joined && !left) return;
+		let hooks: WebhookRecord[];
+		try {
+			hooks = webhooks.all().filter((hook) => hook.userId === userId && hook.state === "on");
+		} catch {
+			return;
+		}
+		for (const hook of hooks) {
+			this.queueWebhook(hook, { ...(joined ? { joined } : {}), ...(left ? { left } : {}), ...(Array.isArray(params.users) ? { users: params.users } : {}) });
+		}
+	}
+
+	/**
+	 * Adds to a webhook's next call; makes it now unless one is being made,
+	 * whose end makes the next with all that came meanwhile (one call MAY
+	 * carry several records). At most WEBHOOK_LIMITS.messagesPerCall wait;
+	 * past that a record is left out and counted in the next call's `skipped`.
+	 */
+	private queueWebhook(hook: WebhookRecord, item: WebhookItem): void {
+		let queue = this.webhookQueues.get(hook.endpointId);
+		if (!queue) this.webhookQueues.set(hook.endpointId, queue = { items: [], running: false, skipped: 0 });
+		if (queue.items.length >= WEBHOOK_LIMITS.messagesPerCall) {
+			queue.skipped += 1;
+			return;
+		}
+		queue.items.push(item);
+		if (queue.running) return;
+		queue.running = true;
+		this.ctx.waitUntil(this.drainWebhook(hook.userId, hook.endpointId, queue));
+	}
+
+	/** Makes a webhook's calls until nothing waits; never throws. */
+	private async drainWebhook(userId: string, endpointId: string, queue: WebhookQueue): Promise<void> {
+		try {
+			while (queue.items.length) {
+				const items = queue.items.splice(0, WEBHOOK_LIMITS.messagesPerCall);
+				const hook = this.store.webhooks?.all().find((entry) => entry.userId === userId && entry.endpointId === endpointId);
+				if (!hook || hook.state !== "on") {
+					queue.items.length = 0;
+					break;
+				}
+				// Connected since: the bot got these as broadcasts.
+				if (this.connectionsOf(userId).length) continue;
+				await this.callWebhook(hook, items, queue);
+			}
+		} catch (error) {
+			// What waits is dropped with the failed call: the bot catches up from `since`.
+			queue.items.length = 0;
+			console.warn(JSON.stringify({ event: "webhook_call_failed", reason: errorToProtocol(error).message }));
+		} finally {
+			queue.running = false;
+		}
+	}
+
+	/** A user object with its `roles` for a call (§4.9.4), from a connection of theirs, else their identity row. */
+	private webhookUser(userId: string, known: Map<string, PublicUser | null>): PublicUser | null {
+		if (known.has(userId)) return known.get(userId)!;
+		let user: PublicUser | null = null;
+		const peer = this.connectionsOf(userId)[0];
+		const state = peer ? connectionAttachment(peer) : null;
+		if (state?.userId === userId) {
+			user = { user_id: userId, ...(state.name ? { name: state.name } : {}), roles: state.roles ?? [] };
+		} else if (!isGuestId(userId)) {
+			const stored = this.store.accounts.get(userId);
+			if (stored) user = { user_id: userId, name: stored.name, roles: stored.roles };
+		}
+		known.set(userId, user);
+		return user;
+	}
+
+	/** A message as a call carries it: as recorded, its sender's `from` with `roles`, and terminal output put back where cached. */
+	private webhookMessage(message: MessageSnapshot, users: Map<string, PublicUser | null>): Record<string, unknown> {
+		const { from, ...rest } = hasOutputRef(message) ? withTerminalOutputs(message, (key) => this.cachedOutput(key)) : message;
+		const sender = this.webhookUser(from.user_id, users);
+		return { ...rest, from: { user_id: from.user_id, ...(from.name !== undefined ? { name: from.name } : {}), ...(sender?.roles ? { roles: sender.roles } : {}) } };
+	}
+
+	/**
+	 * Makes one call (§4.9.4) for `items`, retried on the schedule while it
+	 * times out, cannot connect, or gets 429 or 5xx (Retry-After within
+	 * bounds); 3xx and other 4xx are not retried, and 410 removes the
+	 * registration. Only what the bot may see is sent: a private room's
+	 * messages to its members, and `joined` for a room it or its parent is
+	 * joined to. Charged to the day's allowances as it is made, delivered or
+	 * not; one past them is skipped, and counted in the next call's
+	 * `skipped`. A 2xx body's frames run as the bot (runWebhookFrames). Calls
+	 * given up in a row past WEBHOOK_LIMITS.failingAfter make it `failing`.
+	 */
+	private async callWebhook(hook: WebhookRecord, items: WebhookItem[], queue: WebhookQueue): Promise<void> {
+		const webhooks = this.store.webhooks;
+		const keys = this.webhookSigning;
+		if (!webhooks || !keys) return;
+		const now = nowMs();
+		const identity = this.store.accounts.get(hook.userId);
+		if (!identity || !webhookAccount(identity.userId, "registered", identity.roles)) return;
+		const rooms = new Set(this.liveRoomsOf(identity.userId) ?? identity.rooms);
+		const records = new Map<string, RoomRecord | null>();
+		const roomOf = (roomId: string) => {
+			if (!records.has(roomId)) records.set(roomId, this.store.rooms.get(roomId, now));
+			return records.get(roomId) ?? null;
+		};
+		const wake: Record<string, string[]> = {};
+		const messages: MessageSnapshot[] = [];
+		const joined: unknown[] = [];
+		const left: unknown[] = [];
+		const listed: unknown[] = [];
+		for (const item of items) {
+			if (item.joined) joined.push(...item.joined);
+			if (item.left) left.push(...item.left);
+			if (item.users) listed.push(...item.users);
+			const message = item.message;
+			if (!message) continue;
+			let why = item.reasons ?? 0;
+			if (isPrivateRoomId(message.room_id) && !rooms.has(message.room_id)) continue;
+			if (why & WAKE_SCOPES.joined) {
+				const parent = roomOf(message.room_id)?.parent_room_id;
+				if (!rooms.has(message.room_id) && !(parent !== undefined && rooms.has(parent))) why &= ~WAKE_SCOPES.joined;
+			}
+			if (!why) continue;
+			messages.push(message);
+			wake[message.message_id] = scopeNames(why);
+		}
+		if (!messages.length && !joined.length && !left.length) return;
+		if (!webhooks.chargeCall(hook.userId, now)) {
+			queue.skipped += 1;
+			console.warn(JSON.stringify({ event: "webhook_allowance_reached", user_id: hook.userId }));
+			return;
+		}
+		const you: PublicUser = { user_id: identity.userId, name: identity.name, roles: identity.roles, ...(identity.avatar ? { avatar: identity.avatar } : {}) };
+		const expires = now + WEBHOOK_TOKEN_TTL_MS;
+		const token = await signWebhookToken(keys[0], { userId: identity.userId, createdMs: identity.createdMs ?? 0, expiresMs: expires });
+		const since = queue.since;
+		const skipped = queue.skipped;
+		queue.skipped = 0;
+		const latest = messages.at(-1)?.log_id;
+		let fields: Record<string, unknown>;
+		if (hook.format === "knock") {
+			fields = { ...(latest !== undefined ? { latest_log_id: latest } : {}), token, token_expires: String(expires), ...(skipped ? { skipped } : {}) };
+		} else {
+			const users = new Map<string, PublicUser | null>([[identity.userId, you]]);
+			const out = messages.map((message) => {
+				const shown = this.webhookMessage(message, users);
+				// The message it replies to, as a full snapshot where it is retained (§3.5.4): one lookup.
+				const replyTo = message.reply_to?.message_id;
+				if (replyTo !== undefined) {
+					let target: MessageSnapshot | null = null;
+					try { target = webhooks.message(replyTo, now); } catch { /* sent bare */ }
+					if (target) shown.reply_to = this.webhookMessage(target, users);
+				}
+				return shown;
+			});
+			const roomList = [...new Set(messages.map((message) => message.room_id))].flatMap((roomId) => {
+				const room = roomOf(roomId);
+				if (!room) return [];
+				const { history_log_id: history, ...rest } = room;
+				return [history === null ? rest : room];
+			});
+			const userList = [...users.values()].filter((user): user is PublicUser => !!user && user.user_id !== identity.userId);
+			for (const user of listed) if (isObject(user) && typeof user.user_id === "string" && user.user_id !== identity.userId && !users.has(user.user_id)) userList.push(user as PublicUser);
+			fields = {
+				...(messages.length ? { first_log_id: messages[0].log_id, last_log_id: latest } : {}),
+				token, token_expires: String(expires), wake, ...(skipped ? { skipped } : {}),
+				...(out.length ? { messages: out } : {}),
+				...(roomList.length ? { rooms: roomList } : {}),
+				...(joined.length ? { joined } : {}),
+				...(left.length ? { left } : {}),
+				...(userList.length ? { users: sortedUsers(userList) } : {}),
+			};
+		}
+		// The next call says where this one ended, delivered or not, so a bot that missed it catches up.
+		if (latest !== undefined) queue.since = latest;
+		const msgId = newWebhookId("msg_");
+		let error: string | undefined;
+		for (let attempt = 1; ; attempt++) {
+			const body = JSON.stringify({ method: "webhook", params: { server: hook.server, you, attempt, ...(since !== undefined ? { since } : {}), ...fields } });
+			const outcome = await postWebhook({ url: hook.url, endpointId: hook.endpointId, msgId, body, keys, nowMs: nowMs(), readBody: true });
+			recordMetric(this.runtimeEnv.METRICS, "webhook", ["call", String(outcome.status)], 1);
+			if (outcome.status >= 200 && outcome.status < 300) {
+				const current = hook.failures ? webhooks.update({ userId: hook.userId, endpointId: hook.endpointId, failures: 0, error: null, now: nowMs() }) : hook;
+				if (current && outcome.body) await this.runWebhookFrames(current, identity, outcome.body, expires);
+				return;
+			}
+			if (outcome.status === 410) {
+				webhooks.forget({ userId: hook.userId, endpointId: hook.endpointId, now: nowMs() });
+				return;
+			}
+			error = describeOutcome(outcome, "call");
+			const delay = retryableOutcome(outcome) ? this.webhookRetryDelay(outcome, attempt - 1) : undefined;
+			if (delay === undefined) break;
+			await this.webhookWait(delay);
+			const still = webhooks.all().find((entry) => entry.endpointId === hook.endpointId);
+			if (!still || still.state !== "on") return;
+		}
+		const failures = hook.failures + 1;
+		webhooks.update({
+			userId: hook.userId, endpointId: hook.endpointId, failures, error: `${new Date(nowMs()).toISOString()} ${error}`,
+			...(failures >= WEBHOOK_LIMITS.failingAfter ? { state: "failing" as const } : {}), now: nowMs(),
+		});
+	}
+
+	/**
+	 * Runs the request frames a call's 2xx answer holds (§4.9.4), one a line,
+	 * in order, at most WEBHOOK_LIMITS.framesPerResponse, as the bot with
+	 * the call token's limits (WEBHOOK_TOKEN_METHODS in its rooms, until the
+	 * token expires): on a connection in memory only (WebhookSocket), through
+	 * the same path as a socket's frames, so each is charged, limited and
+	 * deduplicated as any request (§1.2), and gets no result. The first one
+	 * that failed, or frames past the limit, are kept in the registration's
+	 * `error`.
+	 */
+	private async runWebhookFrames(hook: WebhookRecord, identity: { userId: string; name: string; roles: string[]; rooms: string[]; avatar?: string; ext?: Record<string, unknown> }, text: string, until: number): Promise<void> {
+		const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+		if (!lines.length) return;
+		const frames = lines.slice(0, WEBHOOK_LIMITS.framesPerResponse);
+		const socket = new WebhookSocket();
+		this.webhookSockets.add(socket);
+		const connection = socket as unknown as WebSocketConnection;
+		const now = nowMs();
+		const ipKey = `webhook:${identity.userId}`;
+		const attachment: ConnectionAttachment = {
+			v: 1, connId: randomId("w"), ipKey, tier: "registered", userId: identity.userId, name: identity.name, roles: identity.roles,
+			rooms: this.liveRoomsOf(identity.userId) ?? identity.rooms, endpoint: hook.server, openedAt: now, authDeadline: 0,
+			pendingFrames: 0, pendingBytes: 0, policyViolations: [], historyInFlight: 0, frameTimes: [], webhookUntil: until,
+		};
+		setAvatar(attachment, identity.avatar);
+		setExt(attachment, identity.ext);
+		let error: string | undefined;
+		try {
+			// The frames are reserved together, as a connection's block is, sized to them.
+			this.store.admission.reserveFrames({ ipKey, now, count: frames.length });
+			attachment.frameLease = { day: new Date(now).toISOString().slice(0, 10), remaining: frames.length };
+			writeAttachment(connection, attachment);
+			for (const [index, line] of frames.entries()) {
+				if (socket.readyState !== 1) break;
+				const before = socket.sent.length;
+				await this.processFrame(connection, line);
+				const failed = socket.sent.slice(before).map((sent) => { try { return JSON.parse(sent) as Record<string, unknown>; } catch { return null; } })
+					.find((frame) => isObject(frame?.error));
+				if (failed && error === undefined) error = `frame ${index + 1} failed: ${String((failed.error as Record<string, unknown>).message ?? "error").slice(0, 120)}`;
+			}
+		} catch (failure) {
+			error = `frames not run: ${errorToProtocol(failure).message}`;
+		}
+		// Read cursors the frames moved are written as a closing connection's are.
+		const latest = connectionAttachment(connection);
+		if (latest?.reads) this.flushReads(latest, nowMs());
+		if (error === undefined && lines.length > frames.length) error = `only the first ${frames.length} frames of an answer run`;
+		if (error !== undefined) this.store.webhooks?.update({ userId: hook.userId, endpointId: hook.endpointId, error: `${new Date(nowMs()).toISOString()} ${error}`, now: nowMs() });
+	}
+
+	/**
+	 * Why a frame from a connection signed in with a webhook call's token is
+	 * refused, if it is (§4.9.4; recipes/bot.md): a method beyond
+	 * WEBHOOK_TOKEN_METHODS, or a room the bot has not joined. A frame past
+	 * the token's expiry closes the connection instead (dispatch).
+	 */
+	private webhookTokenRefusal(attachment: ConnectionAttachment, request: RequestFrame): ProtocolError | undefined {
+		if (!WEBHOOK_TOKEN_METHODS.has(request.method)) {
+			return { name: "denied", message: "A webhook token may only post, react, show typing and read history" };
+		}
+		const roomId = request.params.room_id;
+		const scoped = request.method === "message" || request.method === "activity" ? roomId ?? ROOM_ID : roomId;
+		if (scoped !== undefined && (typeof scoped !== "string" || !(attachment.rooms ?? []).includes(scoped))) {
+			return { name: "denied", message: "A webhook token acts only in the bot's rooms" };
+		}
+		return undefined;
+	}
+
+	/**
+	 * Signs a bot in with a webhook call's token (§4.9.4 `token`, §3.2.1),
+	 * through the `token` scheme, from any origin as a bot token: one this
+	 * server signed (verifyWebhookToken) that has not expired, for an account
+	 * that is still the one it was made for (its creation time) and still
+	 * holds a webhook that its owner has not paused. The connection may then
+	 * send only WEBHOOK_TOKEN_METHODS, until the token expires. It keeps no
+	 * credential and gets no token: the bot's own token stays as it was.
+	 */
+	private async handleWebhookToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
+		return this.withSessionLock(async () => {
+			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			const invalid = { name: "denied", message: "This webhook token is not valid or has expired" } satisfies ProtocolError;
+			const keys = this.webhookSigning;
+			if (!keys || token.length > MAX_SESSION_TOKEN_CHARS) throw invalid;
+			const grant = await verifyWebhookToken(keys, token, nowMs());
+			if (!grant) throw invalid;
+			const identity = this.store.accounts.get(grant.userId);
+			if (!identity || (identity.createdMs ?? 0) !== grant.createdMs || !webhookAccount(identity.userId, "registered", identity.roles)) throw invalid;
+			if (!this.store.webhooks?.of(identity.userId).some((hook) => hook.state !== "paused")) throw invalid;
+			attachment.webhookUntil = grant.expiresMs;
+			try {
+				await this.signInKeyless(socket, attachment, request, identity);
+			} catch (error) {
+				delete attachment.webhookUntil;
+				throw error;
+			}
+		});
+	}
+
+	/**
+	 * `/webhook` (recipes/bot.md, owner controls): the sender's bot's webhooks
+	 * (`bot_<owner>`), each with its url, `endpoint_id`, scopes, format,
+	 * state, and last error; `pause` stops them calling and their tokens
+	 * signing in, keeping their settings (the bot's push_register then
+	 * answers `failing`, "paused"); `resume` verifies them again before they
+	 * call; `remove` deletes them. Pausing or removing closes the bot's
+	 * connections signed in with a call's token. Shown in a `~private` notice.
+	 */
+	private webhookCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, action: WebhookAction): void {
+		const webhooks = this.store.webhooks!;
+		const botId = BOT_ID_PREFIX + attachment.userId!;
+		const now = nowMs();
+		const hooks = webhooks.of(botId, now);
+		if (!hooks.length) {
+			this.sendNotice(socket, roomId, `Your bot (\`${botId}\`) has no webhook. It registers one with \`push_register\`, kind \`webhook\`.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		const lines: string[] = [];
+		for (const hook of hooks) {
+			if (action === "pause" && hook.state !== "paused") webhooks.update({ userId: botId, endpointId: hook.endpointId, state: "paused", now });
+			if (action === "resume" && hook.state === "paused") {
+				const resumed = webhooks.update({ userId: botId, endpointId: hook.endpointId, state: "verifying", error: null, failures: 0, now });
+				if (resumed) this.ctx.waitUntil(this.verifyWebhook(resumed));
+			}
+			if (action === "remove") webhooks.forget({ userId: botId, endpointId: hook.endpointId, now });
+		}
+		if (action === "pause" || action === "remove") {
+			for (const peer of this.connectionsOf(botId)) {
+				const state = connectionAttachment(peer);
+				if (state?.webhookUntil !== undefined) this.closePolicy(peer, state, 1008, action === "pause" ? "Webhook paused by the bot's owner" : "Webhook removed by the bot's owner");
+			}
+		}
+		const verb = { show: "", pause: "Paused. ", resume: "Resumed; each is verified again before it calls. ", remove: "Removed. " }[action];
+		for (const hook of action === "remove" ? hooks : webhooks.of(botId, now)) {
+			lines.push(`- ${hook.url} (\`${hook.endpointId}\`): ${hook.state}, wakes for ${scopeNames(hook.wake).join(", ")}, format ${hook.format}${hook.error ? `; last error: ${hook.error}` : ""}`);
+		}
+		this.sendNotice(socket, roomId, [`${verb}Your bot's webhooks (\`${botId}\`):`, ...lines].join("\n"));
 		this.reply(socket, request, {});
 	}
 
@@ -7439,6 +8102,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * is never pushed (§4.9), and never reaches here.
 	 */
 	private wakeFor(message: MessageSnapshot): void {
+		// The replied-to author, looked up once for pushes and webhooks, and only when one needs it.
+		let author: string | null | undefined;
+		const replyAuthor = (): string | null => {
+			if (author !== undefined) return author;
+			author = null;
+			const replyTo = message.reply_to?.message_id;
+			if (replyTo === undefined) return author;
+			try {
+				author = this.store.messages.author(replyTo, nowMs());
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "push_reply_lookup_failed", reason: errorToProtocol(error).message }));
+			}
+			return author;
+		};
+		this.webhookFor(message, replyAuthor);
 		const push = this.store.push;
 		if (!push || !PUSH_POLICY || !message.message_id || !message.log_id) return;
 		const now = nowMs();
@@ -7456,17 +8134,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (reasons.size < MAX_PUSH_CANDIDATES) reasons.set(userId, reason);
 			} else if (held.size < MAX_PUSH_CANDIDATES) held.set(userId, reason);
 		};
-		const replyTo = message.reply_to?.message_id;
-		if (replyTo !== undefined) {
-			try {
-				consider(this.store.messages.author(replyTo, now), WAKE_SCOPES.replies);
-			} catch (error) {
-				console.warn(JSON.stringify({ event: "push_reply_lookup_failed", reason: errorToProtocol(error).message }));
-			}
-		}
+		if (message.reply_to?.message_id !== undefined) consider(replyAuthor(), WAKE_SCOPES.replies);
 		const mentions = message.body?.mentions;
 		if (Array.isArray(mentions)) for (const userId of mentions) consider(userId, WAKE_SCOPES.mentions);
-		// Every member of a private room may wake for it (`private`, §4.9.4); claimPushes
+		// Every member of a private room may wake for it (`private`, §4.9.2); claimPushes
 		// wakes only members there, for whatever reason they were considered.
 		if (isPrivateRoomId(message.room_id)) {
 			try {
@@ -7475,7 +8146,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				console.warn(JSON.stringify({ event: "push_members_lookup_failed", reason: errorToProtocol(error).message }));
 			}
 		}
-		// Moderators may wake for every message in a room they joined (`joined`, §4.9.4,
+		// Moderators may wake for every message in a room they joined (`joined`, §4.9.2,
 		// JOINED_WAKE_ROLES); claimPushes checks the role and the membership.
 		try {
 			for (const userId of push.joinedWakers(now)) consider(userId, WAKE_SCOPES.joined);
@@ -7562,7 +8233,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Drops a user from the wakes waiting to push (pendingWakes): all of them
 	 * when they come back (`idle: false`); `roomId`'s when they post there;
 	 * and its messages up to `through` when their read cursor passes them
-	 * (§4.9.4's suggested convention), which their client sends only for
+	 * (§4.9.3's suggested convention), which their client sends only for
 	 * what was on screen. For held wakes released together (`others`), the
 	 * messages seen go, and if the newest is one, the next left waits in its
 	 * place (scheduleHeld).
@@ -7992,7 +8663,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Posts `text` in `general` as the admin user, mentioning every other
 	 * user with the `admin` role (at most MAX_ALERT_ADMINS), and pushes it to
 	 * them at once, attended or not, skipping the wait: a mention is how the
-	 * protocol lets a server reach a phone (§4.9.4). Its storage work runs in
+	 * protocol lets a server reach a phone (§4.9.3). Its storage work runs in
 	 * Store.alert, so neither an exhausted budget nor closed accounting stops
 	 * it. Called through notifyTrigger, which catches what this throws; the
 	 * budget guard calls it over RPC, which the edge stop does not block.
@@ -8445,6 +9116,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 			audit: (feature) => ({ target: feature }),
 			run: ({ cap, runtime, socket, request, roomId }, feature) => runtime.toggle(cap, socket, request, roomId, feature),
+		}),
+		ownerCommand({
+			name: "webhook", usageErrors: "reply",
+			forms: [
+				{ description: "Show your bot's webhooks: where they call, their state, and why they last failed" },
+				{ words: "pause", description: "Stop your bot's webhooks calling, keeping their settings" },
+				{ words: "remove", description: "Remove your bot's webhooks" },
+				{ words: "resume", description: "Let your bot's paused webhooks call again, once verified" },
+			],
+			available: (runtime) => !!runtime.store.webhooks && !!runtime.webhookSigning,
+			parse: ({ words, usage }) => webhookArgs(words, usage),
+			run: ({ runtime, socket, attachment, request, roomId }, action) => runtime.webhookCommand(socket, attachment, request, roomId, action),
 		}),
 	]);
 
@@ -9247,7 +9930,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Whether a connection's user may be woken by push for wake scope
-	 * `joined` (§4.9.4), so its `server` frame lists it: where push is on,
+	 * `joined` (§4.9.2), so its `server` frame lists it: where push is on,
 	 * a registered user holding one of JOINED_WAKE_ROLES but an owner's bot
 	 * (the store checks the same at registration and when it wakes).
 	 */
@@ -10629,7 +11312,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Sends a frame to every connection of one user. */
 	private sendToUser(userId: string, value: unknown): void {
-		for (const peer of this.connectionsOf(userId)) this.deliverTo(peer, value);
+		const peers = this.connectionsOf(userId);
+		for (const peer of peers) this.deliverTo(peer, value);
+		// A bot with no connection hears of its rooms' changes through its webhook (§4.9.4).
+		if (!peers.length) this.webhookRoomChange(userId, value);
 	}
 
 	/**

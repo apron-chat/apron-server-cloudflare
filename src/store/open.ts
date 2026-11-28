@@ -7,7 +7,7 @@ import type { StoreConfig } from "./config";
 import type { Store } from "./parts";
 import {
   sqliteAccounts, sqliteAdmission, sqliteCredentials, sqliteHistory, sqliteLifecycle, sqliteLiveText, sqliteMessages, sqliteMeter, sqliteOps,
-  sqlitePush, sqliteReads, sqliteRooms, sqliteServer, sqliteUploads,
+  sqlitePush, sqliteReads, sqliteRooms, sqliteServer, sqliteUploads, sqliteWebhooks,
 } from "./sqlite-parts";
 import { SqliteStore } from "./sqlite-store";
 import type { StoreClock } from "./types";
@@ -42,6 +42,7 @@ export function storeOver(sqlite: SqliteStore): Store {
     // features (asStoreConfig). A runtime toggle (`/toggle uploads`) leaves
     // them be; the store's own cleanup prunes their tables either way.
     ...(sqlite.config.push ? { push: sqlitePush(sqlite) } : {}),
+    ...(sqlite.config.webhooks ? { webhooks: sqliteWebhooks(sqlite) } : {}),
     ...(sqlite.config.uploads ? { uploads: sqliteUploads(sqlite) } : {}),
     ...(sqlite.config.liveText ? { liveText: sqliteLiveText(sqlite) } : {}),
   });

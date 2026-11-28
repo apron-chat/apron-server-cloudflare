@@ -144,7 +144,7 @@ it('ext:command_list lists each form the user may run, with its hint, uses and r
 		// A registered user gets their own, and none of the admins'.
 		const own = await list(alice, 'alice-list');
 		expect(own.map(usage)).toEqual(await helped(alice, 'alice-help'));
-		expect(own.map((form) => form.name)).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove']);
+		expect(own.map((form) => form.name)).toEqual(['avatar', 'embed-append', 'embed-terminal', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove', 'webhook', 'webhook pause', 'webhook remove', 'webhook resume']);
 		expect(own.filter((form) => form.name.startsWith('invite-device')).map((form) => form.hint)).toEqual(['[<id>]', undefined, '<id>']);
 		expect(own.find((form) => form.name === 'passkeys remove')).toEqual({ name: 'passkeys remove', group: 'member', description: 'Remove one of your account\'s passkeys', hint: '<n>' });
 
@@ -197,7 +197,7 @@ it('ext:command_list follows who may run each command: bots, guests, mods, and b
 
 		// A mod: the owners' commands and /emoji, none of the admins'.
 		await command(admin, 'mod', `/role ${modId} mod`);
-		expect(await listed(mod, 'mod-list')).toEqual(['avatar', 'embed-append', 'embed-terminal', 'emoji add', 'emoji remove', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove']);
+		expect(await listed(mod, 'mod-list')).toEqual(['avatar', 'embed-append', 'embed-terminal', 'emoji add', 'emoji remove', 'help', 'invite-bot', 'invite-device add', 'invite-device list', 'invite-device remove', 'passkeys', 'passkeys remove', 'webhook', 'webhook pause', 'webhook remove', 'webhook resume']);
 
 		// A guest who may only read: /help alone; one who may post also gets live text.
 		await guest.next();

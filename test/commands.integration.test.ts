@@ -112,6 +112,7 @@ const LINES: Record<string, { run?: (users: Users) => string; target?: (users: U
 	'server': { run: () => '/server title Secret title text', target: () => undefined, usage: '/server bogus' },
 	'status': { run: () => '/status', target: () => undefined, usage: null },
 	'toggle': { run: () => '/toggle activity', target: () => 'activity', usage: '/toggle' },
+	'webhook': { usage: '/webhook bogus' },
 };
 
 /** What a command line may never leave in an audit event: tokens, and the text it set. */

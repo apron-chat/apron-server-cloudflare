@@ -120,7 +120,7 @@ describe('live text end to end', () => {
 		const admin = await connect();
 		try {
 			const server = await admin.next();
-			expect(server.params.apron).toBe(10);
+			expect(server.params.apron).toBe(11);
 			expect(server.params.capabilities).toEqual(expect.arrayContaining(['embed:terminal', 'embed:append']));
 			expect(server.params.capabilities).not.toContain('embed:stream');
 			expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');

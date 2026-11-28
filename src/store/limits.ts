@@ -173,7 +173,7 @@ export const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
 export const MAX_PUSH_WAKES_PER_USER = MAX_MEMBERSHIP_ROWS;
 /** A re-registration of an unchanged subscription younger than this writes nothing. */
 export const PUSH_REFRESH_MS = 86_400_000;
-/** `mentions` and `replies`, the default for a registration without `wake` (§4.9.4). */
+/** `mentions` and `replies`, the default for a registration without `wake` (§4.9.2). */
 export const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
 /** Every scope: a registration's `wake` names some of these. */
 export const ALL_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies | WAKE_SCOPES.private | WAKE_SCOPES.joined;

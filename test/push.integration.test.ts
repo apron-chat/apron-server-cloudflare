@@ -132,13 +132,18 @@ describe('push over the socket', () => {
 		const peer = await connect();
 		try {
 			const server = await peer.next();
-			// Before sign-in, without `joined`: only admins and mods wake for it.
-			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies', 'private'] });
+			// Before sign-in, without `joined`: only admins and mods wake for it. Each kind
+			// carries its own scopes (v11), and `key` and the top-level `wake` stay for v10 clients.
+			expect(server.params.push).toMatchObject({ webpush: { vapid_key: env.VAPID_PUBLIC_KEY, key: env.VAPID_PUBLIC_KEY, wake: ['mentions', 'replies', 'private'] }, wake: ['mentions', 'replies', 'private'] });
 		} finally { peer.close(); }
 	});
 
 	it('lists wake scope joined only to connections whose user may wake for it, with a new server frame when that changes', async () => {
-		const wakeOf = (frame: Frame) => frame.params.push.wake;
+		const wakeOf = (frame: Frame) => {
+			// The v10 top-level scopes stay those of webpush.
+			expect(frame.params.push.wake).toEqual(frame.params.push.webpush.wake);
+			return frame.params.push.webpush.wake;
+		};
 		// A role change is an admin's: the capability `/role` would carry, its audit event dropped.
 		const changeRole = (userId: string, on: boolean) => runInDurableObject(stub(), (instance) => {
 			const cap = authorizeAdmin({ tier: 'registered', userId: 'admin', roles: ['admin'] }, 'role', { record() {} }, Date.now());
@@ -655,7 +660,8 @@ describe('wake scopes', () => {
 			mentionsOnlyRepliedTo: await gone('mr', ['mentions']),
 			repliesOnlyRepliedTo: await gone('rr', ['replies']),
 			repliesOnlyMentioned: await gone('rm', ['replies']),
-			nothing: await gone('none', []),
+			// A wake that selects no supported scope is refused (§4.9.2); this one wakes only for private rooms.
+			nothing: await gone('none', ['private']),
 			both: await gone('both'),
 			attended: '',
 			control: await gone('ctrl'),
@@ -724,8 +730,8 @@ describe('wake scopes', () => {
 		await vi.waitFor(async () => expect(await idleOf(moderatorId)).toEqual([]), { timeout: 5_000 });
 		expect((await subscriptionsOf(moderatorId)).map((row) => row.wake)).toEqual([['mentions', 'joined']]);
 		// Anyone else's `joined` is dropped as it is registered.
-		const regular = await gone('jreg', ['joined']);
-		expect((await subscriptionsOf(userOf(regular))).map((row) => row.wake)).toEqual([[]]);
+		const regular = await gone('jreg', ['joined', 'private']);
+		expect((await subscriptionsOf(userOf(regular))).map((row) => row.wake)).toEqual([['private']]);
 		const senderId = unique('sender');
 		const sender = await signedIn(senderId);
 		try {

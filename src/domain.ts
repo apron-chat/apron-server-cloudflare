@@ -147,7 +147,7 @@ export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
  */
 export const WAKE_SCOPES = { mentions: 1, replies: 2, private: 4, joined: 8 } as const;
 /**
- * The roles that may wake for `joined` (§4.9.4), every message in a room
+ * The roles that may wake for `joined` (§4.9.2), every message in a room
  * they joined: a registered user holding one keeps the scope when they
  * register, and only they are woken for it. Others' registrations drop it,
  * so the few who keep it are all a message's `joined` wake reads.
