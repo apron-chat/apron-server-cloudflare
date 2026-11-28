@@ -29,6 +29,12 @@ export interface Accounts {
   get(userId: string): StoredIdentity | null;
   /** Whether an identity has this `user_id` now, one indexed read. */
   exists(userId: string): boolean;
+  /** Whether `/purge` or the idle prune retired this `user_id`, not yet freed: one `_meta` read. */
+  purged(userId: string): boolean;
+  /** Whether `/purge` removed this `user_id` and what it left, not yet freed: one `_meta` read. */
+  removed(userId: string): boolean;
+  /** The `user_id`s `/purge` removed at or after log position `after`, not yet freed, at most `limit`. */
+  removedSince(after: number, limit: number): string[];
   /**
    * Whether a `user_id` may not be issued: an identity has it, `/rename`
    * retired it, or `/purge` or the idle prune retired it and it is not yet

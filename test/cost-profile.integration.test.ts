@@ -236,7 +236,15 @@ it('profiles the storage cost of a typical session', async () => {
 			expect(page.result.messages.length).toBeGreaterThan(40);
 		});
 		await step('history (thread, limit 50)', async () => { expect((await request(bob, 'history-thread', 'history', { room_id: threadId, limit: 50 })).error).toBeUndefined(); });
-		await step('room_list (joined)', async () => { expect((await request(bob, 'joined', 'room_list', { filter: 'joined' })).error).toBeUndefined(); });
+		let position = '0';
+		await step('room_list (joined)', async () => {
+			const listed = await request(bob, 'joined', 'room_list', { filter: 'joined' });
+			expect(listed.error).toBeUndefined();
+			position = (listed.result.joined as Array<{ latest_log_id: string }>).map((room) => room.latest_log_id).sort((a, b) => Number(a) - Number(b)).at(-1)!;
+		});
+		// A client resuming from where it stood, on a connection's first joined listing: the listing, and the
+		// removals since (none).
+		await step('room_list (joined, resuming)', async () => { expect((await request(alicePhone, 'resuming', 'room_list', { filter: 'joined', latest_log_id: position })).error).toBeUndefined(); });
 		await step('room_list (general, members)', async () => { expect((await request(bob, 'members', 'room_list', { room_id: 'general', members: true })).error).toBeUndefined(); });
 
 		// Activity: a read cursor (the first is written at once, the next held), typing.

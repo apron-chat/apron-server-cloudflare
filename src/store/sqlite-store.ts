@@ -42,7 +42,7 @@ import {
   META_ACCOUNT_USAGE, META_ACCOUNTING_GUARD, META_ACCOUNTING_UNSAFE, META_ANNOUNCED_TIER, META_BOT_SWEEP, META_EFFECTIVE_NOW,
   META_GUEST_NUMBER_MARK, META_HISTORY_EXPORT, META_HISTORY_IMPORT, META_HISTORY_IMPORT_PROGRESS, META_HISTORY_PUBLISHED,
   META_HISTORY_ROOMS_DUE, META_HISTORY_THROUGH, META_IDLE_ACTIVITY_SINCE, META_IDLE_PRUNE_DAY, META_IDLE_PRUNED, META_PURGE_ROOMS,
-  META_PURGED_PREFIX, META_RENAMED_PREFIX, META_ROOM_NOTES_ALERTED, META_STORAGE_ALERTED, META_STORAGE_PRESSURE, USER_LIMIT_SCOPES,
+  META_PURGED_PREFIX, META_REMOVED_AT_PREFIX, META_REMOVED_PREFIX, META_RENAMED_PREFIX, META_ROOM_NOTES_ALERTED, META_STORAGE_ALERTED, META_STORAGE_PRESSURE, USER_LIMIT_SCOPES,
 } from "./meta";
 import {
   ACCOUNTING_UNCERTAIN, BREAKER_ALERT_ONLY, BREAKER_EXEMPT, BREAKER_MS, BREAKER_OVERRUNS, BREAKER_WINDOW_MS, DEGRADED, emptyGuard,
@@ -1802,6 +1802,58 @@ export class SqliteStore {
     return this.reserved("isRetiredUserId", { reads: 8 }, true, now, () => this.retiredUserId(userId));
   }
 
+  /**
+   * Whether `/purge` or the idle prune retired this `user_id` (`purged:`) and
+   * it is not yet freed: no identity has it, and what is still logged under
+   * it is its own. One `_meta` read.
+   */
+  purgedUserId(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved("purgedUserId", { reads: 4 }, true, now, () => this.metaValue(META_PURGED_PREFIX + userId) !== "");
+  }
+
+  /**
+   * Whether `/purge` removed this `user_id` and what it left (`removed:`),
+   * not yet freed: nothing is logged under it since. One `_meta` read.
+   */
+  removedUserId(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved("removedUserId", { reads: 8 }, true, now, () => {
+      const position = this.metaValue(META_REMOVED_PREFIX + userId);
+      return position !== "" && this.stillRemoved(userId, Number(position));
+    });
+  }
+
+  /**
+   * Whether what `/purge` removed at `position` is still all there is of
+   * `userId`: no identity has it, and its `purged:` marker was not raised
+   * past it since (a bot made anew, then idle-pruned, keeping what it left;
+   * a move or an editor's save logging it again). Two indexed reads.
+   */
+  private stillRemoved(userId: string, position: number): boolean {
+    const retired = this.metaValue(META_PURGED_PREFIX + userId);
+    return this.identityRow(userId) === null && (retired === "" || Number(retired) <= position);
+  }
+
+  /**
+   * The `user_id`s `/purge` removed at or after log position `after`, not yet
+   * freed and still removed (stillRemoved: a bot may be made anew), newest first, at
+   * most `limit`: a range read of the `removed_at:` keys, one for each such
+   * removal, so it reads what it returns. At: a purge logs nothing, so its
+   * marker is the head a client saw everything up to; told again, a removal
+   * changes nothing. A client's request, so charged as one.
+   */
+  removedSince(after: number, limit: number, now = this.clock.now()): string[] {
+    this.ensureReady();
+    const start = META_REMOVED_AT_PREFIX.length;
+    return this.reserved("removedSince", { reads: 16 + 3 * limit }, false, now, () => this.rawRows<{ key: string }>(
+      "SELECT key FROM _meta WHERE key >= ? AND key < ? ORDER BY key DESC LIMIT ?", removedAtKey(after, ""), META_REMOVED_AT_PREFIX.slice(0, -1) + ";", limit,
+    ).flatMap((row) => {
+      const userId = row.key.slice(row.key.indexOf(":", start) + 1);
+      return this.stillRemoved(userId, Number(row.key.slice(start, start + 16))) ? [userId] : [];
+    }));
+  }
+
   private retiredUserId(userId: string): boolean {
     return this.metaValue(META_RENAMED_PREFIX + userId) !== "" || this.metaValue(META_PURGED_PREFIX + userId) !== "";
   }
@@ -2575,7 +2627,18 @@ export class SqliteStore {
         this.adjustCount("principal_limit_count", -limiters);
       }
       for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
+      // Removed for good, and announced as such: those with an identity, and
+      // ids a purge or the idle prune retired before (what the idle prune kept is gone now).
+      const removed = ids.filter((id) => retired.includes(id) || this.metaValue(META_PURGED_PREFIX + id) !== "");
       for (const userId of retired) this.writeMeta(META_PURGED_PREFIX + userId, String(this.logState().last_log_id));
+      const position = this.logState().last_log_id;
+      for (const userId of removed) {
+        // Removed again (a bot made anew since): its earlier position goes.
+        const earlier = this.metaValue(META_REMOVED_PREFIX + userId);
+        if (earlier !== "") this.rawExec("DELETE FROM _meta WHERE key = ?", removedAtKey(Number(earlier), userId));
+        this.writeMeta(META_REMOVED_PREFIX + userId, String(position));
+        this.writeMeta(removedAtKey(position, userId), "");
+      }
       if (identities) this.adjustCount("identity_count", -identities);
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
@@ -2791,8 +2854,15 @@ export class SqliteStore {
   freeRetiredUserIds(userIds: readonly string[], now = this.clock.now()): void {
     if (!userIds.length) return;
     this.ensureReady();
-    this.reserved("freeRetiredUserIds", { reads: 8 + 2 * userIds.length, writes: 8 + 4 * userIds.length }, true, now, () => {
-      this.rawExec("DELETE FROM _meta WHERE key IN (SELECT ? || value FROM json_each(?))", META_PURGED_PREFIX, JSON.stringify(userIds));
+    // Per id: its `purged:`, `removed:` and `removed_at:` rows, each found, read and deleted (measured: about 13 reads).
+    this.reserved("freeRetiredUserIds", { reads: 8 + 14 * userIds.length, writes: 8 + 6 * userIds.length }, true, now, () => {
+      const ids = JSON.stringify(userIds);
+      this.rawExec("DELETE FROM _meta WHERE key IN (SELECT ? || value FROM json_each(?))", META_PURGED_PREFIX, ids);
+      this.rawExec(
+        `DELETE FROM _meta WHERE key IN (SELECT ? || printf('%016d', CAST(m.value AS INTEGER)) || ':' || j.value FROM json_each(?) AS j JOIN _meta AS m ON m.key = ? || j.value)`,
+        META_REMOVED_AT_PREFIX, ids, META_REMOVED_PREFIX,
+      );
+      this.rawExec("DELETE FROM _meta WHERE key IN (SELECT ? || value FROM json_each(?))", META_REMOVED_PREFIX, ids);
     }, false);
   }
 
@@ -5241,4 +5311,9 @@ export class SqliteStore {
       this.settleReservation(reserved, this.observed.reads - actualReads, this.observed.writes - actualWrites);
     }
   }
+}
+
+/** The `removed_at:` key of a removal at log position `position`, which sorts by position. */
+function removedAtKey(position: number, userId: string): string {
+  return `${META_REMOVED_AT_PREFIX}${String(position).padStart(16, "0")}:${userId}`;
 }

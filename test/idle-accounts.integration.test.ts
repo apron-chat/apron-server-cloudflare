@@ -209,3 +209,80 @@ it('revokes every token of a retired id, and of its bot, before freeing it', asy
 		expect(runtime.store.accounts.idTaken('gone')).toBe(false);
 	});
 });
+
+it('marks removed what /purge removes, an idle-pruned id once purged, and frees the mark with the id', async () => {
+	await withStore('removed-marks', { idleAccountMs: 30 * day, keptActiveAccounts: 0 }, (store, sql, clock) => {
+		const now = clock.now;
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', '0')");
+		const user = seed(sql, now);
+		user('idler', { created: 90 * day, seen: 80 * day });
+		user('purgee', { created: 2 * day });
+		const head = () => Number(sqliteOf(store).logBounds().latest_log_id);
+		// The idle prune retires an id, keeping what it left: no removal.
+		expect(store.accounts.pruneIdle(now).pruned).toEqual(['idler']);
+		expect(store.accounts.purged('idler')).toBe(true);
+		expect(store.accounts.removed('idler')).toBe(false);
+		expect(store.accounts.removedSince(0, 10)).toEqual([]);
+		// /purge removes for good: an account, and an id the idle prune retired; not an id no one had.
+		store.accounts.purge({ userIds: ['purgee', 'bot_purgee', 'idler', 'nobody'], now });
+		expect(store.accounts.removed('purgee')).toBe(true);
+		expect(store.accounts.removed('idler')).toBe(true);
+		expect(store.accounts.removed('bot_purgee')).toBe(false);
+		expect(store.accounts.removed('nobody')).toBe(false);
+		// Told again to a client at or before the position it happened at, not after.
+		expect(new Set(store.accounts.removedSince(head(), 10))).toEqual(new Set(['purgee', 'idler']));
+		expect(store.accounts.removedSince(head() + 1, 10)).toEqual([]);
+		expect(store.accounts.removedSince(0, 1)).toHaveLength(1);
+		// Freed with the retired id.
+		store.accounts.freeRetiredIds(['purgee', 'idler'], now);
+		expect(store.accounts.removed('purgee')).toBe(false);
+		expect(store.accounts.removedSince(0, 10)).toEqual([]);
+	});
+});
+
+it('keeps every removal by position for a resume, newest first, leaving out ids taken again and stale positions', async () => {
+	await withStore('removed-at', {}, (store, sql, clock) => {
+		const now = clock.now;
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', '0')");
+		const user = seed(sql, now);
+		// Each from a poster of its own, so no posting limit is reached.
+		const post = (text: string) => store.messages.mutate({
+			userId: `poster ${text}`, ipKey: `ip ${text}`, requestId: text, method: 'message', now,
+			params: { room_id: 'general', body: { format: 'plain', text } }, identity: { user_id: `poster ${text}`, name: 'Poster' },
+		});
+		const ids = Array.from({ length: 40 }, (_, i) => `gone_${String(i).padStart(2, '0')}`);
+		const at: number[] = [];
+		for (const id of ids) {
+			user(id, { created: day });
+			post(`before ${id}`);
+			store.accounts.purge({ userIds: [id], now });
+			at.push(Number(sqliteOf(store).logBounds().latest_log_id));
+		}
+		const keys = () => sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key LIKE 'removed_at:%' ORDER BY key").toArray().map((row) => row.key.split(':')[2]);
+		// One for each removal, however many.
+		expect(keys()).toEqual(ids);
+		// From where a client stood, newest first; at most the limit, the newest.
+		expect(store.accounts.removedSince(at[30], 256)).toEqual(ids.slice(30).reverse());
+		expect(store.accounts.removedSince(at[39] + 1, 256)).toEqual([]);
+		expect(store.accounts.removedSince(0, 3)).toEqual(ids.slice(37).reverse());
+		// An id with an identity again (a bot made anew) is not told as removed.
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json, seen_ms) VALUES (?, '', 'bot', 'registered', ?, ?, '[\"bot\"]', 0)", ids[39], now, now);
+		expect(store.accounts.removedSince(at[38], 256)).toEqual([ids[38]]);
+		// A removal its purged: marker was raised past since (the idle prune of a bot made anew, keeping
+		// what it posted) is not one any more: not told, nor taken for one by /purge.
+		sql.exec("UPDATE _meta SET value = ? WHERE key = ?", String(at[38] + 1), `purged:${ids[38]}`);
+		expect(store.accounts.removed(ids[38])).toBe(false);
+		expect(store.accounts.removedSince(at[37], 256)).toEqual([ids[37]]);
+		// Removed again, it is at its new position only.
+		post('again');
+		store.accounts.purge({ userIds: [ids[39]], now });
+		const again = Number(sqliteOf(store).logBounds().latest_log_id);
+		expect(keys().filter((id) => id === ids[39])).toHaveLength(1);
+		expect(store.accounts.removedSince(again, 256)).toEqual([ids[39]]);
+		// Freed with its id: both keys go.
+		store.accounts.freeRetiredIds([ids[39], ids[0]], now);
+		expect(keys()).toEqual(ids.slice(1, 39));
+		expect(store.accounts.removed(ids[39])).toBe(false);
+		expect(store.accounts.removedSince(0, 256)).toEqual(ids.slice(1, 38).reverse());
+	});
+});

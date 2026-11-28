@@ -57,6 +57,7 @@ import {
 	type RequestFrame,
 } from "./protocol";
 import {
+	MAX_REMOVALS_RESENT,
 	RETIRED_SWEEP_BATCH,
 	openStore,
 	type Accounts,
@@ -8115,8 +8116,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * when empty. With `members: true`, each room carries its `members` and
 	 * the result `users` (see membersOf); `user_id` then lists only that
 	 * user, if they are a member (memberOf). `latest_log_id` is validated and
-	 * ignored: guests' memberships are not logged, so a delta could miss their
-	 * joins and leaves, and a result without `left` is a full listing. At most
+	 * ignored for the listing: guests' memberships are not logged, so a delta
+	 * could miss their joins and leaves, and a result without `left` is a full
+	 * listing. It is where a resuming client stood, so the removals `/purge`
+	 * made since are told again after the result (§3.3.3). At most
 	 * `roomListRequestsPerUserMinute` listings per user, except the first
 	 * `filter: "joined"` listing after authentication.
 	 */
@@ -8200,6 +8203,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 			result.users = sortedUsers(users.values());
 		}
 		this.reply(socket, request, this.boundedListing(result));
+		// Resuming from a position: what `/purge` removed since, which no record
+		// says, is told again as at the time (§3.3.3), after the listing. Only to
+		// registered users: a guest, whom anyone can be, keeps no history to clean,
+		// and needn't learn which ids were purged. Only on a connection's first
+		// joined listing (`exempt`), where a client resumes: listing again reads no more.
+		if (exempt && attachment.tier === "registered" && typeof params.latest_log_id === "string") {
+			let removed: string[] = [];
+			try { removed = this.store.accounts.removedSince(Number(params.latest_log_id), MAX_REMOVALS_RESENT); } catch { /* a refused read leaves it untold */ }
+			for (const id of removed) {
+				if (id !== attachment.userId) this.deliverTo(socket, { method: "user", params: { new: {}, old: { user_id: id } } });
+			}
+		}
 		if (result.joined?.length) this.sendReadCursors(socket, attachment, result.joined.map((room) => room.room_id));
 	}
 
@@ -9289,17 +9304,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
-		if (!this.store.accounts.exists(userId) && !this.connectionsOf(userId).length) {
+		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
+		const present = (id: string) => this.store.accounts.exists(id) || this.connectionsOf(id).length > 0;
+		// Purged before: nothing is logged under it since, so this only tells
+		// every connection again, as a client that missed it may need.
+		if (!present(userId) && this.store.accounts.removed(userId)) {
+			const removed = userIds.filter((id) => !present(id) && this.store.accounts.removed(id));
+			for (const id of removed) this.announceRemoved(id);
+			this.sendNotice(socket, roomId, `Purged \`${userId}\` already: told every connection again.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		// The idle prune retired it, keeping what it left: that goes now, and the
+		// removal is announced as for any purge.
+		const known = (id: string) => present(id) || this.store.accounts.purged(id);
+		const retiredOnly = !present(userId);
+		if (!known(userId)) {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
-		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
 		// The rooms each is in, stored or on their connections, read before
 		// those close: a thread the purge leaves nobody in is removed after it.
 		const roomsOf = new Map<string, Set<string>>();
 		for (const id of userIds) roomsOf.set(id, new Set([...(this.liveRoomsOf(id) ?? []), ...(this.store.accounts.get(id)?.rooms ?? [])]));
 		const rooms = new Set([...roomsOf.values()].flatMap((ids) => [...ids]));
-		// Those of them that exist (a user may have no bot): only they are announced gone.
-		const existing = userIds.filter((id) => this.store.accounts.exists(id) || this.connectionsOf(id).length > 0);
+		// Those of them that exist or were retired (a user may have no bot): only they are announced gone.
+		const existing = userIds.filter(known);
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);
@@ -9308,19 +9337,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		let purged = { messages: 0, reactions: 0, deletedUploads: [] as string[] };
 		await this.runMutation(async () => {
+			// A retired id is checked again where nothing interleaves: the daily
+			// sweep may have freed it meanwhile, and a new account taken it.
+			if (retiredOnly && (this.store.accounts.exists(userId) || !this.store.accounts.purged(userId))) {
+				throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+			}
 			purged = this.store.accounts.purge({ userIds, now: nowMs() });
 		});
-		// Every other connection forgets them and what they left (§3.3.3): `new`
-		// of `{}`, and `old` with only the user_id. Not logged. Not only those in
-		// their rooms now: what they left in rooms they had left, or that a move
-		// took elsewhere, went too.
-		for (const id of existing) {
-			const frame = { method: "user", params: { new: {}, old: { user_id: id } } };
-			for (const peer of this.ctx.getWebSockets()) {
-				const state = connectionAttachment(peer);
-				if (state?.userId && !userIds.includes(state.userId)) this.deliverTo(peer as WebSocketConnection, frame);
-			}
-		}
+		for (const id of existing) this.announceRemoved(id);
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
 		// The tiers below purge what they hold on the next alarm, in a second.
@@ -9339,6 +9363,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const uploads = purged.deletedUploads.length;
 		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Tells every connection but the user's own that `/purge` removed them and
+	 * what they left (§3.3.3): `new` of `{}`, and `old` with only the user_id.
+	 * Not logged. Not only those in their rooms now: what they left in rooms
+	 * they had left, or that a move took elsewhere, went too.
+	 */
+	private announceRemoved(userId: string): void {
+		const frame = { method: "user", params: { new: {}, old: { user_id: userId } } };
+		for (const peer of this.ctx.getWebSockets()) {
+			const state = connectionAttachment(peer);
+			if (state?.userId && state.userId !== userId && state.userId !== BOT_ID_PREFIX + userId) this.deliverTo(peer as WebSocketConnection, frame);
+		}
 	}
 
 	/**
