@@ -9279,8 +9279,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/purge <user_id>`: disconnects a user and their bot, then deletes them
 	 * and everything they posted, reacted, or uploaded (Store.purgeUsers),
-	 * with no new records: a `user` notification with `new: {}` tells those
-	 * who shared a room with them to forget them and their records (§3.3.3).
+	 * with no new records: a `user` notification with `new: {}` tells every
+	 * other connection to forget them and their records (§3.3.3).
 	 * They may register a new passkey. The sender gets a `~private` notice
 	 * before the result (§1).
 	 */
@@ -9298,6 +9298,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const roomsOf = new Map<string, Set<string>>();
 		for (const id of userIds) roomsOf.set(id, new Set([...(this.liveRoomsOf(id) ?? []), ...(this.store.accounts.get(id)?.rooms ?? [])]));
 		const rooms = new Set([...roomsOf.values()].flatMap((ids) => [...ids]));
+		// Those of them that exist (a user may have no bot): only they are announced gone.
+		const existing = userIds.filter((id) => this.store.accounts.exists(id) || this.connectionsOf(id).length > 0);
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);
@@ -9308,10 +9310,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			purged = this.store.accounts.purge({ userIds, now: nowMs() });
 		});
-		// Everyone who shared a room with them forgets them and what they left
-		// (§3.3.3): `new` of `{}`, and `old` with only the user_id. Not logged.
-		for (const [id, theirs] of roomsOf) {
-			if (theirs.size) this.deliver({ method: "user", params: { new: {}, old: { user_id: id } } }, [...theirs], (state) => !userIds.includes(state.userId ?? ""));
+		// Every other connection forgets them and what they left (§3.3.3): `new`
+		// of `{}`, and `old` with only the user_id. Not logged. Not only those in
+		// their rooms now: what they left in rooms they had left, or that a move
+		// took elsewhere, went too.
+		for (const id of existing) {
+			const frame = { method: "user", params: { new: {}, old: { user_id: id } } };
+			for (const peer of this.ctx.getWebSockets()) {
+				const state = connectionAttachment(peer);
+				if (state?.userId && !userIds.includes(state.userId)) this.deliverTo(peer as WebSocketConnection, frame);
+			}
 		}
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
