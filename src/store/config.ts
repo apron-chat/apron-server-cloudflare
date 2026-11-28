@@ -133,6 +133,8 @@ export interface StoreConfig {
   uploads: StoreUploadConfig | null;
   /** Web Push (protocol §4.9), or null without it: the plan's push policy. */
   push: PushPolicy | null;
+  /** Push kind `webhook` (protocol §4.9.4): whether the deployment signs webhook calls (WEBHOOK_SIGNING_KEY). */
+  webhooks: boolean;
   /**
    * Live text (protocol §4.8.3, `embed:terminal` and `embed:append`), or
    * null without it: the plan's policy, the origin live `url`s are served
@@ -222,6 +224,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   ogMediaHosts: [],
   uploads: null,
   push: null,
+  webhooks: false,
   // These bounds include the reservation row and worst-case indexed control
   // updates for one accepted operation; calibrated workloads may lower them
   // only after observing cursor counts.

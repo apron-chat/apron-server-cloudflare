@@ -47,7 +47,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
-	expect(server.params.apron).toBe(10);
+	expect(server.params.apron).toBe(11);
 	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions', 'ext:command_list', 'ext:editors']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(DEFAULT_LIMITS.pingSeconds);
@@ -1137,12 +1137,12 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 	} finally { peer.close(); }
 });
 
-it('speaks protocol v10: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+it('speaks protocol v11: a sign-in welcome, no email sign-in, and ~private notices', async () => {
 	const withPasskeys = await connect();
 	const bot = await connect({ origin: null });
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
-		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'token', 'guest'] });
+		expect(server.params).toMatchObject({ apron: 11, agent: 'apron-cloudflare-demo/11', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });

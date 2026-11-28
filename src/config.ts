@@ -2,6 +2,7 @@ import { loadLegacyRpId } from "./legacy-passkeys.ts";
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
+import { parseWebhookSigningKeys } from "./webhook.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 import type { BackupSettings } from "./history/exports.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
@@ -132,6 +133,12 @@ export interface RuntimeConfig {
 	 * plan's `push.delaySeconds`, or `PUSH_DELAY_SECONDS` (0 pushes at once).
 	 */
 	pushDelaySeconds: number;
+	/**
+	 * Push kind `webhook` (protocol §4.9.4), on when the deployment sets the
+	 * `WEBHOOK_SIGNING_KEY` secret: its `whsk_` Ed25519 keys, current first,
+	 * which sign every call (src/webhook.ts). Bots only (SPEC section 4.4).
+	 */
+	webhook?: { signingKeys: readonly string[] };
 	/**
 	 * The hosts whose media a client-built `og` may keep (`OG_MEDIA_HOSTS`,
 	 * plus `OG_MEDIA_HOSTS_EXTRA`):
@@ -305,6 +312,7 @@ type EnvLike = {
 	PUSH_HOSTS?: string;
 	PUSH_HOSTS_EXTRA?: string;
 	PUSH_DELAY_SECONDS?: string;
+	WEBHOOK_SIGNING_KEY?: string;
 	OG_MEDIA_HOSTS?: string;
 	OG_MEDIA_HOSTS_EXTRA?: string;
 	BACKUP_EVERY?: string;
@@ -689,6 +697,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const push = loadPush(env);
 	const pushHosts = withExtraHosts(loadPushHosts(env.PUSH_HOSTS), env.PUSH_HOSTS_EXTRA, "PUSH_HOSTS_EXTRA");
 	const pushDelaySeconds = loadPushDelay(env.PUSH_DELAY_SECONDS);
+	const webhook = loadWebhook(env.WEBHOOK_SIGNING_KEY);
 	const ogMediaHosts = withExtraHosts(loadOgMediaHosts(env.OG_MEDIA_HOSTS), env.OG_MEDIA_HOSTS_EXTRA, "OG_MEDIA_HOSTS_EXTRA");
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
@@ -726,6 +735,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		...(push ? { push } : {}),
 		pushHosts,
 		pushDelaySeconds,
+		...(webhook ? { webhook } : {}),
 		ogMediaHosts,
 		billCap: cap,
 		attackPause,
@@ -1000,6 +1010,20 @@ function withExtraHosts(hosts: readonly string[] | "*", raw: string | undefined,
 	const extra = parseHostList(splitList(raw.toLowerCase(), []), name);
 	if (hosts === "*" || extra === "*") return "*";
 	return [...new Set([...hosts, ...extra])];
+}
+
+/**
+ * `WEBHOOK_SIGNING_KEY`: up to MAX_WEBHOOK_SIGNING_KEYS `whsk_` keys (a
+ * 32-byte Ed25519 seed in base64 each), separated by spaces or commas, the
+ * current one first; unset or empty, no webhooks.
+ */
+function loadWebhook(raw: string | undefined): RuntimeConfig["webhook"] {
+	if (raw === undefined || raw.trim() === "") return undefined;
+	try {
+		return { signingKeys: parseWebhookSigningKeys(raw) };
+	} catch (error) {
+		throw new ConfigError((error as Error).message);
+	}
 }
 
 /** `PUSH_DELAY_SECONDS`: whole seconds from 0 to MAX_STATUS_DELAY_SECONDS; unset or empty, the plan's `push.delaySeconds`. */

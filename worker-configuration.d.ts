@@ -32,6 +32,8 @@ declare global {
 		PUSH_HOSTS?: string;
 		PUSH_HOSTS_EXTRA?: string;
 		PUSH_DELAY_SECONDS?: string;
+		/** Push kind `webhook`'s whsk_ signing keys (src/config.ts, RuntimeConfig.webhook). */
+		WEBHOOK_SIGNING_KEY?: string;
 		OG_MEDIA_HOSTS?: string;
 		OG_MEDIA_HOSTS_EXTRA?: string;
 		/** Backups (src/config.ts, RuntimeConfig.backups). */
@@ -91,6 +93,7 @@ declare global {
 			PUSH_HOSTS?: string;
 			PUSH_HOSTS_EXTRA?: string;
 			PUSH_DELAY_SECONDS?: string;
+			WEBHOOK_SIGNING_KEY?: string;
 			OG_MEDIA_HOSTS?: string;
 			OG_MEDIA_HOSTS_EXTRA?: string;
 			BACKUP_EVERY?: string;

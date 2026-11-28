@@ -15,6 +15,8 @@ export type MetricEvent =
 	| "alarm"
 	/** Pushes delivered: `sent`, `failed` or `gone`, valued by count. */
 	| "push"
+	/** A webhook request (§4.9.4): `verify` or `call`, and the HTTP status (`0` when nothing answered). */
+	| "webhook"
 	/** Storage accounting overran (`overrun`, observed), closed on a storage failure (`uncertain`), or reopened (`recovered`); with what happened where known. */
 	| "accounting"
 	/** An admin alert posted (notifyAdmins): `pushed` or `not_pushed`, valued by admins mentioned. */

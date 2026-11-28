@@ -1,12 +1,12 @@
 {
-	"version": "4091af1-dirty",
-	"commit": "4091af1b5eb0c54b3d226ae2f727176c47f7c30a",
+	"version": "d537c23-dirty",
+	"commit": "d537c23d524e7c2ef727ebf0fbd919448403fa72",
 	"heldAlarms": 0,
 	"steps": [
 		{
 			"step": "object.wake (construct, schema ready)",
-			"reads": 52,
-			"writes": 68,
+			"reads": 53,
+			"writes": 70,
 			"reservedReads": 512,
 			"reservedWrites": 512
 		},
@@ -68,10 +68,10 @@
 		},
 		{
 			"step": "message.post (warm-up: first post of the day)",
-			"reads": 21,
-			"writes": 24,
-			"reservedReads": 472,
-			"reservedWrites": 208
+			"reads": 23,
+			"writes": 25,
+			"reservedReads": 520,
+			"reservedWrites": 220
 		},
 		{
 			"step": "message.post x10",

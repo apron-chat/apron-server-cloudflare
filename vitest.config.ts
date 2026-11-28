@@ -57,6 +57,8 @@ export default defineConfig({
 					PUSH_HOSTS: "push.example.net",
 					// Wakes push at once; the suites that cover the wait set one.
 					PUSH_DELAY_SECONDS: "0",
+					// Push kind `webhook` (a test-only Ed25519 seed): nothing is called unless a test registers a bot's webhook.
+					WEBHOOK_SIGNING_KEY: "whsk_AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
 					// Live text (on with PUBLIC_ORIGIN and UPLOAD_SIGNING_KEY) with tiny
 					// time limits, so test/live-text.integration.test.ts sees them end.
 					LIVE_TEXT_MAX_SECONDS: "2",

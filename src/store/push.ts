@@ -26,7 +26,7 @@ export class PushModule {
    * `wake` scopes it wakes for (a WAKE_SCOPES bitmask, DEFAULT_WAKE when not
    * given; `joined` is kept only for a user holding one of
    * JOINED_WAKE_ROLES, and dropped for anyone else, as a scope this server
-   * does not offer them). Registrations are the user's own: registering a `url` the user
+   * does not offer them; one left with no scope is `invalid_params`). Registrations are the user's own: registering a `url` the user
    * holds again replaces its keys, `push_id` (removing one now absent) and
    * scopes, and two
    * users may register the same `url`. A user past `subscriptionsPerUser`
@@ -53,6 +53,8 @@ export class PushModule {
       if (!identity) throw new StoreError("denied", "Sign in to receive push notifications");
       const moderator = identity.tier === "registered" && parseRoles(identity.roles_json).some((role) => JOINED_WAKE_ROLES.includes(role));
       const wake = moderator ? requested : requested & ~WAKE_SCOPES.joined;
+      // A wake that selects no scope this server supports for the user is refused (protocol §4.9.2).
+      if (wake === 0) throw new StoreError("invalid_params", "wake selects no scope this server supports for webpush");
       const pushId = input.pushId ?? null;
       const existing = sql.rows<{ p256dh: string; auth: string; push_id: string | null; wake: number; updated_ms: number }>(
         "SELECT p256dh, auth, push_id, wake, updated_ms FROM push_subscriptions WHERE user_id = ? AND url = ? LIMIT 1",
@@ -86,7 +88,7 @@ export class PushModule {
   }
 
   /**
-   * The users who may wake for `joined` (§4.9.4): those with a live
+   * The users who may wake for `joined` (§4.9.2): those with a live
    * registration that kept it (JOINED_WAKE_ROLES), most recently registered
    * first, at most MAX_PUSH_CANDIDATES. One range of
    * `push_subscriptions_joined_idx`, which only their registrations are in,

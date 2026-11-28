@@ -10,6 +10,7 @@
 import type { AccountUsageSnapshot } from "../account-usage";
 import type { BudgetSnapshot, CostEstimate } from "../budget-ledger";
 import type { StoredCredential, StoredIdentity } from "../domain";
+import type { WebhookFormat, WebhookRecord, WebhookState } from "./webhooks";
 import type { ChunkIndex } from "../history/cold/chunks";
 import type { QueuedRewrite } from "../history/records";
 import type { ChainStatePort } from "../history/state";
@@ -805,7 +806,7 @@ export interface Push {
   /** `push_unregister` (protocol §4.9): removes the user's own registration of `url`, if any. */
   remove(input: { userId: string; url: string; now?: number }): void;
   /**
-   * The users who may wake for `joined` (§4.9.4): those with a live
+   * The users who may wake for `joined` (§4.9.2): those with a live
    * registration that kept it (JOINED_WAKE_ROLES), most recently registered
    * first, at most MAX_PUSH_CANDIDATES. One range of
    * `push_subscriptions_joined_idx`, which only their registrations are in,
@@ -999,6 +1000,28 @@ export interface LiveText {
   expire(streaming: ReadonlySet<string>, now?: number): { broadcasts: Broadcast[]; ended: LiveEntry[]; next?: number };
 }
 
+/** Webhook registrations and call counters (protocol §4.9.4, webhooks.ts). Present only where webhooks are configured. */
+export interface Webhooks {
+  /** Every registration, from memory once read (no SQL after the first read of an instance, until a write). */
+  all(now?: number): readonly WebhookRecord[];
+  /** A user's registrations, from memory. */
+  of(userId: string, now?: number): WebhookRecord[];
+  /** `push_register` kind `webhook` (WebhooksModule.register). */
+  register(input: { userId: string; url: string; server: string; wake: number; format: WebhookFormat; endpointId: string; now?: number }): { hook: WebhookRecord; verify: boolean };
+  /** `push_unregister`: whether a registration of `url` went. */
+  remove(input: { userId: string; url: string; now?: number }): boolean;
+  /** Removes a registration by its endpoint ID (a 410, or its bot's owner). */
+  forget(input: { userId: string; endpointId: string; now?: number }): boolean;
+  /** Sets a registration's state, `error` (null clears it) and failures, while it is still the one with `endpointId`. */
+  update(input: { userId: string; endpointId: string; state?: WebhookState; error?: string | null; failures?: number; now?: number }): WebhookRecord | undefined;
+  /** Charges one call to the day's allowances: whether it may go. */
+  chargeCall(userId: string, now?: number): boolean;
+  /** A message as it is now (not deleted), for a call's `reply_to`: one metered lookup. */
+  message(messageId: string, now?: number): MessageSnapshot | null;
+  /** Calls made today, for `/status`. */
+  callsToday(now?: number): number;
+}
+
 /**
  * The store, as code outside src/store sees it: its parts. `push`,
  * `uploads` and `liveText` are present only where the deploy configures
@@ -1018,6 +1041,8 @@ export interface Store {
   readonly history: History;
   /** Present where push is configured (VAPID keys and the plan's PUSH_POLICY). */
   readonly push?: Push;
+  /** Present where webhooks are configured (WEBHOOK_SIGNING_KEY). */
+  readonly webhooks?: Webhooks;
   /** Present where uploads are configured (MEDIA, its origins, the signing key and the plan's UPLOAD_POLICY). */
   readonly uploads?: Uploads;
   /** Present where live text is configured (the plan's LIVE_TEXT_POLICY and the deployment's origin and key). */

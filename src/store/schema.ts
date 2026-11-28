@@ -78,6 +78,30 @@ export const SEEN_COLUMN_PROBE = "SELECT seen_ms FROM identities LIMIT 0";
 /** Registrations that keep `joined`, the partial index's condition (push_subscriptions_joined_idx), spelled once so every query matches it. */
 export const JOINED_WAKE_CONDITION = `(wake & ${WAKE_SCOPES.joined}) != 0`;
 
+/**
+ * Webhook registrations (protocol §4.9.4, push kind `webhook`; webhooks.ts),
+ * keyed by user and endpoint, with each one's `endpoint_id`, the server
+ * address its calls name, its scopes, format, state and last error. At most
+ * WEBHOOK_LIMITS.perServer rows, all read at once, so no index. Additive,
+ * without a new schema version (a rollback to code without it keeps every
+ * other table, and ignores this one): in SCHEMA_DDL for a new object, and
+ * made by the first use of an older one (WebhooksModule.ensureTable).
+ */
+export const WEBHOOKS_DDL = `CREATE TABLE IF NOT EXISTS webhooks (
+    user_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    server TEXT NOT NULL,
+    wake INTEGER NOT NULL,
+    format TEXT NOT NULL,
+    state TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    failures INTEGER NOT NULL DEFAULT 0,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (user_id, url)
+  ) WITHOUT ROWID`;
+
 /** The indexes of schema 9's tables that schema 10 rebuilds (upgradeFromSchema9), dropped before the rebuild creates its own. */
 export const SCHEMA_9_INDEXES = [
   "records_log_idx", "records_retention_idx", "message_state_latest_idx", "reaction_state_log_idx",
@@ -266,6 +290,7 @@ export const SCHEMA_DDL = `
     PRIMARY KEY (user_id, room_id)
   ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
+  ${WEBHOOKS_DDL};
   CREATE TABLE IF NOT EXISTS user_status (
     user_id TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'online',
@@ -349,6 +374,7 @@ export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   rooms: "sqlite-store.ts",
   push_subscriptions: "push.ts",
   push_wakes: "push.ts",
+  webhooks: "webhooks.ts",
   read_cursors: "reads.ts",
   room_mutes: "reads.ts",
   user_status: "reads.ts",
